@@ -1,0 +1,72 @@
+{% extends "base.html" %}{% block body %}
+<h2>Your devices</h2>
+<p class="mut">Link an e-reader once; every book you request or upload then arrives on it by itself.
+You can also download any of your books from <a href="{{ url_for('my_library') }}">My books</a>.</p>
+
+<div class="card">
+<h3>Kobo</h3>
+{% if not kobo_on %}<p class="mut">Kobo sync is not switched on for this library yet — ask the admin (it is one click in the admin tools).</p>{% endif %}
+{% if kobo %}
+<p>Your personal sync link:</p>
+<p><span class="code">{{ kobo }}</span></p>
+<ol class="mut" style="margin-top:6px">
+<li>Connect the Kobo to a computer and open <code>.kobo/Kobo/Kobo eReader.conf</code>.</li>
+<li>Under <code>[OneStoreServices]</code> set <code>api_endpoint={{ kobo }}</code> (add the section if missing).</li>
+<li>Eject, then tap <em>Sync</em> on the device. Only your books arrive.</li>
+</ol>
+<form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_reset">
+<button type="submit" class="sec">Regenerate link</button> <span class="mut">(the old link stops working; update the device)</span></form>
+{% else %}
+<p class="mut">Generate a private link, then put it in the Kobo's config file (instructions appear after generating).</p>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="kobo"><button type="submit">Generate my Kobo link</button></form>
+{% endif %}
+</div>
+
+<div class="card">
+<h3>Kindle</h3>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="kindle">
+<p><input type="email" name="kindle_mail" value="{{ u.kindle_mail or '' }}" placeholder="yourname_123@kindle.com"></p>
+<div class="row"><button type="submit">Save Kindle address</button>
+{% if u.kindle_mail %}<span class="mut">Current: {{ u.kindle_mail }}</span>{% endif %}</div></form>
+<p class="mut" style="margin-top:8px">Find it under Amazon → Manage Your Content and Devices → Preferences → Personal Document Settings.
+There, also add <strong>{{ cfg.SMTP_FROM or 'the library sender address (ask the admin)' }}</strong> to <em>Approved Personal Document E-mail List</em>, or Amazon will drop the mail.
+Amazon takes EPUB and PDF by mail (not MOBI/AZW3), up to 50 MB per mail.</p>
+{% if kindle_enabled and u.kindle_mail %}
+<form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kindle_test">
+<button type="submit" class="sec">Send a test to my Kindle</button>
+<span class="mut">{% if prefs.last_kindle_test %}last test sent {{ prefs.last_kindle_test }}{% else %}proves the approved-sender step before the first real book{% endif %}</span></form>
+{% endif %}
+{% if not kindle_enabled %}<p class="mut">Sending from this portal is not enabled yet (the admin has not configured outgoing mail). You can still use <em>Send to Kindle</em> inside the <a href="{{ cfg.BOOKS_URL }}" target="_blank" rel="noopener">library site</a>.</p>{% endif %}
+</div>
+
+<div class="card">
+<h3>Preferences</h3>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="prefs">
+<div class="row"><label>Preferred download format
+<select name="preferred_format">{% for f in formats %}<option value="{{f}}" {{ 'selected' if prefs.preferred_format==f }}>{{ f }}{% if f=='epub' %} (Kobo, Kindle by mail, every app){% elif f=='azw3' %} (Kindle via USB only){% elif f=='mobi' %} (legacy Kindles, USB only){% endif %}</option>{% endfor %}</select></label></div>
+<p><label><input type="checkbox" name="auto_kindle" value="1" {{ 'checked' if prefs.auto_kindle }} {{ '' if kindle_enabled else 'disabled' }}>
+Automatically e-mail every new ebook to my Kindle{% if not kindle_enabled %} <span class="mut">(needs outgoing mail)</span>{% endif %}</label></p>
+<p><label><input type="checkbox" name="notify_email" value="1" {{ 'checked' if prefs.notify_email }} {{ '' if kindle_enabled else 'disabled' }}>
+E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or denied{% if not kindle_enabled %} <span class="mut">(needs outgoing mail)</span>{% endif %}</label></p>
+<button type="submit">Save preferences</button></form>
+<p class="mut" style="margin-top:8px">Formats: the library converts books to EPUB on arrival (PDF and comics stay as they are). Kobo receives KEPUB automatically on sync; Kindle accepts EPUB or PDF by e-mail, AZW3/MOBI only over USB.</p>
+</div>
+
+<div class="card">
+<h3>Phone, tablet, computer, KOReader</h3>
+<ul class="mut">
+<li>Read in the browser or in any OPDS reader app: catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the trailing slash) with your library login.</li>
+{% if kosync %}<li>KOReader: OPDS catalog as above, and reading-progress sync (Tools → Progress sync) with server <span class="code">{{ cfg.BOOKS_URL }}/kosync</span> and your library login.</li>{% endif %}
+<li>Audiobooks: install the Audiobookshelf app and sign in at <span class="code">{{ cfg.AUDIO_URL }}</span>{% if abs_linked %} with the same username and password{% endif %}.</li>
+</ul>
+</div>
+
+<div class="card">
+<h3>Account</h3>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="password">
+<div class="row"><label style="flex:1;min-width:160px">Current password<input type="password" name="current" autocomplete="current-password" required></label>
+<label style="flex:1;min-width:160px">New password<input type="password" name="new" minlength="8" autocomplete="new-password" required></label>
+<label style="flex:1;min-width:160px">Repeat<input type="password" name="repeat" minlength="8" autocomplete="new-password" required></label></div>
+<p><button type="submit">Change password</button> <span class="mut">Changes it for the portal, the library site, the extended search{% if abs_linked %} and Audiobookshelf{% endif %}.</span></p></form>
+</div>
+{% endblock %}

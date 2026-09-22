@@ -1,0 +1,50 @@
+{% extends "base.html" %}{% block body %}
+<h2>Admin</h2>
+<div class="grid">
+<div class="card"><h3>Queue</h3>
+<div class="mut">pending <strong class="st-pending">{{ counts.pending }}</strong> · active <strong>{{ counts.queued + counts.downloading + counts.importing }}</strong> · done <strong class="st-done">{{ counts.done }}</strong> · needs tag <strong class="st-needs-tag">{{ counts.needs_tag }}</strong> · failed <strong class="st-error">{{ counts.error }}</strong></div>
+<p><a href="{{ url_for('status') }}">Open the queue</a></p></div>
+<div class="card"><h3>Health</h3>
+<div class="mut">Worker: <strong class="{{ 'st-done' if health.ok else 'st-error' }}">{{ 'healthy' if health.ok else 'DEGRADED — ' + health.problems|join(', ') }}</strong>
+· ingest backlog <strong>{{ health.ingest_pending }}</strong>{% if health.ingest_oldest_s > 1800 %} <span class="st-error">(oldest {{ (health.ingest_oldest_s // 60)|int }} min — CWA import stuck?)</span>{% endif %}<br>
+Kobo sync: <strong>{{ 'on' if kobo_on else 'OFF — enable in the admin tools' }}</strong><br>
+Audiobookshelf automation: <strong>{{ 'linked' if abs_linked else 'not set up (Library → Audiobookshelf)' }}</strong><br>
+Send-to-Kindle mail: <strong>{{ 'configured' if kindle_enabled else 'not configured' }}</strong><br>
+Request quota: <strong>{{ quota if quota else 'unlimited' }}</strong>{% if quota %} per user per day{% endif %}<br>
+{% if disk %}Library disk: <strong class="{{ 'st-error' if disk.pct >= 95 else ('st-needs-tag' if disk.pct >= 85 else '') }}">{{ disk.free_gb }} GB free</strong> ({{ disk.pct }}% used)<br>{% endif %}
+Portal sources: {{ sources|join(', ') }}</div></div>
+</div>
+
+{% if needs_tag %}
+<div class="card"><h3>Imported without an owner tag <span class="mut">({{ needs_tag|length }}; MOBI/AZW3/FB2/TXT cannot carry it)</span></h3>
+<p class="mut">These books are in the library but invisible to their owner until you add the tag in Calibre-Web (edit the book → Tags → <code>owner:&lt;user&gt;</code>). Then dismiss the row from the queue.</p>
+<table><tr><th>File</th><th>Owner → tag to add</th><th>Detail</th></tr>
+{% for r in needs_tag %}<tr><td>{{ r.title }}</td><td><code>owner:{{ r.owner }}</code></td><td class="mut">{{ r.detail or '' }}</td></tr>{% endfor %}</table></div>
+{% endif %}
+
+<div class="card"><h3>Applications</h3>
+<div class="grid">{% for label, url, scope in links %}
+<div><a href="{{ url }}" target="_blank" rel="noopener">{{ label }}</a> <span class="badge">{{ scope }}</span></div>{% endfor %}</div>
+<p class="mut">Tailscale-scoped links only open while you are connected to the tailnet.</p></div>
+
+<div class="card"><h3>Users</h3>
+<table><tr><th>User</th><th>Role</th><th>Isolation</th><th>Kindle</th></tr>
+{% for u in users %}<tr><td>{{ u.name }}</td><td>{{ 'admin' if u.is_admin else 'user' }}</td>
+<td>{% if u.is_admin %}<span class="mut">sees everything</span>{% elif u.isolated %}<span class="st-done">owner:{{ u.name }}</span>{% else %}<span class="st-error">NOT isolated — fix in admin tools (Users → repair)</span>{% endif %}</td>
+<td class="mut">{{ u.kindle_mail or '—' }}</td></tr>{% endfor %}</table>
+<h3 style="margin-top:14px">Add a user</h3>
+<form method="post" class="row" style="align-items:flex-end">{{ csrf_field() }}<input type="hidden" name="action" value="add_user">
+<label style="flex:1;min-width:140px">Username<input type="text" name="name" required pattern="[A-Za-z0-9._-]+" autocomplete="off"></label>
+<label style="flex:1;min-width:160px">E-mail<input type="email" name="email"></label>
+<label style="flex:1;min-width:160px">Password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+<label class="mut"><input type="checkbox" name="admin" value="1"> admin</label>
+<button type="submit">Create</button></form>
+<p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.</p>
+</div>
+
+<div class="card"><h3>Audit trail <span class="mut">(last 100 events; logins, lockouts, requests, downloads, admin actions)</span></h3>
+<table><tr><th>When</th><th>User</th><th>From</th><th>Event</th><th>Detail</th></tr>
+{% for a in audit %}<tr><td class="mut">{{ a.when }}</td><td>{{ a.user or '—' }}</td><td class="mut">{{ a.ip or '' }}</td>
+<td class="{{ 'st-error' if 'fail' in a.event or 'locked' in a.event or 'denied' in a.event else '' }}">{{ a.event }}</td><td class="mut">{{ a.detail or '' }}</td></tr>{% endfor %}
+{% if not audit %}<tr><td colspan="5" class="mut">Nothing yet.</td></tr>{% endif %}</table></div>
+{% endblock %}

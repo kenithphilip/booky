@@ -1,0 +1,2 @@
+# Managed by bookstack.sh (menu 20 adds users). Passwords are argon2id hashes.
+users: {}

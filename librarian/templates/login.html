@@ -1,0 +1,9 @@
+{% extends "base.html" %}{% block body %}
+<div class="card" style="max-width:380px;margin:8vh auto">
+<h2>Sign in</h2>
+<p class="mut">Use the username and password you were given.</p>
+<form method="post">{{ csrf_field() }}
+<p><input type="text" name="username" placeholder="Username" autofocus autocomplete="username"></p>
+<p><input type="password" name="password" placeholder="Password" autocomplete="current-password"></p>
+<button type="submit">Sign in</button></form></div>
+{% endblock %}

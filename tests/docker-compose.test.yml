@@ -1,0 +1,82 @@
+# Override for the end-to-end test (tests/stack-test.sh). Never used in production.
+# - The production Caddy, qBittorrent, aria2, AriaNg and Uptime Kuma are parked behind a
+#   profile (no TLS certs / peer ports on a laptop; Caddy's config is validated separately).
+# - Services get test ports on localhost. The portal leaves host networking (!reset) and
+#   joins the compose network so the test mail server, file server, Audiobookshelf and
+#   Authelia are reachable by name; BIND=0.0.0.0 only exists for this harness.
+# - Extra test-only services: GreenMail (SMTP+IMAP for Send-to-Kindle and e-mail intake),
+#   a static file server (intake webhook source), Authelia + a plain-HTTP Caddy "gate" that
+#   uses the SAME forward_auth snippet as production, in front of the real CWA and portal.
+services:
+  caddy:       { profiles: ["prod"] }
+  qbittorrent: { profiles: ["prod"] }
+  aria2:       { profiles: ["prod"] }
+  ariang:      { profiles: ["prod"] }
+  uptime-kuma: { profiles: ["prod"] }
+
+  calibre-web:
+    ports: !override ["127.0.0.1:18083:8083"]
+  audiobookshelf:
+    ports: !override ["127.0.0.1:23378:80"]
+  shelfmark:
+    ports: !override ["127.0.0.1:18084:8084"]
+    environment:
+      SESSION_COOKIE_SECURE: "false"
+
+  librarian:
+    network_mode: !reset null
+    ports: ["127.0.0.1:18090:8090"]
+    environment:
+      BIND: "0.0.0.0"
+      COOKIE_SECURE: "false"
+      MAX_REQUESTS_PER_DAY: "3"
+      LOCKOUT_FAILS: "4"
+      # the test file server plays the "local Gutenberg mirror": an allowed origin for the
+      # request fence and a trusted netloc for the worker's private-address check
+      GUTENBERG_MIRROR: http://filesrv:8000
+      ABS_URL: http://audiobookshelf:80
+      SMTP_HOST: greenmail
+      SMTP_PORT: "3025"
+      SMTP_SECURITY: none
+      SMTP_USER: ""
+      SMTP_PASS: ""
+      SMTP_FROM: library@example.test
+      IMAP_HOST: greenmail
+      IMAP_PORT: "3143"
+      IMAP_SSL: "false"
+      IMAP_USER: intake@example.test
+      IMAP_PASS: anything
+      IMAP_FOLDER: INBOX
+    depends_on:
+      greenmail:
+        condition: service_started
+
+  greenmail:
+    image: greenmail/standalone:2.1.3
+    container_name: greenmail
+    environment:
+      GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose"
+    ports: ["127.0.0.1:13025:3025", "127.0.0.1:13143:3143"]
+
+  filesrv:
+    image: python:3.12-slim
+    container_name: filesrv
+    command: ["python", "-m", "http.server", "8000", "--directory", "/srv"]
+    volumes: ["./testfiles:/srv:ro"]
+
+  authelia:
+    image: authelia/authelia:4.39
+    container_name: authelia
+    volumes: ["./authelia:/config"]
+    environment:
+      TZ: UTC
+      AUTHELIA_SESSION_SECRET: e2e-session-secret-0123456789abcdef0123456789abcdef
+      AUTHELIA_STORAGE_ENCRYPTION_KEY: e2e-storage-key-0123456789abcdef0123456789abcdef
+      AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET: e2e-jwt-secret-0123456789abcdef0123456789abcdef
+
+  gate:
+    image: caddy:2
+    container_name: gate
+    ports: ["127.0.0.1:18080:80"]
+    volumes: ["./caddy-test/Caddyfile:/etc/caddy/Caddyfile:ro"]
+    depends_on: [authelia]

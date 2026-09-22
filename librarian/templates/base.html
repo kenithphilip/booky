@@ -1,0 +1,39 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Library</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#e6e6e6;--mut:#9aa0ab;--acc:#5b8cff;--line:#262a33;--ok:#4ccf8f;--warn:#e2b93b;--bad:#ff6b6b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 20px;
+border-bottom:1px solid var(--line);flex-wrap:wrap}a{color:var(--acc);text-decoration:none}
+.wrap{max-width:960px;margin:0 auto;padding:20px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:10px 0}
+input,button,select{font:inherit}input[type=text],input[type=password],input[type=email],select{width:100%;padding:10px;
+border-radius:8px;border:1px solid var(--line);background:#0c0e12;color:var(--fg)}
+button,.btn{padding:9px 14px;border:0;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer;display:inline-block}
+button.sec,.btn.sec{background:#3a3f4a}button.danger{background:#7a2b2b}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.mut{color:var(--mut);font-size:13px}
+.badge{font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:20px;color:var(--mut)}
+.flash{background:#1c2740;border:1px solid #2b3d63;padding:10px 12px;border-radius:8px;margin:10px 0}
+table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+code,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#0c0e12;padding:2px 6px;border-radius:6px;word-break:break-all}
+h2{font-size:18px;margin:18px 0 8px}h3{font-size:15px;margin:12px 0 6px}
+.st-done{color:var(--ok)}.st-error{color:var(--bad)}.st-needs-tag{color:var(--warn)}.st-queued,.st-importing,.st-downloading,.st-pending,.st-retrying{color:var(--warn)}.st-denied{color:#c98a8a}.st-dismissed{color:#6b7280}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
+nav a{padding:4px 2px}nav a.active{border-bottom:2px solid var(--acc)}
+</style></head><body>
+<header><strong>{{ cfg.DOMAIN or 'Library' }}</strong>
+<nav class="row">{% if session.user %}
+<a href="{{url_for('index')}}" class="{{ 'active' if request.endpoint=='index' }}">Search</a>
+<a href="{{url_for('status')}}" class="{{ 'active' if request.endpoint=='status' }}">Requests</a>
+<a href="{{url_for('my_library')}}" class="{{ 'active' if request.endpoint=='my_library' }}">My books</a>
+<a href="{{url_for('upload')}}" class="{{ 'active' if request.endpoint=='upload' }}">Upload</a>
+<a href="{{url_for('devices')}}" class="{{ 'active' if request.endpoint=='devices' }}">Devices</a>
+{% if session.admin %}<a href="{{url_for('admin')}}" class="{{ 'active' if request.endpoint=='admin' }}">Admin</a>{% endif %}
+<span class="mut">{{session.user}}{% if session.admin %} · admin{% endif %}</span>
+<form method="post" action="{{url_for('logout')}}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Log out</button></form>
+{% endif %}</nav></header>
+<div class="wrap">
+{% with m=get_flashed_messages() %}{% for x in m %}<div class="flash">{{x}}</div>{% endfor %}{% endwith %}
+{% block body %}{% endblock %}</div></body></html>

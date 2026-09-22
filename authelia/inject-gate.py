@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Inject the Authelia forward_auth gate into a rendered Caddyfile, one bypass list per host.
+
+    python3 inject-gate.py <Caddyfile> <caddy-gate.snippet>
+
+Replaces each marker line `# @AUTHELIA_GATE:<host>@` (host = books, audio, request, shelf)
+with the snippet, its `@@BYPASS@@` filled with that host's device/API paths. A host with an
+empty list gets forward_auth WITHOUT a matcher (everything gated). The Caddyfile is read
+fully before it is opened for writing (v3 truncated it). Exit 1 with a message when there is
+no marker at all, an unknown host, or the snippet lacks the placeholder.
+
+Keep BYPASS in step with authelia/configuration.yml.template (same paths as regex rules).
+"""
+import re
+import sys
+
+MARKER = re.compile(r"^[ \t]*# @AUTHELIA_GATE:([a-z]+)@[ \t]*$")
+BYPASS = {
+    # Kobo sync (token), OPDS and KOReader sync (HTTP Basic) - devices cannot do SSO
+    "books": "/kobo/* /opds /opds/* /kosync /kosync/*",
+    # Audiobookshelf apps: their own token login, API, sockets, streams and public feeds
+    "audio": "/login /logout /api/* /socket.io/* /hls/* /s/* /ping /status /healthcheck /public/* /feed/*",
+    # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback
+    "request": "/intake",
+    # Shelfmark: nothing bypassed
+    "shelf": "",
+}
+
+
+def bypass_regexp(paths):
+    """Caddy's `path` matcher is case-insensitive and not anchored the way the Authelia rules
+    are, so emit one anchored, case-sensitive regexp instead: `/x/*` -> `^/x/`, `/x` -> `^/x$`
+    (`/x` and `/x/*` together -> `^/x(/|$)`)."""
+    exact, prefix = [], []
+    for p in paths.split():
+        if p.endswith("/*"):
+            prefix.append(p[:-2])
+        else:
+            exact.append(p)
+    alts = []
+    for p in sorted(set(prefix) | set(exact)):
+        if p in prefix and p in exact:
+            alts.append(re.escape(p) + "(/|$)")
+        elif p in prefix:
+            alts.append(re.escape(p) + "/")
+        else:
+            alts.append(re.escape(p) + "$")
+    return "^(?:" + "|".join(alts) + ")"
+
+
+def render(snippet, host):
+    paths = BYPASS[host]
+    if paths:
+        return snippet.replace("not path @@BYPASS@@", "not path_regexp " + bypass_regexp(paths)).replace("@@BYPASS@@", bypass_regexp(paths))
+    lines = [l for l in snippet.split("\n") if "@@BYPASS@@" not in l]
+    return "\n".join(lines).replace("forward_auth @authelia_protected ", "forward_auth ")
+
+
+def inject(src, snippet):
+    if "@@BYPASS@@" not in snippet:
+        raise SystemExit("snippet has no @@BYPASS@@ placeholder")
+    out, seen = [], []
+    for line in src.split("\n"):
+        m = MARKER.match(line)
+        if not m:
+            out.append(line)
+            continue
+        host = m.group(1)
+        if host not in BYPASS:
+            raise SystemExit(f"unknown gate marker @AUTHELIA_GATE:{host}@ (known: {' '.join(BYPASS)})")
+        seen.append(host)
+        out.append(render(snippet, host))
+    if not seen:
+        raise SystemExit("no gate markers in Caddyfile; re-render first")
+    return "\n".join(out), seen
+
+
+def main(argv):
+    if len(argv) != 3:
+        raise SystemExit(__doc__.strip().split("\n")[2].strip())
+    cf, snip = argv[1], argv[2]
+    with open(snip) as f:
+        snippet = f.read().rstrip("\n")
+    with open(cf) as f:          # read everything first ...
+        src = f.read()
+    text, seen = inject(src, snippet)
+    with open(cf, "w") as f:     # ... only then truncate and write
+        f.write(text)
+    print(f"gate injected: {' '.join(seen)}")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

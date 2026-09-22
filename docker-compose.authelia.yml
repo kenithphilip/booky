@@ -1,0 +1,24 @@
+# Optional self-hosted SSO + 2FA gate in front of the public apps.
+# Enable/disable via bookstack.sh (menu 18/19). Bound to localhost; Caddy proxies it.
+services:
+  authelia:
+    image: ${IMG_AUTHELIA:-authelia/authelia:4.39.28}
+    container_name: authelia
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    # ~30 MiB idle, ~240 MiB measured while hashing a password (argon2).
+    mem_limit: 384m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    ports:
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - ./authelia:/config
+    environment:
+      - TZ=${TZ}
+      - AUTHELIA_SESSION_SECRET=${AUTHELIA_SESSION_SECRET}
+      - AUTHELIA_STORAGE_ENCRYPTION_KEY=${AUTHELIA_STORAGE_ENCRYPTION_KEY}
+      - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=${AUTHELIA_JWT_SECRET}

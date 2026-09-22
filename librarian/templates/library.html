@@ -1,0 +1,17 @@
+{% extends "base.html" %}{% block body %}
+<h2>{{ 'All books' if admin else 'My books' }}</h2>
+<p class="mut">Preferred format: <strong>{{ prefs.preferred_format }}</strong> (change on <a href="{{ url_for('devices') }}">Devices</a>).
+Kobo owners: just tap Sync on the device.</p>
+{% if not books %}<div class="card mut">Nothing in your library yet. Request or upload a book and it will show up here after import (usually under a minute).</div>{% endif %}
+{% for b in books %}
+<div class="card"><div class="row" style="justify-content:space-between">
+<div><strong>{{ b.title }}</strong><br><span class="mut">{{ b.author }} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>
+<div class="row">
+{% if b.best %}<a class="btn" href="{{ url_for('download', book_id=b.id, fmt=b.best) }}">Download {{ b.best }}</a>{% endif %}
+{% for f in b.formats if f != b.best %}<a class="btn sec" href="{{ url_for('download', book_id=b.id, fmt=f) }}">{{ f }}</a>{% endfor %}
+{% if kindle_enabled and kindle_mail and b.kindle_ok %}
+<form method="post" action="{{ url_for('send_kindle', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Send to Kindle</button></form>
+{% elif kindle_enabled and kindle_mail %}<span class="mut" title="Amazon accepts EPUB or PDF by mail">no Kindle format yet</span>{% endif %}
+</div></div></div>
+{% endfor %}
+{% endblock %}

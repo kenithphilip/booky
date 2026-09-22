@@ -1,0 +1,30 @@
+# Real secrets/config live on the server (bookstack.sh writes /srv/bookstack/.env).
+.env
+# Rendered from templates on the server
+caddy/Caddyfile
+caddy/cf-origin-pull-ca.pem
+authelia/configuration.yml
+authelia/db.sqlite3
+authelia/notification.txt
+# Runtime data if the repo is ever run in place
+librarian/state/
+caddy/data/
+caddy/config/
+cwa/
+abs/
+qbt/
+aria2/
+kuma/
+shelfmark/
+ephemera/
+library/
+downloads/
+# OS / editor
+.DS_Store
+__pycache__/
+*.pyc
+mnt/
+# Local tool state
+.claude/
+.ruff_cache/
+.pytest_cache/

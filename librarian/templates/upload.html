@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block body %}
+<div class="card" style="max-width:520px;margin:6vh auto">
+<h2>Upload a book you own</h2>
+<p class="mut">The file is added to your library. <strong>EPUB, PDF and CBZ</strong> are tagged to you
+automatically and show up under My books and on your devices. <strong>MOBI, AZW3, FB2 and TXT</strong>
+cannot carry the tag: they import, but the admin has to tag them to you first (the request
+shows <em>needs-tag</em> until then). CBR comics are not accepted — convert them to CBZ.
+Audiobooks: one <strong>M4B</strong>, or a <strong>ZIP</strong> of the MP3s. Files up to {{ cfg.MAX_UPLOAD_MB }} MB;
+bigger files go through your dropbox folder (ask the admin).</p>
+<form method="post" enctype="multipart/form-data">{{ csrf_field() }}
+<p><input type="file" name="file" accept=".epub,.mobi,.azw3,.pdf,.cbz,.txt,.fb2,.mp3,.m4b,.zip"></p>
+<button type="submit">Upload</button></form>
+</div>{% endblock %}

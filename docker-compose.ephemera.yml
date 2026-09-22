@@ -1,0 +1,106 @@
+# Optional overlay: Ephemera (search + request queue that auto-downloads a title once it
+# becomes available) plus the FlareSolverr helper it needs. Enable/disable via bookstack.sh
+# (menu 23/24). Everything binds to localhost; Caddy exposes it on the TAILNET ONLY behind
+# the admin password gate, because Ephemera has no login of its own.
+#
+# STATUS (Sept 2026): the upstream project (github.com/OrwellianEpilogue/ephemera) and its
+# container image (ghcr.io/orwellianepilogue/ephemera) were removed from GitHub in early
+# 2026. This builds from a community re-upload of the last release (v1.3.1, Nov 2025),
+# pinned to an exact commit so the build is reproducible. Treat it as UNMAINTAINED: no
+# security fixes are coming. Shelfmark (docker-compose.yml) is the maintained equivalent
+# and covers the same search/download job with per-user accounts; use Ephemera only if
+# you specifically want its request-and-wait queue or its newznab indexer mode.
+services:
+  ephemera:
+    image: bookstack/ephemera:1.3.1
+    build:
+      context: "https://github.com/Nsoromma/ephemera-book-downloader.git#e98e99444ebaddeaf9679cd95929bbe1de90bf5e"
+      # The fork's own Dockerfile installs `pnpm@latest`, which moved to a major version that
+      # rejects one of its config commands (build verified broken 2026-09-22). This is the same
+      # multi-stage build with pnpm pinned to the lockfile's major (lockfileVersion 9) and the
+      # broken line removed. Kept here so the overlay does not depend on upstream fixing it.
+      dockerfile_inline: |
+        FROM node:22-alpine AS build-env
+        RUN apk add --no-cache python3 make g++ gcc musl-dev && npm install -g pnpm@9.15.9
+        ENV CI=true
+        WORKDIR /build
+        COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+        COPY packages/ ./packages/
+        RUN pnpm install --frozen-lockfile
+        RUN cd packages/shared && npx tsc --build --force && cd ../.. && \
+            cd packages/api && npx tsc --build --force && cd ../.. && \
+            cd packages/web && npx tsc && npx vite build
+        FROM node:22-alpine AS prod-deps
+        RUN apk add --no-cache python3 make g++ gcc musl-dev && npm install -g pnpm@9.15.9
+        ENV CI=true
+        WORKDIR /app
+        COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+        COPY packages/ ./packages/
+        # --ignore-scripts skips husky's prepare hook, so build the one native module explicitly
+        # and prove it loads: a missing binding must fail the BUILD, not the container at runtime.
+        RUN pnpm install --frozen-lockfile --prod --ignore-scripts
+        RUN pnpm -r rebuild better-sqlite3 && cd packages/api && node -e "require('better-sqlite3')(':memory:').close(); console.log('better-sqlite3 OK')"
+        FROM node:22-alpine AS runtime
+        RUN apk add --no-cache shadow su-exec && addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
+        WORKDIR /app
+        COPY --from=prod-deps /app/node_modules ./node_modules
+        COPY --from=prod-deps /app/packages/shared/node_modules ./packages/shared/node_modules
+        COPY --from=prod-deps /app/packages/api/node_modules ./packages/api/node_modules
+        COPY --from=build-env /build/packages/shared/dist ./packages/shared/dist
+        COPY --from=build-env /build/packages/shared/package.json ./packages/shared/
+        COPY --from=build-env /build/packages/api/dist ./packages/api/dist
+        COPY --from=build-env /build/packages/api/package.json ./packages/api/
+        COPY --from=build-env /build/packages/api/src/db ./packages/api/src/db
+        COPY --from=build-env /build/packages/web/dist ./packages/web/dist
+        COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+        COPY docker-entrypoint.sh /usr/local/bin/
+        RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+        EXPOSE 8286
+        HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+            CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:8286/health || exit 1
+        ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+    container_name: ephemera
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    environment:
+      - TZ=${TZ}
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - AA_BASE_URL=${EPHEMERA_AA_BASE_URL}
+      - LG_BASE_URL=${EPHEMERA_LG_BASE_URL:-}
+      - AA_API_KEY=${EPHEMERA_AA_API_KEY:-}
+      - FLARESOLVERR_URL=http://flaresolverr:8191
+    ports:
+      - "127.0.0.1:8286:8286"
+    volumes:
+      - ./ephemera/data:/app/data
+      - ./ephemera/downloads:/app/downloads
+      # Ephemera has no per-user concept: everything it fetches lands in ONE user's dropbox,
+      # where the librarian tags it owner:<EPHEMERA_OWNER> and ingests it atomically.
+      - ./library/dropbox/${EPHEMERA_OWNER:-admin}:/app/ingest
+    depends_on:
+      - flaresolverr
+    # Caddy serves it at ephemera.<domain> (Tailscale only, basic_auth)
+
+  flaresolverr:
+    # Headless-Chromium challenge solver Ephemera uses as a slow fallback. ~0.5-1 GB RAM.
+    image: ${IMG_FLARESOLVERR:-ghcr.io/flaresolverr/flaresolverr:v3.5.2}
+    container_name: flaresolverr
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    # Headless Chromium: the biggest fence in the stack; only enable Ephemera on >= 8 GB hosts.
+    mem_limit: 1024m
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    # No published ports: only Ephemera reaches it, over the compose network.

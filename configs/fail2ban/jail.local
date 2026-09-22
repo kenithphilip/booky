@@ -1,0 +1,35 @@
+# Template rendered by bookstack.sh (Security -> fail2ban): the double-at placeholders are filled in.
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 5
+backend = systemd
+
+[sshd]
+enabled = true
+
+# Web logins arrive through Cloudflare, so a ban must be placed AT Cloudflare (an IP Access
+# Rule on the zone) — banning in the local firewall would either do nothing (the client never
+# connects directly) or, worse, block a Cloudflare edge address. Needs the API token to have
+# Zone -> Firewall Services -> Edit.
+[caddy-auth]
+enabled  = @@CADDY_JAIL@@
+filter   = caddy-auth
+logpath  = /srv/bookstack/caddy/data/access.log
+backend  = auto
+maxretry = 8
+findtime = 5m
+bantime  = 2h
+action   = cloudflare-token[cftoken="@@CF_API_TOKEN@@", cfzone="@@CF_ZONE@@"]
+
+# Basic-auth guessing on /opds and /kosync (device paths: no Authelia, no browser check).
+# Loose on purpose: reader apps get one 401 challenge per session.
+[caddy-device-auth]
+enabled  = @@CADDY_JAIL@@
+filter   = caddy-device-auth
+logpath  = /srv/bookstack/caddy/data/access.log
+backend  = auto
+maxretry = 30
+findtime = 10m
+bantime  = 2h
+action   = cloudflare-token[cftoken="@@CF_API_TOKEN@@", cfzone="@@CF_ZONE@@"]

@@ -1,0 +1,5 @@
+# Keep runtime state and local junk out of the image build context.
+state/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,26 @@
+{% extends "base.html" %}{% block body %}
+<form method="get" class="row" style="margin-bottom:6px">
+<input type="text" name="q" value="{{q}}" placeholder="Search title or author…" style="flex:1">
+<button type="submit">Search</button></form>
+<p class="mut">Searching: {{ sources|join(', ') }}{% if cfg.SHELF_URL %} · Not here? Try <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">the extended search</a>.{% endif %}</p>
+{% if q and not results %}<div class="card">No matches in the enabled catalogs.</div>{% endif %}
+{% for r in results %}
+<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
+<div class="row" style="gap:12px;align-items:flex-start">
+{% if r.cover_url %}<img src="{{ url_for('cover', u=r.cover_url) }}" alt="" loading="lazy"
+ style="width:48px;height:72px;object-fit:cover;border-radius:4px;border:1px solid var(--line);flex:none">{% endif %}
+<div><strong>{{r.title}}</strong><br><span class="mut">{{r.author}}</span>
+{% if r.blurb %}<br><span class="mut" style="font-size:12px">{{ r.blurb }}</span>{% endif %}</div>
+</div>
+<div class="row" style="flex:none">
+<span class="badge">{{r.source.replace('_',' ')}}</span>
+<span class="badge">{{ 'audiobook' if r.kind=='audio' else r.format }}</span>
+{% if r.is_torrent %}<span class="badge">P2P</span>{% endif %}
+{% if r.dupe %}<span class="badge" title="Already in the library">in library</span>{% endif %}
+<form method="post" action="{{url_for('make_request')}}">{{ csrf_field() }}
+{% for k in ['kind','source','identifier','title','author','download_url'] %}
+<input type="hidden" name="{{k}}" value="{{ r[k] }}">{% endfor %}
+<input type="hidden" name="is_torrent" value="{{ '1' if r.is_torrent else '0' }}">
+<button type="submit">Request</button></form></div></div></div>
+{% endfor %}
+{% endblock %}

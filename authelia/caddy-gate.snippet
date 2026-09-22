@@ -1,0 +1,14 @@
+	# Rendered per vhost by authelia/inject-gate.py (bypass list per host; no list = no matcher).
+	# route{} keeps the Remote-* strip BEFORE forward_auth (Caddy would otherwise order
+	# request_header after it), so a bypassed path cannot smuggle a Remote-User header in.
+	route {
+		request_header -Remote-User
+		request_header -Remote-Groups
+		request_header -Remote-Email
+		request_header -Remote-Name
+		@authelia_protected not path @@BYPASS@@
+		forward_auth @authelia_protected 127.0.0.1:9091 {
+			uri /api/authz/forward-auth
+			copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
+		}
+	}

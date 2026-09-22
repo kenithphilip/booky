@@ -1,0 +1,76 @@
+# Rendered by bookstack.sh. Secrets come from environment (see the compose override).
+theme: dark
+server:
+  address: 'tcp://0.0.0.0:9091/'
+log:
+  level: info
+totp:
+  issuer: '@@DOMAIN@@'
+
+authentication_backend:
+  file:
+    path: /config/users_database.yml
+    password:
+      algorithm: argon2
+
+access_control:
+  default_policy: deny
+  rules:
+    # Device and app paths cannot do SSO: let them through to the app's own auth (Kobo token,
+    # HTTP Basic, ABS token, intake bearer). Same lists as authelia/inject-gate.py BYPASS;
+    # first matching rule wins, so these sit before the two_factor rule.
+    - domain: 'books.@@DOMAIN@@'
+      policy: bypass
+      resources:
+        - '^/kobo/.*$'
+        - '^/opds.*$'
+        - '^/kosync.*$'
+    - domain: 'audio.@@DOMAIN@@'
+      policy: bypass
+      resources:
+        - '^/login(\?.*)?$'
+        - '^/logout(\?.*)?$'
+        - '^/api/.*$'
+        - '^/socket\.io([/?].*)?$'
+        - '^/hls/.*$'
+        - '^/s/.*$'
+        - '^/ping(\?.*)?$'
+        - '^/status(\?.*)?$'
+        - '^/healthcheck(\?.*)?$'
+        - '^/public/.*$'
+        - '^/feed/.*$'
+    - domain: 'request.@@DOMAIN@@'
+      policy: bypass
+      resources:
+        - '^/intake(\?.*)?$'
+    # everything else on the public apps requires login + 2FA at Authelia first
+    - domain:
+        - 'books.@@DOMAIN@@'
+        - 'audio.@@DOMAIN@@'
+        - 'request.@@DOMAIN@@'
+        - 'shelf.@@DOMAIN@@'
+      policy: two_factor
+
+session:
+  name: authelia_session
+  cookies:
+    - domain: '@@DOMAIN@@'
+      authelia_url: 'https://auth.@@DOMAIN@@'
+      default_redirection_url: 'https://books.@@DOMAIN@@'
+      expiration: '4h'
+      inactivity: '30m'
+
+regulation:
+  max_retries: 4
+  find_time: '2m'
+  ban_time: '10m'
+
+storage:
+  local:
+    path: /config/db.sqlite3
+
+notifier:
+  # Writes password-reset messages to a file by default (no mail dependency). Switch to
+  # SMTP later if you want self-service reset e-mails.
+  filesystem:
+    filename: /config/notification.txt
