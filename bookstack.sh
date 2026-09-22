@@ -93,6 +93,29 @@ render_caddyfile(){
       "$STACK_DIR/caddy/Caddyfile.template" > "$STACK_DIR/caddy/Caddyfile"
   chown 1000:1000 "$STACK_DIR/caddy/Caddyfile"
 }
+ensure_stack_user(){ # the host account behind uid 1000, which every container runs as (PUID/PGID=1000)
+  # Files are owned by the NUMBER 1000, so the account's name does not matter. Many Debian
+  # cloud images already ship a default user with uid 1000 ("debian", "admin", the provider's
+  # name); `useradd -u 1000 books` then fails with "UID 1000 is not unique" and aborted the
+  # system step half-way. Reuse whichever account owns uid 1000; create "books" only if none does.
+  local by_id by_name
+  by_id=$(getent passwd 1000 | cut -d: -f1)
+  by_name=$(getent passwd "$STACK_USER" | cut -d: -f3)
+  if [ -n "$by_id" ]; then
+    [ "$by_id" != "$STACK_USER" ] && echo "uid 1000 already belongs to '$by_id'; using that account for the stack."
+    STACK_USER="$by_id"
+  elif [ -n "$by_name" ]; then
+    # a 'books' account exists with another uid: leave it alone, give uid 1000 its own account
+    STACK_USER="books1000"
+    getent passwd "$STACK_USER" >/dev/null || useradd -m -u 1000 -s /bin/bash "$STACK_USER" \
+      || { msg "Could not create a user with uid 1000 ('$STACK_USER'). Create one by hand and run System again."; return 1; }
+  else
+    useradd -m -u 1000 -s /bin/bash "$STACK_USER" \
+      || { msg "Could not create the '$STACK_USER' user (uid 1000). Run System again after checking 'getent passwd 1000'."; return 1; }
+  fi
+  STACK_HOME=$(getent passwd "$STACK_USER" | cut -d: -f6)
+  usermod -aG docker "$STACK_USER"
+}
 copy_code_trees(){ # repo -> $STACK_DIR: code, templates and scripts (never live data or secrets)
   install -d -o 1000 -g 1000 "$STACK_DIR/caddy" "$STACK_DIR/scripts"
   cp "$SRC_DIR/docker-compose.yml" "$SRC_DIR/docker-compose.authelia.yml" "$SRC_DIR/docker-compose.ephemera.yml" "$STACK_DIR/"
@@ -154,8 +177,7 @@ step_system() {
       || { msg "Docker installation failed. Nothing else was set up; fix apt and run System again."; return 1; }
   fi
 
-  id -u "$STACK_USER" >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash "$STACK_USER"
-  usermod -aG docker "$STACK_USER"
+  ensure_stack_user || return 1
 
   if [ ! -f /swapfile ]; then
     local ram swap=2G; ram=$(free -g 2>/dev/null | awk '/Mem/{print $2}'); [ "${ram:-8}" -le 4 ] && swap=4G
@@ -186,7 +208,7 @@ SYS
   dpkg-reconfigure -f noninteractive unattended-upgrades
   sed -i 's|^//Unattended-Upgrade::Automatic-Reboot .*|Unattended-Upgrade::Automatic-Reboot "true";|;s|^//Unattended-Upgrade::Automatic-Reboot-Time .*|Unattended-Upgrade::Automatic-Reboot-Time "04:30";|' /etc/apt/apt.conf.d/50unattended-upgrades
 
-  if [ -s /root/.ssh/authorized_keys ] || [ -s "/home/$STACK_USER/.ssh/authorized_keys" ]; then
+  if [ -s /root/.ssh/authorized_keys ] || [ -s "${STACK_HOME:-/home/$STACK_USER}/.ssh/authorized_keys" ]; then
     cat > /etc/ssh/sshd_config.d/90-bookstack.conf << 'SSH'
 PasswordAuthentication no
 KbdInteractiveAuthentication no

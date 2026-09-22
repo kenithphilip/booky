@@ -139,6 +139,30 @@ reset; write_docker_daemon_json && ok "write_docker_daemon_json" || bad "write_d
 expect 'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[\"ip\"]==\"127.0.0.1\" and d[\"live-restore\"] is True and d[\"no-new-privileges\"] is True and d[\"log-opts\"][\"max-size\"]==\"10m\"" "$T/etc/docker/daemon.json" && seen "systemctl: restart docker"' "daemon.json: loopback publish default, live-restore, log caps; docker restarted on change"
 reset; write_docker_daemon_json; expect '! seen "systemctl: restart docker"' "unchanged daemon.json -> no docker restart"
 
+# uid 1000 handling: PASSWD is a fake /etc/passwd the stubs read and useradd appends to
+PASSWD="$T/passwd"
+getent(){ [ "$1" = passwd ] || return 2; awk -F: -v k="$2" '($1==k || $3==k){print; f=1} END{exit !f}' "$PASSWD"; }
+useradd(){ echo "useradd: $*" >> "$LOG"; local u="${*: -1}" id=""; [ "$1" = -m ] && id="$3"
+  awk -F: -v i="$id" -v n="$u" '($3==i || $1==n){e=1} END{exit !e}' "$PASSWD" && { echo "useradd: UID $id is not unique" >&2; return 4; }
+  echo "$u:x:$id:$id::/home/$u:/bin/bash" >> "$PASSWD"; }
+usermod(){ echo "usermod: $*" >> "$LOG"; }
+printf 'root:x:0:0::/root:/bin/bash\ndebian:x:1000:1000::/home/debian:/bin/bash\n' > "$PASSWD"
+reset; STACK_USER=books; ensure_stack_user; rc=$?
+expect '[ $rc = 0 ] && [ "$STACK_USER" = debian ] && [ "$STACK_HOME" = /home/debian ] && ! seen "useradd:" && seen "usermod: -aG docker debian"' "uid 1000 taken by the image's default user -> that account is reused, no useradd (was: abort)"
+printf 'root:x:0:0::/root:/bin/bash\n' > "$PASSWD"
+reset; STACK_USER=books; ensure_stack_user; rc=$?
+expect '[ $rc = 0 ] && [ "$STACK_USER" = books ] && seen "useradd: -m -u 1000 -s /bin/bash books" && grep -q "^books:x:1000:" "$PASSWD" && seen "usermod: -aG docker books"' "fresh image -> 'books' created with uid 1000"
+reset; STACK_USER=books; ensure_stack_user; rc=$?
+expect '[ $rc = 0 ] && [ "$STACK_USER" = books ] && ! seen "useradd:"' "re-run is idempotent (existing books/1000 reused)"
+printf 'root:x:0:0::/root:/bin/bash\nbooks:x:1001:1001::/home/books:/bin/bash\n' > "$PASSWD"
+reset; STACK_USER=books; ensure_stack_user; rc=$?
+expect '[ $rc = 0 ] && [ "$STACK_USER" = books1000 ] && grep -q "^books1000:x:1000:" "$PASSWD" && grep -q "^books:x:1001:" "$PASSWD"' "a 'books' account with another uid is left alone; uid 1000 gets its own account"
+printf 'root:x:0:0::/root:/bin/bash\n' > "$PASSWD"
+useradd(){ echo "useradd: $*" >> "$LOG"; return 1; }
+reset; STACK_USER=books; ensure_stack_user; rc=$?
+expect '[ $rc = 1 ] && grep -F "msgbox" "$LOG" | grep -q "Could not create" && ! seen "usermod:"' "useradd failure is reported and stops the step (no half-configured account)"
+unset -f getent useradd usermod; STACK_USER=books
+
 echo "== configure step"
 rm -f "$ENV_FILE"; mkdir -p "$STACK_DIR"
 reset "example.test" "admin@example.test" "Asia/Kolkata" "cf-token-123" "gatepass-12345" "gatepass-12345"
