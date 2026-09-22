@@ -168,10 +168,58 @@ One library, per-user **visibility** (not separate storage — admin sees all fi
   each new audiobook to its owner automatically. Without that step the request detail tells
   the admin which tag to set by hand.
 
+## Before you deploy: accounts and the Cloudflare token
+Everything below is free. The installer asks for each value when it needs it, so nothing has
+to be edited by hand.
+
+**1. Cloudflare (your domain must use Cloudflare's nameservers).**
+Create the token at **dash.cloudflare.com → My Profile → API Tokens → Create Token →
+Create Custom Token** and add these permissions, all with type **Zone**:
+
+| Permission | Level | Why the installer needs it |
+|---|---|---|
+| Zone | Read | find your domain's zone |
+| DNS | Edit | create the `books`, `audio`, `request`, `shelf`, `auth`, `dl`, `aria`, `monitor` records; also DNS-01 certificates |
+| Zone Settings | Edit | SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls, e-reader-breaking features off |
+| Config Rules | Edit | per-host exceptions for the device paths |
+| Cache Rules | Edit | never cache a user's book or audio response |
+| Firewall Services | Edit | fail2ban bans abusive visitors at Cloudflare |
+
+Under **Zone Resources** pick *Include → Specific zone → your domain*. Leave client IP
+filtering empty (the server's IP changes if you ever rebuild) and set no expiry, or put a
+reminder in your calendar. Copy the token once; Cloudflare will not show it again.
+Paste it when **Quick install → Configure** asks for it. It is stored only in
+`/srv/bookstack/.env` (root-only, mode 600) and read by Caddy at runtime. To replace it later,
+re-run **Install & deploy → Configure** and paste the new one.
+
+In the Cloudflare dashboard, turn **Security → WAF → Managed rules ON**. Leave **Bot Fight
+Mode OFF**: it challenges Kobo, OPDS, KOReader and the Audiobookshelf apps, cannot be
+exempted on the Free plan, and the devices fail silently.
+
+**2. Tailscale.** Create an account and install the app on the devices *you* administer
+from. The free Personal plan is enough: only you and the server join the tailnet. End users
+never need Tailscale; they use the public sites through Cloudflare. **Quick install →
+Tailscale** prints a login link for the server.
+
+**3. Outgoing mail (optional, for Send-to-Kindle and notifications).** An SMTP account the
+server sends from, set once by you in **Library → Mail**. Any provider that gives SMTP
+credentials works (a Gmail or Fastmail app password, Brevo, Mailgun, your domain's mail host).
+Users do not configure mail. Each user does two things themselves: enter their Kindle
+address on the portal's **Devices** page, and add the server's *From* address (shown on that
+page) to **Amazon → Manage Your Content and Devices → Preferences → Personal Document
+Settings → Approved Personal Document E-mail List**. The **Send a test to my Kindle** button
+proves it works.
+
+**4. A backup repository off the server (recommended).** Any restic repository: an S3
+bucket (Backblaze B2, Wasabi, Cloudflare R2) or an SFTP host. **Quick install → Backups**
+asks for the repository URL, a password and the access keys. Keep the password somewhere
+other than the server; without it the backups cannot be restored.
+
+**5. Shelfmark release sources.** Nothing is enabled by default. After deploy, open
+`shelf.<domain>` as admin → **Settings** and choose the sources you are entitled to use.
+
 ## Deploy (fresh Debian VPS)
-Prereqs (free): Cloudflare account with the domain + an API token (Zone:Read, DNS:Edit,
-Zone Settings:Edit); Tailscale account + app on your devices. Provision Debian (newest),
-hostname e.g. `lib01.mfdata.in`, paste your SSH key.
+Provision Debian (newest), hostname e.g. `lib01.mfdata.in`, paste your SSH key.
 ```
 scp -r booky root@<VPS-IP>:/root/bookstack
 ssh root@<VPS-IP>
@@ -180,12 +228,10 @@ bash /root/bookstack/bookstack.sh
 Choose **Install & deploy → Quick install**. It runs System → Tailscale → Configure →
 Cloudflare → Deploy → Audiobookshelf setup → Backups, sets the admin password, applies the
 secure app defaults (registration off, Kobo sync on, convert-to-EPUB, per-user copies,
-Kindle fixer), and then offers to add your first users. The Cloudflare API token needs
-Zone:Read, DNS:Edit, Zone Settings:Edit and Firewall Services:Edit (the last one is what
-lets fail2ban ban abusive visitors at Cloudflare). Afterwards: **Library → Mail** (SMTP so users can
-Send-to-Kindle from the portal), **Security → Authelia** if you want SSO + 2FA,
-**Operations → Self-test**. Dashboard-only toggles in Cloudflare: Bot Fight Mode ON, WAF
-Managed rules ON. Every step is re-runnable from its submenu.
+CWA's import-time Kindle fixer off), and then offers to add your first users. The token and
+accounts it asks for are described in the section above. Afterwards: **Library → Mail** (SMTP
+so users can Send-to-Kindle from the portal), **Security → Authelia** if you want SSO + 2FA,
+**Operations → Self-test**. Every step is re-runnable from its submenu.
 
 ## The request flow
 Users sign in at `https://request.<domain>` with their library credentials → search →

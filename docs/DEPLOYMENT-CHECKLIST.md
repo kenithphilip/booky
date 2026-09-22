@@ -74,7 +74,8 @@ and are covered by `Operations → Self-test` after deploy.
 - [ ] Cloudflare API token has **Firewall Services: Edit** (fail2ban bans at Cloudflare); after
       Security → fail2ban, `fail2ban-client status caddy-auth` shows the jail active.
 - [ ] Library → Mail: test mail arrives; a request left pending mails the admin.
-- [ ] Cloudflare dashboard: Bot Fight Mode ON, WAF Managed rules ON.
+- [ ] Cloudflare dashboard: WAF Managed rules ON; Bot Fight Mode **OFF** (it silently breaks
+      Kobo, OPDS, KOReader and the Audiobookshelf apps and cannot be exempted on the Free plan).
 - [ ] (Only if enabling Ephemera) `Operations → Ephemera` builds on the VPS and RAM suffices.
 - [ ] Plan: X8 (4c/8 GB/160 GB) recommended; on X4 keep audiobooks < 40 GB, Ephemera and
       Shelfmark browser sources off (`docs/RESEARCH-GAPS.md` §2 has the upgrade signals).
