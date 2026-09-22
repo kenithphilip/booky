@@ -9,5 +9,12 @@ Audiobooks: one <strong>M4B</strong>, or a <strong>ZIP</strong> of the MP3s. Fil
 bigger files go through your dropbox folder (ask the admin).</p>
 <form method="post" enctype="multipart/form-data">{{ csrf_field() }}
 <p><input type="file" name="file" accept=".epub,.mobi,.azw3,.pdf,.cbz,.txt,.fb2,.mp3,.m4b,.zip"></p>
-<button type="submit">Upload</button></form>
-</div>{% endblock %}
+<button type="submit">Upload</button><span class="busy">Uploading…</span></form>
+</div>
+{% set box = mail_intake(session.user) %}{% if box %}
+<div class="card" style="max-width:520px;margin:0 auto">
+<h3 style="margin-top:0">Or e-mail it in</h3>
+<p class="mut">Send the book as an attachment to <span class="code">{{ box }}</span> <strong>from your own registered
+address</strong> ({{ u_email or 'the address on your Devices page' }}). It is added to your library exactly like an upload.
+Mail from any other address is ignored.</p></div>{% endif %}
+{% endblock %}

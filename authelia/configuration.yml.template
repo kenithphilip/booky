@@ -30,6 +30,8 @@ access_control:
       resources:
         - '^/login(\?.*)?$'
         - '^/logout(\?.*)?$'
+        # token refresh (POST); the ABS access token expires after 1 h
+        - '^/auth/refresh(\?.*)?$'
         - '^/api/.*$'
         - '^/socket\.io([/?].*)?$'
         - '^/hls/.*$'
@@ -69,8 +71,17 @@ storage:
   local:
     path: /config/db.sqlite3
 
+# The block between the markers is replaced by bookstack.sh with an SMTP notifier when SMTP is
+# configured (Mail menu). The SMTP password must NOT come from AUTHELIA_NOTIFIER_SMTP_PASSWORD:
+# Authelia treats that variable (even empty) as a configured smtp notifier and then refuses to
+# start next to the filesystem one ("only one of the 'smtp' or 'filesystem' notifier").
+# Instead docker-compose.authelia.yml enables the template filter and passes BOOKSTACK_SMTP_PASS,
+# and the rendered smtp block reads it with the template function env "BOOKSTACK_SMTP_PASS"
+# piped through quote (double curly braces; not spelled out here because the filter would
+# expand it inside this comment too).
+# @NOTIFIER_BEGIN@
 notifier:
-  # Writes password-reset messages to a file by default (no mail dependency). Switch to
-  # SMTP later if you want self-service reset e-mails.
+  # Writes password-reset messages to a file by default (no mail dependency).
   filesystem:
     filename: /config/notification.txt
+# @NOTIFIER_END@

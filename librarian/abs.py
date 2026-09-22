@@ -5,8 +5,9 @@ zero-click, per-user isolation as ebooks:
     that points at the shared /audiobooks folder                       (TUI: Library -> Audiobookshelf)
   - accounts: create/align a user with accessAllTags=false + itemTagsSelected=[owner:<user>]
     (ABS's tag restriction is the audiobook equivalent of CWA's Allowed Tags)  (TUI: Users)
-  - after the worker places an audiobook: trigger a scan, wait for the item, tag it
-    owner:<user> so only that user sees it                              (worker, background)
+  - after the worker places an audiobook: trigger a scan; the worker's persistent tag jobs
+    (portal DB, retried by the housekeeping loop) wait for the item and tag it owner:<user>
+    so only that user sees it                                           (worker.process_tag_jobs)
 
 Everything needs ABS_TOKEN (an API key). Without it the functions degrade to notes telling the
 admin what to do by hand, exactly as before. Also a CLI for bookstack.sh:
@@ -15,9 +16,9 @@ admin what to do by hand, exactly as before. Also a CLI for bookstack.sh:
     python -m abs list-users | scan | tag "<folder name>" alice
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 Verified against Audiobookshelf 2.36 (tests/e2e_driver.py section 13)."""
-import sys, json, time, threading, argparse
+import sys, json, time, argparse
 import requests
-import config, db
+import config
 
 UA = {"User-Agent": "bookstack-librarian/4.0"}
 USER_PERMISSIONS = {"download": True, "update": False, "delete": False, "upload": False,
@@ -171,17 +172,27 @@ def trigger_scan():
     except Exception as e:
         return f"ABS scan failed ({e}); it will scan on schedule"
 
-def find_item_by_folder(folder, token=None):
+def find_items_by_folder(folder, token=None):
+    """EVERY item ABS indexed under that folder. A box set (Book One/, Book Two/, ...) or a
+    zip holding several books becomes several ABS items under one folder; tagging only the
+    first one left the rest invisible to their owner."""
     lib_id, _ = ensure_library(token=token)
     r = _req("GET", f"/api/libraries/{lib_id}/items", token=token, params={"limit": 0})
     if r.status_code != 200:
-        return None
+        return []
+    out = []
     for it in _json(r).get("results", []):
         rel = it.get("relPath") or ""
         path = it.get("path") or ""
-        if rel == folder or rel.startswith(folder + "/") or path.endswith("/" + folder):
-            return it
-    return None
+        if rel == folder or rel.startswith(folder + "/") or path.endswith("/" + folder) \
+                or ("/" + folder + "/") in path:
+            out.append(it)
+    return out
+
+def find_item_by_folder(folder, token=None):
+    """The first item under the folder (kept for callers that only need existence)."""
+    items = find_items_by_folder(folder, token=token)
+    return items[0] if items else None
 
 def tag_item(item_id, tag, token=None):
     r = _req("GET", f"/api/items/{item_id}", token=token)
@@ -213,16 +224,6 @@ def tag_folder(folder, owner, attempts=None, delay=5, sleep=time.sleep):
                 return f"ABS tagging failed ({last}); set tag {owner_tag(owner)} in ABS"
         sleep(delay)
     return f"ABS did not index '{folder}' in time; set tag {owner_tag(owner)} in ABS"
-
-def tag_folder_async(folder, owner, rid=None):
-    """Background tagging so ingest is not blocked; the request's detail is updated at the end."""
-    def run():
-        note = tag_folder(folder, owner)
-        if rid is not None:
-            rec = db.get(rid)
-            if rec:
-                db.set_status(rid, rec["status"], f"{rec.get('detail') or ''}; {note}".strip("; "))
-    threading.Thread(target=run, daemon=True).start()
 
 # ---- CLI (used by bookstack.sh) -------------------------------------------------------------
 def _password_args(sub, required=True):

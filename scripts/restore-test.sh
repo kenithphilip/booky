@@ -9,10 +9,11 @@ STACK_DIR="${STACK_DIR:-/srv/bookstack}"
 # Next to the stack, on the same disk: /tmp is a small RAM-backed tmpfs on Debian 13.
 tmp="$(mktemp -d "$(dirname "$STACK_DIR")/.bs-restore-test.XXXXXX")"; trap 'rm -rf "$tmp"' EXIT
 fail=0
+R=(--retry-lock 30m)   # the nightly backup may hold the repository lock
 ok(){ echo "  [ OK ] $1"; }
 bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }
 
-age=$(restic snapshots --latest 1 --json 2>/dev/null | python3 -c '
+age=$(restic "${R[@]}" snapshots --latest 1 --json 2>/dev/null | python3 -c '
 import sys, json, re, datetime
 s = re.sub(r"\.\d+", "", json.load(sys.stdin)[-1]["time"]).replace("Z", "+00:00")   # RFC3339 with nanoseconds
 t = datetime.datetime.fromisoformat(s)
@@ -22,13 +23,21 @@ if [ -z "$age" ]; then bad "no snapshot found"; elif [ "$age" -le 36 ]; then ok 
 echo "Restoring latest snapshot to $tmp ..."
 # Only the config and DB snapshots are needed to prove the backup is usable; the library and
 # audiobook trees can be tens of GB and would not fit next to the live copy on a small VPS.
-restic restore latest --target "$tmp" \
+restic "${R[@]}" restore latest --target "$tmp" \
   --include "$STACK_DIR/docker-compose.yml" --include "$STACK_DIR/.env" --include "$STACK_DIR/caddy" \
   --include "$STACK_DIR/.backup-snap" --include "$STACK_DIR/authelia" --include "$STACK_DIR/librarian" \
   >/dev/null || { bad "restic restore failed"; echo "RESTORE TEST FAILED"; exit 1; }
 r="$tmp$STACK_DIR"
 for f in docker-compose.yml caddy/Caddyfile .env .backup-snap/MANIFEST; do
   [ -e "$r/$f" ] && ok "found $f" || bad "missing $f"
+done
+
+# the core databases must have a consistent copy whenever they exist on this server: without it
+# a restore falls back to the raw file without its WAL (recent users, Kobo tokens lost)
+for core in cwa/config/app.db cwa/config/cwa.db library/books/metadata.db librarian/state/librarian.db abs/config/absdatabase.sqlite; do
+  [ -f "$STACK_DIR/$core" ] || continue
+  if [ -f "$r/.backup-snap/MANIFEST" ] && cut -f2 "$r/.backup-snap/MANIFEST" | grep -qxF "$core"; then ok "consistent copy of $core in the snapshot"
+  else bad "no consistent copy of $core in the snapshot (backup.sh could not snapshot it)"; fi
 done
 
 # every consistent DB copy must pass an integrity check; the two that matter most must hold data
@@ -50,7 +59,15 @@ if [ -f "$r/.backup-snap/MANIFEST" ]; then
   done < "$r/.backup-snap/MANIFEST"
 fi
 
+# a full restore goes in place into the stack directory: it needs the snapshot's size in free space
+need=$(restic "${R[@]}" stats latest --mode restore-size --json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)["total_size"])' 2>/dev/null)
+disk=$(df -Pk "$STACK_DIR" 2>/dev/null | awk 'NR==2{print $2}')
+if [ -n "$need" ] && [ -n "$disk" ]; then
+  echo "  info: a full restore needs $(( need / 1073741824 )) GB; this disk holds $(( disk / 1048576 )) GB in total (a replacement server needs at least that much free)"
+fi
+
 echo
-echo "To restore for real: bookstack.sh -> Operations -> 'Restore from backup' (stops the stack,"
-echo "copies the tree back, then copies .backup-snap/* over the live DB files per MANIFEST)."
+echo "To restore for real: bookstack.sh -> Operations -> 'Restore from backup' (pick a snapshot,"
+echo "everything or config + databases only; stops the stack, restores in place, then copies"
+echo ".backup-snap/* over the live DB files per MANIFEST)."
 [ "$fail" = 0 ] && echo "RESTORE TEST PASSED" || { echo "RESTORE TEST FAILED ($fail)"; exit 1; }

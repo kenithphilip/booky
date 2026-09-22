@@ -1,5 +1,8 @@
 # Optional self-hosted SSO + 2FA gate in front of the public apps.
 # Enable/disable via bookstack.sh (menu 18/19). Bound to localhost; Caddy proxies it.
+# Off by default. For a handful of family users, Cloudflare Access (e-mail one-time PIN, free
+# up to 50 users) gives a similar front door with no TOTP devices to lose and no container here;
+# it needs the same device/app path bypasses (authelia/inject-gate.py BYPASS) as Bypass policies.
 services:
   authelia:
     image: ${IMG_AUTHELIA:-authelia/authelia:4.39.28}
@@ -22,3 +25,11 @@ services:
       - AUTHELIA_SESSION_SECRET=${AUTHELIA_SESSION_SECRET}
       - AUTHELIA_STORAGE_ENCRYPTION_KEY=${AUTHELIA_STORAGE_ENCRYPTION_KEY}
       - AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET=${AUTHELIA_JWT_SECRET}
+      # SMTP notifier password (only used when bookstack.sh rendered an smtp block between
+      # # @NOTIFIER_BEGIN@ / # @NOTIFIER_END@ in configuration.yml). Deliberately NOT
+      # AUTHELIA_NOTIFIER_SMTP_PASSWORD: Authelia counts that variable, even empty, as an smtp
+      # notifier and then refuses to start next to the default filesystem notifier (verified
+      # with 4.39.28 validate-config). The template filter lets configuration.yml read this
+      # variable instead; a name starting with AUTHELIA_ would be rejected as unknown.
+      - X_AUTHELIA_CONFIG_FILTERS=template
+      - BOOKSTACK_SMTP_PASS=${SMTP_PASS:-}

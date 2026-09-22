@@ -10,7 +10,7 @@ All statements are short SQLite transactions; CWA reads users per request, so ch
 live immediately. Also usable as a CLI (bookstack.sh menu "Users" calls it):
     python -m cwa add-user alice --email a@x --password '...' [--admin]
     python -m cwa list | kindle alice a@kindle.com | kobo-url alice | passwd alice --password ..
-    python -m cwa remove-user alice | enable-kobo-sync
+    python -m cwa remove-user alice | enable-kobo-sync | rename-user admin kenith-admin
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 """
 import sqlite3, os, sys, json, argparse
@@ -66,12 +66,36 @@ def _checkpoint():
     except sqlite3.Error:
         pass
 
+def checkpoint_passive():
+    """Periodic PASSIVE checkpoint (worker housekeeping): folds changes CWA's own UI wrote
+    (a password changed at books.<domain>/me) into app.db so Shelfmark, which opens it with
+    immutable=1 and ignores the WAL, sees them within minutes. Never blocks CWA's writers."""
+    try:
+        c = sqlite3.connect(config.CWA_DB, timeout=5)
+        try:
+            return c.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
 def _hash(pw):
     # pbkdf2 is understood by every Werkzeug version CWA has shipped with.
     return generate_password_hash(pw, method="pbkdf2:sha256")
 
 def _valid_name(name):
     return bool(name) and name == name.strip() and all(ch.isalnum() or ch in "._-" for ch in name)
+
+NAME_RULE = ("username: lowercase letters, digits, dot, dash, underscore only; no spaces "
+             "(Shelfmark matches names case-sensitively, so a capital letter locks that account "
+             "out of it)")
+
+def _check_name(name):
+    """Accepted name for a NEW account. Lowercase is enforced, not just suggested: an
+    'adm_Kim' worked everywhere except Shelfmark, which answered 401."""
+    if not _valid_name(name) or name != name.lower():
+        raise CwaError(NAME_RULE)
+    return name
 
 def owner_tag(name):
     return f"{config.OWNER_PREFIX}{name}"
@@ -115,8 +139,7 @@ def add_user(name, password, email="", admin=False):
     """Create a CWA user. Non-admins get Allowed Tags = owner:<name> (the isolation model).
     Column set adapts to the CWA version at hand: every known column gets the same value
     CWA's own 'Add user' form would write; unknown columns are left to their defaults."""
-    if not _valid_name(name):
-        raise CwaError("username: letters, digits, dot, dash, underscore only; no spaces")
+    _check_name(name)
     if len(password or "") < 8:
         raise CwaError("password must be at least 8 characters")
     if get_user(name):
@@ -147,6 +170,42 @@ def set_password(name, password):
     if not n:
         raise CwaError(f"no such user '{name}'")
     _checkpoint()
+
+def rename_user(old, new):
+    """Rename an ADMIN account (the installer lets the admin choose a name other than 'admin').
+    An isolated user is refused: their books carry owner:<old>, so a rename would hide them."""
+    if not _valid_name(new) or new != new.lower():
+        raise CwaError("new " + NAME_RULE)
+    u = get_user(old)
+    if not u:
+        raise CwaError(f"no such user '{old}'")
+    other = get_user(new)
+    if other and other["id"] != u["id"]:
+        raise CwaError(f"user '{new}' already exists")
+    if not (u["role"] or 0) & ROLE_ADMIN:
+        raise CwaError(f"'{u['name']}' is not an admin: renaming an isolated user would hide their "
+                       f"books (tagged {owner_tag(u['name'])}); create a new user instead")
+    with _conn() as c:
+        c.execute("UPDATE user SET name=? WHERE id=?", (new, u["id"]))
+    _checkpoint()
+    return {"old": u["name"], "new": new, "id": u["id"]}
+
+def set_email(name, address):
+    """The user's own e-mail (notifications, and the sender allowed for mail-to-library).
+    CWA keeps it UNIQUE, so an address another account uses is refused."""
+    address = (address or "").strip()
+    if not address or "@" not in address or " " in address or len(address) > 120:
+        raise CwaError("that does not look like an e-mail address")
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    with _conn() as c:
+        taken = c.execute("SELECT 1 FROM user WHERE email=? COLLATE NOCASE AND id!=?", (address, u["id"])).fetchone()
+        if taken:
+            raise CwaError("that e-mail address is already used by another account")
+        c.execute("UPDATE user SET email=? WHERE id=?", (address, u["id"]))
+    _checkpoint()
+    return address
 
 def remove_user(name):
     u = get_user(name)
@@ -254,6 +313,28 @@ def _password_args(sub):
 def read_password(args):
     return sys.stdin.read().rstrip("\n") if getattr(args, "password_stdin", False) else args.password
 
+def _audit(event, name, detail=None):
+    """The TUI's user lifecycle shows up on /admin's audit trail too (the portal's own actions
+    always did). Guarded: the state DB may not be reachable from a one-off CLI call."""
+    try:
+        import db
+        db.init()
+        db.audit(event, name, "tui", detail)
+    except Exception:
+        pass
+
+def note_password_synced(name):
+    """Remember the password hash the portal knows about, so the housekeeping drift check does
+    not report a change the portal (or the TUI) made itself."""
+    try:
+        import db, auth
+        fp = auth.fingerprint(name)
+        if fp and fp is not auth.UNAVAILABLE:
+            db.init()
+            db.set_pw_fingerprint(name, fp[0])
+    except Exception:
+        pass
+
 def _cli(argv=None):
     p = argparse.ArgumentParser(prog="cwa", description="Manage Calibre-Web users/devices for bookstack")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -265,24 +346,39 @@ def _cli(argv=None):
     w = sp.add_parser("passwd"); w.add_argument("name"); _password_args(w)
     r = sp.add_parser("remove-user"); r.add_argument("name")
     i = sp.add_parser("isolate"); i.add_argument("name")
+    n = sp.add_parser("rename-user"); n.add_argument("old"); n.add_argument("new")
     sp.add_parser("enable-kobo-sync"); sp.add_parser("harden")
     args = p.parse_args(argv)
     try:
         if args.cmd == "add-user":
             u = add_user(args.name, read_password(args), args.email, args.admin)
+            _audit("user_add", u["name"], "admin" if args.admin else "user")
             print(json.dumps({"ok": True, "user": u["name"], "id": u["id"], "kobo_url": kobo_url(u["name"])}))
         elif args.cmd == "list":
             print(json.dumps(list_users(), indent=1))
         elif args.cmd == "kindle":
-            print(json.dumps({"ok": True, "kindle_mail": set_kindle_mail(args.name, args.address)}))
+            addr = set_kindle_mail(args.name, args.address)
+            _audit("kindle_set", args.name, addr or "(cleared)")
+            print(json.dumps({"ok": True, "kindle_mail": addr}))
         elif args.cmd == "kobo-url":
+            if args.reset:
+                _audit("kobo_reset", args.name)
             print(reset_kobo_token(args.name) and kobo_url(args.name) if args.reset else kobo_url(args.name))
         elif args.cmd == "passwd":
-            set_password(args.name, read_password(args)); print(json.dumps({"ok": True}))
+            set_password(args.name, read_password(args))
+            note_password_synced(args.name)
+            _audit("password_reset", args.name)
+            print(json.dumps({"ok": True}))
         elif args.cmd == "remove-user":
-            remove_user(args.name); print(json.dumps({"ok": True}))
+            remove_user(args.name); _audit("user_remove", args.name); print(json.dumps({"ok": True}))
+        elif args.cmd == "rename-user":
+            out = rename_user(args.old, args.new)
+            _audit("user_rename", out["new"], f"was {out['old']}")
+            print(json.dumps({"ok": True, **out}))
         elif args.cmd == "isolate":
-            print(json.dumps({"ok": True, "isolated": ensure_isolation(args.name)}))
+            done = ensure_isolation(args.name)
+            _audit("user_isolate", args.name, "re-applied" if done else "admin: nothing to do")
+            print(json.dumps({"ok": True, "isolated": done}))
         elif args.cmd == "enable-kobo-sync":
             print(json.dumps({"ok": True, "changed": enable_kobo_sync(), "restart_cwa": True}))
         elif args.cmd == "harden":

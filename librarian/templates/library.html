@@ -1,8 +1,14 @@
 {% extends "base.html" %}{% block body %}
 <h2>{{ 'All books' if admin else 'My books' }}</h2>
-<p class="mut">Preferred format: <strong>{{ prefs.preferred_format }}</strong> (change on <a href="{{ url_for('devices') }}">Devices</a>).
-Kobo owners: just tap Sync on the device.</p>
-{% if not books %}<div class="card mut">Nothing in your library yet. Request or upload a book and it will show up here after import (usually under a minute).</div>{% endif %}
+<p class="mut">Your ebooks. Preferred format: <strong>{{ prefs.preferred_format }}</strong> (change on <a href="{{ url_for('devices') }}">Devices</a>).
+Kobo owners: just tap Sync on the device.{% if cfg.AUDIO_URL %} Audiobooks are in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a>.{% endif %}</p>
+<form method="get" class="row" style="margin-bottom:6px"><input type="text" name="q" value="{{ q }}" placeholder="Find a title or author…" style="flex:1"><button type="submit" class="sec">Find</button></form>
+{% if total %}<p class="mut">Showing {{ first }}–{{ last }} of {{ total }}{% if q %} matching “{{ q }}”{% endif %}.
+{% if page > 0 %}<a href="{{ url_for('my_library', q=q, page=page - 1) }}">← newer</a>{% endif %}
+{% if more %}<a href="{{ url_for('my_library', q=q, page=page + 1) }}">older →</a>{% endif %}</p>{% endif %}
+{% if not books and q %}<div class="card mut">No book matches “{{ q }}”.</div>
+{% elif not books %}<div class="card mut">No <em>ebooks</em> here yet. Request or upload a book and it shows up here after import (usually under a minute).
+{% if cfg.AUDIO_URL %}<br>Audiobooks are not listed here: they live in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a> (same username and password).{% endif %}</div>{% endif %}
 {% for b in books %}
 <div class="card"><div class="row" style="justify-content:space-between">
 <div><strong>{{ b.title }}</strong><br><span class="mut">{{ b.author }} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>

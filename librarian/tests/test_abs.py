@@ -107,28 +107,69 @@ def test_tag_folder_waits_for_scan_then_tags_and_merges(fake):
     assert absapi.tag_folder("x", "bob", attempts=1, sleep=lambda s: None) == "set tag owner:bob in ABS (no API token)"
     assert "skipped" in absapi.trigger_scan()
 
-def test_worker_tags_audiobooks_in_background_when_configured(fake, tmp_path, monkeypatch):
+def test_worker_queues_a_persistent_tag_job_and_keeps_the_request_open(fake, tmp_path, monkeypatch):
     key = absapi.bootstrap("root", "rootpass-1234")["api_key"]; monkeypatch.setattr(config, "ABS_TOKEN", key)
-    started = []
-    monkeypatch.setattr(absapi, "tag_folder_async", lambda folder, owner, rid=None: started.append((folder, owner, rid)))
     z = tmp_path / "great audiobook.zip"
     with zipfile.ZipFile(z, "w") as zf: zf.writestr("01.mp3", b"ID3"); zf.writestr("cover.jpg", b"jpg")
     rid = db.add("alice", {"kind": "audio", "source": "dropbox", "title": "x", "download_url": "local"}, status="importing")
     note = worker.ingest_local_file(str(z), "alice", rid)
-    assert note == "ABS scan triggered; tagging owner:alice in ABS" and started == [("alice - great audiobook", "alice", rid)]
+    assert note == "ABS scan triggered; waiting for Audiobookshelf to index it to tag owner:alice" and worker._status_for(note) == "tagging"
+    assert [(j["folder"], j["owner"], j["rid"]) for j in db.pending_tag_jobs()] == [("alice - great audiobook", "alice", rid)]
     assert sorted(os.listdir(os.path.join(config.AUDIO_DIR, "alice - great audiobook"))) == ["01.mp3", "cover.jpg"]
 
-def test_background_tagging_appends_outcome_to_the_request(fake, monkeypatch):
-    import threading
-    rid = db.add("alice", {"kind": "audio", "source": "dropbox", "title": "x", "download_url": "local"}, status="done")
-    db.set_status(rid, "done", "ABS scan triggered; tagging owner:alice in ABS")
-    monkeypatch.setattr(absapi, "tag_folder", lambda folder, owner, **kw: "tagged owner:alice in ABS")
-    before = set(threading.enumerate())
-    absapi.tag_folder_async("alice - great audiobook", "alice", rid)
-    for t in set(threading.enumerate()) - before:
-        t.join(timeout=5)
-    assert db.get(rid)["detail"] == "ABS scan triggered; tagging owner:alice in ABS; tagged owner:alice in ABS"
-    assert db.get(rid)["status"] == "done"
+def _tagging_request(folder="alice - My Book"):
+    rid = db.add("alice", {"kind": "audio", "source": "librivox", "title": "My Book", "download_url": "https://x"}, status="tagging")
+    db.set_status(rid, "tagging", f"ABS scan triggered; {worker.TAG_WAIT_NOTE} owner:alice")
+    db.add_tag_job(rid, folder, "alice", now=1000.0)
+    return rid
+
+def test_tag_jobs_survive_slow_scans_and_restarts_then_finish_the_request(fake, monkeypatch):
+    """F22: the tag used to be a 2-minute daemon thread; a slow ABS scan or a restart left the
+    audiobook untagged (invisible to its owner) while the request already said 'done'."""
+    key = absapi.bootstrap("root", "rootpass-1234")["api_key"]; monkeypatch.setattr(config, "ABS_TOKEN", key)
+    sent = []
+    monkeypatch.setattr(worker.notify, "send", lambda ev, r: sent.append((ev, r["status"])))
+    rid = _tagging_request()
+    now = 1000.0
+    for _ in range(10):                                    # ABS takes a long time to index it
+        assert worker.process_tag_jobs(now) == 0
+        now += 400
+    assert db.get(rid)["status"] == "tagging" and sent == [] and db.pending_tag_jobs()[0]["attempts"] == 10
+    db.init(); db.recover_on_start()                       # a portal restart does not lose or break the job
+    assert db.get(rid)["status"] == "tagging" and len(db.pending_tag_jobs()) == 1
+    lid = fake.libs[0]["id"]
+    fake.items["it1"] = {"id": "it1", "libraryId": lid, "relPath": "alice - My Book", "path": "/audiobooks/alice - My Book", "media": {"tags": ["Fiction"]}}
+    # J04: the first pass tags what ABS has indexed so far; the job closes only when the item
+    # count is stable across two passes (a box set is indexed book by book)
+    assert worker.process_tag_jobs(now) == 0 and db.get(rid)["status"] == "tagging"
+    assert fake.items["it1"]["media"]["tags"] == ["Fiction", "owner:alice"]
+    assert worker.process_tag_jobs(now + 20) == 1
+    r = db.get(rid)
+    assert r["status"] == "done" and r["detail"] == "ABS scan triggered; tagged owner:alice in ABS" and sent == [("done", "done")]
+    assert db.pending_tag_jobs() == [] and worker.process_tag_jobs(now + 999) == 0
+
+def test_tag_job_errors_are_visible_and_giving_up_alerts_the_admin(fake, monkeypatch):
+    monkeypatch.setattr(config, "ABS_TOKEN", "k")
+    monkeypatch.setattr(absapi, "find_items_by_folder", lambda folder: (_ for _ in ()).throw(requests.ConnectionError("ABS down")))
+    alerts = []
+    monkeypatch.setattr(worker.notify, "alert", lambda title, text, prio="default": alerts.append((title, text, prio)) or ["webhook"])
+    monkeypatch.setattr(worker.notify, "send", lambda ev, r: None)
+    rid = _tagging_request()
+    worker.process_tag_jobs(1000.0)
+    r = db.get(rid)
+    assert r["status"] == "tagging" and "last ABS error: ConnectionError: ABS down" in r["detail"]
+    assert db.pending_tag_jobs()[0]["next_try"] == 1015.0                 # backoff, not a hot loop
+    assert worker.process_tag_jobs(1001.0) == 0 and db.pending_tag_jobs()[0]["attempts"] == 1   # not due yet
+    worker.process_tag_jobs(1000.0 + config.ABS_TAG_GIVE_UP_HOURS * 3600 + 1)
+    r = db.get(rid)
+    assert r["status"] == "needs-tag" and "set tag owner:alice in ABS by hand" in r["detail"] and "ABS down" in r["detail"]
+    assert alerts and alerts[0][0] == "audiobook left untagged" and alerts[0][2] == "high" and db.pending_tag_jobs() == []
+
+def test_tag_jobs_without_a_token_go_to_the_admin(fake, monkeypatch):
+    rid = _tagging_request()
+    monkeypatch.setattr(worker.notify, "send", lambda ev, r: None)
+    worker.process_tag_jobs(2000.0)
+    assert db.get(rid)["status"] == "needs-tag" and db.pending_tag_jobs() == []
 
 def test_zip_extraction_refuses_traversal_and_bombs(tmp_path):
     bad = io.BytesIO()

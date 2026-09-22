@@ -24,8 +24,13 @@ def _fp(row):
     return hashlib.sha256(row["password"].encode()).hexdigest()[:16]
 
 def verify(username, password):
+    """The account dict on a correct password, None when wrong / no such user, UNAVAILABLE
+    when app.db cannot be read right now (a CWA restart): callers must not count that as a
+    failed login."""
     row = _row(username)
-    if not row or row is UNAVAILABLE:
+    if row is UNAVAILABLE:
+        return UNAVAILABLE
+    if not row:
         return None
     try:
         ok = check_password_hash(row["password"], password)

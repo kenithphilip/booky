@@ -41,16 +41,28 @@ def test_list_for_scopes_by_owner_and_status_updates_keep_detail():
 
 def test_recover_on_start_requeues_refetchable_rows_and_fails_local_ones():
     http = _req("alice"); local = _req("bob", source="dropbox", title="up.epub", download_url="local")
-    tor = _req("carol", is_torrent=True, download_url="magnet:?xt=a"); fresh = _req("dave", is_torrent=True, download_url="magnet:?xt=b")
-    db.claim_one(); db.claim_one()                                        # http + local are now 'importing'
-    db.set_status(tor, "downloading"); db.set_status(fresh, "downloading")
-    with db._conn() as c:
-        c.execute("UPDATE requests SET updated=? WHERE id=?", (time.time() - 90000, tor))
+    tor = _req("carol", is_torrent=True, download_url="magnet:?xt=a"); retrying = _req("dave")
+    db.claim_one(); db.claim_one(); db.claim_one()                        # http + local + tor are now 'importing'
+    db.set_status(tor, "downloading")                                     # a row left over from the removed P2P path
+    db.claim_one(); db.set_status(retrying, "retrying", "attempt 1 failed")   # restart during the download backoff (F51)
     db.recover_on_start()
     assert db.get(http)["status"] == "queued" and db.get(http)["detail"] == "requeued after restart"
+    assert db.get(retrying)["status"] == "queued"
     assert db.get(local)["status"] == "error" and db.get(local)["detail"] == "interrupted by restart"
-    assert db.get(tor)["status"] == "error" and "24 h" in db.get(tor)["detail"]
-    assert db.get(fresh)["status"] == "downloading"
+    assert db.get(tor)["status"] == "error" and "P2P" in db.get(tor)["detail"]
+
+def test_a_job_interrupted_by_two_restarts_is_not_requeued_forever():
+    """F52: an intake URL whose file OOM-kills the portal would otherwise loop on every respawn."""
+    rid = _req("alice")
+    db.claim_one(); db.recover_on_start()
+    assert db.get(rid)["status"] == "queued" and db.get(rid)["restarts"] == 1
+    db.claim_one(); db.recover_on_start()
+    r = db.get(rid)
+    assert r["status"] == "error" and "2 times" in r["detail"] and "retry it from the queue" in r["detail"]
+    db.requeue(rid, "requeued by admin")                                  # the admin's retry starts the count over
+    assert db.get(rid)["restarts"] == 0 and db.get(rid)["status"] == "queued"
+    db.claim_one(); db.recover_on_start()
+    assert db.get(rid)["status"] == "queued"
 
 def test_prefs_defaults_and_validation():
     assert db.get_prefs("alice") == {"preferred_format": "epub", "auto_kindle": False, "notify_email": False, "last_kindle_test": None}
@@ -125,6 +137,27 @@ def test_tagger_resolves_encoded_and_miscased_opf_paths_and_fails_closed(tmp_pat
         tagger.add_owner_tag(nocont, "owner:a")
     assert not any(n.endswith(".tmp") for n in os.listdir(tmp_path))
 
+def test_foreign_owner_tags_are_replaced_so_a_reupload_is_not_co_owned(tmp_path):
+    """F59: a book downloaded from the library carries owner:alice; Bob uploading it must
+    become its only owner (no duplicate on Alice's shelf/Kobo). Other subjects stay."""
+    p = make_epub(str(tmp_path / "shared.epub"), subjects=["Fiction", "owner:alice", "owner:carol"])
+    tagger.add_owner_tag(p, "owner:bob")
+    assert _subjects(p) == ["Fiction", "owner:bob"]
+    tagger.add_owner_tag(p, "owner:bob"); assert _subjects(p) == ["Fiction", "owner:bob"]
+    q = make_pdf(str(tmp_path / "shared.pdf"), keywords="Science, owner:alice")
+    tagger.add_owner_tag_pdf(q, "owner:bob")
+    assert PdfReader(q).metadata["/Keywords"] == "Science, owner:bob"
+    c = make_cbz(str(tmp_path / "shared.cbz"), comment=json.dumps({"ComicBookInfo/1.0": {"tags": ["Comics", "owner:alice"]}}).encode())
+    tagger.add_owner_tag_cbz(c, "owner:bob")
+    assert json.loads(zipfile.ZipFile(c).comment.decode())["ComicBookInfo/1.0"]["tags"] == ["Comics", "owner:bob"]
+
+def test_pdf_gets_title_and_author_from_the_request_when_it_has_none(tmp_path):
+    """F58: an IA PDF without metadata must not show up as 'Author - Title' by Unknown."""
+    p = make_pdf(str(tmp_path / "ia.pdf"))
+    tagger.add_owner_tag_pdf(p, "owner:alice", title="Roughing It", author="Mark Twain")
+    m = PdfReader(p).metadata
+    assert m["/Title"] == "Roughing It" and m["/Author"] == "Mark Twain"
+
 def test_pdf_tag_merges_keywords_idempotently_and_fills_missing_title(tmp_path):
     p = make_pdf(str(tmp_path / "paper.pdf"), title="A Paper", keywords="Science; History")
     tagger.add_owner_tag_pdf(p, "owner:alice", title="ignored")
@@ -180,6 +213,23 @@ def test_library_is_tag_scoped_and_paths_are_confined():
     assert library.best_format({"formats": ["pdf"]}, "epub") == "pdf"
     assert library.best_format({"formats": []}, "epub") is None
 
+def test_kepub_made_by_kobo_sync_is_downloadable():
+    """F26/C12: CWA stores the KEPUB it makes on Kobo sync as a real format (file <name>.kepub)."""
+    add_calibre_book(1, "Kobo Book", "Ann", tags=["owner:alice"], formats=("epub", "kepub"))
+    f = library.file_for("alice", 1, "kepub")
+    assert f and f["path"].endswith("Kobo Book - Ann.kepub") and f["filename"] == "Kobo Book - Ann.kepub.epub"
+    assert f["mimetype"] == "application/kepub+zip"
+    assert library.file_for("bob", 1, "kepub") is None
+
+def test_library_pages_and_searches_past_300_books():
+    """F56: 'All books' silently dropped everything after the newest 300."""
+    for i in range(1, 306):
+        add_calibre_book(i, f"Book {i:03d}", "Writer" if i != 7 else "Special Author", tags=["owner:alice"], formats=("pdf",))
+    assert library.count_for("alice") == 305 and len(library.books_for("alice")) == 300
+    rest = library.books_for("alice", offset=300)
+    assert len(rest) == 5
+    assert [b["title"] for b in library.books_for("alice", q="special")] == ["Book 007"] and library.count_for("alice", q="book 01") == 10
+
 # ---- worker: local ingest paths ------------------------------------------------------
 def _ingested(pattern=""):
     return sorted(n for n in os.listdir(config.INGEST_DIR) if pattern in n)
@@ -189,7 +239,8 @@ def test_safe_keeps_unicode_strips_separators_and_controls():
     assert worker._safe("युद्ध और शांति") == "युद्ध और शांति"
     assert worker._safe("a/b\\c:d*e?f\"g<h>i|j\x00k") == "a_b_c_d_e_f_g_h_i_j_k"
     assert worker._safe(" ..hidden.. ") == "hidden" and worker._safe("") == "book" and worker._safe(None) == "book"
-    assert len(worker._safe("x" * 400)) == 150
+    assert len(worker._safe("x" * 400)) == 180                       # J13: bytes, not characters
+    assert len(worker._safe("я" * 400).encode()) <= 180 and worker._safe("я" * 400).startswith("яяя")
     assert worker._safe("Pride & Prejudice (1813)") == "Pride & Prejudice (1813)"
 
 def test_epub_ingest_is_tagged_atomic_and_uniquely_named(tmp_path):
@@ -236,6 +287,20 @@ def test_untaggable_file_fails_closed_for_isolated_users_but_not_admins(tmp_path
     with pytest.raises(RuntimeError):                                   # unknown owner is not an admin either
         worker.ingest_local_file(str(badepub), "ghost")
 
+def test_local_files_over_the_size_cap_are_refused_before_any_copy(tmp_path, monkeypatch):
+    """F06: a huge dropbox file used to be copied to /ingest and OOM-kill the portal in pypdf."""
+    big = make_pdf(str(tmp_path / "scan.pdf"))
+    monkeypatch.setattr(config, "MAX_EBOOK_MB", 0)
+    with pytest.raises(ValueError, match="limit for this kind"):
+        worker.ingest_local_file(big, "alice", rid=1)
+    assert os.listdir(config.INGEST_DIR) == []
+    monkeypatch.setattr(config, "MAX_EBOOK_MB", 500); monkeypatch.setattr(config, "MAX_PDF_MB", 0)
+    cwa.add_user("alice", "alicepass1"); cwa.add_user("boss", "bosspass1", admin=True)
+    with pytest.raises(RuntimeError, match="too large to tag safely"):      # pypdf is never run on it
+        worker.ingest_local_file(big, "alice", rid=2)
+    assert os.listdir(config.INGEST_DIR) == []
+    assert worker.ingest_local_file(big, "boss", rid=3).startswith("tag skipped")   # admins import it untagged
+
 def test_audio_ingest(tmp_path):
     z = tmp_path / "audio book.zip"
     with zipfile.ZipFile(z, "w") as zf: zf.writestr("01.mp3", b"ID3")
@@ -276,13 +341,13 @@ def test_dropbox_scan_skips_partial_hidden_fresh_files_and_unknown_users(caplog)
     assert worker.HEARTBEAT["dropbox"] > time.time() - 5
 
 def test_dropbox_uses_canonical_user_name_and_needs_tag_status(tmp_path):
-    cwa.add_user("Alice", "alicepass1")
-    _drop("Alice", "notes.txt")
+    cwa.add_user("alice", "alicepass1")
+    _drop("Alice", "notes.txt")                                          # folder spelled differently
     _drop("Alice", "paper.pdf", make_pdf)
     assert worker.scan_dropbox_once() == 2
-    rows = {r["title"]: r for r in db.list_for("Alice", False)}
+    rows = {r["title"]: r for r in db.list_for("alice", False)}
     assert rows["notes.txt"]["status"] == "needs-tag" and rows["paper.pdf"]["status"] == "done"
-    assert sorted(_ingested()) == ["notes [Alice-%d].txt" % rows["notes.txt"]["id"], "paper [Alice-%d].pdf" % rows["paper.pdf"]["id"]]
+    assert sorted(_ingested()) == ["notes [alice-%d].txt" % rows["notes.txt"]["id"], "paper [alice-%d].pdf" % rows["paper.pdf"]["id"]]
 
 def test_dropbox_failure_records_one_row_and_parks_the_file(monkeypatch):
     cwa.add_user("bob", "bobpass1")
@@ -295,16 +360,74 @@ def test_dropbox_failure_records_one_row_and_parks_the_file(monkeypatch):
     assert sorted(os.listdir(failed)) == ["bad.zip", "broken.epub"] and not os.path.exists(p)
     assert os.listdir(config.INGEST_DIR) == [] and os.listdir(config.AUDIO_DIR) == []
     assert worker.scan_dropbox_once() == 0 and len(db.list_for("bob", False)) == 2       # parked: not retried
-    # even if the park itself fails, the existing error row stops the flood
+    # a file dropped again under a failed name is a NEW file and is processed (F05/F30) ...
     p = _drop("bob", "broken.epub")
     monkeypatch.setattr(shutil, "move", lambda *a, **k: (_ for _ in ()).throw(OSError("ro fs")))
-    assert worker.scan_dropbox_once() == 0 and len(db.list_for("bob", False)) == 2
+    assert worker.scan_dropbox_once() == 1 and len(db.list_for("bob", False)) == 3
+    assert "could not move it aside" in db.list_for("bob", False)[0]["detail"] and os.path.exists(p)
+    # ... but when parking failed, the same file (same size and mtime) is not retried: no flood
+    assert worker.scan_dropbox_once() == 0 and worker.scan_dropbox_once() == 0 and len(db.list_for("bob", False)) == 3
     monkeypatch.undo()
+    os.remove(p)
     # an admin's untaggable EPUB still imports (they see untagged books anyway)
     cwa.add_user("boss", "bosspass1", admin=True)
     _drop("boss", "broken.epub")
     assert worker.scan_dropbox_once() == 1 and db.list_for("boss", False)[0]["status"] == "done"
     assert "tag skipped" in db.list_for("boss", False)[0]["detail"]
+
+def test_a_good_file_redropped_under_a_failed_name_is_imported(users):
+    """F05/F30: Shelfmark retrying from a working mirror produces the same file name."""
+    p = _drop("alice", "Jane Austen - Emma.epub")                          # broken download
+    assert worker.scan_dropbox_once() == 1 and db.list_for("alice", False)[0]["status"] == "error"
+    _drop("alice", "Jane Austen - Emma.epub", make_epub)                    # the good copy, same name
+    assert worker.scan_dropbox_once() == 1
+    rows = db.list_for("alice", False)
+    assert [r["status"] for r in rows] == ["done", "error"] and not os.path.exists(p)
+    assert [n for n in _ingested() if n.startswith("Jane Austen - Emma [alice-")]
+
+def test_file_interrupted_by_two_restarts_is_parked_not_retried(users):
+    """F06: an OOM kill leaves the row 'interrupted by restart' and the file in place; one more
+    try is fine (an ordinary restart), a second interruption means the file is the problem."""
+    p = _drop("alice", "huge.epub", make_epub)
+    size, mtime = worker._fingerprint(p)
+    for _ in range(2):
+        db.add("alice", {"kind": "ebook", "source": "dropbox", "title": "huge.epub", "download_url": "local",
+                         "src_size": size, "src_mtime": mtime}, status="importing")
+        db.recover_on_start()
+    assert worker.scan_dropbox_once() == 1
+    r = db.list_for("alice", False)[0]
+    assert r["status"] == "error" and "interrupted this import twice" in r["detail"] and ".failed/huge.epub" in r["detail"]
+    assert _ingested() == [] and os.path.exists(os.path.join(config.DROPBOX_DIR, "alice", ".failed", "huge.epub"))
+
+def test_folder_of_ebooks_is_imported_book_by_book_not_as_an_audiobook(users):
+    """F27/F63: a folder is an audiobook only when it holds audio and no ebooks."""
+    d = os.path.join(config.DROPBOX_DIR, "alice", "Books"); os.makedirs(os.path.join(d, "Austen"))
+    make_epub(os.path.join(d, "Austen", "Emma.epub")); make_epub(os.path.join(d, "Persuasion.epub"))
+    open(os.path.join(d, "Austen", "cover.jpg"), "wb").write(b"jpg"); open(os.path.join(d, "metadata.opf"), "w").write("<x/>")
+    open(os.path.join(d, "broken.epub"), "wb").write(b"not a zip")
+    now = time.time() + 60
+    assert worker.scan_dropbox_once(now=now) == 3
+    rows = {r["title"]: r for r in db.list_for("alice", False)}
+    assert rows["Books/Austen/Emma.epub"]["status"] == "done" and rows["Books/Persuasion.epub"]["status"] == "done"
+    assert rows["Books/broken.epub"]["status"] == "error" and all(r["kind"] == "ebook" for r in rows.values())
+    assert os.listdir(config.AUDIO_DIR) == [] and len(_ingested()) == 2
+    assert not os.path.exists(d)                                           # only sidecars were left
+    assert os.listdir(os.path.join(config.DROPBOX_DIR, "alice", ".failed")) == ["Books - broken.epub"]
+
+def test_mixed_and_bookless_folders_are_parked_with_a_clear_message(users):
+    base = os.path.join(config.DROPBOX_DIR, "alice")
+    mixed = os.path.join(base, "Mixed"); os.makedirs(mixed)
+    open(os.path.join(mixed, "01.mp3"), "wb").write(b"ID3"); make_epub(os.path.join(mixed, "book.epub"))
+    junk = os.path.join(base, "Photos"); os.makedirs(junk)
+    open(os.path.join(junk, "a.jpg"), "wb").write(b"jpg"); open(os.path.join(junk, "b.heic"), "wb").write(b"x")
+    notes = os.path.join(base, "Audio with notes"); os.makedirs(notes)
+    open(os.path.join(notes, "01.mp3"), "wb").write(b"ID3"); open(os.path.join(notes, "readme.txt"), "w").write("hi")
+    assert worker.scan_dropbox_once(now=time.time() + 60) == 3
+    rows = {r["title"]: r for r in db.list_for("alice", False)}
+    assert rows["Mixed"]["status"] == "error" and "both audio and ebook" in rows["Mixed"]["detail"]
+    assert rows["Photos"]["status"] == "error" and "no audio or ebook files (b.heic)" in rows["Photos"]["detail"]
+    assert rows["Audio with notes"]["status"] == "needs-tag"                # an audiobook (no ABS token in tests)
+    assert sorted(os.listdir(os.path.join(base, ".failed"))) == ["Mixed", "Photos"] and _ingested() == []
 
 def test_settled_directory_in_dropbox_becomes_an_audiobook(monkeypatch):
     import abs as absapi
@@ -314,9 +437,7 @@ def test_settled_directory_in_dropbox_becomes_an_audiobook(monkeypatch):
         open(os.path.join(d, n), "wb").write(b"ID3")
     assert worker.scan_dropbox_once() == 0                               # files are fresh: still settling
     now = time.time() + 60
-    started = []
     monkeypatch.setattr(config, "ABS_TOKEN", "k"); monkeypatch.setattr(absapi, "trigger_scan", lambda: "ABS scan triggered")
-    monkeypatch.setattr(absapi, "tag_folder_async", lambda folder, owner, rid=None: started.append((folder, owner, rid)))
     open(os.path.join(d, "03.mp3.part"), "wb").write(b"x")               # a download still in progress inside
     assert worker.scan_dropbox_once(now=now) == 0
     os.remove(os.path.join(d, "03.mp3.part"))
@@ -325,24 +446,29 @@ def test_settled_directory_in_dropbox_becomes_an_audiobook(monkeypatch):
     assert sorted(os.listdir(final)) == ["02.mp3", "Disc 1", "cover.jpg"] and os.listdir(os.path.join(final, "Disc 1")) == ["01.mp3"]
     assert not os.path.exists(d)
     r = db.list_for("alice", False)[0]
-    assert r["kind"] == "audio" and r["status"] == "done" and started == [("alice - Great Audiobook", "alice", r["id"])]
-    # a directory that is not a user's is ignored; a cross-device move falls back to copy
+    assert r["kind"] == "audio" and r["status"] == "tagging"                # done only once the ABS tag is set (F22)
+    assert [(j["folder"], j["owner"], j["rid"]) for j in db.pending_tag_jobs()] == [("alice - Great Audiobook", "alice", r["id"])]
+    # a cross-device move falls back to a copy that keeps the loop's heartbeat fresh (F63)
     monkeypatch.setattr(os, "rename", lambda a, b: (_ for _ in ()).throw(OSError("EXDEV")) if a.startswith(config.DROPBOX_DIR) else os.replace(a, b))
     d2 = os.path.join(config.DROPBOX_DIR, "alice", "Second"); os.makedirs(d2); open(os.path.join(d2, "a.mp3"), "wb").write(b"x")
+    beats = []
+    monkeypatch.setattr(worker, "_beat", lambda name: beats.append(name))
     assert worker.scan_dropbox_once(now=now + 100) == 1
     assert os.listdir(os.path.join(config.AUDIO_DIR, "alice - Second")) == ["a.mp3"] and not os.path.exists(d2)
+    assert beats.count("dropbox") >= 3
 
-def test_sweep_stale_quarantines_old_partials_only():
-    old = time.time() - 7200
-    for n in ("crash.part", "crash.part.tmp", "recent.part", "book.epub"):
-        p = os.path.join(config.INGEST_DIR, n); open(p, "wb").write(b"x")
-        if n != "recent.part": os.utime(p, (old, old))
+def test_sweep_orphans_deletes_our_partials_whatever_their_age():
+    """F06/F52: every restart after an OOM kill used to leave another full-size copy behind."""
+    h = "0123456789abcdef0123456789abcdef"
+    for n in (f"{h}.part", f"{h}.part.tmp", "someone-elses.part", "book.epub"):
+        open(os.path.join(config.INGEST_DIR, n), "wb").write(b"x")               # all brand new
     d = os.path.join(config.DROPBOX_DIR, "alice"); os.makedirs(d)
-    p = os.path.join(d, ".up.epub.uploading"); open(p, "wb").write(b"x"); os.utime(p, (old, old))
-    assert worker.sweep_stale() == 3
-    assert sorted(os.listdir(config.INGEST_DIR)) == ["book.epub", "recent.part"] and os.listdir(d) == []
-    q = os.listdir(os.path.join(config.STAGING_DIR, "quarantine"))
-    assert len(q) == 3 and all(n.split("-", 1)[1] in ("crash.part", "crash.part.tmp", ".up.epub.uploading") for n in q)
+    open(os.path.join(d, f".{h}.uploading"), "wb").write(b"x"); open(os.path.join(d, ".shelfmark.tmp"), "wb").write(b"x")
+    t = os.path.join(config.STAGING_DIR, "tmp", "tmpabc"); os.makedirs(t); open(os.path.join(t, "book.bin"), "wb").write(b"x")
+    assert worker.sweep_orphans() == 4
+    assert sorted(os.listdir(config.INGEST_DIR)) == ["book.epub", "someone-elses.part"] and os.listdir(d) == [".shelfmark.tmp"]
+    assert os.listdir(os.path.join(config.STAGING_DIR, "tmp")) == []
+    assert os.path.dirname(worker._tmpdir()) == os.path.join(config.STAGING_DIR, "tmp")   # downloads land there, not /tmp
 
 def test_auto_kindle_runs_before_ingest_when_opted_in(monkeypatch, tmp_path):
     cwa.add_user("alice", "alicepass1"); cwa.set_kindle_mail("alice", "alice@kindle.com")
@@ -359,7 +485,7 @@ def test_auto_kindle_runs_before_ingest_when_opted_in(monkeypatch, tmp_path):
     db.set_prefs("alice", auto_kindle=False)
     assert "Kindle" not in worker.ingest_local_file(make_epub(str(tmp_path / "k3.epub")), "alice")
 
-def test_process_http_ebook_and_torrent_handoff(monkeypatch, tmp_path):
+def test_process_http_ebook_and_refuses_torrents_and_removed_users(monkeypatch, tmp_path, users):
     src = make_epub(str(tmp_path / "dl.epub"))
     monkeypatch.setattr(worker, "_download", lambda url, dest, **kw: shutil.copyfile(src, dest))
     rid = _req("alice", title="Pride & Prejudice", author="Jane Austen")
@@ -371,19 +497,39 @@ def test_process_http_ebook_and_torrent_handoff(monkeypatch, tmp_path):
     pid = _req("alice", title="A Paper", author="X", source="mycatalog")
     worker._process(db.claim_one())
     assert db.get(pid)["status"] == "done" and f"X - A Paper [alice-{pid}].pdf" in os.listdir(config.INGEST_DIR)   # sniffed, not assumed epub
-    added = {}
-    monkeypatch.setattr(worker.Qbit, "add", lambda self, url, path: added.update(url=url, path=path))
-    monkeypatch.setattr(worker.Qbit, "__init__", lambda self: None)
-    tid = _req("bob", is_torrent=True, download_url="magnet:?xt=urn:btih:abc")
+    m = PdfReader(os.path.join(config.INGEST_DIR, f"X - A Paper [alice-{pid}].pdf")).metadata
+    assert m["/Title"] == "A Paper" and m["/Author"] == "X"                                 # F58: not 'X - A Paper' by Unknown
+    tid = _req("bob", is_torrent=True, download_url="magnet:?xt=urn:btih:abc")              # C5: no P2P path any more
     worker._process(db.claim_one())
-    assert db.get(tid)["status"] == "downloading" and added == {"url": "magnet:?xt=urn:btih:abc", "path": config.STAGING_DIR}
-    tid2 = _req("bob", is_torrent=True, download_url="http://127.0.0.1:2019/x.torrent")     # .torrent URLs are fenced too
+    assert db.get(tid)["status"] == "error" and "P2P" in db.get(tid)["detail"]
+    gone = _req("carol")                                                                    # F24: a removed user's queued request
     worker._process(db.claim_one())
-    assert db.get(tid2)["status"] == "error" and "non-public" in db.get(tid2)["detail"]
+    assert db.get(gone)["status"] == "error" and "no longer exists" in db.get(gone)["detail"]
     def boom(*a, **k): raise RuntimeError("network down")
     monkeypatch.setattr(worker, "_download", boom)
     eid = _req("alice"); worker._process(db.claim_one())
     assert db.get(eid)["status"] == "error" and "network down" in db.get(eid)["detail"]
+
+def test_queue_loop_survives_database_errors(monkeypatch):
+    """F29: one 'database or disk is full' used to kill the queue thread for good."""
+    import sqlite3
+    calls, sleeps = [], []
+    def claim():
+        calls.append(1)
+        if len(calls) < 3:
+            raise sqlite3.OperationalError("database or disk is full")
+        return None
+    class Stop(Exception): pass
+    def fake_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 5: raise Stop()
+    monkeypatch.setattr(db, "claim_one", claim)
+    monkeypatch.setattr(worker.time, "sleep", fake_sleep)
+    monkeypatch.setattr(worker.threading, "Thread", lambda *a, **k: type("T", (), {"start": lambda self: None})())
+    monkeypatch.setattr(worker, "sweep_orphans", lambda: 0)
+    with pytest.raises(Stop):
+        worker.run_forever()
+    assert len(calls) >= 3 and 5 in sleeps                                  # errors logged, loop kept going
 
 def test_http_ebook_that_cannot_be_tagged_is_kept_for_the_admin(monkeypatch, tmp_path):
     cwa.add_user("alice", "alicepass1")
@@ -391,8 +537,9 @@ def test_http_ebook_that_cannot_be_tagged_is_kept_for_the_admin(monkeypatch, tmp
     rid = _req("alice", title="Odd", author="Q")
     worker._process(db.claim_one())
     r = db.get(rid)
-    assert r["status"] == "error" and "could not embed owner tag" in r["detail"] and "dropbox/alice/.failed/Q - Odd.epub" in r["detail"]
-    assert os.path.exists(os.path.join(config.DROPBOX_DIR, "alice", ".failed", "Q - Odd.epub")) and os.listdir(config.INGEST_DIR) == []
+    # J11/J40: a truncated download is named for what it IS and explained in plain words
+    assert r["status"] == "error" and "damaged or incomplete" in r["detail"] and "dropbox/alice/.failed/Q - Odd.zip" in r["detail"]
+    assert os.path.exists(os.path.join(config.DROPBOX_DIR, "alice", ".failed", "Q - Odd.zip")) and os.listdir(config.INGEST_DIR) == []
 
 # ---- worker: outbound trust boundary ------------------------------------------------------
 def _resolves_to(monkeypatch, *ips):
@@ -403,7 +550,7 @@ def _resolves_to(monkeypatch, *ips):
                                 "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "224.0.0.1"])
 def test_check_target_refuses_internal_addresses(monkeypatch, ip):
     _resolves_to(monkeypatch, ip)
-    with pytest.raises(ValueError, match="non-public"):
+    with pytest.raises(ValueError, match="not allowed"):
         worker._check_target("https://host.example/x.epub")
 
 def test_check_target_allows_public_hosts_and_trusted_catalog_origins(monkeypatch):
@@ -462,7 +609,7 @@ def test_fetch_follows_redirects_by_hand_rechecks_each_hop_and_caps_size(monkeyp
     assert open(dest, "rb").read() == b"book" and seen == list(responses)                 # every hop checked, in order
     assert auths == {"https://cat.mine.tld/get/1": ("me", ""), "https://cat.mine.tld/files/1.epub": ("me", ""), "https://cdn.example/1.epub": None}
     responses["https://cdn.example/1.epub"] = _Resp(302, {"Location": "http://127.0.0.1:2019/config/"})
-    with pytest.raises(ValueError, match="non-public"):                                     # a redirect cannot escape the fence
+    with pytest.raises(ValueError, match="non-public"):                                      # a redirect cannot escape the fence (stubbed _check_target)
         worker._fetch("https://cat.mine.tld/get/1", dest, {"source": "mycatalog"})
     loop = {"https://a/": _Resp(302, {"Location": "https://a/"})}
     monkeypatch.setattr(worker.requests, "get", lambda url, **kw: loop[url])
@@ -505,9 +652,13 @@ class FakeImap:
     def store(self, num, flags, value): self.flagged.append(num)
     def logout(self): pass
 
-def _mail(to, delivered=None, filename="my book.epub", payload=b"PK\x03\x04data", sender="alice@example.test"):
+def _mail(to, delivered=None, filename="my book.epub", payload=b"PK\x03\x04data", sender="alice@example.test", auth="pass"):
     from email.message import EmailMessage
-    m = EmailMessage(); m["From"] = f"Someone <{sender}>"; m["To"] = to
+    m = EmailMessage()
+    if auth:                                   # what the receiving MTA prepends
+        dom = sender.rsplit("@", 1)[1]
+        m["Authentication-Results"] = f"mx.example.test; dkim={auth} header.i=@{dom} header.s=s1; spf=neutral smtp.mailfrom={sender}"
+    m["From"] = f"Someone <{sender}>"; m["To"] = to
     if delivered: m["Delivered-To"] = delivered
     m["Subject"] = "book"; m.set_content("hi")
     m.add_attachment(payload, maintype="application", subtype="epub+zip", filename=filename)
@@ -543,6 +694,37 @@ def test_imap_intake_routes_by_plus_address_checks_users_and_senders(monkeypatch
     fake3 = FakeImap([_mail("intake@example.test", sender="forwarder@example.test")]); monkeypatch.setattr(imap, "_connect", lambda: fake3)
     assert imap.poll_once() == 1 and os.listdir(os.path.join(config.DROPBOX_DIR, "dave")) == ["my book.epub"]
 
+def test_imap_needs_an_authenticated_sender_and_checks_size_first(monkeypatch):
+    """F55: the From header alone is forgeable; F49: rejected mail shows up in the audit trail."""
+    import imap
+    cwa.add_user("alice", "alicepass1", "alice@example.test")
+    forged_below = _mail("intake+alice@example.test", filename="forged2.epub", auth=None)
+    forged_below = forged_below.replace(b"From:", b"Authentication-Results: evil; dmarc=pass\r\nFrom:", 1)
+    msgs = [_mail("intake+alice@example.test", filename="forged.epub", auth=None),              # no result at all
+            _mail("intake+alice@example.test", filename="failed.epub", auth="fail"),
+            b"Authentication-Results: mx.example.test; dkim=pass header.d=evil.test; spf=pass smtp.mailfrom=x@evil.test\r\n"
+            + _mail("intake+alice@example.test", filename="other-domain.epub", auth=None),            # aligned to the wrong domain
+            b"Authentication-Results: mx.example.test; dmarc=none\r\n" + forged_below,              # sender's own header is not trusted
+            b"Authentication-Results: mx.example.test; dmarc=pass header.from=example.test\r\n"
+            + _mail("intake+alice@example.test", filename="dmarc.epub", auth=None),
+            _mail("intake+alice@example.test", filename="dkim.epub")]
+    class SizedImap(FakeImap):
+        def fetch(self, num, what):
+            if what == "(RFC822.SIZE)":
+                size = 10 ** 9 if int(num) == 1 else len(self.messages[int(num) - 1])
+                return "OK", [f"{int(num)} (RFC822.SIZE {size})".encode()]
+            assert int(num) != 1, "an oversized message must never be downloaded"
+            return super().fetch(num, what)
+    fake = SizedImap([_mail("intake+alice@example.test", filename="huge.epub")] + msgs)
+    monkeypatch.setattr(imap, "_connect", lambda: fake)
+    assert imap.poll_once() == 2
+    assert sorted(os.listdir(os.path.join(config.DROPBOX_DIR, "alice"))) == ["dkim.epub", "dmarc.epub"]
+    rejected = [a["detail"] for a in db.audit_recent(20) if a["event"] == "imap_rejected"]
+    assert len(rejected) == 5 and sum("not authenticated" in d for d in rejected) == 4 and any("over the" in d for d in rejected)
+    monkeypatch.setattr(config, "IMAP_REQUIRE_AUTH", False)                 # a local relay without the header
+    fake = FakeImap([_mail("intake+alice@example.test", filename="relay.epub", auth=None)]); monkeypatch.setattr(imap, "_connect", lambda: fake)
+    assert imap.poll_once() == 1
+
 def test_imap_connect_modes(monkeypatch):
     import imap, imaplib
     calls = {}
@@ -573,6 +755,23 @@ def test_gutenberg_adapter_prefers_epub_and_mirror(monkeypatch):
     monkeypatch.setattr(config, "GUTENBERG_MIRROR", "https://mirror.local/")
     assert fetchers.gutenberg("pride")[0]["download_url"].startswith("https://mirror.local/ebooks/")
     assert fetchers.url_allowed("gutenberg", fetchers.gutenberg("pride")[0]["download_url"])
+
+def test_standard_ebooks_failure_is_not_cached(monkeypatch):
+    """F54: the feed now answers 401; that used to be cached (as garbage) until restart."""
+    calls = []
+    class Resp:
+        def __init__(self, code, content=b""): self.status_code, self.content = code, content
+        def raise_for_status(self):
+            if self.status_code >= 400: raise IOError(str(self.status_code))
+    feed = b"""<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Emma</title><author><name>Jane Austen</name></author>
+<link rel="http://opds-spec.org/acquisition" type="application/epub+zip" href="/ebooks/emma.epub"/></entry></feed>"""
+    answers = [Resp(401, b"<html/>"), Resp(200, feed)]
+    monkeypatch.setattr(fetchers, "_get", lambda url, **kw: (calls.append(url), answers.pop(0))[1])
+    monkeypatch.setitem(fetchers._SE_CACHE, "feed", None)
+    assert fetchers.standard_ebooks("emma") == [] and fetchers._SE_CACHE["feed"] is None
+    assert fetchers.standard_ebooks("emma")[0]["download_url"] == "https://standardebooks.org/ebooks/emma.epub"
+    assert fetchers.standard_ebooks("emma") and len(calls) == 2                       # success is cached
+    assert config.SOURCES["standard_ebooks"] is False                                  # off by default now
 
 def test_url_allowed_per_source(monkeypatch):
     ok, no = fetchers.url_allowed, lambda s, u: not fetchers.url_allowed(s, u)

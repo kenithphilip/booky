@@ -1,7 +1,10 @@
 # Optional overlay: Ephemera (search + request queue that auto-downloads a title once it
 # becomes available) plus the FlareSolverr helper it needs. Enable/disable via bookstack.sh
 # (menu 23/24). Everything binds to localhost; Caddy exposes it on the TAILNET ONLY behind
-# the admin password gate, because Ephemera has no login of its own.
+# the admin password gate, because Ephemera has no login of its own. The ephemera.<domain>
+# vhost sits between # @EPHEMERA_BEGIN@ / # @EPHEMERA_END@ in caddy/Caddyfile.template and is
+# rendered only while EPHEMERA_ENABLED=true (no certificate or 502 vhost otherwise).
+# Needs >= 8 GB RAM: FlareSolverr's headless Chromium is fenced at 1 GB on its own.
 #
 # STATUS (Sept 2026): the upstream project (github.com/OrwellianEpilogue/ephemera) and its
 # container image (ghcr.io/orwellianepilogue/ephemera) were removed from GitHub in early

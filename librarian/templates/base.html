@@ -19,15 +19,20 @@ button.sec,.btn.sec{background:#3a3f4a}button.danger{background:#7a2b2b}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
 code,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#0c0e12;padding:2px 6px;border-radius:6px;word-break:break-all}
 h2{font-size:18px;margin:18px 0 8px}h3{font-size:15px;margin:12px 0 6px}
-.st-done{color:var(--ok)}.st-error{color:var(--bad)}.st-needs-tag{color:var(--warn)}.st-queued,.st-importing,.st-downloading,.st-pending,.st-retrying{color:var(--warn)}.st-denied{color:#c98a8a}.st-dismissed{color:#6b7280}
+.st-done{color:var(--ok)}.st-error{color:var(--bad)}.st-needs-tag{color:var(--warn)}.st-queued,.st-importing,.st-tagging,.st-pending,.st-retrying,.st-downloading{color:var(--warn)}.st-denied{color:#c98a8a}.st-dismissed{color:#6b7280}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
 nav a{padding:4px 2px}nav a.active{border-bottom:2px solid var(--acc)}
+/* CSS-only "working on it": the clicked button keeps focus while the browser loads the next
+   page (the CSP forbids scripts, so there is nothing else to hang a spinner on) */
+.busy{display:none;color:var(--mut);font-size:13px}
+button:focus ~ .busy,button:active ~ .busy{display:inline}
 </style></head><body>
 <header><strong>{{ cfg.DOMAIN or 'Library' }}</strong>
 <nav class="row">{% if session.user %}
 <a href="{{url_for('index')}}" class="{{ 'active' if request.endpoint=='index' }}">Search</a>
 <a href="{{url_for('status')}}" class="{{ 'active' if request.endpoint=='status' }}">Requests</a>
 <a href="{{url_for('my_library')}}" class="{{ 'active' if request.endpoint=='my_library' }}">My books</a>
+{% if cfg.AUDIO_URL %}<a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobooks ↗</a>{% endif %}
 <a href="{{url_for('upload')}}" class="{{ 'active' if request.endpoint=='upload' }}">Upload</a>
 <a href="{{url_for('devices')}}" class="{{ 'active' if request.endpoint=='devices' }}">Devices</a>
 {% if session.admin %}<a href="{{url_for('admin')}}" class="{{ 'active' if request.endpoint=='admin' }}">Admin</a>{% endif %}

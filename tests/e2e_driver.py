@@ -60,6 +60,7 @@ class Session:
         except Exception as e:
             return 0, {}, str(e).encode()
     def get(self, url, **kw): return self.req(url, **kw)
+    def put(self, url, **kw): return self.req(url, method="PUT", **kw)
     def post(self, url, data=None, **kw): return self.req(url, data=data if data is not None else ({} if kw.get("json_body") is None and kw.get("files") is None else None), **kw)
 
 def csrf(html): m = re.search(rb'name="csrf" value="([^"]+)"', html); return m.group(1).decode() if m else None
@@ -227,6 +228,8 @@ st, h, b = Session().post(PORTAL + "/intake", json_body={"user": "bob", "url": "
 check(st == 401, "intake without token is refused", str(st))
 st, h, b = Session().post(PORTAL + "/intake", json_body={"user": "bob", "url": "http://filesrv:8000/intake.epub", "title": "Intake Hook Book", "author": "Automation"}, headers={"X-Intake-Token": "e2e-intake"})
 check(st == 202, "intake accepted (202)", f"{st} {b[:80]!r}")
+st2, h2, b2 = Session().post(PORTAL + "/intake", json_body={"user": "bob", "url": "http://filesrv:8000/intake.epub", "title": "Intake Hook Book", "author": "Automation"}, headers={"X-Intake-Token": "e2e-intake"})
+check(st2 == 200 and b'"duplicate"' in b2, "a replayed intake POST returns the existing request instead of downloading twice", f"{st2} {b2[:100]!r}")
 intake_id = wait(lambda: imported("Intake Hook Book", "bob"), 300, 5)
 check(intake_id is not None, "intake download was fetched, tagged owner:bob and imported by CWA")
 if intake_id:
@@ -348,7 +351,7 @@ if deny_id:
 st, h, b = pa.get(PORTAL + "/admin")
 check(b"login_locked" in b and b"198.51.100.9" in b and b"download_denied" in b and b"deny" in b, "audit trail shows lockouts with the real client IP, denied downloads and admin actions")
 st, h, b = p.get(PORTAL + "/admin"); check(st == 302, "alice is bounced from /admin", str(st))
-portal_post(pa, "/admin", "/admin", {"action": "add_user", "name": "carol", "password": "carolpass-e2e"})
+portal_post(pa, "/admin", "/admin", {"action": "add_user", "name": "carol", "email": "carol@example.test", "password": "carolpass-e2e"})
 r = lib("list"); check("carol" in r.stdout and os.path.isdir(f"{STACK}/library/dropbox/carol"), "admin created carol from the dashboard (+ dropbox)")
 sc, stc, locc, _ = cwa_login("carol", "carolpass-e2e"); check(stc in (302, 303) and "/login" not in locc, "CWA accepts carol")
 pc, st, loc = portal_login("carol", "carolpass-e2e")
@@ -377,7 +380,34 @@ st, h, b = g.get(f"{GATE}/kobo/{alice_kobo}/v1/initialization", headers={"Host":
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test", **basic("alice", ALICE_PW)}); check(st == 200, "/opds bypasses the gate (reader apps keep working)", str(st))
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test"}); check(st == 401, "/opds still requires CWA credentials behind the bypass", str(st))
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test", "Remote-User": "admin"}); check(st == 401, "a client-supplied Remote-User header is stripped on a bypassed path", str(st))
-st, h, b = g.get(GATE + "/kosync/users/auth", headers={"Host": "books.example.test", **basic("alice", ALICE_PW)}); check(st != 302 and "auth.example.test" not in h.get("Location", ""), "/kosync (KOReader) bypasses the gate", str(st))
+st, h, b = g.get(GATE + "/kosync/users/auth", headers={"Host": "books.example.test", **basic("alice", ALICE_PW)})
+check(st == 200 and b'"authorized"' in b, "/kosync (KOReader) bypasses the gate and authenticates with the library password", f"{st} {b[:120]}")
+st, h, b = g.get(GATE + "/kosync/users/auth", headers={"Host": "books.example.test", **basic("alice", "wrong-pw")})
+check(st == 401, "/kosync refuses a wrong password (no gate, so CWA must do it)", str(st))
+# a full KOReader round trip: PUT progress as alice, read it back, and make sure bob cannot
+doc = "e2e" + "0" * 29
+prog = {"document": doc, "progress": "/body/DocFragment[3]", "percentage": 0.42, "device": "KOReader", "device_id": "e2e-dev"}
+st, h, b = g.put(GATE + "/kosync/syncs/progress", json_body=prog, headers={"Host": "books.example.test", **basic("alice", ALICE_PW)})
+check(st == 200 and doc.encode() in b, "KOReader progress is accepted (PUT /kosync/syncs/progress)", f"{st} {b[:160]}")
+st, h, b = g.get(f"{GATE}/kosync/syncs/progress/{doc}", headers={"Host": "books.example.test", **basic("alice", ALICE_PW)})
+check(st == 200 and b'"percentage"' in b and b"DocFragment" in b, "alice reads her own progress back", f"{st} {b[:160]}")
+st, h, b = g.get(f"{GATE}/kosync/syncs/progress/{doc}", headers={"Host": "books.example.test", **basic("bob", BOB_PW)})
+check(b"DocFragment" not in b, "bob does not see alice's reading position", f"{st} {b[:160]}")
+# CWA ships its convert-library / epub-fixer / log endpoints with no authentication at all
+# (reproduced against the image: 200 anonymously). Caddy must 403 them for everyone, gate or no gate.
+BOOKS = {"Host": "books.example.test"}
+blocked = ["/cwa-convert-library-overview", "/cwa-convert-library-start", "/convert-library-status",
+           "/cwa-epub-fixer-overview", "/cwa-epub-fixer-start", "/epub-fixer-status",
+           "/cwa-logs/read/x", "/cwa-logs/download/x", "/reconnect",
+           "/cwa-convert-library-overview?x=1", "/CWA-Convert-Library-Overview", "//cwa-logs/read/x"]
+codes = {u: g.get(GATE + u, headers=BOOKS)[0] for u in blocked}
+check(all(c == 403 for c in codes.values()), "CWA's unauthenticated admin-job endpoints are 403 at the edge (anonymous, no gate needed)", str(codes))
+st, h, b = g.post(GATE + "/cwa-internal/reconnect-db", json_body={}, headers=BOOKS)
+check(st == 403, "POST /cwa-internal/* is 403 too", str(st))
+st, h, b = g.get(GATE + "/login", headers=BOOKS)
+check(st != 403, "...while Calibre-Web's own login page is not caught by the block (the Authelia gate still applies)", str(st))
+st, h, b = g.get(GATE + "/opds", headers={**BOOKS, **basic("alice", ALICE_PW)})
+check(st == 200, "...and OPDS is not caught by the block", str(st))
 st, h, b = g.get(GATE + "/ping", headers={"Host": "audio.example.test"}); check(st == 200, "Audiobookshelf /ping bypasses the gate (mobile apps keep working)", str(st))
 st, h, b = g.post(GATE + "/login", json_body={"username": "alice", "password": ALICE_PW}, headers={"Host": "audio.example.test"}); check(st in (200, 401), "Audiobookshelf's own /login is reachable through the gate", str(st))
 st, h, b = g.get(GATE + "/", headers={"Host": "audio.example.test", **BROWSER}); check(st == 302 and "auth.example.test" in h.get("Location", ""), "Audiobookshelf web UI is still gated for browsers", str(st))
@@ -421,7 +451,9 @@ if root_tok:
             return it if it and "owner:alice" in ((it.get("media") or {}).get("tags") or []) else None
         item = wait(tagged_item, 150, 5)
         check(bool(item), "worker scanned AND tagged the audiobook owner:alice in ABS automatically (no admin action)")
-        st, h, b = p.get(PORTAL + "/status"); check(b"tagged owner:alice in ABS" in b, "request detail records the automatic ABS tagging")
+        check(wait(lambda: b"tagged owner:alice in ABS" in pa.get(PORTAL + "/status")[2] or None, 90, 3) is not None, "admin request detail records the automatic ABS tagging (status tagging -> done)")
+        st, h, b = p.get(PORTAL + "/status")
+        check(b"added to your audiobooks" in b or b"in your audiobooks" in b, "...while alice reads plain language, with no owner: tag or container path", b[b.find(b"E2E Audio"):][:200])
         if item:
             def visible_to(name, pw):
                 s = Session(); st, h, b = s.post(ABS + "/login", json_body={"username": name, "password": pw}); u = (jload(b) or {}).get("user") or {}
@@ -441,6 +473,7 @@ st, h, b = Session().get(PORTAL + "/healthz"); check(st == 200 and b == b"ok", "
 r = subprocess.run(["docker", "exec", "-i", "librarian", "python", "-c", "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:8090/healthz').read().decode())"], capture_output=True, text=True)
 hj = jload(r.stdout) or {}
 check(hj.get("ok") is True and all(v is not None and v < 120 for v in (hj.get("heartbeats") or {}).values()), "inside the box /healthz reports JSON with fresh heartbeats", r.stdout[:200])
+check(bool(hj.get("version")) and "cwa" in hj, "/healthz detail reports the portal build version and whether Calibre-Web answers", json.dumps({k: hj.get(k) for k in ("version", "cwa")})[:160])
 st, h, b = Session().get(ABS + "/healthcheck"); check(st == 200, "audiobookshelf /healthcheck", str(st))
 
 print(f"\nE2E RESULT: {fails} failed")

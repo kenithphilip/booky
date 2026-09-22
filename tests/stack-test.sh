@@ -52,8 +52,8 @@ mkdir -p cwa/config abs/config abs/metadata shelfmark/config librarian/state tes
          library/{books,ingest,audiobooks,podcasts,staging,dropbox}
 # .env exactly as the installer writes it (quoted values incl. a hostile secret)
 envset DOMAIN example.test; envset ADMIN_EMAIL admin@example.test; envset TZ UTC
-envset PUID "$(id -u)"; envset PGID "$(id -g)"; envset CF_API_TOKEN dummy; envset ARIA2_SECRET dummy
-envset LIBRARIAN_SECRET 'pa$$w0rd&|it'"'"'s"tricky'; envset INTAKE_TOKEN e2e-intake; envset PUBLIC_IP 127.0.0.1; envset TAILSCALE_IP 127.0.0.1
+envset PUID "$(id -u)"; envset PGID "$(id -g)"; envset CF_API_TOKEN dummy; envset CF_DNS_TOKEN dummy
+envset LIBRARIAN_SECRET 'pa$$w0rd&|it'"'"'s"tricky'; envset INTAKE_TOKEN e2e-intake; envset PUBLIC_IP 127.0.0.1; envset BIND_IP 127.0.0.1; envset TAILSCALE_IP 127.0.0.1
 envset ADMIN_HASH '$2a$14$hash'; envset APPROVALS_REQUIRED true; envset SHELFMARK_LANGUAGE en; envset AUTHELIA_ENABLED true
 compose config -q || { echo "compose files do not render"; exit 1; }
 
@@ -88,6 +88,24 @@ http://auth.example.test {
 	reverse_proxy authelia:9091
 }
 EOF
+# Give the test gate the SAME books. route that 403s CWA's unauthenticated admin-job endpoints
+# (convert-library, epub-fixer, cwa-logs, cwa-internal, /reconnect), copied from the production
+# template so the two can never drift. Must run before the gate is injected (it replaces the marker).
+python3 - caddy-test/Caddyfile "$REPO/caddy/Caddyfile.template" <<'PY'
+import sys, re
+p, tpl_path = sys.argv[1], sys.argv[2]
+s, tpl = open(p).read(), open(tpl_path).read()
+m = re.search(r"\n\troute \{\n\t\t@cwa_admin_jobs .*?\n\t\}\n", tpl, re.S)
+if not m:
+    sys.exit("could not find the @cwa_admin_jobs route in caddy/Caddyfile.template")
+block = re.sub(r"^\t", "", m.group(0), flags=re.M).lstrip("\n")
+marker = "\t# @AUTHELIA_GATE:books@"
+if marker not in s:
+    sys.exit("books gate marker missing from the test Caddyfile")
+open(p, "w").write(s.replace(marker, "\t" + block.replace("\n", "\n") + marker, 1))
+print("   gate: copied the CWA admin-jobs 403 route from the production template")
+PY
+
 python3 "$REPO/authelia/inject-gate.py" caddy-test/Caddyfile authelia/caddy-gate.snippet || { echo "inject-gate.py failed"; exit 1; }
 python3 - caddy-test/Caddyfile <<'PY'
 import sys, re
@@ -104,7 +122,7 @@ for _ in $(seq 1 120); do [ -f cwa/config/app.db ] && curl -fs -o /dev/null http
 curl -fs -o /dev/null http://127.0.0.1:18083/login || { echo "CWA never came up"; compose logs calibre-web | tail -30; exit 1; }
 # the same CWA conversion policy apply_library_defaults sets on a real deploy (convert to EPUB,
 # keep per-user copies, Kindle fixer, leave PDF/comics in their native format)
-docker exec -i calibre-web sqlite3 /config/cwa.db "UPDATE cwa_settings SET auto_convert=1, auto_convert_target_format='epub', auto_ingest_automerge='new_record', kindle_epub_fixer=0, auto_convert_ignored_formats='pdf,cbz,cbr,cb7', auto_backup_imports=0, auto_backup_conversions=0, auto_backup_epub_fixes=0;" \
+docker exec -i calibre-web sqlite3 /config/cwa.db "UPDATE cwa_settings SET auto_convert=1, auto_convert_target_format='epub', auto_ingest_automerge='new_record', kindle_epub_fixer=0, auto_convert_ignored_formats='pdf,cbz,cbr,cb7', auto_backup_imports=0, auto_backup_conversions=0, auto_backup_epub_fixes=0, koreader_sync_enabled=1;" \
   && echo "   [ OK ] CWA conversion defaults applied (as apply_library_defaults does)" || echo "   [FAIL] could not apply CWA defaults"
 echo "== starting audiobookshelf and bootstrapping it through the portal image CLI (what Library -> Audiobookshelf runs)"
 compose up -d audiobookshelf

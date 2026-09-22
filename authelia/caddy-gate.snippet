@@ -9,6 +9,10 @@
 		@authelia_protected not path @@BYPASS@@
 		forward_auth @authelia_protected 127.0.0.1:9091 {
 			uri /api/authz/forward-auth
+			# Authelia logs and regulates on X-Forwarded-For: give it the one real client IP
+			# (Cloudflare's CF-Connecting-IP via the global client_ip_headers), not the
+			# client-controlled list.
+			header_up X-Forwarded-For {client_ip}
 			copy_headers Remote-User Remote-Groups Remote-Email Remote-Name
 		}
 	}

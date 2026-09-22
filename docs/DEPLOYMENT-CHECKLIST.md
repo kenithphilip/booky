@@ -1,6 +1,6 @@
 # Deployment checklist (pre-flight for the first VPS install)
 
-Status as of 2026-09-22 (v4.2). Items marked **on the VPS** cannot be exercised on a laptop
+Status as of 2026-09-22 (v4.3). Items marked **on the VPS** cannot be exercised on a laptop
 and are covered by `Operations → Self-test` after deploy.
 
 ## Verified locally (this machine, Docker/OrbStack running)
@@ -54,16 +54,22 @@ and are covered by `Operations → Self-test` after deploy.
       portal reports comics as `needs-tag`. Covered by unit tests and the end-to-end run.
 - [x] Installer harness 158/158, portal suite 115/115 (15 new regressions), end-to-end run 11
       green: 147 checks, no worker crash, no container restart (see README → Testing).
-- [x] Restore test restores only config + DB snapshots, beside the stack (not tmpfs); the
-      disk watchdog talks to qBittorrent 5 (`stop`/`start`) with the old verbs as fallback.
+- [x] Restore test restores only config + DB snapshots, beside the stack (not tmpfs).
+
+## Verified locally in v4.3 (fan-out audit, fixes, synthetic journeys)
+- [x] 77 verified findings fixed across installer, wiring, portal, journeys and operations
+      (see README → What changed in v4.3); portal suite 138/138, installer harness 263/263.
+- [x] Rendered Caddyfile validates with the new pinned Caddy build for torrents/Ephemera on
+      and off, with and without the Authelia gate; every compose combination renders.
+- [x] End-to-end run on real containers green after the fixes (see the commit message).
 
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,
       `.env` 0600, every non-admin isolated, CWA registration off / Kobo on, public
       reachability through Cloudflare, origin refusing direct connections, backup timer).
-- [ ] `PUBLIC_IP` detected by Configure is an address actually bound on the VPS (Caddy uses
-      `bind <ip>`). On NAT'd providers set it by hand in `.env` and re-run Configure.
+- [ ] On NAT'd providers set `PUBLIC_IP` by hand in `.env` and answer No to "re-detect" in
+      Configure; Caddy binds `BIND_IP` (the server's own source address) automatically.
 - [ ] One real Kobo: Devices → generate link → device syncs only that user's books.
 - [ ] One real Kindle: Library → Mail → test mail arrives; Devices → address; My books →
       Send to Kindle arrives (sender approved at Amazon).
@@ -74,6 +80,8 @@ and are covered by `Operations → Self-test` after deploy.
 - [ ] Cloudflare API token has **Firewall Services: Edit** (fail2ban bans at Cloudflare); after
       Security → fail2ban, `fail2ban-client status caddy-auth` shows the jail active.
 - [ ] Library → Mail: test mail arrives; a request left pending mails the admin.
+- [ ] Alerts: the test notification from Quick install → Alerts arrived on your phone.
+- [ ] Tailscale: key expiry disabled for this machine (the Tailscale step checks it).
 - [ ] Cloudflare dashboard: WAF Managed rules ON; Bot Fight Mode **OFF** (it silently breaks
       Kobo, OPDS, KOReader and the Audiobookshelf apps and cannot be exempted on the Free plan).
 - [ ] (Only if enabling Ephemera) `Operations → Ephemera` builds on the VPS and RAM suffices.

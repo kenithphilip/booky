@@ -4,10 +4,12 @@
 {% for r in pending %}
 <div class="card"><div class="row" style="justify-content:space-between">
 <div><strong>{{r.title}}</strong> <span class="mut">— {{r.author}}</span><br>
-<span class="mut">by {{r.owner}} · {{r.source.replace('_',' ')}}{% if r.is_torrent %} · P2P{% endif %} · from <span class="code">{{ r.host }}</span></span></div>
+<span class="mut">by {{r.owner}} · {{ source_label(r.source) }} · from <span class="code">{{ r.host }}</span></span></div>
 <div class="row">
 <form method="post" action="{{url_for('approve', rid=r.id)}}">{{ csrf_field() }}<button type="submit">Approve</button></form>
-<form method="post" action="{{url_for('deny', rid=r.id)}}">{{ csrf_field() }}<button type="submit" class="danger">Deny</button></form>
+<form method="post" action="{{url_for('deny', rid=r.id)}}" class="row">{{ csrf_field() }}
+<input type="text" name="reason" maxlength="200" placeholder="Reason (optional, shown to them)" style="width:220px">
+<button type="submit" class="danger">Deny</button></form>
 </div></div></div>
 {% endfor %}
 {% endif %}
@@ -20,7 +22,7 @@
 {% for r in failed %}
 <div class="card"><div class="row" style="justify-content:space-between">
 <div><strong>{{r.title}}</strong> <span class="mut">— {{r.author}}</span><br>
-<span class="mut">by {{r.owner}} · {{r.source.replace('_',' ')}} · {{ r.detail or 'failed' }}</span></div>
+<span class="mut">by {{r.owner}} · {{ source_label(r.source) }} · {{ r.detail or 'failed' }}</span></div>
 <div class="row">
 {% if r.retryable %}<form method="post" action="{{url_for('retry', rid=r.id)}}">{{ csrf_field() }}<button type="submit">Retry</button></form>
 {% else %}<span class="mut" title="No re-fetchable source (uploaded/dropbox file)">not retryable</span>{% endif %}
@@ -32,9 +34,10 @@
 <h2>{{ 'All requests' if admin else 'My requests' }}</h2>
 <p class="mut">Finished books appear under <a href="{{ url_for('my_library') }}">My books</a> and on your linked devices.</p>
 <div class="card"><table>
-<tr><th>Title</th>{% if admin %}<th>Owner</th>{% endif %}<th>Source</th><th>Status</th><th>Detail</th></tr>
+<tr><th>Title</th>{% if admin %}<th>Owner</th>{% endif %}<th>Source</th><th>Status</th><th>Detail</th><th></th></tr>
 {% for r in rows %}<tr><td>{{r.title}}</td>{% if admin %}<td>{{r.owner}}</td>{% endif %}
-<td>{{r.source.replace('_',' ')}}</td><td class="st-{{r.status}}">{{r.status}}</td>
-<td class="mut">{{r.detail or ''}}</td></tr>{% endfor %}
-{% if not rows %}<tr><td colspan="5" class="mut">Nothing yet.</td></tr>{% endif %}
+<td>{{ source_label(r.source) }}</td><td class="st-{{r.status}}">{{ 'waiting for approval' if r.status=='pending' else r.status }}</td>
+<td class="mut">{{ friendly_detail(r.detail, admin) }}</td>
+<td>{% if r.can_dismiss %}<form method="post" action="{{ url_for('dismiss', rid=r.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Clear</button></form>{% endif %}</td></tr>{% endfor %}
+{% if not rows %}<tr><td colspan="6" class="mut">Nothing yet.</td></tr>{% endif %}
 </table></div>{% endblock %}

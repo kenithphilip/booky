@@ -13,9 +13,32 @@ def _scope_sql(owner, is_admin):
     return ("AND EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag "
             "WHERE l.book=b.id AND t.name=?)", (f"{config.OWNER_PREFIX}{owner}",))
 
-def books_for(owner, is_admin=False, limit=300):
-    """[{id,title,author,formats:[...],added}] visible to this user."""
+PAGE = 300
+MIMETYPES = {"kepub": "application/kepub+zip", "epub": "application/epub+zip", "pdf": "application/pdf",
+             "cbz": "application/vnd.comicbook+zip", "azw3": "application/vnd.amazon.ebook",
+             "mobi": "application/x-mobipocket-ebook", "txt": "text/plain", "fb2": "application/x-fictionbook+xml"}
+
+def _search_sql(q):
+    if not q:
+        return "", ()
+    like = f"%{q.lower()}%"
+    return ("AND (lower(b.title) LIKE ? OR EXISTS (SELECT 1 FROM books_authors_link al JOIN authors a "
+            "ON a.id=al.author WHERE al.book=b.id AND lower(a.name) LIKE ?))", (like, like))
+
+def count_for(owner, is_admin=False, q=""):
     scope, params = _scope_sql(owner, is_admin)
+    search, sparams = _search_sql(q)
+    try:
+        with _conn() as c:
+            return c.execute(f"SELECT COUNT(*) FROM books b WHERE 1=1 {scope} {search}", (*params, *sparams)).fetchone()[0]
+    except Exception:
+        return 0
+
+def books_for(owner, is_admin=False, limit=PAGE, offset=0, q=""):
+    """[{id,title,author,formats:[...],added}] visible to this user, newest first; `q` filters
+    on title/author, `offset` pages through big libraries."""
+    scope, params = _scope_sql(owner, is_admin)
+    search, sparams = _search_sql(q)
     try:
         with _conn() as c:
             rows = c.execute(f"""
@@ -25,8 +48,8 @@ def books_for(owner, is_admin=False, limit=300):
                        (SELECT group_concat(lower(d.format)) FROM data d WHERE d.book=b.id) AS formats,
                        (SELECT group_concat(t.name) FROM books_tags_link l JOIN tags t ON t.id=l.tag
                           WHERE l.book=b.id AND t.name LIKE ?) AS owners
-                FROM books b WHERE 1=1 {scope} ORDER BY b.timestamp DESC LIMIT ?""",
-                (f"{config.OWNER_PREFIX}%", *params, limit)).fetchall()
+                FROM books b WHERE 1=1 {scope} {search} ORDER BY b.timestamp DESC, b.id DESC LIMIT ? OFFSET ?""",
+                (f"{config.OWNER_PREFIX}%", *params, *sparams, limit, max(0, offset))).fetchall()
     except Exception:
         return []
     out = []
@@ -47,10 +70,12 @@ def visible(owner, book_id, is_admin=False):
         return False
 
 def file_for(owner, book_id, fmt, is_admin=False):
-    """Absolute path of one book file if the user may see the book, else None."""
+    """Absolute path of one book file if the user may see the book, else None. KEPUB (which
+    CWA creates on Kobo sync and keeps as a format) is served as <name>.kepub.epub so other
+    readers and Kobo side-loading recognise it."""
     scope, params = _scope_sql(owner, is_admin)
     fmt = (fmt or "").lower()
-    if fmt not in config.FORMATS and fmt not in ("txt", "cbz", "cbr", "fb2", "djvu"):
+    if fmt not in config.DOWNLOAD_FORMATS:
         return None
     try:
         with _conn() as c:
@@ -66,7 +91,9 @@ def file_for(owner, book_id, fmt, is_admin=False):
     real = os.path.realpath(path)
     if not real.startswith(os.path.realpath(config.LIBRARY_DIR) + os.sep) or not os.path.isfile(real):
         return None
-    return {"path": real, "title": r[3], "format": fmt, "filename": f"{r[1]}.{fmt}"}
+    filename = f"{r[1]}.kepub.epub" if fmt == "kepub" else f"{r[1]}.{fmt}"
+    return {"path": real, "title": r[3], "format": fmt, "filename": filename,
+            "mimetype": MIMETYPES.get(fmt, "application/octet-stream")}
 
 def best_format(book, preferred):
     """Pick the file to hand out: preferred if present, else epub, else the first available."""

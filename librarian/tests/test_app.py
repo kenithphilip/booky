@@ -12,7 +12,7 @@ PUBLIC = {"X-Forwarded-For": "203.0.113.5"}          # a client behind Caddy, no
 
 def _alive(monkeypatch):
     now = time.time()
-    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "torrent": now})
+    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "housekeeping": now})
 
 def test_anonymous_is_redirected_and_healthz_is_plain_for_the_public(client, monkeypatch):
     for p in ("/", "/status", "/library", "/devices", "/upload", "/admin", "/download/1/epub"):
@@ -26,7 +26,7 @@ def test_anonymous_is_redirected_and_healthz_is_plain_for_the_public(client, mon
 def test_healthz_json_on_loopback_or_for_admins_and_503_when_degraded(client, users, monkeypatch):
     _alive(monkeypatch)
     r = client.get("/healthz")                               # test client = 127.0.0.1
-    assert r.status_code == 200 and r.get_json()["ok"] and set(r.get_json()["heartbeats"]) == {"queue", "dropbox", "torrent"}
+    assert r.status_code == 200 and r.get_json()["ok"] and set(r.get_json()["heartbeats"]) == {"queue", "dropbox", "housekeeping"}
     assert r.get_json()["ingest_pending"] == 0 and r.get_json()["free_gb"] > 0
     worker.HEARTBEAT["dropbox"] = time.time() - 500
     r = client.get("/healthz", headers=PUBLIC); assert r.status_code == 503 and r.data == b"degraded"
@@ -40,7 +40,12 @@ def test_healthz_json_on_loopback_or_for_admins_and_503_when_degraded(client, us
     post(client, "/logout"); login(client, "admin", users["admin"])
     assert client.get("/healthz?detail=1", headers=PUBLIC).get_json()["ok"] is True
     open(os.path.join(config.INGEST_DIR, "waiting.epub"), "wb").write(b"x")
-    assert client.get("/healthz").get_json()["ingest_pending"] == 1
+    assert client.get("/healthz").get_json()["ingest_pending"] == 1 and client.get("/healthz").status_code == 200
+    # F23: CWA's ingest died -> files pile up -> /healthz (Kuma, compose) goes 503
+    old = time.time() - 16 * 60; os.utime(os.path.join(config.INGEST_DIR, "waiting.epub"), (old, old))
+    h = client.get("/healthz")
+    assert h.status_code == 503 and any(p.startswith("ingest stalled: oldest file waiting 16 min") for p in h.get_json()["problems"])
+    os.remove(os.path.join(config.INGEST_DIR, "waiting.epub"))
     monkeypatch.setattr(config, "CWA_DB", "/nonexistent/app.db")
     assert client.get("/healthz").status_code == 503 and "cwa app.db unreadable" in client.get("/healthz").get_json()["problems"]
 
@@ -131,8 +136,8 @@ def test_request_url_fence_refuses_tampered_forms(client, users, monkeypatch):
     assert req(download_url="http://127.0.0.1:2019/config/").status_code == 400          # Caddy admin API
     assert req(download_url="http://www.gutenberg.org/x.epub").status_code == 400        # plain http
     assert req(download_url="https://www.gutenberg.org@evil.test/x.epub").status_code == 400
-    assert req(download_url="https://evil.test/x.epub", source="standard_ebooks").status_code == 400
-    assert req(is_torrent="1").status_code == 400                                          # torrents only for IA when enabled
+    assert req(download_url="https://evil.test/x.epub", source="internet_archive").status_code == 400
+    assert req(is_torrent="1").status_code == 400                                          # no P2P path at all (C5)
     r = req(source="mycatalog", download_url="https://books.mine.tld/get/1")                 # source disabled: refused (flash)
     assert r.status_code == 302 and db.list_for("alice", False) == []
     monkeypatch.setitem(config.SOURCES, "mycatalog", True); monkeypatch.setattr(config, "MYCATALOG_URL", "https://books.mine.tld/opds")
@@ -140,10 +145,9 @@ def test_request_url_fence_refuses_tampered_forms(client, users, monkeypatch):
     assert req(source="mycatalog", download_url="https://books.mine.tld/get/1").status_code == 302
     assert req(source="librivox", download_url="https://www.archive.org/download/x/x.zip").status_code == 302
     assert db.list_for("alice", False)[0]["kind"] == "audio"                               # kind comes from the source, not the form
-    monkeypatch.setattr(config, "IA_USE_TORRENT", True)
-    assert req(source="internet_archive", download_url="https://archive.org/download/x/x_archive.torrent", is_torrent="1").status_code == 302
+    assert req(source="internet_archive", download_url="https://archive.org/download/x/x_archive.torrent", is_torrent="1").status_code == 400
     assert any(a["event"] == "request_refused" for a in db.audit_recent(20))
-    assert len(db.list_for("alice", False)) == 3
+    assert len(db.list_for("alice", False)) == 2
 
 def test_approvals_can_be_switched_off(client, users, monkeypatch):
     monkeypatch.setattr(config, "APPROVALS_REQUIRED", False)
@@ -162,10 +166,14 @@ def test_upload_keeps_unicode_names_lands_in_own_dropbox_and_filters_types(clien
     r = up("Война и мир.EPUB", open(epub, "rb")); assert "Uploaded Война и мир.epub" in r.get_data(as_text=True)
     r = up("युद्ध और शांति.pdf", io.BytesIO(b"%PDF-1.4")); assert "Uploaded युद्ध और शांति.pdf" in r.get_data(as_text=True)
     r = up("../../etc/passwd.txt", io.BytesIO(b"x")); assert "Uploaded passwd.txt" in r.get_data(as_text=True)
-    r = up("...epub", io.BytesIO(b"x")); assert re.search(r"Uploaded upload-[0-9a-f]{8}\.epub", r.get_data(as_text=True))
+    r = up("...epub", open(epub, "rb")); assert re.search(r"Uploaded upload-[0-9a-f]{8}\.epub", r.get_data(as_text=True))
     names = os.listdir(os.path.join(config.DROPBOX_DIR, "alice"))
     assert {"my book.epub", "passwd.txt", "Война и мир.epub", "युद्ध और शांति.pdf"} < set(names) and len(names) == 5
     assert not any(n.endswith(".uploading") for n in names)
+    r = up("my book.epub", io.BytesIO(b"PK\x03\x04second copy"))                         # F62: never overwrites a waiting file
+    assert "Uploaded my book (2).epub" in r.get_data(as_text=True)
+    assert open(os.path.join(config.DROPBOX_DIR, "alice", "my book (2).epub"), "rb").read() == b"PK\x03\x04second copy"
+    assert open(os.path.join(config.DROPBOX_DIR, "alice", "my book.epub"), "rb").read() == open(epub, "rb").read()
     r = up("evil.exe", io.BytesIO(b"x")); assert b"not supported" in r.data
     r = up("comic.cbr", io.BytesIO(b"Rar!")); assert b"convert it to CBZ" in r.data
     r = client.post("/upload", data={"csrf": csrf_of(client, "/upload")}, content_type="multipart/form-data", follow_redirects=True)
@@ -202,6 +210,35 @@ def test_devices_page_manages_kindle_kobo_prefs_and_test_mail(client, users, mon
     # bob's devices page never shows alice's token
     post(client, "/logout"); login(client, "bob", users["bob"])
     assert b"/kobo/" not in client.get("/devices").data
+
+def test_upload_is_refused_for_an_account_name_the_dropbox_cannot_match(client, users):
+    """F64: 'Mom Smith' (made in CWA's own UI) would see 'Uploaded' and nothing would ever import."""
+    c = sqlite3.connect(config.CWA_DB); c.execute("UPDATE user SET name='Mom Smith' WHERE name='bob'"); c.commit(); c.close()
+    login(client, "Mom Smith", users["bob"])
+    r = client.post("/upload", data={"csrf": csrf_of(client, "/upload"), "file": (io.BytesIO(b"x"), "a.epub")},
+                    content_type="multipart/form-data", follow_redirects=True)
+    assert b"spaces or symbols" in r.data and not os.path.exists(os.path.join(config.DROPBOX_DIR, "Mom Smith"))
+    post(client, "/logout"); login(client, "admin", users["admin"])
+    assert b"uploads and the dropbox cannot work" in client.get("/admin").data
+
+def test_kepub_download_and_koreader_instructions(client, users, monkeypatch):
+    """F26/F60/C12."""
+    add_calibre_book(1, "Kobo Book", "Ann", tags=["owner:alice"], formats=("epub", "kepub"))
+    login(client, "alice", users["alice"])
+    assert b"/download/1/kepub" in client.get("/library").data
+    r = client.get("/download/1/kepub")
+    assert r.status_code == 200 and r.mimetype == "application/kepub+zip" and "Kobo Book - Ann.kepub.epub" in r.headers["Content-Disposition"]
+    monkeypatch.setattr(config, "KOSYNC_ENABLED", True)
+    page = client.get("/devices").data
+    assert b"https://books.example.test/kosync" in page and b"install the plugin" in page
+
+def test_user_can_set_own_email(client, users):
+    """F49: the default <name>@domain breaks notifications and the IMAP sender check."""
+    login(client, "alice", users["alice"])
+    r = post(client, "/devices", action="email", email="alice.real@gmail.test")
+    assert b"E-mail address saved" in r.data and cwa.get_user("alice")["email"] == "alice.real@gmail.test"
+    r = post(client, "/devices", action="email", email="bob@example.test"); assert b"already used" in r.data
+    r = post(client, "/devices", action="email", email="nope"); assert b"does not look like" in r.data
 
 def test_library_download_is_isolated(client, users):
     add_calibre_book(1, "Alice Book", "Ann Author", tags=["owner:alice"], formats=("epub", "pdf"))
@@ -266,13 +303,23 @@ def test_admin_dashboard_user_creation_and_needs_tag_list(client, users, monkeyp
     post(client, "/logout"); login(client, "admin", users["admin"])
     _alive(monkeypatch)
     r = client.get("/admin")
-    assert r.status_code == 200 and b"owner:alice" in r.data and b"Calibre-Web (books)" in r.data and b"https://dl.example.test" in r.data
-    assert b"Kobo sync: <strong>OFF" in r.data and b"healthy" in r.data
+    assert r.status_code == 200 and b"owner:alice" in r.data and b"Calibre-Web (books)" in r.data
+    assert b"https://dl.example.test" not in r.data and b"aria" not in r.data.lower()      # C4/C5: torrents opt-in, no aria2
+    assert b"Kobo sync: <strong>OFF" in r.data and b"healthy" in r.data and b"NOBODY is told" in r.data
+    monkeypatch.setattr(config, "TORRENTS_ENABLED", True); monkeypatch.setattr(config, "NOTIFY_WEBHOOK", "https://ntfy.sh/x")
+    r = client.get("/admin"); assert b"https://dl.example.test" in r.data and b"NOBODY is told" not in r.data
     r = post(client, "/admin", action="add_user", name="carol", email="c@example.test", password="carolpass1")
     assert b"User carol created" in r.data and cwa.get_user("carol")["allowed_tags"] == "owner:carol"
     assert os.path.isdir(os.path.join(config.DROPBOX_DIR, "carol"))
-    r = post(client, "/admin", action="add_user", name="carol", password="carolpass1"); assert b"already exists" in r.data
-    r = post(client, "/admin", action="add_user", name="bad name", password="carolpass1"); assert b"Could not create" in r.data
+    r = post(client, "/admin", action="add_user", name="carol", email="c2@example.test", password="carolpass1"); assert b"already exists" in r.data
+    r = post(client, "/admin", action="add_user", name="bad name", email="b@example.test", password="carolpass1"); assert b"Could not create" in r.data
+    r = post(client, "/admin", action="add_user", name="dave", password="davepass12")           # F49: a real e-mail is required
+    assert b"real e-mail address" in r.data and cwa.get_user("dave") is None
+    monkeypatch.setattr(config, "AUTHELIA_ENABLED", True)                                       # F24: TUI is the only way then
+    assert b"bookstack.sh" in client.get("/admin").data
+    r = post(client, "/admin", action="add_user", name="erin", email="e@example.test", password="erinpass12")
+    assert b"Authelia is on" in r.data and cwa.get_user("erin") is None
+    monkeypatch.setattr(config, "AUTHELIA_ENABLED", False)
     # unisolated user is flagged
     c = sqlite3.connect(config.CWA_DB); c.execute("UPDATE user SET allowed_tags='' WHERE name='bob'"); c.commit(); c.close()
     assert b"NOT isolated" in client.get("/admin").data
@@ -288,7 +335,7 @@ def test_intake_webhook(client, monkeypatch):
     r = client.post("/intake", json={"user": "alice", "url": "https://x/y.epub"}, headers={"X-Intake-Token": "intake-token-123"})
     assert r.status_code == 202 and r.get_json()["ok"]
     rec = db.get(r.get_json()["id"]); assert rec["owner"] == "alice" and rec["status"] == "queued" and rec["title"] == "y.epub"
-    r = client.post("/intake", json={"user": "ALICE", "url": "https://x/y.epub"}, headers={"X-Intake-Token": "intake-token-123"})
+    r = client.post("/intake", json={"user": "ALICE", "url": "https://x/z.epub"}, headers={"X-Intake-Token": "intake-token-123"})
     assert r.status_code == 202 and db.get(r.get_json()["id"])["owner"] == "alice"          # canonical name
     hdr = {"X-Intake-Token": "intake-token-123"}
     r = client.post("/intake", json={"user": "alice", "url": "ftp://x/y"}, headers=hdr); assert r.status_code == 400
@@ -298,8 +345,9 @@ def test_intake_webhook(client, monkeypatch):
     r = client.post("/intake", json={"user": "../alice", "url": "https://x/y.epub"}, headers=hdr); assert r.status_code == 400
     r = client.post("/intake", json={"user": "alice", "url": "https://x/y.epub", "kind": "video"}, headers=hdr); assert r.status_code == 400
     assert len(db.list_for("alice", False)) == 2
-    monkeypatch.setattr(config, "INTAKE_TOKEN", "")
-    r = client.post("/intake", json={"user": "alice", "url": "https://x/y.epub"}, headers={"X-Intake-Token": ""}); assert r.status_code == 403
+    r = client.post("/intake", json={"user": "alice", "url": "magnet:?xt=urn:btih:abc"}, headers=hdr); assert r.status_code == 400
+    monkeypatch.setattr(config, "INTAKE_TOKEN", "")                                          # C11: disabled = not there
+    r = client.post("/intake", json={"user": "alice", "url": "https://x/y.epub"}, headers={"X-Intake-Token": ""}); assert r.status_code == 404
 
 def test_cover_proxy_caps_size_type_and_redirects(client, users, monkeypatch):
     login(client, "alice", users["alice"])
@@ -321,6 +369,19 @@ def test_cover_proxy_caps_size_type_and_redirects(client, users, monkeypatch):
     assert calls["allow_redirects"] is False and calls["stream"] is True
     fake_get.resp = R(ctype="text/html", data=b"<html>"); assert client.get("/cover?u=https://covers.openlibrary.org/x").status_code == 404
     fake_get.resp = R(status=302); assert client.get("/cover?u=https://covers.openlibrary.org/x").status_code == 404
+    # F47: Open Library redirects many covers to archive.org; follow those (<= 2 hops), nothing else
+    hops = {"https://covers.openlibrary.org/b/id/9-M.jpg": R(302), "https://archive.org/download/m/9-M.jpg": R(302),
+            "https://ia800.us.archive.org/9-M.jpg": R()}
+    hops["https://covers.openlibrary.org/b/id/9-M.jpg"].headers["Location"] = "https://archive.org/download/m/9-M.jpg"
+    hops["https://archive.org/download/m/9-M.jpg"].headers["Location"] = "https://ia800.us.archive.org/9-M.jpg"
+    monkeypatch.setattr(requests, "get", lambda u, **kw: hops[u])
+    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 200
+    evil = R(302); evil.headers["Location"] = "https://evil.test/x.jpg"
+    monkeypatch.setattr(requests, "get", lambda u, **kw: evil)
+    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 404
+    loop = R(302); loop.headers["Location"] = "https://archive.org/again"
+    monkeypatch.setattr(requests, "get", lambda u, **kw: loop)
+    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 404
     fake_get.resp = R(data=b"x" * (2 * 1024 * 1024 + 1)); assert client.get("/cover?u=https://covers.openlibrary.org/x").status_code == 404
     assert client.get("/cover?u=https://evil.test/x.jpg").status_code == 404
 
@@ -348,6 +409,26 @@ def test_login_lockout_per_user_and_ip(client, users, monkeypatch):
     events = [(a["event"], a["ip"]) for a in db.audit_recent(20)]
     assert ("login_locked", "198.51.100.7") in events and ("login_ok", "203.0.113.1") in events
     assert any(e == "login_fail" and ip == "198.51.100.7" for e, ip in events)
+
+def test_client_ip_is_the_single_x_forwarded_for_caddy_sends(client, users):
+    """C2/F25: Caddy replaces X-Forwarded-For with the real client ({client_ip} from
+    CF-Connecting-IP), so the lockout and audit key on the visitor, not a Cloudflare edge."""
+    tok = csrf_of(client, "/login")
+    client.post("/login", data={"username": "alice", "password": "nope", "csrf": tok}, headers={"X-Forwarded-For": "203.0.113.9"})
+    a = db.audit_recent(1)[0]
+    assert a["event"] == "login_fail" and a["ip"] == "203.0.113.9"
+    with db._conn() as c:
+        keys = {r[0] for r in c.execute("SELECT key FROM login_attempts")}
+    assert keys == {"alice|203.0.113.9", "203.0.113.9"}
+
+def test_login_while_app_db_is_unreadable_is_not_a_failure(client, users, monkeypatch):
+    """F48: a correct password during a CWA upgrade must not lead to a lockout."""
+    monkeypatch.setattr(config, "LOCKOUT_FAILS", 2)
+    monkeypatch.setattr(auth, "_row", lambda u: auth.UNAVAILABLE)
+    for _ in range(4):
+        r = login(client, "alice", users["alice"]); assert r.status_code == 503 and b"restarting" in r.data
+    monkeypatch.undo()
+    assert login(client, "alice", users["alice"]).status_code == 302
 
 def test_ip_wide_lockout_and_window_expiry():
     now = 1_000_000.0
@@ -425,7 +506,11 @@ def test_email_notifications(monkeypatch, users):
     notify._mail("denied", dict(rec, status="denied", detail="denied by admin"))
     assert sent[-1][1].endswith("was denied") and "denied by admin" in sent[-1][2]
     sent.clear(); notify._mail("done", dict(rec, source="dropbox")); assert sent == []       # own uploads: no mail
-    monkeypatch.setattr(config, "SMTP_HOST", ""); notify._mail("done", dict(rec, status="done")); assert sent == []
+    notify._mail("error", dict(rec, source="dropbox", status="error", detail="not a zip"))    # F57: but failures are mailed
+    assert sent[-1][0] == "alice@example.test" and "could not be added" in sent[-1][1] and "not a zip" in sent[-1][2]
+    sent.clear(); notify._mail("needs-tag", dict(rec, source="dropbox", status="needs-tag", detail="needs-tag: azw3"))
+    assert {m[0] for m in sent} == {"admin@example.test", "alice@example.test"} and any("owner tag" in m[1] for m in sent)
+    sent.clear(); monkeypatch.setattr(config, "SMTP_HOST", ""); notify._mail("done", dict(rec, status="done")); assert sent == []
 
 def test_alert_helper_posts_webhook_and_mails_admin_best_effort(monkeypatch, capsys):
     import urllib.request
@@ -443,6 +528,22 @@ def test_alert_helper_posts_webhook_and_mails_admin_best_effort(monkeypatch, cap
     monkeypatch.setattr(notify, "_deliver", boom)
     assert notify.alert("t", "x") == ["webhook"] and "mail failed" in capsys.readouterr().err
 
+def test_alert_cli_exits_3_when_nobody_was_told_and_ntfy_gets_plain_text(monkeypatch, capsys):
+    """C1/F04: alert.sh falls back to the journal + its own curl only if it can see the failure."""
+    import urllib.request
+    hooks = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: hooks.append(req))
+    assert notify._cli(["alert", "backup failed", "restic exit 1", "high"]) == 3
+    out = capsys.readouterr()
+    assert json.loads(out.out)["ok"] is False and "NOTIFY_WEBHOOK is empty" in out.err and "ADMIN_EMAIL is empty" in out.err
+    monkeypatch.setattr(config, "NOTIFY_WEBHOOK", "https://ntfy.sh/family-books-9f3k")
+    assert notify._cli(["alert", "backup failed", "restic exit 1", "high"]) == 0
+    req = hooks[-1]
+    assert req.data == b"restic exit 1" and req.get_header("Title") == "[bookstack] backup failed" and req.get_header("Priority") == "high"
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: (_ for _ in ()).throw(OSError("offline")))
+    assert notify._cli(["alert", "t", "x"]) == 3 and "webhook failed" in capsys.readouterr().err
+    assert notify._cli(["bogus"]) == 2
+
 def test_search_page_flags_duplicates_and_lists_sources(client, users, monkeypatch):
     import fetchers
     add_calibre_book(1, "Emma", "Austen", tags=["owner:bob"])
@@ -450,5 +551,7 @@ def test_search_page_flags_duplicates_and_lists_sources(client, users, monkeypat
                                                         "identifier": "gutenberg:158", "format": "epub", "download_url": "https://x", "is_torrent": False}])
     login(client, "alice", users["alice"])
     r = client.get("/?q=emma")
-    assert b"in library" in r.data and b"Request" in r.data and b"gutenberg" in r.data
+    assert b"in library" not in r.data and b"Request" in r.data and b"gutenberg" in r.data     # F53: bob's copy is not hers
+    add_calibre_book(2, "Emma", "Austen", tags=["owner:alice"])
+    assert b"in library" in client.get("/?q=emma").data
     assert b"No matches" in client.get("/?q=zzz").data or True

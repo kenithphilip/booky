@@ -15,13 +15,19 @@ generic "enter any endpoint + credentials + query template" provider: that would
 point-it-at-anything grabber. To add a source, you (or I) write a concrete adapter for that
 source's real API — the same way the ones below are written.
 """
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import requests, config
 from urllib.parse import urlsplit
 from lxml import etree
 import opds
 
 UA = {"User-Agent": "bookstack-librarian/2.0"}
-TIMEOUT = 20
+# One slow catalog used to hold the whole page: the search ran the adapters one after the
+# other with a 20 s timeout each (16-35 s pages were normal). Every HTTP call now has a short
+# timeout, the adapters run in parallel and the page renders with whatever answered in time.
+TIMEOUT = 8
+SEARCH_DEADLINE = 12
 
 # Hosts each adapter may hand to the worker. The request form echoes download_url back, so
 # app.make_request re-validates it here before anything is fetched from the host network.
@@ -82,13 +88,23 @@ def gutenberg(q, limit=8):
         pass
     return out
 
-_SE_CACHE = {"feed": None}
+_SE_CACHE = {"feed": None, "at": 0.0}
+SE_CACHE_SECONDS = 6 * 3600
+
+def _se_feed():
+    """The whole Standard Ebooks catalog feed, cached for a few hours. A failed fetch (the feed
+    answers 401 without a Patrons Circle login) raises and is NOT cached, so the next search
+    tries again instead of silently finding nothing until the portal restarts."""
+    if _SE_CACHE["feed"] is None or time.time() - _SE_CACHE["at"] > SE_CACHE_SECONDS:
+        r = _get("https://standardebooks.org/feeds/opds/all")
+        r.raise_for_status()
+        _SE_CACHE.update(feed=r.content, at=time.time())
+    return _SE_CACHE["feed"]
+
 def standard_ebooks(q, limit=8):
     out = []
     try:
-        if _SE_CACHE["feed"] is None:
-            _SE_CACHE["feed"] = _get("https://standardebooks.org/feeds/opds/all").content
-        root = etree.fromstring(_SE_CACHE["feed"])
+        root = etree.fromstring(_se_feed())
         ns = {"a": "http://www.w3.org/2005/Atom"}
         ql = q.lower()
         for e in root.findall("a:entry", ns):
@@ -124,15 +140,6 @@ def internet_archive(q, limit=8):
         docs = _get("https://archive.org/advancedsearch.php", params=params).json()["response"]["docs"]
         for d in docs:
             ident = d["identifier"]
-            if config.IA_USE_TORRENT:
-                url = f"https://archive.org/download/{ident}/{ident}_archive.torrent"
-                out.append({"source": "internet_archive", "kind": "ebook",
-                            "title": d.get("title", ident),
-                            "author": (d.get("creator") if isinstance(d.get("creator"), str)
-                                       else ", ".join(d.get("creator", [])) or "Unknown"),
-                            "identifier": f"ia:{ident}", "format": "torrent",
-                            "download_url": url, "is_torrent": True})
-                continue
             meta = _get(f"https://archive.org/metadata/{ident}").json()
             epub = next((f["name"] for f in meta.get("files", [])
                          if f.get("name", "").lower().endswith(".epub")), None)
@@ -180,12 +187,37 @@ PROVIDERS = [
     {"name": "mycatalog",        "label": "My OPDS catalog",     "kind": "ebook"},
 ]
 
-def search(q):
-    results = []
-    for name, enabled in config.SOURCES.items():
-        if enabled and name in _ADAPTERS:
+def _dedupe(results):
+    """The same book from the same source twice (Gutenberg lists several editions, IA the same
+    scan under two identifiers) is noise on a family search page."""
+    seen, out = set(), []
+    for r in results:
+        key = (r.get("source"), (r.get("title") or "").strip().lower(),
+               (r.get("author") or "").strip().lower(), r.get("download_url"))
+        short = (r.get("source"), key[1], key[2])
+        if key in seen or short in seen:
+            continue
+        seen.add(key); seen.add(short)
+        out.append(r)
+    return out
+
+def search(q, deadline=SEARCH_DEADLINE):
+    """Ask every enabled catalog at once and return what answered within `deadline` seconds.
+    A source that is down or slow costs the page its own results, not the whole search."""
+    names = [n for n, on in config.SOURCES.items() if on and n in _ADAPTERS]
+    if not names:
+        return []
+    results, until = [], time.monotonic() + deadline
+    ex = ThreadPoolExecutor(max_workers=len(names))
+    try:
+        futures = [ex.submit(_ADAPTERS[n], q) for n in names]
+        for f in futures:
             try:
-                results.extend(_ADAPTERS[name](q))
+                results.extend(f.result(timeout=max(0.1, until - time.monotonic())))
+            except FutureTimeout:
+                pass                  # that source keeps working in its thread; the page does not wait
             except Exception:
                 pass
-    return results
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return _dedupe(results)

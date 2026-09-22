@@ -56,17 +56,26 @@ E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or
 <h3>Phone, tablet, computer, KOReader</h3>
 <ul class="mut">
 <li>Read in the browser or in any OPDS reader app: catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the trailing slash) with your library login.</li>
-{% if kosync %}<li>KOReader: OPDS catalog as above, and reading-progress sync (Tools → Progress sync) with server <span class="code">{{ cfg.BOOKS_URL }}/kosync</span> and your library login.</li>{% endif %}
+{% if kosync %}<li>KOReader reading-progress sync: KOReader's built-in <em>Progress sync</em> does not work with this library. Open <a href="{{ cfg.BOOKS_URL }}/kosync" target="_blank" rel="noopener">{{ cfg.BOOKS_URL }}/kosync</a> while signed in, install the plugin it offers into KOReader, then sign in there with your library username and password.</li>{% endif %}
 <li>Audiobooks: install the Audiobookshelf app and sign in at <span class="code">{{ cfg.AUDIO_URL }}</span>{% if abs_linked %} with the same username and password{% endif %}.</li>
+{% set box = mail_intake(session.user) %}{% if box %}
+<li>E-mail books in: attach the file to a mail to <span class="code">{{ box }}</span> sent from your own address ({{ u.email or 'set it below' }}).</li>{% endif %}
 </ul>
 </div>
 
 <div class="card">
 <h3>Account</h3>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="email">
+<div class="row"><label style="flex:1;min-width:220px">Your e-mail <span class="mut">(for notifications; mail-to-library accepts books sent from it)</span>
+<input type="email" name="email" value="{{ u.email or '' }}" required></label>
+<button type="submit" class="sec">Save e-mail</button></div></form>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="password">
 <div class="row"><label style="flex:1;min-width:160px">Current password<input type="password" name="current" autocomplete="current-password" required></label>
 <label style="flex:1;min-width:160px">New password<input type="password" name="new" minlength="8" autocomplete="new-password" required></label>
 <label style="flex:1;min-width:160px">Repeat<input type="password" name="repeat" minlength="8" autocomplete="new-password" required></label></div>
-<p><button type="submit">Change password</button> <span class="mut">Changes it for the portal, the library site, the extended search{% if abs_linked %} and Audiobookshelf{% endif %}.</span></p></form>
+<p><button type="submit">Change password</button> <span class="mut">Changes it for the portal, the library site, Shelfmark{% if abs_linked %} and Audiobookshelf{% endif %}.{% if cfg.AUTHELIA_ENABLED %} Not for the Authelia sign-in page: the admin changes that one.{% endif %}</span></p></form>
+<p class="mut"><strong>Change your password only here.</strong> The library site has a password field of its own on
+its profile page; a password changed there does <em>not</em> reach{% if abs_linked %} Audiobookshelf, so the audiobook app
+would keep asking for the old one{% else %} the other apps{% endif %}.</p>
 </div>
 {% endblock %}

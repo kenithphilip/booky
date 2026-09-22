@@ -1,9 +1,19 @@
 {% extends "base.html" %}{% block body %}
 <form method="get" class="row" style="margin-bottom:6px">
 <input type="text" name="q" value="{{q}}" placeholder="Search title or author…" style="flex:1">
-<button type="submit">Search</button></form>
-<p class="mut">Searching: {{ sources|join(', ') }}{% if cfg.SHELF_URL %} · Not here? Try <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">the extended search</a>.{% endif %}</p>
-{% if q and not results %}<div class="card">No matches in the enabled catalogs.</div>{% endif %}
+<button type="submit">Search</button><span class="busy">Searching the catalogs — this can take a few seconds…</span></form>
+<p class="mut">Searching: {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.last }}{% endfor %}{% if cfg.SHELF_URL %} · Not here? Try <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">Shelfmark</a>, which searches further afield.{% endif %}</p>
+{% if q and not results %}<div class="card">No matches in the catalogs above.</div>{% endif %}
+{% if not q %}
+<div class="card"><h3 style="margin-top:0">Start here</h3>
+<ul class="mut" style="margin:0;padding-left:18px">
+<li><strong>Search</strong> above for a free, public-domain book — it lands in <a href="{{ url_for('my_library') }}">My books</a> and on your devices by itself.</li>
+<li><strong>Upload</strong> a book you already own under <a href="{{ url_for('upload') }}">Upload</a> (EPUB, PDF, CBZ, or an M4B/zip audiobook).</li>
+{% set box = mail_intake(session.user) %}{% if box %}
+<li><strong>E-mail</strong> a book to <span class="code">{{ box }}</span> from your own registered address and it is added for you.</li>{% endif %}
+<li><strong>Link a device</strong> once under <a href="{{ url_for('devices') }}">Devices</a> (Kobo, Kindle, phone apps){% if cfg.AUDIO_URL %}; audiobooks live in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a>{% endif %}.</li>
+</ul></div>
+{% endif %}
 {% for r in results %}
 <div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
 <div class="row" style="gap:12px;align-items:flex-start">
@@ -13,14 +23,12 @@
 {% if r.blurb %}<br><span class="mut" style="font-size:12px">{{ r.blurb }}</span>{% endif %}</div>
 </div>
 <div class="row" style="flex:none">
-<span class="badge">{{r.source.replace('_',' ')}}</span>
+<span class="badge">{{ source_label(r.source) }}</span>
 <span class="badge">{{ 'audiobook' if r.kind=='audio' else r.format }}</span>
-{% if r.is_torrent %}<span class="badge">P2P</span>{% endif %}
 {% if r.dupe %}<span class="badge" title="Already in the library">in library</span>{% endif %}
 <form method="post" action="{{url_for('make_request')}}">{{ csrf_field() }}
 {% for k in ['kind','source','identifier','title','author','download_url'] %}
 <input type="hidden" name="{{k}}" value="{{ r[k] }}">{% endfor %}
-<input type="hidden" name="is_torrent" value="{{ '1' if r.is_torrent else '0' }}">
 <button type="submit">Request</button></form></div></div></div>
 {% endfor %}
 {% endblock %}

@@ -95,7 +95,7 @@ def test_set_password_takes_effect():
 
 def test_verify_survives_missing_db(monkeypatch):
     monkeypatch.setattr(config, "CWA_DB", "/nonexistent/app.db")
-    assert auth.verify("alice", "x") is None
+    assert auth.verify("alice", "x") is auth.UNAVAILABLE      # not "wrong password": no lockout counting (F48)
 
 # ---- devices -----------------------------------------------------------------------
 def test_kindle_mail_roundtrip_and_validation():
@@ -189,3 +189,29 @@ def test_cli_reads_passwords_from_stdin(capsys, monkeypatch):
             cwa._cli(bad)
     monkeypatch.setattr(sys, "stdin", io.StringIO("short\n"))
     assert cwa._cli(["passwd", "alice", "--password-stdin"]) == 2 and "at least 8" in capsys.readouterr().err
+
+def test_cli_rename_user_for_a_chosen_admin_name(capsys):
+    """C10: the installer lets the admin pick a name other than 'admin' and renames the row."""
+    cwa.add_user("admin", "adminpass1", admin=True); cwa.add_user("alice", "alicepass1")
+    assert cwa._cli(["rename-user", "admin", "kenith-admin"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": True, "old": "admin", "new": "kenith-admin", "id": out["id"]}
+    assert cwa.get_user("admin") is None and auth.verify("kenith-admin", "adminpass1")["is_admin"]
+    assert _immutable_reader_sees("kenith-admin") is not None                        # WAL checkpointed for Shelfmark
+    assert cwa._cli(["rename-user", "kenith-admin", "alice"]) == 2 and "already exists" in capsys.readouterr().err
+    assert cwa._cli(["rename-user", "kenith-admin", "bad name"]) == 2 and "no spaces" in capsys.readouterr().err
+    assert cwa._cli(["rename-user", "nobody", "x"]) == 2 and "no such user" in capsys.readouterr().err
+    assert cwa._cli(["rename-user", "alice", "alicia"]) == 2 and "not an admin" in capsys.readouterr().err
+    # J17: uppercase is refused everywhere (Shelfmark matches names case-sensitively)
+    assert cwa._cli(["rename-user", "kenith-admin", "Kenith-Admin"]) == 2 and "lowercase" in capsys.readouterr().err
+    assert cwa.get_user("kenith-admin")["name"] == "kenith-admin"
+
+def test_passive_checkpoint_folds_cwa_ui_writes_for_shelfmark():
+    """F50: a password changed in CWA's own UI sits in the WAL, which immutable=1 readers ignore."""
+    cwa.add_user("alice", "alicepass1")
+    holder = sqlite3.connect(config.CWA_DB)                   # CWA's own connection keeps the WAL alive
+    holder.execute("UPDATE user SET kindle_mail='ui@kindle.com' WHERE name='alice'"); holder.commit()
+    assert _immutable_reader_sees("alice")[1] != "ui@kindle.com"
+    assert cwa.checkpoint_passive() is not None
+    assert _immutable_reader_sees("alice")[1] == "ui@kindle.com"
+    holder.close()

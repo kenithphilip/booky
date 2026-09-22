@@ -15,9 +15,12 @@ envget(){ local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } |
 compose(){ (cd "$STACK_DIR" && docker compose "$@"); }
 code(){ curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
 D=$(envget DOMAIN)
+ADMIN_USER=$(envget ADMIN_USER); ADMIN_USER="${ADMIN_USER:-admin}"
+TORRENTS=$(envget TORRENTS_ENABLED)
 
 echo "== Containers"
-for c in caddy calibre-web audiobookshelf qbittorrent aria2 ariang librarian shelfmark uptime-kuma; do
+core="caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma"; [ "$TORRENTS" = true ] && core="$core qbittorrent"
+for c in $core; do
   st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null | tr -d '\n'); st="${st:-missing}"
   case "$st" in running\ healthy|running\ |running) ok "$c: $st";; *) bad "$c: $st";; esac
 done
@@ -44,6 +47,16 @@ fi
 [ -f "$STACK_DIR/caddy/cf-origin-pull-ca.pem" ] && ok "Cloudflare origin-pull CA present" || bad "cf-origin-pull-ca.pem missing (run Cloudflare step)"
 docker compose -f "$STACK_DIR/docker-compose.yml" config -q 2>/dev/null && ok "docker-compose.yml renders" || bad "docker-compose.yml does not render"
 if command -v timedatectl >/dev/null; then [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && ok "clock is NTP-synchronised" || bad "clock NOT NTP-synchronised (TOTP, Kobo sync, ACME and mTLS drift): timedatectl set-ntp true"; fi
+# J03: the running portal image vs the code that was last deployed. Without this a stale
+# librarian image looks perfectly healthy while none of the deployed fixes are actually live.
+# /healthz?detail=1 answers JSON on loopback; "version" is the image's BUILD_VERSION build arg.
+want_ver=$(cut -d' ' -f1 "$STACK_DIR/.version" 2>/dev/null)
+got_ver=$(curl -fsS -m 5 'http://127.0.0.1:8090/healthz?detail=1' 2>/dev/null \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin).get("version",""))' 2>/dev/null)
+if [ -z "$want_ver" ]; then warn "no $STACK_DIR/.version yet (run Install -> Deploy or Operations -> Update)"
+elif [ -z "$got_ver" ]; then warn "the portal reports no version: its image predates the version stamp — Operations -> Update rebuilds it"
+elif [ "$got_ver" = "$want_ver" ]; then ok "portal image matches the deployed code ($want_ver)"
+else warn "STALE PORTAL IMAGE: running '$got_ver', deployed code is '$want_ver' — the container is older than $STACK_DIR/librarian; run Operations -> Update to rebuild"; fi
 
 echo "== Security posture"
 if command -v ufw >/dev/null; then
@@ -51,7 +64,7 @@ if command -v ufw >/dev/null; then
   ufw status | grep -qE "^443/tcp.*Anywhere" && bad "443 open to Anywhere (should be Cloudflare ranges only)" || ok "443 not open to the world"
   ufw status | grep -qE "^22/tcp.*ALLOW.*Anywhere" && warn "SSH still public (Security → Lock SSH once Tailscale works)" || ok "SSH not public"
 fi
-for p in 8083 13378 8080 6800 6880 8090 8084 3001 9091 8286; do
+for p in 8083 13378 8080 8090 8084 3001 9091 8286; do
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)$p\$" ; then
     ss -ltn | awk '{print $4}' | grep -E ":$p\$" | grep -qvE '^(127\.0\.0\.1|\[::1\]):' && bad "port $p bound to a non-loopback address" || ok "port $p loopback-only"
   fi
@@ -60,9 +73,21 @@ ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ':2019$' && bad "Caddy admin A
 pub=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | while IFS=$'\t' read -r n p; do
         printf '%s' "$p" | tr ',' '\n' | grep -E '(0\.0\.0\.0|\[::\]|:::)[0-9]+->' | grep -qv ':6881->' && printf '%s ' "$n"; done)
 [ -z "$pub" ] && ok "no container port published on a public address (except the torrent peer port)" || bad "published on a public address: $pub (Docker bypasses ufw)"
-grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config.d/90-bookstack.conf 2>/dev/null && ok "SSH password login disabled" || warn "SSH password login not disabled (add a key, re-run System step)"
+if [ "$TORRENTS" != true ] && command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qE '^6881'; then warn "port 6881 open in ufw but torrents are off (re-run Install -> System)"; fi
+# the EFFECTIVE sshd configuration: a provider drop-in (50-cloud-init.conf) can override ours
+if command -v sshd >/dev/null; then
+  if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then ok "SSH password login disabled (effective sshd -T)"
+  elif [ -f /etc/ssh/sshd_config.d/01-bookstack.conf ]; then bad "SSH password login is still ON although 01-bookstack.conf disables it: another sshd drop-in overrides it (sshd -T | grep -i passwordauth)"
+  else warn "SSH password login not disabled (add a key, re-run System step)"; fi
+fi
+if [ "$(envget SSH_LOCKED)" = true ] && ufw status 2>/dev/null | grep -qE "^22/tcp.*ALLOW.*Anywhere"; then bad "Lock SSH was chosen but port 22 is open to the world again (ufw delete allow 22/tcp)"; fi
 [ "$(stat -c %a "$ENV_FILE" 2>/dev/null)" = "600" ] && ok ".env is 0600" || bad ".env permissions are not 0600"
 [ "$(stat -c %U "$ENV_FILE" 2>/dev/null)" = root ] && ok ".env owned by root" || bad ".env is owned by $(stat -c %U "$ENV_FILE" 2>/dev/null) (containers run as uid 1000; run Configure)"
+tsip=$(envget TAILSCALE_IP)
+if [ -n "$tsip" ] && [ "$tsip" != 127.0.0.1 ] && command -v ip >/dev/null; then
+  ip -o addr show 2>/dev/null | grep -qF " $tsip/" && ok "Tailscale IP $tsip is on an interface" \
+    || warn "Tailscale IP $tsip is not on any interface (tailscaled down or IP changed): monitor./dl. unreachable; run Install -> Tailscale, then Configure"
+fi
 if command -v tailscale >/dev/null && ! ufw status 2>/dev/null | grep -qE '^22/tcp.*ALLOW.*Anywhere'; then
   exp=$(tailscale status --json 2>/dev/null | jq -r '.Self.KeyExpiry // "null"' 2>/dev/null)
   if [ "$exp" = null ] || [ -z "$exp" ]; then ok "Tailscale key expiry disabled"
@@ -70,12 +95,21 @@ if command -v tailscale >/dev/null && ! ufw status 2>/dev/null | grep -qE '^22/t
     [ "$days" -gt 30 ] && ok "Tailscale key expires in $days d" || bad "Tailscale key expires in $days d and SSH is Tailscale-only: admin console -> Machines -> Disable key expiry"; fi
 fi
 if command -v fail2ban-client >/dev/null; then
+  if systemctl is-active fail2ban >/dev/null 2>&1; then ok "fail2ban running"
+  else bad "fail2ban is installed but NOT running, so not even the SSH jail is active (journalctl -u fail2ban; Security -> fail2ban)"; fi
   fail2ban-client status caddy-auth >/dev/null 2>&1 && ok "fail2ban caddy-auth jail active" || warn "caddy-auth jail not active (Security -> fail2ban)"
   fail2ban-client status caddy-device-auth >/dev/null 2>&1 && ok "fail2ban caddy-device-auth jail active" || warn "caddy-device-auth jail not active (Security -> fail2ban)"
+  # Audiobookshelf has no login lockout of its own; this jail is it (J25).
+  fail2ban-client status caddy-abs-login >/dev/null 2>&1 && ok "fail2ban caddy-abs-login jail active (Audiobookshelf login lockout)" || warn "caddy-abs-login jail not active: Audiobookshelf /login has no lockout (Security -> fail2ban)"
 fi
 # the factory admin/admin123 must be dead (CWA's login needs the CSRF token of a session)
 cj=$(mktemp); tok=$(curl -s -m 5 -c "$cj" http://127.0.0.1:8083/login 2>/dev/null | grep -oE 'name="csrf_token"[^>]*value="[^"]+"' | grep -oE 'value="[^"]+"' | cut -d'"' -f2)
-lc=$(curl -s -m 8 -b "$cj" -o /dev/null -w '%{http_code}' --data-urlencode "csrf_token=$tok" -d 'username=admin&password=admin123&submit=&next=/' http://127.0.0.1:8083/login 2>/dev/null); rm -f "$cj"
+lc=000
+fus="admin"; [ "$ADMIN_USER" != admin ] && fus="admin $ADMIN_USER"   # the factory row may have been renamed to ADMIN_USER
+for fu in $fus; do
+  c1=$(curl -s -m 8 -b "$cj" -o /dev/null -w '%{http_code}' --data-urlencode "csrf_token=$tok" --data-urlencode "username=$fu" -d 'password=admin123&submit=&next=/' http://127.0.0.1:8083/login 2>/dev/null)
+  case "$c1" in 302|303) lc=$c1; break;; 000) ;; *) lc=$c1;; esac
+done; rm -f "$cj"
 case "$lc" in 302|303) bad "Calibre-Web still accepts admin/admin123 (Users -> Reset password NOW)";; 000) warn "could not test the factory admin password";; *) ok "factory admin password rejected";; esac
 curl -s -m 5 http://127.0.0.1:13378/status 2>/dev/null | grep -q '"isInit":false' && bad "Audiobookshelf has NO root user: the first visitor becomes admin (Library -> Audiobookshelf)" || ok "Audiobookshelf initialised"
 ulist=$(docker exec librarian python -m cwa list 2>/dev/null || true)
@@ -94,12 +128,15 @@ echo "== Isolation invariants (cwa.db)"
 cols=$(docker exec calibre-web sqlite3 /config/cwa.db "pragma table_info(cwa_settings)" 2>/dev/null | cut -d'|' -f2 | tr '\n' ' ')
 if [ -z "$cols" ]; then warn "could not read cwa_settings"
 else
-  sel=""; for c in auto_ingest_automerge duplicate_auto_resolve_enabled auto_metadata_update_tags auto_convert_ignored_formats koreader_sync_enabled; do
+  sel=""; for c in auto_ingest_automerge duplicate_auto_resolve_enabled duplicate_notifications_enabled auto_metadata_update_tags auto_convert_ignored_formats koreader_sync_enabled; do
     case " $cols " in *" $c "*) sel="$sel IFNULL($c,'') AS $c,";; esac; done
   row=$(docker exec calibre-web sqlite3 -json /config/cwa.db "select ${sel%,} from cwa_settings limit 1" 2>/dev/null)
   val(){ printf '%s' "$row" | python3 -c 'import sys,json; r=json.load(sys.stdin); print(r[0].get(sys.argv[1],"") if r else "")' "$1" 2>/dev/null; }
   [ "$(val auto_ingest_automerge)" = new_record ] && ok "auto_ingest_automerge = new_record" || bad "auto_ingest_automerge = '$(val auto_ingest_automerge)' (must be new_record: Library -> Formats)"
   case " $cols " in *" duplicate_auto_resolve_enabled "*) [ "$(val duplicate_auto_resolve_enabled)" = 0 ] && ok "duplicate auto-resolve off" || bad "duplicate_auto_resolve_enabled=1 can merge two users' copies (Users -> Repair)";; esac
+  # Per-user copies of one title are intentional here; CWA's duplicate notice asks the admin to
+  # 'resolve' them, which means deleting another reader's book (J31).
+  case " $cols " in *" duplicate_notifications_enabled "*) [ "$(val duplicate_notifications_enabled)" = 0 ] && ok "duplicate notifications off (per-user copies are intentional)" || bad "duplicate_notifications_enabled=1 invites deleting another user's copy (Users -> Repair)";; esac
   case " $cols " in *" auto_metadata_update_tags "*) [ "$(val auto_metadata_update_tags)" = 0 ] && ok "metadata fetch leaves tags alone" || bad "auto_metadata_update_tags=1 can replace owner:<user> tags (Users -> Repair)";; esac
   echo "  info: auto_convert_ignored_formats='$(val auto_convert_ignored_formats)' koreader_sync_enabled='$(val koreader_sync_enabled)'"
 fi
@@ -120,7 +157,7 @@ if [ -n "$D" ]; then
   if grep -qi '^cf-mitigated' "$hdr"; then bad "Cloudflare challenges /opds (Browser Integrity Check / Bot Fight Mode must be OFF)"
   elif [ "$c" = 401 ] && grep -qi '^www-authenticate' "$hdr"; then ok "/opds answers a Basic-auth challenge (CWA reached)"
   else bad "/opds -> $c without WWW-Authenticate"; fi
-  tok=$(docker exec librarian python -m cwa kobo-url admin 2>/dev/null | tr -d '"' | sed 's#.*/kobo/##; s#/.*##')
+  tok=$(docker exec librarian python -m cwa kobo-url "$ADMIN_USER" 2>/dev/null | tr -d '"' | sed 's#.*/kobo/##; s#/.*##')
   case "$tok" in None|null|"") tok="";; esac
   if [ -n "$tok" ]; then
     c=$(curl -s -m 12 -A 'Mozilla/5.0 (Linux; U; Android 2.0; en-us;) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1 Kobo' -D "$hdr" -o "$body" -w '%{http_code}' "https://books.$D/kobo/$tok/v1/initialization" 2>/dev/null)
@@ -154,6 +191,14 @@ print(int((datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.from
   fi
 else warn "backups not scheduled (Install → Backups)"; fi
 [ -f /etc/cron.d/bookstack-disk ] && ok "disk watchdog installed" || warn "disk watchdog not installed (re-run Deploy)"
+if [ -f /etc/cron.d/bookstack-disk ] || [ -f /etc/cron.d/bookstack-cfips ]; then
+  systemctl is-active cron >/dev/null 2>&1 && ok "cron daemon running (disk watchdog, Cloudflare IP refresh)" || bad "cron is not running: the disk watchdog and the Cloudflare IP refresh never run (apt-get install cron; systemctl enable --now cron)"
+fi
+
+echo "== Alerts"
+if [ -n "$(envget NOTIFY_WEBHOOK)" ]; then ok "alert webhook configured"
+elif [ -n "$(envget SMTP_HOST)" ]; then ok "alerts go by e-mail (SMTP configured, no webhook)"
+else bad "no alert channel: failed backups and a full disk reach nobody (Install -> Alerts)"; fi
 
 echo; echo "RESULT: $pass passed, $fail failed"
 exit "$fail"

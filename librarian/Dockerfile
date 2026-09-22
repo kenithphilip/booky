@@ -1,5 +1,8 @@
 FROM python:3.12.14-slim
-ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+# Identifies the code in the image (git hash / date, passed by compose or the installer), so
+# /healthz?detail=1, /admin and selftest can tell a stale portal image from the checkout.
+ARG BUILD_VERSION=unknown
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 BUILD_VERSION=${BUILD_VERSION}
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends libxml2 libxslt1.1 \
     && rm -rf /var/lib/apt/lists/*
@@ -14,6 +17,9 @@ COPY . .
 RUN chmod -R a+rX /app
 # Runs as the library owner (1000) via compose "user:". Binds localhost by default (host
 # network + Caddy in front); BIND=0.0.0.0 is for the test harness only.
-# ONE worker process: the background engine (queue, dropbox/torrent watchers) runs inside
+# ONE worker process: the background engine (queue, dropbox watcher, housekeeping) runs inside
 # it, so a second process would double-process; threads give the request concurrency.
-CMD gunicorn -w 1 --threads 8 -b "${BIND:-127.0.0.1}:8090" --access-logfile - app:app
+# exec-form CMD + `exec`: gunicorn becomes PID 1 and receives SIGTERM, so `docker stop`,
+# restarts and updates shut it down gracefully instead of waiting 10 s for the SIGKILL
+# (which cut uploads off and left 'interrupted by restart' rows behind).
+CMD ["sh", "-c", "exec gunicorn -w 1 --threads 8 --graceful-timeout 25 -b \"${BIND:-127.0.0.1}:8090\" --access-logfile - app:app"]

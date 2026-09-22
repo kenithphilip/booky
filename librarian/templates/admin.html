@@ -2,24 +2,28 @@
 <h2>Admin</h2>
 <div class="grid">
 <div class="card"><h3>Queue</h3>
-<div class="mut">pending <strong class="st-pending">{{ counts.pending }}</strong> · active <strong>{{ counts.queued + counts.downloading + counts.importing }}</strong> · done <strong class="st-done">{{ counts.done }}</strong> · needs tag <strong class="st-needs-tag">{{ counts.needs_tag }}</strong> · failed <strong class="st-error">{{ counts.error }}</strong></div>
+<div class="mut">pending <strong class="st-pending">{{ counts.pending }}</strong> · active <strong>{{ counts.queued + counts.downloading + counts.retrying + counts.importing + counts.tagging }}</strong> · done <strong class="st-done">{{ counts.done }}</strong> · needs tag <strong class="st-needs-tag">{{ counts.needs_tag }}</strong> · failed <strong class="st-error">{{ counts.error }}</strong></div>
 <p><a href="{{ url_for('status') }}">Open the queue</a></p></div>
 <div class="card"><h3>Health</h3>
 <div class="mut">Worker: <strong class="{{ 'st-done' if health.ok else 'st-error' }}">{{ 'healthy' if health.ok else 'DEGRADED — ' + health.problems|join(', ') }}</strong>
-· ingest backlog <strong>{{ health.ingest_pending }}</strong>{% if health.ingest_oldest_s > 1800 %} <span class="st-error">(oldest {{ (health.ingest_oldest_s // 60)|int }} min — CWA import stuck?)</span>{% endif %}<br>
+· ingest backlog <strong>{{ health.ingest_pending }}</strong>{% if health.ingest_oldest_s > 900 %} <span class="st-error">(oldest {{ (health.ingest_oldest_s // 60)|int }} min — CWA import stuck?)</span>{% endif %}<br>
+Calibre-Web: <strong class="{{ 'st-done' if health.cwa == 'ok' else 'st-error' }}">{{ 'answering' if health.cwa == 'ok' else health.cwa }}</strong><br>
+Alerts: <strong class="{{ '' if alerts_ok else 'st-error' }}">{{ 'configured' if alerts_ok else 'NOBODY is told about failures — set up Alerts (ntfy / webhook) in the admin tools' }}</strong><br>
 Kobo sync: <strong>{{ 'on' if kobo_on else 'OFF — enable in the admin tools' }}</strong><br>
 Audiobookshelf automation: <strong>{{ 'linked' if abs_linked else 'not set up (Library → Audiobookshelf)' }}</strong><br>
 Send-to-Kindle mail: <strong>{{ 'configured' if kindle_enabled else 'not configured' }}</strong><br>
 Request quota: <strong>{{ quota if quota else 'unlimited' }}</strong>{% if quota %} per user per day{% endif %}<br>
 {% if disk %}Library disk: <strong class="{{ 'st-error' if disk.pct >= 95 else ('st-needs-tag' if disk.pct >= 85 else '') }}">{{ disk.free_gb }} GB free</strong> ({{ disk.pct }}% used)<br>{% endif %}
-Portal sources: {{ sources|join(', ') }}</div></div>
+Portal sources: {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.last }}{% endfor %}<br>
+Portal build: <strong>{{ health.version }}</strong> <span class="mut">(compare with the checkout before trusting a test run)</span></div></div>
 </div>
 
 {% if needs_tag %}
-<div class="card"><h3>Imported without an owner tag <span class="mut">({{ needs_tag|length }}; MOBI/AZW3/FB2/TXT cannot carry it)</span></h3>
-<p class="mut">These books are in the library but invisible to their owner until you add the tag in Calibre-Web (edit the book → Tags → <code>owner:&lt;user&gt;</code>). Then dismiss the row from the queue.</p>
-<table><tr><th>File</th><th>Owner → tag to add</th><th>Detail</th></tr>
-{% for r in needs_tag %}<tr><td>{{ r.title }}</td><td><code>owner:{{ r.owner }}</code></td><td class="mut">{{ r.detail or '' }}</td></tr>{% endfor %}</table></div>
+<div class="card"><h3>Imported without an owner tag <span class="mut">({{ needs_tag|length }}; MOBI/AZW3/FB2/TXT cannot carry it, audiobooks when Audiobookshelf could not be reached)</span></h3>
+<p class="mut">These are in the library but invisible to their owner until you add the tag: ebooks in Calibre-Web (edit the book → Tags → <code>owner:&lt;user&gt;</code>), audiobooks in Audiobookshelf (edit the item → Tags). Then mark the row resolved here.</p>
+<table><tr><th>File</th><th>Owner → tag to add</th><th>Detail</th><th></th></tr>
+{% for r in needs_tag %}<tr><td>{{ r.title }}</td><td><code>owner:{{ r.owner }}</code></td><td class="mut">{{ r.detail or '' }}</td>
+<td><form method="post" action="{{ url_for('dismiss', rid=r.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Mark resolved</button></form></td></tr>{% endfor %}</table></div>
 {% endif %}
 
 <div class="card"><h3>Applications</h3>
@@ -30,16 +34,22 @@ Portal sources: {{ sources|join(', ') }}</div></div>
 <div class="card"><h3>Users</h3>
 <table><tr><th>User</th><th>Role</th><th>Isolation</th><th>Kindle</th></tr>
 {% for u in users %}<tr><td>{{ u.name }}</td><td>{{ 'admin' if u.is_admin else 'user' }}</td>
-<td>{% if u.is_admin %}<span class="mut">sees everything</span>{% elif u.isolated %}<span class="st-done">owner:{{ u.name }}</span>{% else %}<span class="st-error">NOT isolated — fix in admin tools (Users → repair)</span>{% endif %}</td>
+<td>{% if u.is_admin %}<span class="mut">sees everything</span>{% elif u.isolated %}<span class="st-done">owner:{{ u.name }}</span>{% else %}<span class="st-error">NOT isolated — fix in admin tools (Users → repair)</span>{% endif %}
+{% if u.bad_name %}<br><span class="st-error">name has spaces/symbols: uploads and the dropbox cannot work for this account</span>{% endif %}</td>
 <td class="mut">{{ u.kindle_mail or '—' }}</td></tr>{% endfor %}</table>
 <h3 style="margin-top:14px">Add a user</h3>
+{% if authelia %}<p class="mut">Authelia is on, so users are added in the admin tools (<code>bookstack.sh</code> → Users): that also creates their Authelia login.</p>
+{% else %}
 <form method="post" class="row" style="align-items:flex-end">{{ csrf_field() }}<input type="hidden" name="action" value="add_user">
-<label style="flex:1;min-width:140px">Username<input type="text" name="name" required pattern="[A-Za-z0-9._-]+" autocomplete="off"></label>
-<label style="flex:1;min-width:160px">E-mail<input type="email" name="email"></label>
+<label style="flex:1;min-width:140px">Username <span class="mut">(lowercase)</span><input type="text" name="name" required pattern="[a-z0-9._-]+" autocomplete="off"></label>
+<label style="flex:1;min-width:160px">E-mail (their real address)<input type="email" name="email" required></label>
 <label style="flex:1;min-width:160px">Password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
 <label class="mut"><input type="checkbox" name="admin" value="1"> admin</label>
 <button type="submit">Create</button></form>
 <p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.</p>
+{% endif %}
+<p class="mut">Everything else about an account lives in the admin tools on the server (<code>bookstack.sh</code> → <em>Users</em>):
+<strong>4</strong> reset a Kobo link, <strong>5</strong> reset a password, <strong>6</strong> remove a user.</p>
 </div>
 
 <div class="card"><h3>Audit trail <span class="mut">(last 100 events; logins, lockouts, requests, downloads, admin actions)</span></h3>

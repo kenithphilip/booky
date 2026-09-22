@@ -1,11 +1,21 @@
 # Hardened book library stack. Managed by bookstack.sh — you rarely need to touch this.
 #
 # Network model
-#   caddy            host network: listens on PUBLIC_IP (books, audio) and TAILSCALE_IP (dl, aria)
+#   caddy            host network: public sites listen on BIND_IP (books, audio, request, shelf,
+#                    auth; firewall admits only Cloudflare), admin sites (monitor, dl, ephemera)
+#                    on the default listener but abort anything not from the tailnet (Caddyfile
+#                    tailnet_only), so a missing tailnet IP can never stop the public sites.
+#   librarian,       host network too (librarian: loopback to CWA/ABS, Caddy upstream;
+#   uptime-kuma      Kuma: so its http://127.0.0.1:<port> monitors reach the services).
+#                    Host-network processes can reach the admin's other tailnet devices when the
+#                    tailnet policy allows it: the portal's download fence refuses 100.64.0.0/10
+#                    and private ranges, and the Tailscale step should apply the tailnet ACL that
+#                    gives this machine (tag:bookstack) no outbound access.
 #   everything else  bound to 127.0.0.1 only; reachable solely through Caddy
-#   qbittorrent      additionally opens 6881 to the internet for peer traffic (that's all it
-#                    exposes). Written as 0.0.0.0:6881 on purpose: the Docker daemon's default
-#                    publish address is 127.0.0.1 (daemon.json, bookstack.sh step_system).
+#   qbittorrent      OPT-IN (profile "torrents", Library -> Torrents). Additionally opens 6881
+#                    to the internet for peer traffic (that's all it exposes). Written as
+#                    0.0.0.0:6881 on purpose: the Docker daemon's default publish address is
+#                    127.0.0.1 (daemon.json, bookstack.sh step_system).
 #
 # Images are pinned through IMG_* in .env (bookstack.sh seeds them; Operations -> Update bumps
 # them). The defaults here are the tags current on 2026-09-22, so compose renders with an
@@ -31,7 +41,11 @@ services:
     mem_limit: 256m
     oom_score_adj: -500
     environment:
-      - CF_API_TOKEN=${CF_API_TOKEN}
+      # Least privilege: only the Zone:DNS:Edit token for ACME DNS-01 (CF_DNS_TOKEN; the
+      # installer writes a copy of the main token when no separate one was given). The main
+      # CF_API_TOKEN (zone settings, rules, firewall) stays on the host. The fallback keeps an
+      # older .env without CF_DNS_TOKEN renewing certificates until Configure runs again.
+      - CF_API_TOKEN=${CF_DNS_TOKEN:-${CF_API_TOKEN:-}}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/cf-origin-pull-ca.pem:/etc/caddy/cf-origin-pull-ca.pem:ro
@@ -80,9 +94,26 @@ services:
       - ./library/podcasts:/podcasts
       - ./abs/config:/config
       - ./abs/metadata:/metadata
+    healthcheck:
+      # GET /healthcheck is a bare 200 in 2.36.1 (server/Server.js: router.get('/healthcheck',
+      # (req, res) => res.sendStatus(200))) and needs no token. The image has no curl, but it
+      # does ship /usr/bin/wget (both verified in ghcr.io/advplyr/audiobookshelf:2.36.1).
+      # ABS listens on port 80 inside the container (published on 127.0.0.1:13378).
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/healthcheck"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # A first scan of a big library keeps the event loop busy; don't flap during it.
+      start_period: 60s
 
   qbittorrent:
     <<: *common
+    # Opt-in: only started with `--profile torrents` (bookstack.sh adds it when
+    # TORRENTS_ENABLED=true). It sees ONLY the user dropboxes: every finished download must sit
+    # in a category whose save path is /dropbox/<cwa-user>, so the portal tags it owner:<user>
+    # and ingests it (ebooks -> Calibre-Web, audiobooks -> Audiobookshelf). No direct mounts of
+    # ingest/audiobooks/staging: those bypass owner tagging.
+    profiles: ["torrents"]
     image: ${IMG_QBIT:-lscr.io/linuxserver/qbittorrent:5.2.3}
     container_name: qbittorrent
     mem_limit: 512m
@@ -99,47 +130,33 @@ services:
       - "0.0.0.0:6881:6881/udp"
     volumes:
       - ./qbt/config:/config
-      - ./library/ingest:/downloads/ebooks
-      - ./library/audiobooks:/downloads/audiobooks
-      - ./library/staging:/downloads/owned-staging
       - ./downloads/incomplete:/downloads/incomplete
-
-  aria2:
-    <<: *common
-    # p3terx publishes no version tags; :latest is the only choice (small, stable image).
-    image: ${IMG_ARIA2:-p3terx/aria2-pro:latest}
-    container_name: aria2
-    mem_limit: 128m
-    environment:
-      - PUID=${PUID}
-      - PGID=${PGID}
-      - TZ=${TZ}
-      - RPC_SECRET=${ARIA2_SECRET}
-      - UMASK_SET=022
-      - UPDATE_TRACKERS=false
-    ports:
-      - "127.0.0.1:6800:6800"
-    volumes:
-      - ./aria2/config:/config
-      - ./library/ingest:/downloads
-
-  ariang:
-    <<: *common
-    image: ${IMG_ARIANG:-p3terx/ariang:latest}
-    container_name: ariang
-    mem_limit: 64m
-    ports:
-      - "127.0.0.1:6880:6880"
+      - ./library/dropbox:/dropbox
 
   librarian:
     <<: *common
-    build: ./librarian
+    build:
+      context: ./librarian
+      args:
+        # Baked into the image (ARG + ENV) so /healthz and /admin can show which checkout the
+        # running portal was built from: a stale image is otherwise invisible. Deploy/Update
+        # pass the git hash; a plain `docker compose build` gets "dev".
+        BUILD_VERSION: ${BUILD_VERSION:-dev}
     image: bookstack/librarian:latest
     container_name: librarian
-    # Host network so it can reach qBittorrent/aria2 on 127.0.0.1 and be proxied by Caddy.
+    # Host network: reaches Audiobookshelf on 127.0.0.1 and is proxied by Caddy on 127.0.0.1.
     network_mode: host
     user: "${PUID}:${PGID}"
-    mem_limit: 384m
+    # Graceful shutdown. The image's CMD now execs gunicorn (librarian/Dockerfile), so the
+    # signal reaches it; init: true additionally puts docker-init (tini) at PID 1, which
+    # reaps the short-lived children the worker forks (calibre/ffmpeg probes) instead of
+    # leaving them to gunicorn. 30 s > gunicorn's --graceful-timeout 25, so an in-flight
+    # upload finishes instead of being SIGKILLed after the default 10 s and leaving
+    # 'interrupted by restart' rows and orphans behind.
+    init: true
+    stop_grace_period: 30s
+    # 1g: rendering/converting a large PDF upload was OOM-killed at 384m.
+    mem_limit: 1g
     mem_reservation: 128m
     oom_score_adj: -500
     depends_on:
@@ -167,11 +184,10 @@ services:
       - STAGING_DIR=/staging
       - AUDIO_DIR=/audiobooks
       - SRC_GUTENBERG=${SRC_GUTENBERG:-true}
-      - SRC_STANDARD=${SRC_STANDARD:-true}
+      - SRC_STANDARD=${SRC_STANDARD:-false}   # its feed now needs a Patrons Circle login
       - SRC_ARCHIVE=${SRC_ARCHIVE:-true}
       - SRC_LIBRIVOX=${SRC_LIBRIVOX:-true}
       - IA_COLLECTIONS=${IA_COLLECTIONS:-gutenberg,opensource,americana,cdl}
-      - IA_USE_TORRENT=${IA_USE_TORRENT:-false}
       - SRC_MYCATALOG=${SRC_MYCATALOG:-false}
       - MYCATALOG_NAME=${MYCATALOG_NAME:-My catalog}
       - MYCATALOG_URL=${MYCATALOG_URL:-}
@@ -180,8 +196,11 @@ services:
       - ABS_URL=http://127.0.0.1:13378
       - ABS_TOKEN=${ABS_TOKEN:-}
       - ABS_LIBRARY_NAME=${ABS_LIBRARY_NAME:-Audiobooks}
-      - APPROVALS_REQUIRED=${APPROVALS_REQUIRED:-true}
+      - APPROVALS_REQUIRED=${APPROVALS_REQUIRED:-false}   # family default; Configure explains
       - NOTIFY_WEBHOOK=${NOTIFY_WEBHOOK:-}
+      - NOTIFY_WEBHOOK_FORMAT=${NOTIFY_WEBHOOK_FORMAT:-auto}   # auto = ntfy style when the URL host contains 'ntfy'
+      - AUTHELIA_ENABLED=${AUTHELIA_ENABLED:-false}           # portal hides self-service user creation when the gate is on
+      - TORRENTS_ENABLED=${TORRENTS_ENABLED:-false}           # shows the qBittorrent admin link
       - DEDUPE_WARN=${DEDUPE_WARN:-true}
       - ENRICH_METADATA=${ENRICH_METADATA:-true}
       - CALIBRE_DB=/calibre-library/metadata.db
@@ -193,6 +212,7 @@ services:
       - GUTENBERG_MIRROR=${GUTENBERG_MIRROR:-}
       - MAX_EBOOK_MB=${MAX_EBOOK_MB:-500}     # worker download caps per kind (SSRF/abuse fence)
       - MAX_AUDIO_MB=${MAX_AUDIO_MB:-2048}
+      - MAX_PDF_MB=${MAX_PDF_MB:-250}         # PDFs above this are not tagged in memory (parked for users)
       - IMAP_ALLOWED_SENDERS=${IMAP_ALLOWED_SENDERS:-}   # blank = sender must be the user's own e-mail
       - IMAP_HOST=${IMAP_HOST:-}
       - IMAP_PORT=${IMAP_PORT:-0}
@@ -201,7 +221,7 @@ services:
       - IMAP_PASS=${IMAP_PASS:-}
       - IMAP_FOLDER=${IMAP_FOLDER:-INBOX}
       - IMAP_DEFAULT_USER=${IMAP_DEFAULT_USER:-}
-      - QBIT_URL=http://127.0.0.1:8080
+      - IMAP_REQUIRE_AUTH=${IMAP_REQUIRE_AUTH:-true}   # file mail only when DMARC/DKIM/SPF pass (off for a local relay)
     volumes:
       # CWA's config dir. The portal authenticates against app.db and performs a few
       # well-defined writes to it (users, Kindle address, Kobo token — see librarian/cwa.py).
@@ -232,6 +252,20 @@ services:
     # Which release sources are enabled is chosen by the admin in Shelfmark's Settings.
     image: ${IMG_SHELFMARK:-ghcr.io/calibrain/shelfmark:v1.3.7}
     container_name: shelfmark
+    # Fail closed: Shelfmark silently falls back to auth mode "none" (no login at all, everyone
+    # admin) when CWA's app.db is missing or unreadable at start. Refuse to start unless the
+    # file exists and the run-as user can read a SQLite header from it; restart: unless-stopped
+    # retries every few seconds until it can. The image's own entrypoint is then exec'd
+    # unchanged (keep in step with the image: ENTRYPOINT dumb-init --, CMD /app/entrypoint.sh).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if ! gosu "$${PUID:-1000}:$${PGID:-1000}" head -c 16 /auth/app.db 2>/dev/null | grep -q '^SQLite format 3'; then
+          echo "shelfmark: /auth/app.db (Calibre-Web's user database) is missing or unreadable; refusing to start without authentication" >&2
+          sleep 10; exit 1
+        fi
+        exec /usr/bin/dumb-init -- /app/entrypoint.sh
     mem_limit: 768m
     mem_reservation: 128m
     environment:
@@ -243,13 +277,36 @@ services:
       # Log in with Calibre-Web accounts (CWA admins are Shelfmark admins). Read-only mount.
       - AUTH_METHOD=cwa
       - CWA_DB_PATH=/auth/app.db
-      # {User} = the signed-in CWA username -> ./library/dropbox/<user>/ (watched by librarian)
-      - INGEST_DIR=/dropbox/{User}
-      - FILE_ORGANIZATION=rename
-      # Audiobooks take the same route: flat into the user's dropbox (file or folder), and the
-      # librarian moves them into Audiobookshelf tagged owner:<user>. Never straight to /audiobooks.
-      - DESTINATION_AUDIOBOOK=/dropbox/{User}
-      - FILE_ORGANIZATION_AUDIOBOOK=rename
+      # Where downloads land. The per-user level is written into the NAMING TEMPLATES, not
+      # into the destination path, for two reasons (both verified in
+      # ghcr.io/calibrain/shelfmark:v1.3.7):
+      #  * the image's entrypoint runs `make_writable "${INGEST_DIR:-/books}"` -> `mkdir -p`
+      #    on the RAW value (/app/entrypoint.sh:481), so a destination of "/dropbox/{User}"
+      #    created a literal folder named "{User}" in the dropbox root at every start, which
+      #    the librarian then logged as "not an existing user's folder; ignored". With
+      #    INGEST_DIR=/dropbox it only touches the real mount.
+      #  * only "organize" mode may contain path separators, and only it keeps a multi-file
+      #    audiobook together: "rename" renames single-file downloads and drops multi-file
+      #    downloads flat under their original names (download/postprocess/transfer.py), so
+      #    a 3-part audiobook became 3 separate Audiobookshelf items.
+      # INGEST_DIR is the ONLY env name for the books destination: the setting is called
+      # DESTINATION but declares env_var="INGEST_DIR" (config/settings.py), so an env var
+      # named DESTINATION is ignored. DESTINATION_AUDIOBOOK is its own key and is read as-is.
+      # {User} = the signed-in CWA username, sanitised by Shelfmark (no "/", no "..").
+      - INGEST_DIR=/dropbox
+      - FILE_ORGANIZATION=organize
+      # -> /dropbox/<user>/<Author> - <Title> (<Year>).epub, i.e. exactly what the previous
+      # rename template produced, plus " - Part NN" when a download really has several files.
+      - TEMPLATE_ORGANIZE={User}/{Author} - {Title} ({Year}){ - Part }{PartNumber}
+      # Audiobooks take the same route: into the user's dropbox, where the librarian moves
+      # them into Audiobookshelf tagged owner:<user>. Never straight to /audiobooks.
+      - DESTINATION_AUDIOBOOK=/dropbox
+      - FILE_ORGANIZATION_AUDIOBOOK=organize
+      # -> ONE top-level folder per audiobook:
+      #    /dropbox/<user>/<Author> - <Title>/<Title> - Part 01.mp3, ... - Part 02.mp3, ...
+      # so the librarian's dropbox watcher sees a single book instead of one item per file.
+      # A single-file audiobook gets the same folder with one file in it.
+      - TEMPLATE_AUDIOBOOK_ORGANIZE={User}/{Author} - {Title}/{Title}{ - Part }{PartNumber}
       - BOOK_LANGUAGE=${SHELFMARK_LANGUAGE:-en}
       - SEARCH_PAGE_TITLE=${SHELFMARK_TITLE:-Library search}
       - MAX_CONCURRENT_DOWNLOADS=${SHELFMARK_CONCURRENCY:-1}
@@ -264,10 +321,12 @@ services:
       - ./shelfmark/config:/config
       - ./library/dropbox:/dropbox
       # Read access to the library keeps Shelfmark's "already in library" link working.
-      - ./library/audiobooks:/audiobooks
+      - ./library/audiobooks:/audiobooks:ro
       - ./cwa/config:/auth:ro
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8084/api/health"]
+      # Unhealthy unless Shelfmark reports Calibre-Web authentication (it re-resolves the mode
+      # per request, so a vanished app.db later would flip it to "none"); selftest checks too.
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8084/api/auth/check | grep -q '\"auth_mode\": *\"cwa\"'"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -279,9 +338,15 @@ services:
     # Stay on the 1.x line: 2.x needs a database migration.
     image: ${IMG_KUMA:-louislam/uptime-kuma:1}
     container_name: uptime-kuma
+    # Host network, listening on loopback only, so monitors such as
+    # http://127.0.0.1:8090/healthz and http://127.0.0.1:8084/api/health reach the services
+    # (on a bridge network 127.0.0.1 would be Kuma's own container).
+    network_mode: host
     mem_limit: 384m
-    ports:
-      - "127.0.0.1:3001:3001"
+    environment:
+      - UPTIME_KUMA_HOST=127.0.0.1
+      - UPTIME_KUMA_PORT=3001
+      - TZ=${TZ}
     volumes:
       - ./kuma/data:/app/data
     # Reached only over Tailscale at monitor.<domain>

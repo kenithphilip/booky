@@ -1,5 +1,5 @@
 # Override for the end-to-end test (tests/stack-test.sh). Never used in production.
-# - The production Caddy, qBittorrent, aria2, AriaNg and Uptime Kuma are parked behind a
+# - The production Caddy, qBittorrent (opt-in 'torrents' profile anyway) and Uptime Kuma are parked behind a
 #   profile (no TLS certs / peer ports on a laptop; Caddy's config is validated separately).
 # - Services get test ports on localhost. The portal leaves host networking (!reset) and
 #   joins the compose network so the test mail server, file server, Audiobookshelf and
@@ -10,8 +10,6 @@
 services:
   caddy:       { profiles: ["prod"] }
   qbittorrent: { profiles: ["prod"] }
-  aria2:       { profiles: ["prod"] }
-  ariang:      { profiles: ["prod"] }
   uptime-kuma: { profiles: ["prod"] }
 
   calibre-web:
@@ -47,6 +45,12 @@ services:
       IMAP_USER: intake@example.test
       IMAP_PASS: anything
       IMAP_FOLDER: INBOX
+      IMAP_REQUIRE_AUTH: "false"
+      KOSYNC_ENABLED: "true"   # the installer sets this when CWA KOReader sync is on
+      # The gate container in front of CWA/ABS/portal IS Authelia-enabled in this harness, but the
+      # portal's own flag stays false so the driver can still exercise admin-page user creation
+      # (the "Authelia on -> use the TUI" guard is covered by the unit tests).
+      AUTHELIA_ENABLED: "false"   # GreenMail adds no Authentication-Results header
     depends_on:
       greenmail:
         condition: service_started

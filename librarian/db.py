@@ -21,9 +21,29 @@ def init():
             author TEXT,
             download_url TEXT,
             is_torrent INTEGER DEFAULT 0,
-            status TEXT NOT NULL,          -- pending|queued|downloading|retrying|importing|done|needs-tag|error|denied|dismissed
+            status TEXT NOT NULL,          -- pending|queued|downloading|retrying|importing|tagging|done|needs-tag|error|denied|dismissed
             detail TEXT,
             created REAL, updated REAL)""")
+        rcols = {r[1] for r in c.execute("PRAGMA table_info(requests)")}
+        for col, decl in (("restarts", "INTEGER DEFAULT 0"),   # times a restart interrupted this row
+                          ("src_size", "INTEGER"), ("src_mtime", "REAL")):   # dropbox file fingerprint
+            if col not in rcols:
+                c.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
+        # Audiobook owner tags still to be applied in ABS. Persisted (not a daemon thread) so a
+        # slow ABS scan or a portal restart cannot leave an audiobook untagged and invisible.
+        c.execute("""CREATE TABLE IF NOT EXISTS abs_tags(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rid INTEGER, folder TEXT NOT NULL, owner TEXT NOT NULL,
+            attempts INTEGER DEFAULT 0, next_try REAL, last_error TEXT,
+            created REAL, done REAL)""")
+        # how many ABS items the last pass found under the folder: the job closes only when
+        # that count is stable, so a box set does not close after its first book is indexed
+        if "last_count" not in {r[1] for r in c.execute("PRAGMA table_info(abs_tags)")}:
+            c.execute("ALTER TABLE abs_tags ADD COLUMN last_count INTEGER DEFAULT 0")
+        # Password fingerprints as the portal last saw them: a change made in Calibre-Web's own
+        # UI (which the portal cannot mirror to Audiobookshelf) shows up as a mismatch.
+        c.execute("""CREATE TABLE IF NOT EXISTS pw_sync(
+            owner TEXT PRIMARY KEY, fp TEXT, updated REAL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS prefs(
             owner TEXT PRIMARY KEY,
             preferred_format TEXT,         -- epub|kepub|azw3|mobi|pdf
@@ -120,21 +140,65 @@ def audit_recent(limit=100, user=None):
             rows = c.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [dict(r) for r in rows]
 
+# A request that was denied, failed or dismissed cost the family nothing: it must not eat the
+# daily allowance (a source being down would otherwise lock a reader out for the day).
+UNCOUNTED = ("denied", "error", "dismissed")
+_QUOTA_SQL = ("SELECT COUNT(*), MIN(created) FROM requests WHERE owner=? AND created>? "
+              "AND download_url!='local' AND status NOT IN (?,?,?)")
+
 def requests_today(owner, now=None):
-    """Requests this user made in the last 24 h (uploads/dropbox files do not count)."""
+    """Requests this user made in the last 24 h that count against the quota (uploads/dropbox
+    files, denied, failed and dismissed rows do not)."""
     now = now or time.time()
     with _conn() as c:
-        return c.execute("SELECT COUNT(*) FROM requests WHERE owner=? AND created>? AND download_url!='local'",
-                         (owner, now - 86400)).fetchone()[0]
+        return c.execute(_QUOTA_SQL, (owner, now - 86400, *UNCOUNTED)).fetchone()[0]
+
+def add_if_under_quota(owner, r, limit, status="queued", now=None):
+    """Count and insert in ONE immediate transaction, so parallel submissions cannot each see
+    'still under the limit' and all get through. Returns (rid, remaining, resets_at); rid is
+    None when the limit is reached (remaining 0, resets_at = when the oldest one ages out)."""
+    now = now or time.time()
+    with _lock:
+        c = _conn()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            used, oldest = c.execute(_QUOTA_SQL, (owner, now - 86400, *UNCOUNTED)).fetchone()
+            resets = (oldest or now) + 86400
+            if limit and used >= limit:
+                c.execute("COMMIT")
+                return None, 0, resets
+            cur = c.execute("""INSERT INTO requests
+                (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated,src_size,src_mtime)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (owner, r["kind"], r["source"], r.get("identifier"), r["title"], r.get("author"),
+                 r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now,
+                 r.get("src_size"), r.get("src_mtime")))
+            c.execute("COMMIT")
+            remaining = max(0, limit - used - 1) if limit else 0
+            return cur.lastrowid, remaining, (oldest or now) + 86400
+        except Exception:
+            c.execute("ROLLBACK"); raise
+        finally:
+            c.close()
+
+def find_open_by_url(owner, url):
+    """An earlier request from the same user for the same URL that is not dead: /intake
+    replaying a hook must not queue the same book twice."""
+    with _conn() as c:
+        row = c.execute("SELECT * FROM requests WHERE owner=? AND download_url=? "
+                        "AND status NOT IN (?,?,?) ORDER BY id DESC LIMIT 1",
+                        (owner, url, *UNCOUNTED)).fetchone()
+        return dict(row) if row else None
 
 def add(owner, r, status="queued"):
     now = time.time()
     with _lock, _conn() as c:
         cur = c.execute("""INSERT INTO requests
-            (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated,src_size,src_mtime)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (owner, r["kind"], r["source"], r.get("identifier"), r["title"], r.get("author"),
-             r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now))
+             r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now,
+             r.get("src_size"), r.get("src_mtime")))
         return cur.lastrowid
 
 def get(rid):
@@ -146,6 +210,12 @@ def set_status(rid, status, detail=None):
     with _lock, _conn() as c:
         c.execute("UPDATE requests SET status=?, detail=COALESCE(?,detail), updated=? WHERE id=?",
                   (status, detail, time.time(), rid))
+
+def requeue(rid, detail):
+    """Put a failed request back in the queue (admin retry); the restart counter starts over."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE requests SET status='queued', detail=?, restarts=0, updated=? WHERE id=?",
+                  (detail, time.time(), rid))
 
 def claim_one():
     """Atomically take the next queued request for the worker. BEGIN IMMEDIATE serialises
@@ -165,18 +235,29 @@ def claim_one():
         finally:
             c.close()
 
+INTERRUPTED = "interrupted by restart"
+MAX_RESTARTS = 2    # a job that was running during this many restarts is probably what kills us
+
 def recover_on_start(now=None):
-    """Called once when the worker starts. A row left 'importing' by a crash or restart is
-    requeued when its source can be fetched again, marked failed when it was a local file
-    (the file is gone or parked by then); a torrent 'downloading' for over a day is given up."""
+    """Called once when the worker starts. A row left 'importing'/'retrying' by a crash or
+    restart is requeued when its source can be fetched again, unless restarts already
+    interrupted it MAX_RESTARTS times (an intake URL whose file OOM-kills the portal must not
+    loop forever); a local (dropbox) row is marked 'interrupted by restart' and the dropbox
+    watcher decides whether the file gets one more try. Rows from the removed P2P path fail."""
     now = now or time.time()
     with _lock, _conn() as c:
-        c.execute("UPDATE requests SET status='queued', detail='requeued after restart', updated=? "
-                  "WHERE status='importing' AND download_url!='local'", (now,))
-        c.execute("UPDATE requests SET status='error', detail='interrupted by restart', updated=? "
-                  "WHERE status='importing' AND download_url='local'", (now,))
-        c.execute("UPDATE requests SET status='error', detail='torrent did not complete in 24 h', updated=? "
-                  "WHERE status='downloading' AND updated < ?", (now, now - 86400))
+        # a torrent row can only come from the removed P2P path: it can never be fetched again
+        c.execute("UPDATE requests SET status='error', detail='the P2P download path was removed; "
+                  "request it again', updated=? WHERE is_torrent=1 AND status NOT IN "
+                  "('done','error','denied','dismissed','needs-tag')", (now,))
+        live = "status IN ('importing','retrying','downloading') AND download_url!='local'"
+        c.execute(f"UPDATE requests SET restarts=COALESCE(restarts,0)+1 WHERE {live}")
+        c.execute(f"UPDATE requests SET status='error', updated=?, detail='interrupted by a restart ' || restarts || "
+                  f"' times (too large for the portal?); not retried automatically - retry it from the queue' "
+                  f"WHERE {live} AND restarts >= ?", (now, MAX_RESTARTS))
+        c.execute(f"UPDATE requests SET status='queued', detail='requeued after restart', updated=? WHERE {live}", (now,))
+        c.execute("UPDATE requests SET status='error', detail=?, updated=? "
+                  "WHERE status IN ('importing','retrying','downloading') AND download_url='local'", (INTERRUPTED, now))
 
 def last_for(owner, title, source):
     """The most recent request row for this owner/title/source, or None."""
@@ -185,10 +266,38 @@ def last_for(owner, title, source):
                         (owner, title, source)).fetchone()
         return dict(row) if row else None
 
-def downloading_for_torrents():
+def interrupted_count(owner, title, source, size, mtime):
+    """How often this exact dropbox file (same name, size and mtime) was interrupted by a restart."""
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM requests WHERE owner=? AND title=? AND source=? AND detail=? "
+                         "AND src_size IS ? AND src_mtime IS ?",
+                         (owner, title, source, INTERRUPTED, size, mtime)).fetchone()[0]
+
+# ---- pending Audiobookshelf tag jobs --------------------------------------------------------
+def add_tag_job(rid, folder, owner, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        return c.execute("INSERT INTO abs_tags(rid,folder,owner,attempts,next_try,created) VALUES(?,?,?,?,?,?)",
+                         (rid, folder, owner, 0, now, now)).lastrowid
+
+def due_tag_jobs(now=None):
+    now = now or time.time()
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT * FROM requests WHERE status='downloading' AND is_torrent=1 ORDER BY id").fetchall()]
+            "SELECT * FROM abs_tags WHERE done IS NULL AND next_try <= ? ORDER BY id", (now,)).fetchall()]
+
+def pending_tag_jobs():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM abs_tags WHERE done IS NULL ORDER BY id").fetchall()]
+
+def tag_job_retry(jid, next_try, error=None, count=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE abs_tags SET attempts=attempts+1, next_try=?, last_error=COALESCE(?,last_error), "
+                  "last_count=COALESCE(?,last_count) WHERE id=?", (next_try, error, count, jid))
+
+def tag_job_close(jid, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE abs_tags SET done=? WHERE id=?", (now or time.time(), jid))
 
 def list_for(owner, is_admin):
     with _conn() as c:
@@ -196,3 +305,37 @@ def list_for(owner, is_admin):
             return [dict(r) for r in c.execute("SELECT * FROM requests ORDER BY id DESC LIMIT 200")]
         return [dict(r) for r in c.execute(
             "SELECT * FROM requests WHERE owner=? ORDER BY id DESC LIMIT 100", (owner,))]
+
+def counts_by_status():
+    """Every row counted, not just the newest 200 the admin page lists."""
+    with _conn() as c:
+        return {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM requests GROUP BY status")}
+
+def rows_by_status(statuses, limit=500):
+    """All rows in these statuses (needs-tag list, retry-all, the import reconciliation)."""
+    statuses = tuple(statuses)
+    if not statuses:
+        return []
+    marks = ",".join("?" * len(statuses))
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM requests WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?", (*statuses, limit))]
+
+def dismiss_interrupted(owner, title, source, keep_rid):
+    """A dropbox file that was interrupted by a restart and then imported successfully leaves a
+    dead error row next to the good one: mark those dismissed so they stop counting as failures."""
+    with _lock, _conn() as c:
+        return c.execute("UPDATE requests SET status='dismissed', updated=?, "
+                         "detail='interrupted by a restart; the retry succeeded' "
+                         "WHERE owner=? AND title=? AND source=? AND id!=? AND status='error' AND detail=?",
+                         (time.time(), owner, title, source, keep_rid, INTERRUPTED)).rowcount
+
+def get_pw_fingerprint(owner):
+    with _conn() as c:
+        r = c.execute("SELECT fp FROM pw_sync WHERE owner=?", (owner,)).fetchone()
+    return r["fp"] if r else None
+
+def set_pw_fingerprint(owner, fp):
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO pw_sync(owner,fp,updated) VALUES(?,?,?) ON CONFLICT(owner) "
+                  "DO UPDATE SET fp=excluded.fp, updated=excluded.updated", (owner, fp, time.time()))

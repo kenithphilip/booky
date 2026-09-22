@@ -1,4 +1,6 @@
 # Template rendered by bookstack.sh (Security -> fail2ban): the double-at placeholders are filled in.
+# @@CADDY_LOG@@ = $STACK_DIR/caddy/data/access.log; bookstack.sh creates it if missing (fail2ban
+# refuses to start with a missing logpath, which would also take the sshd jail down).
 [DEFAULT]
 bantime = 1h
 findtime = 10m
@@ -15,11 +17,25 @@ enabled = true
 [caddy-auth]
 enabled  = @@CADDY_JAIL@@
 filter   = caddy-auth
-logpath  = /srv/bookstack/caddy/data/access.log
+logpath  = @@CADDY_LOG@@
 backend  = auto
 maxretry = 8
 findtime = 5m
 bantime  = 2h
+action   = cloudflare-token[cftoken="@@CF_API_TOKEN@@", cfzone="@@CF_ZONE@@"]
+
+# Audiobookshelf login guessing on audio.<domain> (J25). ABS has no lockout of its own and its
+# POST /login has to bypass Authelia for the mobile apps, so this jail is the lockout: 10 wrong
+# passwords in 10 minutes -> the real visitor is banned at Cloudflare for an hour. Looser than
+# caddy-auth because an app that holds a stale password retries on its own.
+[caddy-abs-login]
+enabled  = @@CADDY_JAIL@@
+filter   = caddy-abs-login
+logpath  = @@CADDY_LOG@@
+backend  = auto
+maxretry = 10
+findtime = 10m
+bantime  = 1h
 action   = cloudflare-token[cftoken="@@CF_API_TOKEN@@", cfzone="@@CF_ZONE@@"]
 
 # Basic-auth guessing on /opds and /kosync (device paths: no Authelia, no browser check).
@@ -27,7 +43,7 @@ action   = cloudflare-token[cftoken="@@CF_API_TOKEN@@", cfzone="@@CF_ZONE@@"]
 [caddy-device-auth]
 enabled  = @@CADDY_JAIL@@
 filter   = caddy-device-auth
-logpath  = /srv/bookstack/caddy/data/access.log
+logpath  = @@CADDY_LOG@@
 backend  = auto
 maxretry = 30
 findtime = 10m

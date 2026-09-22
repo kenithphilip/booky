@@ -19,6 +19,28 @@ Everything an admin previously had to click through in three different web UIs (
 creation, Allowed Tags, Kobo sync toggle, registration off, conversion settings, Kindle
 addresses) is now done by the menu or by users themselves in the portal.
 
+## What changed in v4.3 (fan-out audit + synthetic user journeys)
+Five auditors, each checked by a skeptic, went through the installer, the service wiring, the
+portal, every family journey and operations; every verified finding (8 high, 24 medium, 37
+low, 8 simplifications) is fixed and covered by tests. Highlights:
+- **Alerts reach you.** A required Alerts step (ntfy or webhook, with a test); the scripts
+  fall back to a direct post when the portal is down; the self-test fails with no channel.
+- **Nothing on the admin side can take the public sites down.** Admin sites no longer bind the
+  Tailscale address (they listen normally and drop anyone outside the tailnet); the nightly
+  Cloudflare-IP refresh never touches the firewall when a download fails.
+- **Real client IPs** from `CF-Connecting-IP` for every rate limit, lockout and log.
+- **Dropboxes behave:** re-dropped files import, folders are classified properly, oversized
+  files are parked, restarts cannot loop, audiobook tags are retried until confirmed.
+- **Restore and update you can trust:** snapshot picker, config-only restore, free-space check,
+  in-place restore; Update ships the new code, gates on health and rolls back images.
+- **SSH and firewall stay locked** across re-runs; the SSH drop-in wins over cloud-init.
+- **Smaller surface for a family:** aria2/AriaNg removed, torrents opt-in and owner-tagged,
+  approvals and the intake webhook off by default, a chosen admin username instead of
+  `admin`, a DNS-only token for Caddy, scripts owned by root.
+- **BookOrbit** was studied and trialled next to a copy of the library: it can run read-only
+  alongside CWA, but for now it is recommended as an admin-only trial (see
+  `docs/DECISIONS-PENDING.md`).
+
 ## What changed in v4.2 (research sweep + adversarial review)
 Twenty pre-deploy items from `docs/RESEARCH-GAPS.md` (what comparable self-hosted stacks
 do, what this one lacked) were implemented, then three independent reviewers tried to break
@@ -119,8 +141,9 @@ frontend changes. Each adapter is bound in code to one specific, vetted source.
 ## Sources — read this first
 The **request portal** (`request.`) fetches only from catalogs free to redistribute:
 **Project Gutenberg, Standard Ebooks, Internet Archive (collections you allow), LibriVox**
-(audio), plus **your own OPDS catalog**. Internet Archive also publishes torrents, so the
-P2P path is real. The portal's source set is fixed in code — it is not a general indexer.
+(audio), plus **your own OPDS catalog**. Standard Ebooks is off by default (its feed now
+needs a Patrons Circle login). The portal's source set is fixed in code — it is not a
+general indexer.
 
 **Shelfmark** (`shelf.`) is a separate, general search-and-download UI. It ships with *no*
 release source enabled; you pick them in its Settings (direct-download mirrors, Prowlarr
@@ -138,13 +161,16 @@ For your own writing you don't need a tracker: the **OPDS source** (Library → 
 |---|---|---|
 | request / books / audio / shelf .mfdata.in | Your users, anywhere | Cloudflare DDoS+WAF+bot → mTLS-locked origin → **(optional) Authelia SSO+2FA** → per-user app login |
 | auth.mfdata.in | Users (only when Authelia on) | The SSO portal itself |
-| dl / aria / monitor .mfdata.in | You, only on Tailscale | Not on the public internet → password gate → app login |
-| ephemera.mfdata.in (optional) | You, only on Tailscale | Not on the public internet → password gate (Ephemera has no login of its own) |
+| monitor .mfdata.in | You, from your other Tailscale devices | Caddy aborts any client outside the tailnet → app login |
+| dl .mfdata.in (only with Torrents on) | You, from your other Tailscale devices | tailnet-only → password gate → qBittorrent login |
+| ephemera.mfdata.in (optional) | You, from your other Tailscale devices | tailnet-only → password gate (Ephemera has no login of its own) |
 | SSH | You, only on Tailscale (after locking) | Key-only |
-| Port 6881 | Torrent peers | qB peer port only — no UI, no files |
+| Port 6881 (only with Torrents on) | Torrent peers | qB peer port only — no UI, no files |
 
 Origin locked three ways (IP not in public DNS as an origin, firewall accepts 80/443 only
-from Cloudflare, Caddy requires Cloudflare's client cert). Every container binds 127.0.0.1
+from Cloudflare, Caddy requires Cloudflare's client cert). Caddy takes the visitor's address
+from Cloudflare's `CF-Connecting-IP` only, so rate limits, lockouts, fail2ban and the audit
+trail see the real client and cannot be fooled by a forged `X-Forwarded-For`. Every container binds 127.0.0.1
 with `no-new-privileges`. No anonymous browsing, no self-registration, no third-party
 scripts, no telemetry. In the portal: CSRF tokens on every form, HttpOnly/Secure/Lax
 sessions that expire after 12 h, a strict Content-Security-Policy (no scripts at all),
@@ -179,7 +205,7 @@ Create Custom Token** and add these permissions, all with type **Zone**:
 | Permission | Level | Why the installer needs it |
 |---|---|---|
 | Zone | Read | find your domain's zone |
-| DNS | Edit | create the `books`, `audio`, `request`, `shelf`, `auth`, `dl`, `aria`, `monitor` records; also DNS-01 certificates |
+| DNS | Edit | create the `books`, `audio`, `request`, `shelf`, `auth`, `monitor` (and `dl` with torrents) records |
 | Zone Settings | Edit | SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls, e-reader-breaking features off |
 | Config Rules | Edit | per-host exceptions for the device paths |
 | Cache Rules | Edit | never cache a user's book or audio response |
@@ -188,6 +214,11 @@ Create Custom Token** and add these permissions, all with type **Zone**:
 Under **Zone Resources** pick *Include → Specific zone → your domain*. Leave client IP
 filtering empty (the server's IP changes if you ever rebuild) and set no expiry, or put a
 reminder in your calendar. Copy the token once; Cloudflare will not show it again.
+
+Optionally create a **second token with only Zone → DNS → Edit** for the same zone. Configure
+asks for it: Caddy, the one internet-facing process, then only holds that narrow token for
+certificate renewals, and the powerful one stays on the host. Leave it blank to reuse the
+main token.
 Paste it when **Quick install → Configure** asks for it. It is stored only in
 `/srv/bookstack/.env` (root-only, mode 600) and read by Caddy at runtime. To replace it later,
 re-run **Install & deploy → Configure** and paste the new one.
@@ -201,7 +232,13 @@ from. The free Personal plan is enough: only you and the server join the tailnet
 never need Tailscale; they use the public sites through Cloudflare. **Quick install →
 Tailscale** prints a login link for the server.
 
-**3. Outgoing mail (optional, for Send-to-Kindle and notifications).** An SMTP account the
+**3. An alert channel (required).** Failed backups, a full disk or a failed restore test must
+reach you. **Quick install → Alerts** asks for an [ntfy](https://ntfy.sh) topic URL (free: pick
+a long random topic name and subscribe to it in the ntfy phone app) or any webhook, and sends
+a test. For a dead-man check on backups, optionally add a free healthchecks.io URL in the
+Backups step.
+
+**4. Outgoing mail (optional, for Send-to-Kindle and notifications).** An SMTP account the
 server sends from, set once by you in **Library → Mail**. Any provider that gives SMTP
 credentials works (a Gmail or Fastmail app password, Brevo, Mailgun, your domain's mail host).
 Users do not configure mail. Each user does two things themselves: enter their Kindle
@@ -210,12 +247,12 @@ page) to **Amazon → Manage Your Content and Devices → Preferences → Person
 Settings → Approved Personal Document E-mail List**. The **Send a test to my Kindle** button
 proves it works.
 
-**4. A backup repository off the server (recommended).** Any restic repository: an S3
+**5. A backup repository off the server (recommended).** Any restic repository: an S3
 bucket (Backblaze B2, Wasabi, Cloudflare R2) or an SFTP host. **Quick install → Backups**
 asks for the repository URL, a password and the access keys. Keep the password somewhere
 other than the server; without it the backups cannot be restored.
 
-**5. Shelfmark release sources.** Nothing is enabled by default. After deploy, open
+**6. Shelfmark release sources.** Nothing is enabled by default. After deploy, open
 `shelf.<domain>` as admin → **Settings** and choose the sources you are entitled to use.
 
 ## Deploy (fresh Debian VPS)
@@ -235,16 +272,18 @@ so users can Send-to-Kindle from the portal), **Security → Authelia** if you w
 
 ## The request flow
 Users sign in at `https://request.<domain>` with their library credentials → search →
-**Request**. By default (`APPROVALS_REQUIRED=true`) a non-admin request lands as **pending**;
-the admin sees it in the portal's approval queue (and the `/admin` dashboard) and approves or
-denies it. Admin requests skip the queue. On approval the book downloads centrally, is
+**Request**. Approvals are **off** by default for a family (`APPROVALS_REQUIRED=false`; they
+only ever covered the public-domain catalogs, not Shelfmark or uploads). Turned on in
+Library → Sources, a non-admin request lands as **pending** in the portal's approval queue
+until the admin approves or denies it. The book then downloads centrally, is
 tagged to the requester, and appears in *their* library within seconds (audiobooks go to
 Audiobookshelf). From there it reaches the user's devices:
 - **Kobo**: automatically at the next sync (they linked the device once on Devices).
 - **Kindle**: automatically if they enabled auto-send, or with one click under My books.
 - **Anything else**: Download under My books (preferred format first), OPDS, the ABS app.
-Set `NOTIFY_WEBHOOK` to get a JSON POST on requested/approved/denied/done/error. Search
-results flag titles already in the library. Library → Sources toggles approvals.
+Audiobooks show the status **tagging** until Audiobookshelf has confirmed the owner tag; one
+still untagged after 24 h becomes *needs-tag* and the admin is alerted. Search results flag
+titles already in the requester's library.
 
 ## Devices (what users do themselves, once)
 On the portal's **Devices** page:
@@ -259,12 +298,15 @@ On the portal's **Devices** page:
 - **Notifications** — opt in to an e-mail when a request is ready or denied.
 - **Account** — change their own password (portal, CWA, Shelfmark and Audiobookshelf at once).
 - **Phone/tablet** — OPDS `https://books.<domain>/opds` in any reader; audiobooks via the
-  Audiobookshelf app with the same login; KOReader progress sync at `/kosync` when enabled.
+  Audiobookshelf app with the same login; KOReader progress sync via the plugin at
+  `https://books.<domain>/kosync` when enabled.
+- **E-mail** — their own address (for notifications and mail-in).
 
 ## Formats & conversion (Library → Formats)
 Drives CWA's own settings in `cwa.db`, applied on the next import:
-target format (EPUB recommended: Kobo receives KEPUB automatically on sync, Kindle accepts
-EPUB by mail), convert on import on/off, Kindle EPUB fixer, originals to keep alongside, and
+the target format is always EPUB (Kobo receives KEPUB automatically on sync and users can
+download it as `.kepub.epub`; Kindle accepts EPUB by mail), convert on import on/off, CWA's
+import-time Kindle fixer (keep off), originals to keep alongside, and
 the duplicate policy (`new_record` required for isolation). Deploy applies the secure
 defaults; users choose their own *download* format on Devices.
 
@@ -278,11 +320,13 @@ successor of *calibre-web-automated-book-downloader*:
   `app.db` present it would run with *no* authentication.
 - **Per-user destination**: `INGEST_DIR=/dropbox/{User}` → every ebook lands in
   `library/dropbox/<username>/`, is tagged `owner:<username>` and atomically ingested within
-  ~15 s. File organization must stay `rename` (flat files).
-- **Audiobooks** go straight to `library/audiobooks` as `Author/Title/`; tag `owner:<user>`
-  in Audiobookshelf.
-- **Sources are opt-in** in Shelfmark → Settings. For torrent-backed sources point its
-  qBittorrent client at `http://qbittorrent:8080` (compose network, not localhost).
+  ~15 s. Limit its formats to epub, pdf and cbz.
+- **Audiobooks** land in the same dropbox; an audio-only folder becomes one audiobook, tagged
+  to its owner in Audiobookshelf automatically. A folder of ebooks is imported book by book;
+  mixed or empty folders are parked in `.failed` with a reason.
+- **Sources are opt-in** in Shelfmark → Settings.
+- Shelfmark refuses to start without CWA's `app.db` and reports unhealthy if its auth mode is
+  ever anything but `cwa`.
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
 
@@ -301,32 +345,49 @@ Four more ways files enter, all owner-mapped and run through the same state mach
 - **Per-user dropboxes** — `library/dropbox/<username>/` is watched (scp, rsync, Syncthing,
   WebDAV, rclone). Hidden/partial files are ignored until complete.
 - **Browser upload** — the portal's Upload page.
-- **Intake webhook** — `POST https://request.<domain>/intake` with `X-Intake-Token` and JSON
+- **Intake webhook** (off until enabled in Library → Intake; `/intake` answers 404 until
+  then) — `POST https://request.<domain>/intake` with `X-Intake-Token` and JSON
   `{"user":"alice","url":"https://.../book.epub"}`; pulls that exact URL for that user.
-- **Email-to-library (optional IMAP)** — mail to `<mailbox>+alice@yourdomain`.
+- **Email-to-library (optional IMAP)** — mail to `<mailbox>+alice@yourdomain`. Filed only
+  when the receiving server's `Authentication-Results` shows DMARC, DKIM or SPF passing for the
+  sender (`IMAP_REQUIRE_AUTH=false` for a local relay).
+A re-dropped file with the name of an earlier failure is imported; a second upload with the
+same name becomes `name (2).ext` instead of overwriting. Size caps: 500 MB ebooks, 2 GB audio,
+PDFs over 250 MB are not tagged (parked for users).
 Gutenberg can pull from a local mirror; the OPDS source pulls from any catalog you host.
 
 ## Application hardening
 Applied by Deploy / Users → Repair: CWA public registration OFF, anonymous browsing OFF,
-Kobo sync ON, Kobo store proxy OFF, convert-to-EPUB, `new_record` duplicates, Kindle fixer.
-Still yours to do once: **Audiobookshelf** root user + per-user tags; **qBittorrent** (dl.,
-Tailscale) real Web UI password, "Bypass authentication for localhost", categories
-`ebooks`,`audiobooks`,`owned-staging`, require encryption; **AriaNg** RPC secret; CWA SMTP
-(Admin → Edit e-mail server) if you also want CWA's own Send-to-Kindle button; Uptime Kuma
-monitors. Operations → Self-test checks the posture.
+Kobo sync ON, Kobo store proxy OFF, convert-to-EPUB, `new_record` duplicates, CWA's Kindle
+fixer OFF, duplicate auto-resolve and metadata tag updates OFF.
+
+**Torrents are opt-in** (Library → Torrents). Enabling starts qBittorrent, opens port 6881,
+creates `dl.<domain>` and seeds its default save path to your dropbox; point every category at
+`/dropbox/<user>` so downloads are owner-tagged like everything else. aria2 and AriaNg were
+removed.
+
+Still yours to do once: a real qBittorrent Web UI password (if you enable torrents), CWA SMTP
+(Admin → Edit e-mail server) if you also want CWA's own Send-to-Kindle button, and Uptime Kuma
+monitors (loopback checks such as `http://127.0.0.1:8084/api/auth/check`, keyword `cwa`, now
+work) plus one free external monitor for "the whole VPS is down". Operations → Self-test
+checks the posture.
 
 ## Security & ops menu (what's where)
-- **Install & deploy**: Quick install, System, Tailscale, Configure, Cloudflare, Deploy, Backups.
+- **Install & deploy**: Quick install, System, Tailscale, Configure, Cloudflare, Deploy, Backups, Alerts.
 - **Users & devices**: list / add / Kindle / Kobo link / password / remove / repair / guide.
 - **Library**: Formats & conversion, Mail (SMTP + test), Sources & approvals, Shelfmark,
-  Intake & dropboxes, isolation guide.
+  Intake & dropboxes (webhook enable/show/disable), Torrents, isolation guide.
 - **Security**: Authelia enable / disable / add user, Lock SSH to Tailscale, fail2ban,
   SPF/DMARC, Cloudflare Access guide.
-- **Operations**: Self-test, Status, Logs, Update, Backups, Restore test, Monitoring,
-  Ephemera enable / disable.
+- **Operations**: Self-test, Status, Logs, Update, Backups, Restore test, Restore from backup,
+  Alerts, Monitoring, Ephemera enable / disable.
 
-Backups are encrypted restic (7 daily / 4 weekly / 6 monthly) — keep the repo password
-safe. Update monthly. Watch `df -h /srv`; audiobooks fill 60 GB fastest.
+Backups are encrypted restic (7 daily / 4 weekly / 6 monthly; `pre-update` snapshots kept
+90 days; `restic check` weekly; a monthly restore test on the 1st) — keep the repo password
+safe. **Restore** lets you pick a snapshot and restore everything or only config +
+databases; it checks free space first and restores in place. **Update** deploys the code from
+the checkout it runs from, gates on container health, and can roll back to the previous
+images and Caddyfile. Watch `df -h /srv`; audiobooks fill the disk fastest.
 
 ## Authelia notes
 Authelia gives login + TOTP/passkey 2FA + brute-force lockout in front of the public apps,
@@ -383,7 +444,7 @@ Peak resident memory per container during the full end-to-end run (laptop, arm64
 | shelfmark | 140–195 MiB |
 | portal (librarian) | ~70 MiB |
 | caddy | ~55 MiB |
-| qbittorrent / aria2 / AriaNg / Uptime Kuma (not in the run) | ~150 / 30 / 10 / 150 MiB typical |
+| qbittorrent (opt-in) / Uptime Kuma (not in the run) | ~150 / 150 MiB typical |
 
 Core stack ≈ 1.3–1.7 GB resident, plus calibre conversion spikes (a few hundred MB per
 `ebook-convert`), Audiobookshelf's first scan (up to 1–1.5 GB on a big library) and the OS.
