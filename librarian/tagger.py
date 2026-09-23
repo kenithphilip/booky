@@ -29,6 +29,50 @@ class TagError(Exception):
 MAX_ZIP_MEMBERS, MAX_ZIP_UNPACKED = 5000, 1024 * 1024 * 1024
 COPY_CHUNK = 1 << 20
 
+# zipfile.ZipFile() materialises a ZipInfo for EVERY member before anything can count them, so
+# a guard that reads infolist() runs too late: a 459 MB EPUB with 4.5 M entries needed more
+# than the container's 1 GiB and OOM-killed gunicorn, the queue loop, the dropbox watcher and
+# the IMAP poller together. The End-Of-Central-Directory record is a few hundred bytes at the
+# end of the file and states the entry count, so the refusal costs one seek.
+EOCD_SIG, ZIP64_LOCATOR_SIG, ZIP64_EOCD_SIG = b"PK\x05\x06", b"PK\x06\x07", b"PK\x06\x06"
+EOCD_TAIL = (1 << 16) + 22        # a zip comment is at most 64 KiB, the record itself 22 bytes
+
+def zip_entry_count(path):
+    """How many members a zip CLAIMS, from its EOCD record alone. None when there is no usable
+    record (a truncated or non-zip file: let zipfile report that in its own words)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - EOCD_TAIL))
+            tail = f.read()
+            at = tail.rfind(EOCD_SIG)
+            if at < 0 or len(tail) - at < 22:
+                return None
+            count = int.from_bytes(tail[at + 10:at + 12], "little")
+            if count != 0xFFFF:
+                return count
+            # ZIP64: the real count sits in the zip64 EOCD the locator points at
+            loc = tail.rfind(ZIP64_LOCATOR_SIG, 0, at)
+            if loc < 0 or len(tail) - loc < 20:
+                return None
+            off = int.from_bytes(tail[loc + 8:loc + 16], "little")
+            f.seek(off)
+            rec = f.read(56)
+            if not rec.startswith(ZIP64_EOCD_SIG) or len(rec) < 40:
+                return None
+            return int.from_bytes(rec[32:40], "little")
+    except OSError:
+        return None
+
+def precheck_zip(path, what="this file", max_members=MAX_ZIP_MEMBERS):
+    """Refuse an absurd archive BEFORE zipfile opens it. Returns the claimed entry count."""
+    n = zip_entry_count(path)
+    if n is not None and n > max_members:
+        raise TagError(f"{what} says it holds {n} files (limit {max_members}); "
+                       f"opening it would use more memory than the portal has")
+    return n
+
 def _check_zip_bomb(zin, what):
     infos = zin.infolist()
     if len(infos) > MAX_ZIP_MEMBERS:
@@ -71,6 +115,7 @@ def _foreign_owner(text, owner_tag):
 
 def add_owner_tag(epub_path, owner_tag):
     tmp = epub_path + ".tmp"
+    precheck_zip(epub_path, "this EPUB")     # before ZipFile parses the central directory
     try:
         zin = zipfile.ZipFile(epub_path, "r")
     except zipfile.BadZipFile as e:
@@ -197,6 +242,7 @@ CBI_KEY = "ComicBookInfo/1.0"
 def add_owner_tag_cbz(cbz_path, owner_tag, title=None):
     """Put the tag in a ComicBookInfo/1.0 block in the archive comment (merged if one exists)."""
     tmp = cbz_path + ".tmp"
+    precheck_zip(cbz_path, "this comic")
     try:
         zin = zipfile.ZipFile(cbz_path, "r")
     except zipfile.BadZipFile as e:

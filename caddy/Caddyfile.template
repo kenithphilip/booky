@@ -51,10 +51,19 @@
 	request_header -Remote-Name
 	# Client-supplied "my IP is" headers: apps and libraries (ABS's request-ip, Flask ProxyFix)
 	# would believe them. The public proxies set X-Forwarded-For / X-Real-IP to {client_ip}.
+	# The whole request-ip family is stripped, not just the four an app happens to read today:
+	# one app update is enough to turn a header we left alone into a live spoof.
+	# Safe for {client_ip}: trusted_proxies/client_ip_headers resolves CF-Connecting-IP in the
+	# HTTP server, before any handler runs, so removing the header here only affects upstreams.
 	request_header -X-Real-IP
 	request_header -X-Client-IP
 	request_header -True-Client-IP
 	request_header -Forwarded
+	request_header -CF-Connecting-IP
+	request_header -Fastly-Client-IP
+	request_header -X-Cluster-Client-IP
+	request_header -X-Forwarded
+	request_header -Forwarded-For
 	# Inside a route so it is answered before the (later) Authelia gate route
 	route /robots.txt {
 		respond <<ROBOTS
@@ -127,9 +136,13 @@
 # Slow down password guessing on login forms (Cloudflare adds its own layer on top).
 # Imported by books., request. and shelf.; audio. has its own, tighter pair of zones
 # (see the audio block) because Audiobookshelf has no account lockout.
+# A rate_limit zone name is GLOBAL to the Caddy process, so one hardcoded `zone login` gave the
+# three sites a single shared 15/min bucket: 8 wrong passwords on shelf. plus 7 on books. was a
+# 429 for the whole household. The importer passes its own name, so each site gets its own zone.
+#   import login_ratelimit books   ->   zone books_login
 (login_ratelimit) {
 	rate_limit {
-		zone login {
+		zone {args[0]}_login {
 			match {
 				method POST
 				path /login* /api/auth/*
@@ -149,7 +162,7 @@ books.@@DOMAIN@@ {
 	bind @@BIND_IP@@
 	import public_tls
 	import hardening
-	import login_ratelimit
+	import login_ratelimit books
 	# Device paths use HTTP Basic against CWA (no lockout of its own) and bypass the Authelia
 	# gate, so cap them per client: a password oracle at Cloudflare speed is not acceptable.
 	# OPDS apps fetch one cover per entry, so the ceiling is loose for a real reader.
@@ -183,6 +196,12 @@ books.@@DOMAIN@@ {
 	route {
 		@cwa_admin_jobs path /cwa-convert-library-overview /cwa-convert-library-start /cwa-convert-library /cwa-convert-library/* /convert-library-status /convert-library-cancel /cwa-epub-fixer-overview /cwa-epub-fixer-start /cwa-epub-fixer /cwa-epub-fixer/* /epub-fixer-status /epub-fixer-cancel /cwa-logs /cwa-logs/* /cwa-internal /cwa-internal/* /reconnect
 		respond @cwa_admin_jobs "Not available" 403
+		# The one shape the exact list above cannot express: an old-style ';' path parameter.
+		# /cwa-convert-library-start;x is a different string to `path` but the same endpoint to
+		# some routers. Werkzeug 404s it today, so this is defence in depth, not a live hole.
+		# `path` is case-insensitive; path_regexp is not, hence (?i).
+		@cwa_admin_jobs_params path_regexp cwa_admin_jobs_params (?i)^/(?:cwa-convert-library|convert-library-status|convert-library-cancel|cwa-epub-fixer|epub-fixer-status|epub-fixer-cancel|cwa-logs|cwa-internal|reconnect).*;
+		respond @cwa_admin_jobs_params "Not available" 403
 	}
 	# @AUTHELIA_GATE:books@
 	reverse_proxy 127.0.0.1:8083 {
@@ -239,7 +258,7 @@ request.@@DOMAIN@@ {
 	bind @@BIND_IP@@
 	import public_tls
 	import hardening
-	import login_ratelimit
+	import login_ratelimit request
 	# Bulk-download and automation abuse limits (per real client IP)
 	rate_limit {
 		zone portal_downloads {
@@ -273,7 +292,7 @@ shelf.@@DOMAIN@@ {
 	bind @@BIND_IP@@
 	import public_tls
 	import hardening
-	import login_ratelimit
+	import login_ratelimit shelf
 	# @AUTHELIA_GATE:shelf@
 	reverse_proxy 127.0.0.1:8084 {
 		header_up X-Forwarded-For {client_ip}

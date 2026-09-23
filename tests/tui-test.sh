@@ -466,7 +466,9 @@ expect '[ "$(grep -c "^logpath  = $STACK_DIR/caddy/data/access.log$" "$j")" = 3 
 af="$T/etc/fail2ban/filter.d/caddy-abs-login.conf"
 expect 'grep -q "^\[caddy-abs-login\]" "$j" && grep -A9 "^\[caddy-abs-login\]" "$j" | grep -q "^maxretry = 10$" && grep -A9 "^\[caddy-abs-login\]" "$j" | grep -q "^findtime = 10m$" && grep -A9 "^\[caddy-abs-login\]" "$j" | grep -q "^bantime  = 1h$"' "Audiobookshelf login jail: 10 failures in 10 min -> 1 h ban via cloudflare-token (J25)"
 expect '[ -f "$af" ] && ! grep -q "@@" "$af" && grep -q "audio\\\\.example\\\\.test" "$af" && grep -q "^datepattern = " "$af"' "its filter is rendered with the REGEX-ESCAPED domain (audio\\.example\\.test), no placeholders left (J25)"
-python3 - "$af" "$REPO/configs/fail2ban/caddy-auth.conf" <<'PY' && ok "caddy-abs-login matches only POST /login 401 on audio.<domain>, keyed on client_ip (J25)" || bad "caddy-abs-login filter regex"
+lf="$T/etc/fail2ban/filter.d/caddy-auth.conf"
+expect '[ -f "$lf" ] && ! grep -q "@@" "$lf" && grep -q "(?:request|shelf|auth)\\\\.example\\\\.test" "$lf"' "caddy-auth is rendered with the regex-escaped domain too, so it can be host-scoped (V/contract 3)"
+python3 - "$af" "$lf" <<'PY' && ok "caddy-abs-login matches only POST /login 401 on audio.<domain>, keyed on client_ip (J25)" || bad "caddy-abs-login filter regex"
 import re, sys
 def rx(path):
     conf = open(path).read()
@@ -487,13 +489,13 @@ assert not abs_.search(line("203.0.113.9", "POST", "request.example.test", "/log
 assert not abs_.search(line("203.0.113.9", "GET",  "books.example.test", "/opds", 401))         # reader challenge
 assert login.search(line("203.0.113.9", "POST", "request.example.test", "/login", 401))         # still the portal's jail
 PY
-python3 - "$REPO/configs/fail2ban/caddy-auth.conf" "$REPO/configs/fail2ban/caddy-device-auth.conf" <<'PY' && ok "caddy-auth counts login POSTs only; caddy-device-auth counts /opds + /kosync 401s, both by client_ip" || bad "fail2ban filter regexes"
+python3 - "$lf" "$REPO/configs/fail2ban/caddy-device-auth.conf" <<'PY' && ok "caddy-auth counts login POSTs only; caddy-device-auth counts /opds + /kosync 401s, both by client_ip" || bad "fail2ban filter regexes"
 import re, sys
 def rx(path):
     conf = open(path).read()
     return re.compile(re.search(r"failregex = (.*)", conf).group(1).replace("<HOST>", r"(?P<host>\S+?)"))
 login, dev = rx(sys.argv[1]), rx(sys.argv[2])
-line = lambda ip, cip, m, uri, st: '{"request":{"remote_ip":"%s","remote_port":"1","client_ip":"%s","proto":"HTTP/2.0","method":"%s","host":"request.x","uri":"%s","headers":{}},"status":%d}' % (ip, cip, m, uri, st)
+line = lambda ip, cip, m, uri, st, host="request.example.test": '{"request":{"remote_ip":"%s","remote_port":"1","client_ip":"%s","proto":"HTTP/2.0","method":"%s","host":"%s","uri":"%s","headers":{}},"status":%d}' % (ip, cip, m, host, uri, st)
 assert login.search(line("172.71.1.1", "203.0.113.9", "POST", "/login", 401)).group("host") == "203.0.113.9"      # the visitor, not Cloudflare
 assert login.search(line("172.71.1.1", "203.0.113.9", "POST", "/api/auth/login", 401))                          # Shelfmark
 assert login.search(line("172.71.1.1", "203.0.113.9", "POST", "/api/firstfactor", 401))                          # Authelia
@@ -501,6 +503,11 @@ assert not login.search(line("172.71.1.1", "203.0.113.9", "GET", "/opds", 401)) 
 assert not login.search(line("172.71.1.1", "203.0.113.9", "GET", "/login", 200))
 assert not login.search(line("172.71.1.1", "203.0.113.9", "POST", "/login", 302))                                # success
 assert not login.search(line("172.71.1.1", "203.0.113.9", "POST", "/request", 401))
+# host-scoped: Audiobookshelf's own /login belongs to the looser caddy-abs-login jail, or an ABS
+# app with a stale password trips the 2 h ban that locks the household out of all four sites
+assert not login.search(line("172.71.1.1", "203.0.113.9", "POST", "/login", 401, "audio.example.test"))
+assert login.search(line("172.71.1.1", "203.0.113.9", "POST", "/api/firstfactor", 401, "auth.example.test"))
+assert login.search(line("172.71.1.1", "203.0.113.9", "POST", "/api/auth/login", 401, "shelf.example.test"))
 assert dev.search(line("172.71.1.1", "203.0.113.9", "GET", "/opds", 401)).group("host") == "203.0.113.9"
 assert dev.search(line("172.71.1.1", "203.0.113.9", "GET", "/opds/new?page=2", 401))
 assert dev.search(line("172.71.1.1", "203.0.113.9", "GET", "/kosync/users/auth", 401))
@@ -591,6 +598,9 @@ cat > "$bin/restic" <<'EOS'
 echo "restic: $*" >> "$RLOG"
 while [ "${1:-}" = --retry-lock ]; do shift 2; done
 case "${1:-}" in
+  # `restic backup --help` is how both bookstack.sh and scripts/backup.sh probe for --retry-lock
+  # (restic 0.16+). RESTIC_NO_RETRY_LOCK=1 plays the Debian 12 restic 0.14 that lacks it.
+  backup) [ "${2:-}" = --help ] && { [ "${RESTIC_NO_RETRY_LOCK:-0}" = 1 ] || echo "      --retry-lock duration   retry to lock the repository"; exit 0; };;
   cat) [ "${RESTIC_NOREPO:-0}" = 1 ] && exit 1;;
   restore) [ "${2:-}" = --help ] && exit 0
     tgt=""; incs=(); shift 2
@@ -602,16 +612,25 @@ esac
 exit 0
 EOS
 chmod +x "$bin/restic"
+RX='restic: (--retry-lock 30m )?'   # restic_run probes for --retry-lock, so it is present or not
 reset "/mnt/backup" "resticpass-123" "resticpass-123" "https://hc-ping.example/uuid" "no"; step_backup && ok "step_backup" || bad "step_backup failed"
 renv="$T/etc/bookstack/restic.env"; u="$T/etc/systemd/system"
 expect 'grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv" && grep -q "^RESTIC_PASSWORD=resticpass-123$" "$renv" && [ "$(stat -c %a "$renv" 2>/dev/null || stat -f %Lp "$renv")" = 600 ]' "restic.env written 0600 with repo + password"
-expect 'grep -q "restic: cat config" "$RLOG" && ! grep -q "restic: init" "$RLOG" && [ "$(envget BACKUP_PING_URL)" = https://hc-ping.example/uuid ]' "existing repository opened (not re-initialised); optional ping URL stored (C1)"
+expect 'grep -qE "${RX}cat config" "$RLOG" && ! grep -qE "${RX}init" "$RLOG" && [ "$(envget BACKUP_PING_URL)" = https://hc-ping.example/uuid ]' "existing repository opened (not re-initialised); optional ping URL stored (C1)"
+expect 'grep -q -- "--retry-lock 30m cat config" "$RLOG" && [ ! -e "$renv.new" ]' "restic_run probes restic for --retry-lock and passes it when the binary has it; no candidate file left behind"
+: > "$RLOG"; RESTIC_NO_RETRY_LOCK=1 restic_run cat config
+expect 'grep -qx "restic: cat config" "$RLOG" && ! grep -q -- "--retry-lock" "$RLOG"' "restic 0.14 (Debian 12) has no --retry-lock: it is NOT passed, so the call does not die on 'unknown flag'"
 expect 'grep -q "^OnCalendar=\*-\*-\* 01:00:00" "$u/bookstack-backup.timer" && grep -q "^OnFailure=bookstack-alert@backup.service" "$u/bookstack-backup.service"' "backup at 01:00 with OnFailure alert"
 expect 'grep -q "^OnCalendar=\*-\*-01 13:00:00" "$u/bookstack-restore-test.timer" && grep -q "restore-test.sh" "$u/bookstack-restore-test.service" && grep -q "^OnFailure=bookstack-alert@restore-test.service" "$u/bookstack-restore-test.service"' "restore test on the 1st at 13:00 (never overlaps the 01:00 backup, F40) with OnFailure alert"
 expect 'grep -q "scripts/alert.sh" "$u/bookstack-alert@.service" && grep -q "%i" "$u/bookstack-alert@.service"' "templated bookstack-alert@.service"
 expect 'seen "systemctl: enable --now bookstack-backup.timer bookstack-restore-test.timer" && grep -F "msgbox" "$LOG" | grep -q "Keep these OFF this server" && grep -F msgbox "$LOG" | grep -q "NO alert channel"' "timers enabled; offsite-secrets checklist shown; missing alert channel called out"
-: > "$RLOG"; export RESTIC_NOREPO=1; reset "/mnt/backup" "resticpass-123" "resticpass-123" "" "no"; step_backup; export RESTIC_NOREPO=0
-expect 'grep -q "restic: init" "$RLOG"' "a new repository is initialised by the Backups step (only there, F67)"
+\# A01: a password that does not open the repository must NOT replace /etc/bookstack/restic.env
+cp "$renv" "$T/renv.good"; : > "$RLOG"; export RESTIC_NOREPO=1
+reset "/mnt/backup" "typo-password-9" "typo-password-9" "no"; step_backup; rc=$?; export RESTIC_NOREPO=0
+expect '[ $rc = 1 ] && cmp -s "$renv" "$T/renv.good" && [ ! -e "$renv.new" ] && ! grep -qE "${RX}init" "$RLOG" && grep -F msgbox "$LOG" | grep -q "still opens your existing backups"' "a wrong/rotated restic password leaves the existing key file untouched and refuses to init over it (A01)"
+expect 'grep -F "yesno: " "$LOG" | grep -q "key add"' "and the prompt says a restic password cannot be changed by typing a new one (it needs key add)"
+: > "$RLOG"; export RESTIC_NOREPO=1; reset "/mnt/backup" "resticpass-123" "resticpass-123" "yes" "" "no"; step_backup; export RESTIC_NOREPO=0
+expect 'grep -qE "${RX}init" "$RLOG" && grep -q "^RESTIC_PASSWORD=resticpass-123$" "$renv" && [ ! -e "$renv.new" ]' "a brand-new repository is initialised by the Backups step (only there, F67) and the key file is moved into place afterwards"
 reset "s3:s3.example/bucket" "resticpass-123" "resticpass-123" "<cancel>"; step_backup; expect '[ $? = 1 ] && grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv"' "Cancel at the S3 key prompt aborts without touching restic.env"
 # C1: alerts step
 printf '#!/usr/bin/env bash\necho "alert.sh $*" >> "%s"\n' "$LOG" > "$STACK_DIR/scripts/alert.sh"; chmod +x "$STACK_DIR/scripts/alert.sh"
@@ -620,11 +639,20 @@ expect '[ $rc = 0 ] && [ "$(envget NOTIFY_WEBHOOK)" = https://ntfy.sh/family-sec
 reset "" "no"; step_alerts; rc=$?; expect '[ $rc = 1 ] && [ "$(envget NOTIFY_WEBHOOK)" = https://ntfy.sh/family-secret-topic ]' "blank keeps the webhook; unconfirmed delivery returns 1"
 reset "ftp://nope"; step_alerts; expect '[ $? = 1 ] && [ "$(envget NOTIFY_WEBHOOK)" = https://ntfy.sh/family-secret-topic ]' "non-http URL refused"
 expect 'declare -f menu_install | grep -q step_alerts && declare -f menu_ops | grep -q step_alerts' "Alerts in the Install and Operations menus"
+# A14: Lock SSH needs the same tailnet-address guard Quick install applies, or it closes port 22
+# pointing at the 127.0.0.1 placeholder and only the provider's serial console gets back in.
+tsbak2=$(envget TAILSCALE_IP); envset TAILSCALE_IP 127.0.0.1; IP_ADDRS="10.0.0.5"
+reset "yes" "yes"; step_lock_ssh; rc=$?
+expect '[ $rc = 1 ] && ! seen "ufw: --force delete" && [ "$(envget SSH_LOCKED)" != true ] && grep -F msgbox "$LOG" | grep -q "placeholder Configure writes"' "TAILSCALE_IP is still the 127.0.0.1 placeholder: SSH stays public, nothing asked (A14)"
+envset TAILSCALE_IP 100.64.7.7; IP_ADDRS="10.0.0.5"
+reset "yes" "yes"; step_lock_ssh; rc=$?
+expect '[ $rc = 1 ] && ! seen "ufw: --force delete" && [ "$(envget SSH_LOCKED)" != true ] && grep -F msgbox "$LOG" | grep -q "not an address on this host"' "a stale tailnet address (Tailscale re-auth) also refuses to close port 22 (A14)"
+envset TAILSCALE_IP "$tsbak2"; IP_ADDRS="$(envget TAILSCALE_IP)"
 TS_EXPIRY='"2027-03-01T00:00:00Z"'; reset "yes" "no"; step_lock_ssh; rc=$?; expect '[ $rc = 1 ] && ! seen "ufw: --force delete" && grep -F "msgbox" "$LOG" | grep -q "Disable key expiry"' "key expiry set + 'not done' -> SSH stays public, told what to do"
 envset SSH_LOCKED false
 reset "yes" "yes"; step_lock_ssh; expect 'seen "ufw: --force delete allow 22/tcp" && [ "$(envget SSH_LOCKED)" = true ]' "confirmed -> port 22 closed and SSH_LOCKED recorded (F12)"; TS_EXPIRY=null
 reset "yes"; step_lock_ssh; expect 'seen "ufw: --force delete allow 22/tcp" && ! grep -q "yesno: IMPORTANT" "$LOG"' "KeyExpiry null -> no extra prompt"
-envset SSH_LOCKED false
+envset SSH_LOCKED false; IP_ADDRS=""
 reset; step_tailscale >/dev/null; expect 'grep -F "msgbox" "$LOG" | grep -q "Disable key expiry" && grep -q "advertise-tags=tag:bookstack" "$LOG" && [ "$(envget TAILSCALE_IP)" = 100.64.0.1 ]' "Tailscale step: key expiry warning + tag:bookstack ACL advice; IP stored"
 TS_EXPIRY='"2027-03-01T00:00:00Z"'; reset "no"; step_tailscale >/dev/null; rc=$?; TS_EXPIRY=null
 expect '[ $rc = 0 ] && seen "yesno: Key expiry is still ENABLED"' "Tailscale step checks KeyExpiry and asks the admin to disable it (C3)"
@@ -644,19 +672,19 @@ fail2ban-client(){ :; }       # "installed": restore must restart fail2ban AFTER
 envset PUBLIC_IP 203.0.113.5; envset TAILSCALE_IP 100.64.0.1; envset TZ UTC; envset ABS_TOKEN old-token
 echo "live" > "$STACK_DIR/cwa/config/app.db-wal"; echo "book" > "$T/fakesnap$STACK_DIR/library/books/big.epub"
 : > "$RLOG"; reset "abc12345" "full" "yes" "yes"; step_restore && ok "step_restore ran" || bad "step_restore failed"
-expect 'grep -q "restic: snapshots --json" "$RLOG" && grep -F "whiptail: " "$LOG" | grep -q "Restore: pick a snapshot" && grep -q "restic: stats abc12345 --mode restore-size --json" "$RLOG"' "snapshot picker (restic snapshots --json) and a restore-size check before anything stops (F01/F16)"
-expect 'grep -qx "restic: restore abc12345 --target / --include $STACK_DIR" "$RLOG" && seen "docker: compose down" && [ -f "$STACK_DIR/library/books/big.epub" ] && ! ls -d "$(dirname "$STACK_DIR")"/.bs-restore.* >/dev/null 2>&1' "restores the picked snapshot IN PLACE (target /), no temporary copy of the library (F01)"
+expect 'grep -qE "${RX}snapshots --json" "$RLOG" && grep -F "whiptail: " "$LOG" | grep -q "Restore: pick a snapshot" && grep -qE "${RX}stats abc12345 --mode restore-size --json" "$RLOG"' "snapshot picker (restic snapshots --json) and a restore-size check before anything stops (F01/F16)"
+expect 'grep -qxE "${RX}restore abc12345 --target / --include $STACK_DIR" "$RLOG" && seen "docker: compose down" && [ -f "$STACK_DIR/library/books/big.epub" ] && ! ls -d "$(dirname "$STACK_DIR")"/.bs-restore.* >/dev/null 2>&1' "restores the picked snapshot IN PLACE (target /), no temporary copy of the library (F01)"
 expect '[ "$(envget ABS_TOKEN)" = from-snapshot ] && [ "$(envget PUBLIC_IP)" = 203.0.113.5 ] && [ "$(envget TAILSCALE_IP)" = 100.64.0.1 ] && [ "$(envget TZ)" = UTC ]' "snapshot .env restored, but this server's PUBLIC_IP / TAILSCALE_IP / TZ kept"
 expect '[ "$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"select count(*) from user\").fetchone()[0])" "$STACK_DIR/cwa/config/app.db")" = 1 ] && [ ! -f "$STACK_DIR/cwa/config/app.db-wal" ]' "consistent DB copy replaced the raw file per MANIFEST; stale -wal removed"
 expect 'seen "docker: compose up -d" && [ "$(line_of "compose down")" -lt "$(line_of "compose up -d")" ] && [ -f "$T/etc/cron.d/bookstack-disk" ] && grep -F "msgbox" "$LOG" | grep -q "Keep these OFF this server"' "stack restarted, watchdog re-installed, checklist shown"
 expect 'seen "systemctl: restart fail2ban" && [ "$(line_of "compose up -d")" -lt "$(line_of "systemctl: restart fail2ban")" ] && [ -f "$STACK_DIR/caddy/data/access.log" ]' "fail2ban restarted after the stack is up, with its log file present (F15)"
 : > "$RLOG"; reset "abc12345" "config" "yes" "yes"; step_restore >/dev/null
-expect 'grep "restic: restore abc12345 --target /" "$RLOG" | grep -q -- "--include $STACK_DIR/.env --include $STACK_DIR/.backup-snap" && ! grep -qE -- "--include $STACK_DIR( |$)" "$RLOG" && ! grep -q "restic: stats" "$RLOG"' "'config + databases only' restores .env, DB copies and app configs, not the library (F16)"
+expect 'grep -E "${RX}restore abc12345 --target /" "$RLOG" | grep -q -- "--include $STACK_DIR/.env --include $STACK_DIR/.backup-snap" && ! grep -qE -- "--include $STACK_DIR( |$)" "$RLOG" && ! grep -qE "${RX}stats" "$RLOG"' "'config + databases only' restores .env, DB copies and app configs, not the library (F16)"
 : > "$RLOG"; export RESTIC_STATS_SIZE=999999999999999; reset "abc12345" "full"; step_restore; rc=$?; unset RESTIC_STATS_SIZE
-expect '[ $rc = 1 ] && ! grep -q "restic: restore" "$RLOG" && ! seen "compose down" && grep -F msgbox "$LOG" | grep -q "Not enough disk space"' "snapshot larger than the free space: refused before the stack is stopped (F01)"
+expect '[ $rc = 1 ] && ! grep -q "restore abc12345" "$RLOG" && ! seen "compose down" && grep -F msgbox "$LOG" | grep -q "Not enough disk space"' "snapshot larger than the free space: refused before the stack is stopped (F01)"
 reset "abc12345" "full" "yes" "no"; : > "$RLOG"
 step_restore; rc=$?
-expect '[ "$rc" != 0 ] && ! grep -q "restic: restore" "$RLOG" && ! seen "compose down"' "second confirmation declined -> nothing restored, stack not stopped"
+expect '[ "$rc" != 0 ] && ! grep -q "restore abc12345" "$RLOG" && ! seen "compose down"' "second confirmation declined -> nothing restored, stack not stopped"
 reset "<cancel>"; step_restore; expect '[ $? != 0 ] && ! seen "compose down"' "Cancel in the snapshot picker changes nothing"
 unset -f fail2ban-client
 
@@ -758,7 +786,7 @@ expect 'grep -q "docker: compose stop shelfmark" "$DLOG" && ! grep -q "aria2" "$
 expect '[ ! -f "$fs/downloads/incomplete/old.part" ] && [ ! -f "$fs/library/staging/old.bin" ] && [ ! -f "$fs/library/ingest/old.part" ] && [ -f "$fs/downloads/incomplete/new.part" ] && [ -f "$fs/library/ingest/stuck.epub" ]' "stale partials/staging deleted; fresh files and real ingest files kept"
 expect 'grep -q "journalctl: --vacuum-size=200M" "$DLOG" && grep -q "docker: builder prune -f --filter until=168h" "$DLOG"' "journal and build cache trimmed"
 : > "$DLOG"; dw 96; expect '! grep -q "notify alert" "$DLOG"' "still 96 %: no repeated alert"
-: > "$DLOG"; dw 50; expect 'grep -q "docker: compose start shelfmark" "$DLOG" && ! grep -q qbittorrent "$DLOG" && grep -q "^paused=0" "$T/disk.state"' "back under 80 %: shelfmark started again; qBittorrent left alone while torrents are off"
+: > "$DLOG"; dw 50; expect 'grep -q "docker: compose up -d shelfmark" "$DLOG" && ! grep -q qbittorrent "$DLOG" && grep -q "^paused=0" "$T/disk.state"' "back under 80 %: shelfmark recreated with up -d (start cannot revive a removed container); qBittorrent left alone while torrents are off"
 printf "TORRENTS_ENABLED='true'\n" > "$fs/.env"
 : > "$DLOG"; QBIT_RUNNING=1 dw 97; expect 'grep -q "docker: compose --profile torrents stop qbittorrent" "$DLOG" && grep -q "qbittorrent" "$DLOG"' "96 %+ with torrents running: qBittorrent container stopped (F32)"
 : > "$DLOG"; dw 40; expect 'grep -q "docker: compose --profile torrents up -d qbittorrent" "$DLOG"' "below 80 % with torrents enabled: qBittorrent started again"

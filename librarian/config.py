@@ -46,6 +46,11 @@ MAX_AUDIO_MB  = int(os.environ.get("MAX_AUDIO_MB", "2048"))   # ... (LibriVox zi
 # pypdf holds a whole PDF (and its clone) in memory while it embeds the owner tag; a 262 MB
 # scan needed more than 384 MB. PDFs above this are parked instead of OOM-killing the portal.
 MAX_PDF_MB    = int(os.environ.get("MAX_PDF_MB", "250"))
+# Mail is NOT an upload: email.message_from_bytes + get_payload(decode=True) costs roughly a
+# dozen times the attachment in RSS, and the portal runs under mem_limit 1g. A 94 MB
+# attachment that passed MAX_UPLOAD_MB SIGKILLed the container (and BODY.PEEK left the message
+# unseen, so it came back every 60 s). Keep this well under MAX_UPLOAD_MB.
+MAX_MAIL_MB   = int(os.environ.get("MAX_MAIL_MB", "40"))
 GUTENBERG_MIRROR = os.environ.get("GUTENBERG_MIRROR", "")     # e.g. a local/rsynced Gutenberg mirror base URL
 EBOOK_EXTS = ("epub", "mobi", "azw3", "pdf", "cbz", "cbr", "txt", "fb2")
 AUDIO_EXTS = ("mp3", "m4b", "m4a", "flac", "ogg", "opus", "aac", "wav", "zip")
@@ -119,6 +124,7 @@ ADMIN_EMAIL     = os.environ.get("ADMIN_EMAIL", "")
 KOSYNC_ENABLED  = _bool("KOSYNC_ENABLED", False)  # set by the TUI when CWA's KOReader sync is on
 AUTHELIA_ENABLED = _bool("AUTHELIA_ENABLED", False)  # users are then managed in the TUI only (Authelia has its own user file)
 TORRENTS_ENABLED = _bool("TORRENTS_ENABLED", False)  # qBittorrent is an opt-in compose profile
+EPHEMERA_ENABLED = _bool("EPHEMERA_ENABLED", False)  # ditto; its vhost only exists when it is on
 
 # --- Site URLs (for device links, the admin dashboard and Kobo sync URLs) --------------
 DOMAIN      = os.environ.get("DOMAIN", "")
@@ -135,7 +141,9 @@ def admin_links():
         ("qBittorrent",              f"https://dl.{d}" if d and TORRENTS_ENABLED else "", "tailscale"),
         ("Uptime Kuma",              f"https://monitor.{d}"  if d else "",   "tailscale"),
         ("Authelia",                 f"https://auth.{d}" if d and AUTHELIA_ENABLED else "", "public"),
-        ("Ephemera (if enabled)",    f"https://ephemera.{d}" if d else "",   "tailscale"),
+        # only when it is switched on: render_caddyfile drops the vhost and step_cloudflare
+        # creates no DNS record otherwise, so the link resolved to nothing on a default install
+        ("Ephemera",                 f"https://ephemera.{d}" if d and EPHEMERA_ENABLED else "", "tailscale"),
     ]
     return [link for link in links if link[1]]
 

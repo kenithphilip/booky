@@ -22,7 +22,14 @@ echo "== Containers"
 core="caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma"; [ "$TORRENTS" = true ] && core="$core qbittorrent"
 for c in $core; do
   st=$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null | tr -d '\n'); st="${st:-missing}"
-  case "$st" in running\ healthy|running\ |running) ok "$c: $st";; *) bad "$c: $st";; esac
+  # "running starting" = inside the image's healthcheck start period (CWA 120 s, ABS 60 s,
+  # librarian/shelfmark 30 s). Self-test is most often run in the first two minutes after a
+  # Deploy, Update or reboot, and calling that a FAIL trains the admin to ignore the result.
+  case "$st" in
+    running\ healthy|running\ |running) ok "$c: $st";;
+    running\ starting) warn "$c: still inside its healthcheck start period — re-run Self-test in a minute";;
+    *) bad "$c: $st";;
+  esac
 done
 for c in authelia ephemera flaresolverr; do
   st=$(docker inspect -f '{{.State.Status}}' "$c" 2>/dev/null || true); [ -n "$st" ] && { [ "$st" = running ] && ok "$c: running (optional)" || warn "$c: $st (optional)"; }
@@ -35,6 +42,12 @@ if [ "$(envget EPHEMERA_ENABLED)" = true ]; then tot=$(awk '/MemTotal/{print $2}
 echo "== Local endpoints"
 curl -fs -m 5 http://127.0.0.1:8090/healthz >/dev/null && ok "portal /healthz" || bad "portal /healthz"
 curl -fs -m 5 http://127.0.0.1:8084/api/health >/dev/null && ok "shelfmark /api/health" || bad "shelfmark /api/health"
+# Shelfmark silently falls back to auth mode "none" (no login at all, everyone admin) when CWA's
+# app.db is missing or unreadable, and it re-resolves the mode per request. Its healthcheck
+# asserts this too, but nothing depends_on Shelfmark, so an unhealthy container just sits there.
+curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null | grep -q '"auth_mode": *"cwa"' \
+  && ok "shelfmark authenticates against Calibre-Web (auth_mode: cwa)" \
+  || bad "shelfmark is NOT in auth_mode 'cwa': it is open to everyone (check ./cwa/config/app.db is readable, then Operations -> Restart shelfmark)"
 curl -fs -m 5 -o /dev/null http://127.0.0.1:8083/login && ok "calibre-web /login" || bad "calibre-web /login"
 curl -fs -m 5 -o /dev/null http://127.0.0.1:13378/healthcheck && ok "audiobookshelf /healthcheck" || bad "audiobookshelf /healthcheck"
 
@@ -101,6 +114,15 @@ if command -v fail2ban-client >/dev/null; then
   fail2ban-client status caddy-device-auth >/dev/null 2>&1 && ok "fail2ban caddy-device-auth jail active" || warn "caddy-device-auth jail not active (Security -> fail2ban)"
   # Audiobookshelf has no login lockout of its own; this jail is it (J25).
   fail2ban-client status caddy-abs-login >/dev/null 2>&1 && ok "fail2ban caddy-abs-login jail active (Audiobookshelf login lockout)" || warn "caddy-abs-login jail not active: Audiobookshelf /login has no lockout (Security -> fail2ban)"
+  # Both Caddy filters are host-scoped templates. An unrendered @@DOMAIN@@ matches nothing, so
+  # the jail is "active" and counts zero failures — worse than no jail, because it looks fine.
+  for f in /etc/fail2ban/filter.d/caddy-auth.conf /etc/fail2ban/filter.d/caddy-abs-login.conf; do
+    [ -f "$f" ] || continue
+    b=$(basename "$f")
+    if grep -q '@@DOMAIN@@' "$f"; then bad "$b still carries the @@DOMAIN@@ placeholder: the jail matches nothing (Security -> fail2ban to re-render)"
+    elif [ -n "$D" ] && ! grep -qF "$(printf '%s' "$D" | sed 's/\./\\./g')" "$f"; then bad "$b is scoped to a different domain than $D (Security -> fail2ban to re-render)"
+    else ok "$b is rendered${D:+ for $D}"; fi
+  done
 fi
 # the factory admin/admin123 must be dead (CWA's login needs the CSRF token of a session)
 cj=$(mktemp); tok=$(curl -s -m 5 -c "$cj" http://127.0.0.1:8083/login 2>/dev/null | grep -oE 'name="csrf_token"[^>]*value="[^"]+"' | grep -oE 'value="[^"]+"' | cut -d'"' -f2)
@@ -147,6 +169,30 @@ if [ -n "$D" ]; then
     c=$(code "https://$h.$D/")
     case "$c" in 200|302|301|401) ok "https://$h.$D -> $c";; *) bad "https://$h.$D -> $c";; esac
   done
+  # Caddy fetches Cloudflare's published ranges at start (trusted_proxies cloudflare). If that
+  # fetch fails it starts ANYWAY with an empty trust list and silently falls back to the socket
+  # peer — which behind Cloudflare is an EDGE address. Then the whole family shares one
+  # rate-limit bucket and every fail2ban jail would ban Cloudflare itself. Nothing warned.
+  # The four requests just made came through Cloudflare, so the access log must now hold a line
+  # whose client_ip differs from remote_ip. If it never does, the list did not load.
+  alog="$STACK_DIR/caddy/data/access.log"
+  if [ -s "$alog" ]; then
+    if tail -500 "$alog" 2>/dev/null | python3 -c '
+import sys, json
+for line in sys.stdin:
+    try: r = json.loads(line).get("request") or {}
+    except Exception: continue
+    ci, ri = r.get("client_ip"), r.get("remote_ip")
+    if ci and ri and ci != ri: sys.exit(0)
+sys.exit(1)' 2>/dev/null; then ok "Caddy resolves the real client IP behind Cloudflare (client_ip != remote_ip in the access log)"
+    else bad "Caddy is logging the Cloudflare EDGE address as the client: its Cloudflare IP list never loaded (no egress at start?). Rate limits are shared by everyone and a fail2ban ban would hit Cloudflare — restart caddy with working egress: docker compose restart caddy"; fi
+  else warn "no Caddy access log yet; real-client-IP trust not verified"; fi
+  # CWA ships convert-library / epub-fixer / cwa-logs / cwa-internal / reconnect with no auth at
+  # all. The 403 is in the production Caddyfile only — assert it on the real edge, anonymously.
+  for u in /cwa-convert-library-overview /cwa-internal/reconnect-db '/cwa-convert-library-start;x'; do
+    c=$(code "https://books.$D$u")
+    [ "$c" = 403 ] && ok "books.$D$u -> 403 (CWA admin job blocked at the edge)" || bad "books.$D$u -> $c (must be 403: Calibre-Web serves it unauthenticated)"
+  done
   c=$(code -k "https://$(envget PUBLIC_IP)/" -H "Host: books.$D")
   [ "$c" = 000 ] && ok "origin refuses direct (non-Cloudflare) connections" || bad "origin answered a direct connection ($c) — mTLS/firewall not enforcing"
   cc=$(curl -sI -m 12 "https://books.$D/login" 2>/dev/null | grep -i '^cf-cache-status:' | awk '{print toupper($2)}' | tr -d '\r')
@@ -182,15 +228,29 @@ pb=$(du -sm "$STACK_DIR/cwa/config/processed_books" 2>/dev/null | cut -f1); [ "$
 if systemctl is-enabled bookstack-backup.timer >/dev/null 2>&1; then
   ok "backup timer enabled ($(systemctl show bookstack-backup.timer -p NextElapseUSecRealtime --value))"
   systemctl is-enabled bookstack-restore-test.timer >/dev/null 2>&1 && ok "monthly restore-test timer enabled" || warn "restore-test timer missing (re-run Install -> Backups)"
-  if [ -f /etc/bookstack/restic.env ] && command -v restic >/dev/null; then
-    age=$( (set -a; . /etc/bookstack/restic.env; set +a; restic snapshots --latest 1 --json 2>/dev/null) | python3 -c '
+else warn "backups not scheduled (Install → Backups)"; fi
+# An enabled timer proves nothing: scripts/backup.sh passing a flag this restic does not have
+# (--retry-lock on Debian 12's 0.14) failed EVERY scheduled run while the install, the timer and
+# this test all looked green. What matters is whether a backup actually succeeded, and recently.
+# These checks run whether or not the timer is enabled, so a repository with no timer is caught.
+if [ -f /etc/bookstack/restic.env ] && command -v restic >/dev/null; then
+  age=$( (set -a; . /etc/bookstack/restic.env; set +a; restic snapshots --latest 1 --json 2>/dev/null) | python3 -c '
 import sys, json, re, datetime
 s = re.sub(r"\.\d+", "", json.load(sys.stdin)[-1]["time"]).replace("Z", "+00:00")
 print(int((datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(s)).total_seconds() // 3600))' 2>/dev/null)
-    if [ -z "$age" ]; then bad "no restic snapshot found (or repository unreachable)"; elif [ "$age" -le 36 ]; then ok "latest backup snapshot ${age} h old"; else bad "latest backup snapshot ${age} h old (> 36 h)"; fi
-  fi
-else warn "backups not scheduled (Install → Backups)"; fi
+  if [ -z "$age" ]; then bad "NO restic snapshot exists (or the repository is unreachable): nothing has ever been backed up successfully — run scripts/backup.sh by hand and read the error"
+  elif [ "$age" -le 36 ]; then ok "latest backup snapshot ${age} h old"
+  else bad "latest backup snapshot ${age} h old (> 36 h): the scheduled backup is failing — journalctl -u bookstack-backup -n 50"; fi
+  # ExecMainStatus is 0 for a unit that has never run, so only trust it once there is a start
+  # timestamp to go with it.
+  bts=$(systemctl show bookstack-backup.service -p ExecMainStartTimestamp --value 2>/dev/null)
+  if systemctl is-failed bookstack-backup.service >/dev/null 2>&1; then bad "the last bookstack-backup run FAILED (journalctl -u bookstack-backup -n 50)"
+  elif [ -n "$bts" ] && [ "$(systemctl show bookstack-backup.service -p ExecMainStatus --value 2>/dev/null)" = 0 ]; then ok "the last bookstack-backup run exited 0 ($bts)"
+  elif [ -z "$bts" ]; then warn "bookstack-backup has never run yet (the timer fires at 01:00; Install -> Backups can run one now)"; fi
+  if systemctl is-failed bookstack-restore-test.service >/dev/null 2>&1; then bad "the last restore test FAILED: the backup may not be restorable (journalctl -u bookstack-restore-test -n 50)"; fi
+elif [ -f /etc/bookstack/restic.env ]; then bad "restic.env exists but restic is not installed: no backup can run (apt-get install restic)"; fi
 [ -f /etc/cron.d/bookstack-disk ] && ok "disk watchdog installed" || warn "disk watchdog not installed (re-run Deploy)"
+[ -e "$STACK_DIR/library/staging/.disk-paused" ] && warn "the disk watchdog has PAUSED the downloaders AND the portal's own imports (library/staging/.disk-paused); it clears itself below DISK_RESUME_PCT"
 if [ -f /etc/cron.d/bookstack-disk ] || [ -f /etc/cron.d/bookstack-cfips ]; then
   systemctl is-active cron >/dev/null 2>&1 && ok "cron daemon running (disk watchdog, Cloudflare IP refresh)" || bad "cron is not running: the disk watchdog and the Cloudflare IP refresh never run (apt-get install cron; systemctl enable --now cron)"
 fi

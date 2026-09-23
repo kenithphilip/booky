@@ -399,7 +399,10 @@ BOOKS = {"Host": "books.example.test"}
 blocked = ["/cwa-convert-library-overview", "/cwa-convert-library-start", "/convert-library-status",
            "/cwa-epub-fixer-overview", "/cwa-epub-fixer-start", "/epub-fixer-status",
            "/cwa-logs/read/x", "/cwa-logs/download/x", "/reconnect",
-           "/cwa-convert-library-overview?x=1", "/CWA-Convert-Library-Overview", "//cwa-logs/read/x"]
+           "/cwa-convert-library-overview?x=1", "/CWA-Convert-Library-Overview", "//cwa-logs/read/x",
+           # ';'-parameter shape: a different string to Caddy's `path` matcher, same endpoint to
+           # some routers (Werkzeug 404s it today, so this is the last variant, not a live hole)
+           "/cwa-convert-library-start;x", "/cwa-logs/read/x;y"]
 codes = {u: g.get(GATE + u, headers=BOOKS)[0] for u in blocked}
 check(all(c == 403 for c in codes.values()), "CWA's unauthenticated admin-job endpoints are 403 at the edge (anonymous, no gate needed)", str(codes))
 st, h, b = g.post(GATE + "/cwa-internal/reconnect-db", json_body={}, headers=BOOKS)
@@ -408,7 +411,19 @@ st, h, b = g.get(GATE + "/login", headers=BOOKS)
 check(st != 403, "...while Calibre-Web's own login page is not caught by the block (the Authelia gate still applies)", str(st))
 st, h, b = g.get(GATE + "/opds", headers={**BOOKS, **basic("alice", ALICE_PW)})
 check(st == 200, "...and OPDS is not caught by the block", str(st))
+# The Caddy matcher and the Authelia rule must agree: Authelia's '^/opds.*$' bypassed /opdsfoo,
+# so Caddy's anchored matcher bought nothing — the LOOSER list is the one that decides.
+st, h, b = g.get(GATE + "/opdsfoo", headers={**BOOKS, **BROWSER})
+check(st == 302 and "auth.example.test" in h.get("Location", ""), "/opdsfoo is NOT bypassed (Caddy's and Authelia's bypass lists agree)", f"status {st} loc {h.get('Location','')[:80]}")
 st, h, b = g.get(GATE + "/ping", headers={"Host": "audio.example.test"}); check(st == 200, "Audiobookshelf /ping bypasses the gate (mobile apps keep working)", str(st))
+# POST /init is how the FIRST root user is created; with the gate on there is no Authelia
+# account that could get past it either, so gating it locked the admin out of the setup screen.
+st, h, b = g.post(GATE + "/init", json_body={}, headers={"Host": "audio.example.test"})
+check(st not in (302, 401), "Audiobookshelf POST /init bypasses the gate (first-run root creation)", str(st))
+# A Socket.IO client may ask for the bare /socket.io (no trailing slash); Caddy emitted a
+# prefix-only matcher for it while Authelia allowed both.
+st, h, b = g.get(GATE + "/socket.io?EIO=4&transport=polling", headers={"Host": "audio.example.test"})
+check(st not in (302, 401), "bare /socket.io (no trailing slash) bypasses the gate", str(st))
 st, h, b = g.post(GATE + "/login", json_body={"username": "alice", "password": ALICE_PW}, headers={"Host": "audio.example.test"}); check(st in (200, 401), "Audiobookshelf's own /login is reachable through the gate", str(st))
 st, h, b = g.get(GATE + "/", headers={"Host": "audio.example.test", **BROWSER}); check(st == 302 and "auth.example.test" in h.get("Location", ""), "Audiobookshelf web UI is still gated for browsers", str(st))
 st, h, b = g.get(GATE + "/healthz", headers={"Host": "request.example.test"}); check(st in (302, 401), "/healthz is gated at the edge (health checks use loopback)", str(st))
@@ -474,6 +489,9 @@ r = subprocess.run(["docker", "exec", "-i", "librarian", "python", "-c", "import
 hj = jload(r.stdout) or {}
 check(hj.get("ok") is True and all(v is not None and v < 120 for v in (hj.get("heartbeats") or {}).values()), "inside the box /healthz reports JSON with fresh heartbeats", r.stdout[:200])
 check(bool(hj.get("version")) and "cwa" in hj, "/healthz detail reports the portal build version and whether Calibre-Web answers", json.dumps({k: hj.get(k) for k in ("version", "cwa")})[:160])
+# The VALUE, not just the key: with CWA_URL unset the probe reported the library down for every
+# run and the whole suite still went green, so the admin dashboard's headline line was untested.
+check(hj.get("cwa") == "ok", "the Calibre-Web liveness probe reports 'ok' against a live CWA", repr(hj.get("cwa")))
 st, h, b = Session().get(ABS + "/healthcheck"); check(st == 200, "audiobookshelf /healthcheck", str(st))
 
 print(f"\nE2E RESULT: {fails} failed")

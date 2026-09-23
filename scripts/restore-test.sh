@@ -9,7 +9,9 @@ STACK_DIR="${STACK_DIR:-/srv/bookstack}"
 # Next to the stack, on the same disk: /tmp is a small RAM-backed tmpfs on Debian 13.
 tmp="$(mktemp -d "$(dirname "$STACK_DIR")/.bs-restore-test.XXXXXX")"; trap 'rm -rf "$tmp"' EXIT
 fail=0
-R=(--retry-lock 30m)   # the nightly backup may hold the repository lock
+# --retry-lock (the nightly backup may hold the repository lock) needs restic >= 0.16; Debian 12
+# ships 0.14, which fails every call with "unknown flag". Probe, exactly as scripts/backup.sh does.
+R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
 ok(){ echo "  [ OK ] $1"; }
 bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }
 

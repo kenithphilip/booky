@@ -125,6 +125,48 @@ def clear_login_failures(user, ip):
     with _lock, _conn() as c:
         c.execute("DELETE FROM login_attempts WHERE key=?", (f"{(user or '').lower()}|{ip}",))
 
+def locked_keys(now=None):
+    """Every live lock, split into user locks ('<user>|<ip>') and bare-IP ones. The admin
+    console had no way to see who was stuck or for how long (the lock only ever showed up as a
+    'login_locked' row in the audit trail)."""
+    now = now or time.time()
+    users, ips = [], []
+    with _conn() as c:
+        rows = c.execute("SELECT key, locked_until FROM login_attempts WHERE locked_until > ? "
+                         "ORDER BY locked_until DESC", (now,)).fetchall()
+    for r in rows:
+        key, until = r["key"], float(r["locked_until"])
+        entry = {"until": int(until), "seconds": int(until - now)}
+        if "|" in key:
+            u, _, ip = key.partition("|")
+            users.append({"user": u, "ip": ip, **entry})
+        else:
+            ips.append({"ip": key, **entry})
+    return users, ips
+
+def clear_login_failures_for(user=None, ip=None, everything=False):
+    """Release a lockout from the admin console. A user name clears that user from EVERY
+    address; an address clears the bare-IP row and every user locked from it (a family behind
+    one NAT shares the address, so the bare-IP lock takes the whole household down)."""
+    with _lock, _conn() as c:
+        if everything:
+            return c.execute("DELETE FROM login_attempts").rowcount
+        # matched in Python, not with LIKE: '_' and '%' are legal in a user name and are LIKE
+        # wildcards, so 'a_b' would also release 'axb'
+        if user:
+            want = user.lower()
+            keys = [k for (k,) in c.execute("SELECT key FROM login_attempts")
+                    if k == want or k.startswith(want + "|")]
+        elif ip:
+            keys = [k for (k,) in c.execute("SELECT key FROM login_attempts")
+                    if k == ip or k.endswith("|" + ip)]
+        else:
+            return 0
+        n = 0
+        for k in keys:
+            n += c.execute("DELETE FROM login_attempts WHERE key=?", (k,)).rowcount
+        return n
+
 # ---- audit trail ------------------------------------------------------------------------------
 def audit(event, user=None, ip=None, detail=None):
     with _lock, _conn() as c:
@@ -210,6 +252,14 @@ def set_status(rid, status, detail=None):
     with _lock, _conn() as c:
         c.execute("UPDATE requests SET status=?, detail=COALESCE(?,detail), updated=? WHERE id=?",
                   (status, detail, time.time(), rid))
+
+def set_status_if(rid, expect, status, detail=None):
+    """Move a row only while it is still in `expect`, and say whether this call is the one that
+    did it. Approve/deny were check-then-act, so two admins clicking at once both notified the
+    requester (and Approve racing Deny sent 'denied' and 'in your library' for one book)."""
+    with _lock, _conn() as c:
+        return c.execute("UPDATE requests SET status=?, detail=COALESCE(?,detail), updated=? "
+                         "WHERE id=? AND status=?", (status, detail, time.time(), rid, expect)).rowcount
 
 def requeue(rid, detail):
     """Put a failed request back in the queue (admin retry); the restart counter starts over."""
@@ -320,6 +370,42 @@ def rows_by_status(statuses, limit=500):
     with _conn() as c:
         return [dict(r) for r in c.execute(
             f"SELECT * FROM requests WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?", (*statuses, limit))]
+
+def list_requests(status=None, limit=50, offset=0):
+    """A page of the queue for the admin console, oldest-first within the newest-first order.
+    Deliberately NOT capped at 200 the way list_for() is: an approval or a failure older than
+    the newest 200 rows was unreachable from every console."""
+    limit = max(1, min(int(limit or 50), 500))
+    offset = max(0, int(offset or 0))
+    where, args = "", []
+    if status:
+        where, args = "WHERE status=?", [status]
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            f"SELECT * FROM requests {where} ORDER BY id DESC LIMIT ? OFFSET ?", (*args, limit, offset))]
+
+def count_requests(status=None):
+    with _conn() as c:
+        if status:
+            return c.execute("SELECT COUNT(*) FROM requests WHERE status=?", (status,)).fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
+
+def interrupted_rows(limit=200):
+    """Local (dropbox) rows the restart recovery marked INTERRUPTED. The file may well have
+    reached /ingest before the kill, in which case the row is a permanent bogus failure for a
+    book the reader can already see — reconcile_imports checks and closes those."""
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM requests WHERE status='error' AND detail=? ORDER BY id DESC LIMIT ?",
+            (INTERRUPTED, limit))]
+
+def detail_like(fragment, limit=1):
+    """The most recent request detail containing this fragment (the admin console uses it to
+    show WHY a file was parked in .failed/)."""
+    with _conn() as c:
+        return [r["detail"] for r in c.execute(
+            "SELECT detail FROM requests WHERE detail LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+            ("%" + fragment.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%", limit))]
 
 def dismiss_interrupted(owner, title, source, keep_rid):
     """A dropbox file that was interrupted by a restart and then imported successfully leaves a

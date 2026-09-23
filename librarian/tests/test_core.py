@@ -729,7 +729,7 @@ def test_imap_connect_modes(monkeypatch):
     import imap, imaplib
     calls = {}
     class Fake:
-        def __init__(self, host, port): calls.update(host=host, port=port)
+        def __init__(self, host, port, timeout=None): calls.update(host=host, port=port, timeout=timeout)
         def login(self, u, p): calls.update(user=u)
     monkeypatch.setattr(imaplib, "IMAP4_SSL", Fake); monkeypatch.setattr(imaplib, "IMAP4", Fake)
     monkeypatch.setattr(config, "IMAP_HOST", "mail.example.test"); monkeypatch.setattr(config, "IMAP_USER", "u")

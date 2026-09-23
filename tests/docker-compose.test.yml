@@ -33,6 +33,10 @@ services:
       # request fence and a trusted netloc for the worker's private-address check
       GUTENBERG_MIRROR: http://filesrv:8000
       ABS_URL: http://audiobookshelf:80
+      # The portal is off the host network here, so config.py's default http://127.0.0.1:8083
+      # would point at the portal's own container: the Calibre-Web liveness probe (the headline
+      # health line on /admin) then failed for the whole run and nothing noticed.
+      CWA_URL: http://calibre-web:8083
       SMTP_HOST: greenmail
       SMTP_PORT: "3025"
       SMTP_SECURITY: none
@@ -69,7 +73,10 @@ services:
     volumes: ["./testfiles:/srv:ro"]
 
   authelia:
-    image: authelia/authelia:4.39
+    # Exactly the pin production runs (docker-compose.authelia.yml / IMG_AUTHELIA). A floating
+    # 4.39 tag meant the gate and the bypass lists were exercised against a version the VPS
+    # never sees. Bump this together with IMG_AUTHELIA.
+    image: authelia/authelia:4.39.28
     container_name: authelia
     volumes: ["./authelia:/config"]
     environment:

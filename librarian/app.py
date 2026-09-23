@@ -268,25 +268,30 @@ def make_request():
 @admin_required
 def approve(rid):
     rec = db.get(rid)
-    if rec and rec["status"] == "pending":
-        db.set_status(rid, "queued", "approved by admin")
+    # conditional on the row still being pending: two admins clicking at once (or Approve
+    # racing Deny) otherwise both notified the requester
+    if rec and db.set_status_if(rid, "pending", "queued", "approved by admin"):
         notify.send("approved", db.get(rid))
         _audit("approve", f"#{rid} {rec['title']} for {rec['owner']}")
         flash(f"Approved: {rec['title']}")
+    elif rec and rec["status"] != "pending":
+        flash("Another admin already handled that request.")
     return redirect(url_for("status"))
 
 @app.route("/deny/<int:rid>", methods=["POST"])
 @admin_required
 def deny(rid):
     rec = db.get(rid)
-    if rec and rec["status"] == "pending":
-        # "denied by admin" alone left the requester guessing; a one-line reason reaches them
-        # in the status list and in the notification
-        reason = " ".join((request.form.get("reason") or "").split())[:200]
-        db.set_status(rid, "denied", f"denied by admin: {reason}" if reason else "denied by admin")
+    # "denied by admin" alone left the requester guessing; a one-line reason reaches them
+    # in the status list and in the notification
+    reason = " ".join((request.form.get("reason") or "").split())[:200]
+    detail = f"denied by admin: {reason}" if reason else "denied by admin"
+    if rec and db.set_status_if(rid, "pending", "denied", detail):
         notify.send("denied", db.get(rid))
         _audit("deny", f"#{rid} {rec['title']} for {rec['owner']}" + (f" ({reason})" if reason else ""))
         flash(f"Denied: {rec['title']}")
+    elif rec and rec["status"] != "pending":
+        flash("Another admin already handled that request.")
     return redirect(url_for("status"))
 
 COVER_MAX = 2 * 1024 * 1024
@@ -381,10 +386,14 @@ def dismiss(rid):
 def status():
     rows = db.list_for(session["user"], session.get("admin", False))
     is_admin = session.get("admin", False)
-    pending = [r for r in rows if r["status"] == "pending"] if is_admin else []
+    # The actionable lists come from dedicated queries, NOT from the capped scrollback: once
+    # 200 newer rows existed, a waiting approval and every failed download became invisible
+    # here while /admin kept counting them (and 'Retry all', which is itself uncapped,
+    # disappeared with the section that holds it).
+    pending = db.rows_by_status(("pending",)) if is_admin else []
     for r in pending:                       # the approver must see WHERE the file comes from
         r["host"] = urlsplit(r.get("download_url") or "").hostname or "?"
-    failed = [r for r in rows if r["status"] == "error"] if is_admin else []
+    failed = db.rows_by_status(("error",)) if is_admin else []
     for r in failed:
         r["retryable"] = _retryable(r)
     for r in rows:                          # a user may clear their own failed rows (J40)
@@ -576,7 +585,13 @@ def devices():
                     if config.AUTHELIA_ENABLED:
                         note += " The sign-in page in front of the sites (Authelia) keeps its own password: ask the admin to change it too."
                     _audit("password_change")
-                    flash("Password changed for the portal, the library and Shelfmark." + note)
+                    # NOT Shelfmark: it signs its own session cookie and only checks app.db at
+                    # login, so an old cookie keeps working until the container is restarted.
+                    # Saying otherwise told someone whose password had leaked that they were
+                    # covered when they were not (the restart is an admin action).
+                    note += (" Shelfmark keeps you signed in on devices that were already signed in: "
+                             "ask the admin to restart Shelfmark if this was because of a leaked password.")
+                    flash("Password changed for the portal and the library." + note)
         except cwa.CwaError as e:
             flash(str(e))
         return redirect(url_for("devices"))

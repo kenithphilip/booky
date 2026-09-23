@@ -75,11 +75,17 @@ def _safe_name(fn):
     stem, dot, ext = os.path.basename(fn).rpartition(".")
     return f"{worker._safe(stem)}.{ext.lower()}"
 
+# A black-holed mail host (provider outage, firewall DROP, half-open NAT) used to wedge the
+# poller inside the constructor for ever: mail intake stopped silently and /healthz started
+# answering 503 for "imap loop stale", so compose marked the whole portal unhealthy over a
+# mailbox. imaplib takes a timeout for the connect and the socket from Python 3.9 on.
+CONNECT_TIMEOUT = 30
+
 def _connect():
     if config.IMAP_SSL:
-        M = imaplib.IMAP4_SSL(config.IMAP_HOST, config.IMAP_PORT or 993)
+        M = imaplib.IMAP4_SSL(config.IMAP_HOST, config.IMAP_PORT or 993, timeout=CONNECT_TIMEOUT)
     else:
-        M = imaplib.IMAP4(config.IMAP_HOST, config.IMAP_PORT or 143)
+        M = imaplib.IMAP4(config.IMAP_HOST, config.IMAP_PORT or 143, timeout=CONNECT_TIMEOUT)
     M.login(config.IMAP_USER, config.IMAP_PASS)
     return M
 
@@ -92,29 +98,55 @@ def _size(M, num):
     except Exception:
         return None
 
+def _over_limit(cap):
+    """The biggest message worth parsing for an attachment of `cap` bytes: base64 inflates the
+    part by ~4/3 and the headers/body text add a little."""
+    return int(cap * 1.37) + (1 << 18)
+
+def _too_big(M, num, size):
+    """Refuse a message without parsing it, and mark it seen so it is not fetched again every
+    minute for ever."""
+    log.warning("mail #%s dropped: %d bytes is over the %d MB mail limit",
+                num, size, config.MAX_MAIL_MB)
+    try:
+        db.audit("imap_rejected", None, None,
+                 f"message of {size >> 20} MB is over the {config.MAX_MAIL_MB} MB limit for mailed-in files")
+    except Exception:
+        pass
+    M.store(num, "+FLAGS", "\\Seen")
+
 def poll_once():
     """Fetch unseen mail once; returns the number of attachments filed."""
     exts = tuple(set(config.EBOOK_EXTS + config.AUDIO_EXTS))
-    cap = config.MAX_UPLOAD_MB * 1024 * 1024
+    # NOT MAX_UPLOAD_MB: a browser upload is streamed to disk, a message is parsed in memory
+    # at roughly a dozen times the attachment (see config.MAX_MAIL_MB).
+    cap = config.MAX_MAIL_MB * 1024 * 1024
+    limit = _over_limit(cap)
     filed = 0
     M = _connect()
     try:
         M.select(config.IMAP_FOLDER)
         _, data = M.search(None, "UNSEEN")
         for num in data[0].split():
+            worker._beat("imap")       # a slow-but-alive mailbox must not look like a dead loop
             size = _size(M, num)
-            # Parsing a message costs roughly a dozen times the attachment in memory, so the
-            # precheck sits just above the attachment cap + base64 inflation (~4/3), not at a
-            # multiple of it: a bigger message is refused before it is ever downloaded.
-            if size is not None and size > cap * 1.37 + (1 << 18):
-                log.warning("mail #%s dropped: %d bytes is over the %d MB limit", num, size, config.MAX_UPLOAD_MB)
-                db.audit("imap_rejected", None, None, f"message of {size >> 20} MB is over the {config.MAX_UPLOAD_MB} MB limit")
-                M.store(num, "+FLAGS", "\\Seen")
+            # The precheck sits just above the attachment cap + base64 inflation (~4/3), not at
+            # a multiple of it: a bigger message is refused before it is ever downloaded.
+            if size is not None and size > limit:
+                _too_big(M, num, size)
                 continue
             # BODY.PEEK[] does NOT set \Seen: a message that kills the process while it is
             # parsed is still unseen afterwards and is retried instead of being lost.
             _, d = M.fetch(num, "(BODY.PEEK[])")
-            msg = email.message_from_bytes(d[0][1])
+            raw = d[0][1] if d and d[0] and not isinstance(d[0], bytes) else b""
+            # Second, exact gate: the raw bytes cost 1x, message_from_bytes + get_payload cost
+            # ~12x. A server that does not answer RFC822.SIZE (so `size` is None) previously
+            # got us here with 94 MB in hand, and the parse SIGKILLed the container — after
+            # which BODY.PEEK left the message unseen and it came back every 60 s, for ever.
+            if len(raw) > limit:
+                _too_big(M, num, len(raw))
+                continue
+            msg = email.message_from_bytes(raw)
             target = _target_user(msg)
             user = _existing_user(target)
             frm = (parseaddr(msg.get("From", "") or "")[1] or "").lower()
@@ -142,10 +174,10 @@ def poll_once():
                     if not payload:
                         continue
                     if len(payload) > cap:
-                        log.warning("attachment %r for %s dropped: over %d MB", fn, user["name"], config.MAX_UPLOAD_MB)
+                        log.warning("attachment %r for %s dropped: over %d MB", fn, user["name"], config.MAX_MAIL_MB)
                         db.audit("imap_skipped", user["name"], None,
                                  f"attachment {fn[:80]!r} is {len(payload) >> 20} MB, over the "
-                                 f"{config.MAX_UPLOAD_MB} MB limit")
+                                 f"{config.MAX_MAIL_MB} MB limit for mailed-in files")
                         continue
                     safe = _safe_name(fn)
                     worker.place_in_dropbox(dest, safe, lambda out, data=payload: out.write(data))
@@ -159,8 +191,8 @@ def poll_once():
     return filed
 
 def poll_forever():
-    worker._beat("imap")
     while True:
+        worker._beat("imap")      # before the blocking connect as well as after the pass
         try:
             poll_once()
         except Exception:

@@ -3,3 +3,6 @@ state/
 __pycache__/
 *.pyc
 .DS_Store
+.ruff_cache/
+# the test suite is bind-mounted at /app/tests by tests/run-unit.sh, never baked in
+tests/

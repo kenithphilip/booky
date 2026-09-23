@@ -12,7 +12,7 @@ from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
 import config, db, notify, abs as absapi, kindle, cwa
-from tagger import add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz
+from tagger import add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError
 
 log = logging.getLogger("worker")
 UA = {"User-Agent": "bookstack-librarian/4.3"}
@@ -58,10 +58,19 @@ def _safe(name, max_bytes=NAME_MAX_BYTES):
 def _owner_tag(owner):
     return f"{config.OWNER_PREFIX}{owner}"
 
+NAME_MAX_TOTAL = 255      # Linux NAME_MAX, in BYTES
+EXT_ROOM = 12             # '.epub' ... '.crdownload'-sized headroom for the extension
+
 def _unique(base, owner, rid=None):
     """Two users importing the same title within CWA's pickup window must not overwrite each
-    other's file in /ingest; CWA reads the metadata from the file, not the name."""
-    return f"{base} [{_safe(owner)}-{rid if rid is not None else uuid4().hex[:6]}]"
+    other's file in /ingest; CWA reads the metadata from the file, not the name.
+
+    The suffix is what identifies the row (reconcile_imports looks for it), so it is never
+    cut: the BASE is re-truncated to whatever is left of NAME_MAX. A long Cyrillic author plus
+    a long title used to build a 378-byte name and fail every retry with a raw ENAMETOOLONG."""
+    suffix = f" [{_safe(owner, 64)}-{rid if rid is not None else uuid4().hex[:6]}]"
+    room = NAME_MAX_TOTAL - len(suffix.encode("utf-8")) - EXT_ROOM
+    return _safe(base, max(16, room)) + suffix
 
 def _cwa_user(owner):
     try:
@@ -252,8 +261,15 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
     mobi/azw3/fb2/txt cannot and are placed raw with a 'needs-tag' outcome. `title`/`author`
     fill in a PDF/CBZ that has no metadata of its own (default: the file-name base)."""
     part = os.path.join(config.INGEST_DIR, uuid4().hex + ".part")
-    shutil.copyfile(src, part)
     try:
+        # inside the try: an ENOSPC here used to leave a full-size orphan .part holding the
+        # last free bytes of the disk, which nothing reclaimed for 24 h (disk-watch), was
+        # filtered out of every listing, and kept the disk watchdog latched at 'paused'
+        shutil.copyfile(src, part)
+        if ext in ("epub", "cbz"):
+            # before anything opens it, and for admins too: an absurd archive OOM-kills the
+            # container, and "tag skipped" would hand it to Calibre-Web to die on instead
+            _zip_ok(part, f"this {ext.upper()}")
         if ext in _TAGGERS:
             note = _tag_or_fail(part, owner, ext, title=title or final_base, author=author)
             if ext in ("epub", "pdf"):
@@ -366,6 +382,15 @@ def _refuse_links(path):
 # ---- audiobooks -------------------------------------------------------------------------------
 MAX_ZIP_MEMBERS, MAX_ZIP_UNPACKED = 2000, 8 * 1024 ** 3   # zip-bomb guard for audiobook archives
 
+def _zip_ok(path, what="this archive"):
+    """Refuse an absurd archive BEFORE zipfile.ZipFile() parses (and materialises) the whole
+    central directory — _safe_extract's member count runs far too late to save the container.
+    tagger owns the End-Of-Central-Directory reader; this is its ValueError face."""
+    try:
+        precheck_zip(path, what, MAX_ZIP_MEMBERS)
+    except TagError as e:
+        raise ValueError(str(e))
+
 def _safe_extract(zf, dest):
     """Extract an audiobook zip without path traversal, symlinks or absurd expansion."""
     infos = zf.infolist()
@@ -382,6 +407,15 @@ def _safe_extract(zf, dest):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with zf.open(info) as src, open(target, "wb") as out:
             shutil.copyfileobj(src, out)
+
+# Sniffing recognises the CONTAINER, not the codec: ADTS AAC shares MPEG frame sync with MP3
+# and Opus rides in an Ogg container, so an .aac was renamed .mp3 and an .opus .ogg — wrong
+# names in Audiobookshelf for files that were perfectly well named. A name that is already a
+# valid extension for the sniffed container is kept; only an unrelated one (download.bin, an
+# m4b someone called .zip) is corrected.
+SNIFF_ALIASES = {"mp3": ("mp3", "aac"), "ogg": ("ogg", "opus", "oga", "spx"),
+                 "m4a": ("m4a", "m4b", "aac", "mp4"), "m4b": ("m4b", "m4a"),
+                 "flac": ("flac",), "wav": ("wav",)}
 
 TAG_WAIT_NOTE = "waiting for Audiobookshelf to index it to tag"
 
@@ -448,6 +482,7 @@ def _place_audio_file(src, owner, base, rid=None):
     os.makedirs(inc, exist_ok=True)
     try:
         if zipfile.is_zipfile(src):
+            _zip_ok(src)
             with zipfile.ZipFile(src) as zf:
                 _safe_extract(zf, inc)
             kind = _classify_dir(inc)
@@ -462,7 +497,7 @@ def _place_audio_file(src, owner, base, rid=None):
             # someone named .zip would otherwise look like "no audio here"
             name = os.path.basename(src)
             sniffed = _sniff_ext(src)
-            if sniffed in AUDIO_SNIFFED and _ext(name) != sniffed:
+            if sniffed in AUDIO_SNIFFED and _ext(name) not in SNIFF_ALIASES.get(sniffed, (sniffed,)):
                 name = f"{name.rsplit('.', 1)[0] if '.' in name else name}.{sniffed}"
             shutil.copyfile(src, os.path.join(inc, name))
             if _classify_dir(inc) != "audio":
@@ -481,8 +516,24 @@ def _copy_beating(src, dst, *, follow_symlinks=True):
     _beat("dropbox")                             # a multi-GB cross-device copy must not look like a dead loop
     return shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
 
+def _expand_audio_zips(d):
+    """A dropped folder often carries the audiobook as one zip (LibriVox, a Shelfmark grab).
+    Audiobookshelf cannot read a zip, so each audio archive is unpacked where it lies and the
+    archive itself removed — otherwise the folder lands in the library holding nothing
+    playable, ABS indexes no item and the tag job waits 24 h for something that never appears."""
+    zips = [os.path.join(r, n) for r, _dirs, names in os.walk(d) for n in names if _ext(n) == "zip"]
+    for p in zips:
+        if _zip_kind(p) != "audio-zip":
+            continue
+        _zip_ok(p)
+        with zipfile.ZipFile(p) as zf:
+            _safe_extract(zf, os.path.dirname(p))
+        os.remove(p)
+        _beat("dropbox")
+
 def _place_audio_dir(src_dir, owner, base, rid=None):
     """A folder of audio files dropped in a dropbox (Shelfmark, rsync) becomes one audiobook."""
+    _expand_audio_zips(src_dir)
     if _audio_duplicate(owner, base, _tree_size(src_dir)):
         raise ValueError("this audiobook is already in your audiobooks (same name and size)")
     final = _audio_final(owner, base)
@@ -575,10 +626,15 @@ def _classify_dir(path):
     audiobook), 'ebooks' (ebook files and no audio: each is imported on its own), 'mixed' or
     'nothing' (parked for the admin). A .txt next to audio is read as notes, not a book."""
     audio = ebooks = texts = 0
-    for _root, _dirs, names in os.walk(path):
+    for root, _dirs, names in os.walk(path):
         for n in names:
             e = _ext(n)
-            if e in config.AUDIO_EXTS and e != "zip":
+            if e == "zip":
+                # a folder whose only content is an audiobook ZIP (the usual LibriVox shape)
+                # counted as neither audio nor ebook and was parked as 'nothing'
+                if _zip_kind(os.path.join(root, n)) == "audio-zip":
+                    audio += 1
+            elif e in config.AUDIO_EXTS:
                 audio += 1
             elif e == "txt":
                 texts += 1
@@ -738,15 +794,22 @@ ARCHIVE_SNIFFED = ("audio-zip", "book-zip", "zip")            # archives worth o
 _SNIFF_NAMES = {"pdf": "a PDF", "epub": "an EPUB", "cbz": "a comic archive",
                 "zip": "a zip archive with no books or audio in it",
                 "damaged-zip": "a damaged or incomplete zip/EPUB (the download may have been cut short)",
+                "oversize-zip": "an archive claiming far more files than any real book or audiobook "
+                                "has (it would use more memory than the portal has)",
                 "cbr": "a RAR (CBR) archive, which cannot be tagged", "m4b": "an M4B audiobook",
                 "m4a": "an M4A audio file", "mp3": "an MP3", "flac": "a FLAC file",
                 "ogg": "an Ogg file", "wav": "a WAV file"}
 # what such a file is CALLED on disk when it has to be parked for the admin
-_PARK_EXT = {"audio-zip": "zip", "book-zip": "zip", "damaged-zip": "zip", "zip": "zip"}
+_PARK_EXT = {"audio-zip": "zip", "book-zip": "zip", "damaged-zip": "zip", "zip": "zip",
+             "oversize-zip": "zip"}
 
 def _zip_kind(path):
     """What a zip really is: an EPUB, a comic, an audiobook archive, an archive of books, or
     something with nothing usable in it."""
+    try:
+        _zip_ok(path)
+    except ValueError:
+        return "oversize-zip"           # refused on the EOCD entry count, before ZipFile
     try:
         with zipfile.ZipFile(path) as z:
             low = [n.lower() for n in z.namelist()]
@@ -799,7 +862,9 @@ def _place_http(req):
     try:
         raw = os.path.join(tmpdir, "download.bin")
         _download(req["download_url"], raw, req=req, rid=req["id"])
-        base = f"{_safe(req['author'])} - {_safe(req['title'])}"
+        # ONE byte budget for the whole name: two independent 180-byte truncations added up to
+        # 363 bytes, and the ingest rename then failed with ENAMETOOLONG on every retry
+        base = _safe(f"{_safe(req['author'])} - {_safe(req['title'])}")
         ext = _sniff_ext(raw)
         if ext in AUDIO_SNIFFED or ext in ("audio-zip", "book-zip"):
             # _place_audio_file opens the archive and sends an archive of BOOKS to the ebook
@@ -816,6 +881,10 @@ def _place_http(req):
             raise ValueError(f"the download is not a book or an audiobook "
                              f"({_SNIFF_NAMES.get(ext, 'an unrecognised file')}); kept at {kept}")
         _finish(req["id"], _status_for(note), note)
+    except OSError as e:
+        # never surface a raw errno and an internal container path to a family member
+        raise ValueError(f"the file could not be saved ({e.strerror or e.__class__.__name__}); "
+                         f"the title or the author name may be too long for this filesystem")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1020,23 +1089,50 @@ def _in_calibre(marker):
         return False
 
 IMPORT_GRACE_SECONDS = 180     # CWA normally takes seconds; this is generous
+# A row nobody has touched for this long is settled: CWA either imported it or the ingest
+# watchdog has been alerting about it for hours. Without a ceiling this loop re-walked the
+# newest 200 rows — every one of them a listdir of /ingest, a walk of CWA's failed tree and a
+# metadata.db query — every pass, for ever.
+RECONCILE_MAX_AGE = 24 * 3600
 STILL_WAITING = "still waiting for the library to import it"
+
+def _ingest_names():
+    try:
+        return os.listdir(config.INGEST_DIR)
+    except OSError:
+        return []
+
+def _cwa_failed_names():
+    """One walk of CWA's processed_books/failed per pass, not one per row."""
+    out = []
+    try:
+        for _root, dirs, names in os.walk(os.path.join(config.CWA_PROCESSED_DIR, "failed")):
+            out += dirs + names
+    except OSError:
+        pass
+    return out
 
 def reconcile_imports(now=None):
     """'Handed to CWA' is not 'imported'. For every ebook row we called done (or that is still
-    importing), check what actually happened to its file:
+    importing, or that a restart killed mid-ingest), check what actually happened to its file:
       - it is in CWA's failed folder            -> the request FAILS visibly (and the admin is told)
       - it is still in /ingest after the grace  -> back to 'importing' (the nudge loop works on it)
       - metadata.db knows it                    -> done
     Returns the number of rows whose status changed."""
     now = now or time.time()
     changed = 0
-    for r in db.rows_by_status(("done", "importing"), limit=200):
-        if r["kind"] == "audio" or (r.get("updated") or now) > now - IMPORT_GRACE_SECONDS:
+    ingest, failed_names = _ingest_names(), _cwa_failed_names()
+    rows = db.rows_by_status(("done", "importing"), limit=200) + db.interrupted_rows(limit=200)
+    for r in rows:
+        updated = r.get("updated") or now
+        if r["kind"] == "audio" or updated > now - IMPORT_GRACE_SECONDS or updated < now - RECONCILE_MAX_AGE:
             continue
         marker = _ingest_marker(r["owner"], r["id"])
         detail = r.get("detail") or ""
-        if _cwa_failed(marker):
+        interrupted = r["status"] == "error"      # a local row db.recover_on_start gave up on
+        if any(marker in n for n in failed_names):
+            if interrupted:
+                continue                          # already an error row, and for the honest reason
             _finish(r["id"], "error",
                     "the library (Calibre-Web) could not import this file — it is in CWA's "
                     "failed folder; the admin can look at it and retry")
@@ -1044,17 +1140,34 @@ def reconcile_imports(now=None):
                          f"{r['owner']}: '{r['title']}' is in Calibre-Web's processed_books/failed.", "high")
             changed += 1
             continue
-        if _in_ingest(marker):
+        if any(marker in n for n in ingest):
             if r["status"] == "done":
-                db.set_status(r["id"], "importing",
-                              f"{detail}; {STILL_WAITING}".lstrip("; "))
+                db.set_status(r["id"], "importing", f"{detail}; {STILL_WAITING}".lstrip("; "))
+                changed += 1
+            elif interrupted:
+                # the file DID reach /ingest before the kill: the row is a bogus permanent
+                # failure for a book the reader can already see
+                db.set_status(r["id"], "importing", f"the restart happened after the file was handed "
+                                                    f"to the library; {STILL_WAITING}")
+                changed += 1
+            continue
+        if interrupted:
+            if _in_calibre(marker):
+                _finish(r["id"], "done", "imported into your library (a restart interrupted the "
+                                         "request, but the file had already been handed over)")
                 changed += 1
             continue
         # An 'importing' row is only closed here when we KNOW its file reached the ingest
         # folder: either metadata.db has it, or this loop is the one that re-opened it (a row
         # that is still downloading has neither and must be left alone).
         if r["status"] == "importing" and (_in_calibre(marker) or STILL_WAITING in detail):
-            _finish(r["id"], "done", detail.replace(f"; {STILL_WAITING}", "") or "imported into your library")
+            clean = detail.replace(f"; {STILL_WAITING}", "") or "imported into your library"
+            if STILL_WAITING in detail:
+                # this loop re-opened a row that had already been reported done (and notified):
+                # a second _finish sent the reader "it is in your library" all over again
+                db.set_status(r["id"], "done", clean)
+            else:
+                _finish(r["id"], "done", clean)
             changed += 1
     return changed
 
@@ -1081,6 +1194,10 @@ def check_password_drift():
         if known == fp[0]:
             continue
         db.set_pw_fingerprint(name, fp[0])
+        # the change came from CWA's own UI, so it is still sitting in the WAL that Shelfmark
+        # (immutable=1) cannot see: fold it in now instead of at the next 5-minute checkpoint,
+        # during which the OLD password still opened Shelfmark
+        cwa._checkpoint()
         if not absapi.configured():
             continue
         db.audit("password_changed_in_cwa", name, None,
@@ -1093,26 +1210,33 @@ def check_password_drift():
     return told
 
 CHECKPOINT_EVERY = 300
+# Reconciliation has its own, much shorter cadence: riding on the 300 s checkpoint meant a
+# reader could see 'done' (and get the "it is in your library" mail) for up to IMPORT_GRACE +
+# CHECKPOINT ~= 8 minutes before it was corrected. Now the worst case is ~4.
+RECONCILE_EVERY = 60
 _LAST_CHECKPOINT = [0.0]
+_LAST_RECONCILE = [0.0]
+
+def _guarded(fn, *a):
+    try:
+        fn(*a)
+    except Exception:
+        log.exception("%s failed", fn.__name__)
 
 def housekeeping_once(now=None):
-    """Tag jobs and the /ingest watchdog every pass; a passive app.db WAL checkpoint every few
-    minutes (so Shelfmark, which ignores the WAL, sees password changes made in CWA's own UI),
-    and with it the import reconciliation and the password-drift check."""
+    """Tag jobs and the /ingest watchdog every pass; the import reconciliation every minute;
+    a passive app.db WAL checkpoint every few minutes (so Shelfmark, which ignores the WAL,
+    sees password changes made in CWA's own UI) and with it the password-drift check."""
     now = now or time.time()
     process_tag_jobs(now)
-    try:
-        nudge_ingest_once(now)
-    except Exception:
-        log.exception("ingest nudge failed")
+    _guarded(nudge_ingest_once, now)
+    if now - _LAST_RECONCILE[0] >= RECONCILE_EVERY:
+        _LAST_RECONCILE[0] = now
+        _guarded(reconcile_imports)
     if now - _LAST_CHECKPOINT[0] >= CHECKPOINT_EVERY:
         _LAST_CHECKPOINT[0] = now
         cwa.checkpoint_passive()
-        for fn in (reconcile_imports, check_password_drift):
-            try:
-                fn()
-            except Exception:
-                log.exception("%s failed", fn.__name__)
+        _guarded(check_password_drift)
 
 def _loop(name, fn, every):
     _beat(name)

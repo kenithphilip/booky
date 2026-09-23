@@ -99,7 +99,11 @@ services:
       # (req, res) => res.sendStatus(200))) and needs no token. The image has no curl, but it
       # does ship /usr/bin/wget (both verified in ghcr.io/advplyr/audiobookshelf:2.36.1).
       # ABS listens on port 80 inside the container (published on 127.0.0.1:13378).
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/healthcheck"]
+      # /healthcheck is a constant 200 that touches neither the database nor the library
+      # (server/Server.js: res.sendStatus(200)), so it can only fail when the process is dead.
+      # /status reports real state; "isInit":true is what scripts/selftest.sh already asserts,
+      # and it goes through the database, so a corrupt absdatabase.sqlite now shows as unhealthy.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/status | grep -q '\"isInit\":true'"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -169,6 +173,19 @@ services:
       - ADMIN_EMAIL=${ADMIN_EMAIL:-}  # gets a mail when a request awaits approval (needs SMTP)
       - MAX_REQUESTS_PER_DAY=${MAX_REQUESTS_PER_DAY:-30}
       - KOSYNC_ENABLED=${KOSYNC_ENABLED:-false}
+      # Abuse controls and session length. These were only in librarian/config.py, so tightening
+      # them after an attack — or loosening them because the household kept locking itself out —
+      # meant editing this file, which every Deploy overwrites from the checkout. .env wins.
+      - LOCKOUT_FAILS=${LOCKOUT_FAILS:-5}            # failed logins per user+IP ...
+      - LOCKOUT_WINDOW=${LOCKOUT_WINDOW:-900}        # ... within this many seconds ...
+      - LOCKOUT_SECONDS=${LOCKOUT_SECONDS:-900}      # ... lock that pair for this long
+      - LOCKOUT_IP_FAILS=${LOCKOUT_IP_FAILS:-20}     # any usernames from one IP (a family shares one)
+      - SESSION_HOURS=${SESSION_HOURS:-12}
+      # The disk watchdog's thresholds (scripts/disk-watch.sh owns the behaviour); the portal
+      # reads them so it can explain a pause instead of just stopping.
+      - DISK_WARN_PCT=${DISK_WARN_PCT:-85}
+      - DISK_STOP_PCT=${DISK_STOP_PCT:-95}
+      - DISK_RESUME_PCT=${DISK_RESUME_PCT:-80}
       - LIBRARIAN_SECRET=${LIBRARIAN_SECRET}
       - CWA_DB=/cwa/app.db
       - LIBRARY_DIR=/calibre-library
@@ -179,6 +196,7 @@ services:
       - SMTP_PASS=${SMTP_PASS:-}
       - SMTP_FROM=${SMTP_FROM:-}
       - SMTP_SECURITY=${SMTP_SECURITY:-starttls}
+      - KINDLE_MAX_MB=${KINDLE_MAX_MB:-45}   # Amazon rejects bigger attachments
       - STATE_DB=/state/librarian.db
       - INGEST_DIR=/ingest
       - STAGING_DIR=/staging
@@ -210,7 +228,7 @@ services:
       # through the user's dropbox.
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-95}
       - GUTENBERG_MIRROR=${GUTENBERG_MIRROR:-}
-      - MAX_EBOOK_MB=${MAX_EBOOK_MB:-500}     # worker download caps per kind (SSRF/abuse fence)
+      - MAX_EBOOK_MB=${MAX_EBOOK_MB:-200}     # worker download caps per kind (SSRF/abuse fence)
       - MAX_AUDIO_MB=${MAX_AUDIO_MB:-2048}
       - MAX_PDF_MB=${MAX_PDF_MB:-250}         # PDFs above this are not tagged in memory (parked for users)
       - IMAP_ALLOWED_SENDERS=${IMAP_ALLOWED_SENDERS:-}   # blank = sender must be the user's own e-mail

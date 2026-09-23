@@ -18,10 +18,13 @@ MARKER = re.compile(r"^[ \t]*# @AUTHELIA_GATE:([a-z]+)@[ \t]*$")
 BYPASS = {
     # Kobo sync (token), OPDS and KOReader sync (HTTP Basic) - devices cannot do SSO
     "books": "/kobo/* /opds /opds/* /kosync /kosync/*",
-    # Audiobookshelf apps: their own token login, token refresh (POST /auth/refresh; the access
-    # token lives 1 h, so without it the apps log out or stop syncing hourly), API, sockets,
-    # streams and public feeds
-    "audio": "/login /logout /auth/refresh /api/* /socket.io/* /hls/* /s/* /ping /status /healthcheck /public/* /feed/*",
+    # Audiobookshelf apps: their own token login, first-run root creation (POST /init — with the
+    # gate on there is no Authelia account yet either, so gating it traps the admin), token
+    # refresh (POST /auth/refresh; the access token lives 1 h, so without it the apps log out or
+    # stop syncing hourly), OIDC if it is ever turned on, API, sockets, streams and public feeds.
+    # "/socket.io /socket.io/*" (not just the prefix) so a client that asks for the bare
+    # /socket.io?EIO=4 is bypassed here too — configuration.yml.template already allows it.
+    "audio": "/login /logout /init /auth/refresh /auth/openid /auth/openid/* /api/* /socket.io /socket.io/* /hls/* /s/* /ping /status /healthcheck /public/* /feed/*",
     # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback
     "request": "/intake",
     # Shelfmark: nothing bypassed

@@ -19,19 +19,29 @@ access_control:
     # Device and app paths cannot do SSO: let them through to the app's own auth (Kobo token,
     # HTTP Basic, ABS token, intake bearer). Same lists as authelia/inject-gate.py BYPASS;
     # first matching rule wins, so these sit before the two_factor rule.
+    # Every resource here must be NO LOOSER than the matching Caddy bypass matcher: Caddy only
+    # forwards what its matcher does not catch, so a looser rule here is the one that decides.
+    # '^/opds.*$' bypassed /opdsfoo as well, which made Caddy's anchored matcher buy nothing.
+    # ([/?].*)? — Authelia matches path AND query, so the '?' branch must stay (OPDS search).
     - domain: 'books.@@DOMAIN@@'
       policy: bypass
       resources:
         - '^/kobo/.*$'
-        - '^/opds.*$'
-        - '^/kosync.*$'
+        - '^/opds([/?].*)?$'
+        - '^/kosync([/?].*)?$'
     - domain: 'audio.@@DOMAIN@@'
       policy: bypass
       resources:
         - '^/login(\?.*)?$'
         - '^/logout(\?.*)?$'
+        # First-run root-user creation. With the gate on and a fresh abs/config there is no
+        # Authelia account that can get past it either, so gating /init traps the admin out of
+        # the setup screen the self-test tells them to complete.
+        - '^/init(\?.*)?$'
         # token refresh (POST); the ABS access token expires after 1 h
         - '^/auth/refresh(\?.*)?$'
+        # OIDC login/callback, if the admin ever turns it on in Audiobookshelf (404 until then)
+        - '^/auth/openid([/?].*)?$'
         - '^/api/.*$'
         - '^/socket\.io([/?].*)?$'
         - '^/hls/.*$'

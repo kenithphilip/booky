@@ -48,16 +48,21 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 
 ## scripts/
 - `cf-ips.sh` — firewall allowlist synced to Cloudflare ranges (nightly)
-- `backup.sh` — encrypted restic backup (7 daily / 4 weekly / 6 monthly)
+- `backup.sh` — encrypted restic backup (retention from `RESTIC_KEEP_*`, default 7/4/6; probes
+  for `--retry-lock`, which Debian 12's restic 0.14 does not have)
 - `restore-test.sh` — proves the backup restores (config + DB snapshots) and reports the full-restore size
-- `disk-watch.sh` — hourly: alert at 85 %, stop downloaders at 95 %, restart below 80 %
+- `disk-watch.sh` — hourly: alert at `DISK_WARN_PCT`, stop the downloaders and raise
+  `library/staging/.disk-paused` (the portal's own imports honour it) at `DISK_STOP_PCT`,
+  start them again below `DISK_RESUME_PCT`
 - `alert.sh` — one entry point for alerts: portal (webhook/e-mail), else journal + direct ntfy/webhook post
 - `selftest.sh` — non-destructive health/security check (Operations → Self-test)
 
 ## configs/fail2ban/
-- `jail.local` (template) — SSH jail (local firewall) + Caddy login jail that bans at
-  Cloudflare via `cloudflare-token`; `caddy-auth.conf` — matches failed POST logins by the
-  real client IP only
+- `jail.local` (template) — SSH jail (local firewall) + three Caddy jails that ban at
+  Cloudflare via `cloudflare-token`. Both Caddy login filters are host-scoped templates
+  (`@@DOMAIN@@`, rendered by `render_fail2ban`): `caddy-auth.conf` counts failed POST logins
+  on request./shelf./auth. by the real client IP, `caddy-abs-login.conf` covers audio. under
+  its own looser threshold, and `caddy-device-auth.conf` covers Basic auth on /opds + /kosync
 
 ## tests/ (not shipped to the server)
 - `run-unit.sh` — runs the portal tests inside the shipping image

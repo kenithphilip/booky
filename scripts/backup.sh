@@ -18,10 +18,21 @@ set -a; . "${RESTIC_ENV:-/etc/bookstack/restic.env}"; set +a
 STACK_DIR="${STACK_DIR:-/srv/bookstack}"
 SNAP="$STACK_DIR/.backup-snap"
 extra_tag=""; [ "${1:-}" = "--tag" ] && extra_tag="${2:-}"
-R=(--retry-lock 30m)                                      # wait for a concurrent restore test instead of failing
+# --retry-lock (wait for a concurrent restore test instead of failing) landed in restic 0.16.
+# Debian 12 ships 0.14, which dies with "unknown flag" on EVERY call — i.e. every nightly backup.
+# Probe for it the way bookstack.sh probes `restic restore --overwrite`.
+R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
 envget(){ local raw; raw=$({ grep -E "^$1=" "$STACK_DIR/.env" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
 PING_URL=$(envget BACKUP_PING_URL)
+# Retention, tunable from the environment or $STACK_DIR/.env (Install -> Backups writes them) so
+# an admin never has to edit this file — copy_code_trees restores it from the checkout on every
+# Deploy and every Update, which would silently revert the edit. A non-numeric value falls back
+# to the default rather than handing `restic forget` an argument it refuses.
+num(){ local v="${!1:-}"; [ -n "$v" ] || v=$(envget "$1"); case "$v" in ''|*[!0-9]*) v="$2";; esac; printf '%s' "$v"; }
+KEEP_DAILY=$(num RESTIC_KEEP_DAILY 7)
+KEEP_WEEKLY=$(num RESTIC_KEEP_WEEKLY 4)
+KEEP_MONTHLY=$(num RESTIC_KEEP_MONTHLY 6)
 finish(){
   local rc=$?
   if [ -n "$PING_URL" ]; then
@@ -54,7 +65,8 @@ PY
 done
 # host state (small, root-only): needed to rebuild the server, not just the stack
 for p in /etc/bookstack/restic.env /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-auth.conf \
-         /etc/fail2ban/filter.d/caddy-device-auth.conf /etc/ssh/sshd_config.d/01-bookstack.conf \
+         /etc/fail2ban/filter.d/caddy-device-auth.conf /etc/fail2ban/filter.d/caddy-abs-login.conf \
+         /etc/ssh/sshd_config.d/01-bookstack.conf \
          /etc/sysctl.d/90-bookstack.conf /etc/docker/daemon.json /etc/cron.d/bookstack-cfips /etc/cron.d/bookstack-disk; do
   [ -f "$p" ] && { mkdir -p "$SNAP/host$(dirname "$p")"; cp -p "$p" "$SNAP/host$p"; }
 done
@@ -95,7 +107,7 @@ if [ -n "$old_pre" ]; then
   # shellcheck disable=SC2086
   restic "${R[@]}" tag --remove pre-update $old_pre >/dev/null
 fi
-restic "${R[@]}" forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-tag pre-update --prune
+restic "${R[@]}" forget --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY" --keep-tag pre-update --prune
 
 if [ -n "$snapfail" ]; then
   echo "BACKUP INCOMPLETE: no consistent copy of:$snapfail (the raw files are in the snapshot, possibly without their WAL)" >&2

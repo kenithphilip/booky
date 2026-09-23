@@ -1,5 +1,10 @@
 {% extends "base.html" %}{% block body %}
 <h2>Admin</h2>
+<p class="mut">This page is a <strong>dashboard</strong>, on purpose: it shows you what the stack is doing and
+lets you add a user. Everything that changes the stack — passwords, removals, isolation repair, quotas, sources,
+mail, backups, updates, lockouts, parked files, the request queue — lives in the admin tools on the server
+(<code>bookstack.sh</code> over SSH, on the tailnet once <em>Lock SSH</em> has been run). Secrets and root actions
+stay on the box rather than behind a browser session.</p>
 <div class="grid">
 <div class="card"><h3>Queue</h3>
 <div class="mut">pending <strong class="st-pending">{{ counts.pending }}</strong> · active <strong>{{ counts.queued + counts.downloading + counts.retrying + counts.importing + counts.tagging }}</strong> · done <strong class="st-done">{{ counts.done }}</strong> · needs tag <strong class="st-needs-tag">{{ counts.needs_tag }}</strong> · failed <strong class="st-error">{{ counts.error }}</strong></div>

@@ -377,25 +377,91 @@ checks the posture.
 - **Users & devices**: list / add / Kindle / Kobo link / password / remove / repair / guide.
 - **Library**: Formats & conversion, Mail (SMTP + test), Sources & approvals, Shelfmark,
   Intake & dropboxes (webhook enable/show/disable), Torrents, isolation guide.
-- **Security**: Authelia enable / disable / add user, Lock SSH to Tailscale, fail2ban,
-  SPF/DMARC, Cloudflare Access guide.
-- **Operations**: Self-test, Status, Logs, Update, Backups, Restore test, Restore from backup,
-  Alerts, Monitoring, Ephemera enable / disable.
+- **Security**: Authelia enable / disable / add user, Lock SSH to Tailscale, Reopen public SSH,
+  fail2ban, Bans — list and release, Clear a login lockout, SPF/DMARC, Cloudflare Access guide.
+- **Operations**: Self-test, Status, Logs, Restart a service, Update, Backups, Restore test,
+  Restore from backup, Restore a single file, Alerts, Monitoring, Ephemera enable / disable.
 
-Backups are encrypted restic (7 daily / 4 weekly / 6 monthly; `pre-update` snapshots kept
-90 days; `restic check` weekly; a monthly restore test on the 1st) — keep the repo password
-safe. **Restore** lets you pick a snapshot and restore everything or only config +
+Backups are encrypted restic (7 daily / 4 weekly / 6 monthly by default — `RESTIC_KEEP_DAILY`
+/ `_WEEKLY` / `_MONTHLY` in `.env`; `pre-update` snapshots kept 90 days; `restic check` weekly;
+a monthly restore test on the 1st) — keep the repo password safe. **Restore** lets you pick a snapshot and restore everything or only config +
 databases; it checks free space first and restores in place. **Update** deploys the code from
 the checkout it runs from, gates on container health, and can roll back to the previous
 images and Caddyfile. Watch `df -h /srv`; audiobooks fill the disk fastest.
 
+## When things go wrong
+Everything here is a menu entry in `bookstack.sh` over Tailscale SSH. That is the admin
+console; the web `/admin` page is a read-mostly dashboard and says so. Start with
+**Operations → Self-test**: it names the menu entry for almost every failure it reports.
+
+**"Convert library" / "EPUB fixer" / "Show logs" in Calibre-Web's own admin page do nothing
+(403).** That is deliberate and it also hits *you*. Calibre-Web Automated v4.0.6 registers
+those four blueprints (`/cwa-convert-library*`, `/cwa-epub-fixer*`, `/cwa-logs*`,
+`/cwa-internal/*`, plus `/reconnect`) with **no authentication at all** — one anonymous GET,
+or a cross-site `<img src>` loaded in your logged-in browser, starts a library-wide
+conversion or runs the EPUB fixer, which rewrites every EPUB and drops the `owner:` tags this
+stack's per-user isolation depends on. Caddy therefore returns 403 on those paths for
+everyone, gate or no gate, so the buttons on CWA's admin page fail for the admin too. They
+are not needed in normal use (ingest converts on import — Library → Formats). If you really
+want one, run it from the server itself, where the block does not apply:
+
+```sh
+ssh root@<tailscale-ip>
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8083/cwa-convert-library-start
+docker logs -n 100 calibre-web      # watch it
+```
+
+**A family member (or you) is suddenly locked out of every site.** fail2ban bans at
+Cloudflare, and the household shares one public address, so one ban cuts off books., audio.,
+request. and shelf. at once for everybody. Use **Security → Bans — list and release**: it
+shows the banned addresses per jail and releases them *both* locally and at Cloudflare (the
+local `fail2ban-client unbanip` alone does not remove the Cloudflare IP Access Rule).
+Audiobookshelf apps holding a stale password are the usual cause — fix the saved password in
+the app, or the ban comes straight back.
+
+**"Too many attempts, try again later" on the portal.** That is the portal's own lockout
+(`LOCKOUT_*` in `.env`), separate from fail2ban. **Security → Clear a login lockout** releases
+a user or an address immediately; it expires by itself after `LOCKOUT_SECONDS`.
+
+**A service is wedged.** **Operations → Restart a service**. It recreates the container
+(`up -d`, not `restart`), so a setting the TUI just wrote into `.env` is picked up too.
+
+**You ran Security → Lock SSH and Tailscale is unavailable.** Reach the VPS through your
+provider's serial/web console, log in as root and run `bash /srv/bookstack/bookstack.sh` →
+**Security → Reopen public SSH**. Key-only authentication stays enforced.
+
+**One file needs to come back, not the whole stack.** **Operations → Restore a single file
+from backup** — pick a snapshot and a path; it restores beside the live copy so nothing is
+overwritten until you say so. **Operations → Restore from backup** is the whole-stack path.
+
+**Downloads and imports stopped on their own.** The disk watchdog stops Shelfmark and
+qBittorrent at `DISK_STOP_PCT` (95 % by default) and raises
+`library/staging/.disk-paused`, which also pauses the portal's own queue, dropbox watcher and
+mail intake — otherwise they keep writing 2 GB files onto a full disk. Free space; below
+`DISK_RESUME_PCT` (80 %) the watchdog starts everything again and clears the flag. If a
+service does not come back it says so and keeps retrying hourly rather than claiming success.
+
+**Backups.** Self-test asserts that a snapshot actually exists and is under 36 h old, not just
+that the timer is installed — an installed timer whose every run fails looks identical
+otherwise. On a failure: `journalctl -u bookstack-backup -n 50`, then
+`bash /srv/bookstack/scripts/backup.sh` by hand to read the error directly.
+
 ## Authelia notes
 Authelia gives login + TOTP/passkey 2FA + brute-force lockout in front of the public apps,
-self-hosted. Enabling generates secrets, starts it, injects a Caddy `forward_auth` gate
-(bypassing `/kobo/*` and `/opds`) and offers to create Authelia logins for existing users;
+self-hosted. Enabling generates secrets, starts it, injects a Caddy `forward_auth` gate and
+offers to create Authelia logins for existing users;
 new users created afterwards get one automatically. **Test in a browser right after
 enabling**; *disable* removes the gate instantly. Apps keep their own logins behind the gate
 (defence in depth); double login is the trade for that.
+
+Paths that cannot do SSO are bypassed: `/kobo/*`, `/opds`, `/kosync` on books.; the
+Audiobookshelf apps' own login, token refresh, API, sockets, streams and feeds on audio.,
+plus `POST /init` so a **fresh** Audiobookshelf can still have its first root user created
+with the gate on; the intake webhook on request. The bypass list lives in two files that must
+stay equivalent — `authelia/inject-gate.py` (what Caddy forwards) and
+`authelia/configuration.yml.template` (what Authelia allows). The looser of the two is the one
+that decides, so keep them anchored the same way; `tests/e2e_driver.py` asserts a few of the
+edges (`/opdsfoo` is *not* bypassed, bare `/socket.io` *is*).
 
 ## Testing (run before every deploy)
 ```

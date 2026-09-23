@@ -20,7 +20,19 @@ CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same bas
 # BOOKSTACK_LIB=1 sources this file for tests without running anything.
 if [ "${BOOKSTACK_LIB:-0}" != 1 ]; then
   [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo bash $0"; exit 1; }
-  command -v whiptail >/dev/null || { apt-get update -qq; apt-get install -y -qq whiptail; }
+  # envset is read-modify-write, so two TUI sessions (two SSH logins, or one left open in tmux)
+  # silently drop each other's .env keys — and could run Deploy/Update against the same compose
+  # project at once. One instance per server; the lock is released when this process exits.
+  BOOKSTACK_LOCKFILE="${BOOKSTACK_LOCK:-/run/bookstack.lock}"
+  if command -v flock >/dev/null 2>&1 && : > "$BOOKSTACK_LOCKFILE" 2>/dev/null; then
+    exec 9>"$BOOKSTACK_LOCKFILE"
+    flock -n 9 || { echo "Another bookstack.sh is already running on this server. Close it (or wait for it to finish) and run this again."; exit 1; }
+  fi
+  # the only apt call the owner meets before any menu is drawn: a freshly booted VPS still has
+  # cloud-init / unattended-upgrades holding the dpkg lock, and errexit would abort with a raw
+  # apt error and no explanation.
+  command -v whiptail >/dev/null || { apt-get update -qq || true; apt-get install -y -qq whiptail \
+    || { echo "Could not install whiptail, which draws these menus. apt may still be busy on a freshly booted server (cloud-init and the first unattended-upgrades run hold the dpkg lock for a minute or two), or the network is not up yet. Wait a moment and run this again."; exit 1; }; }
 fi
 
 # ---------- helpers ----------
@@ -51,20 +63,30 @@ askpw2() { # password typed twice, min 8 chars; refuses anything carrying termin
 # written by older versions).
 envget() {
   local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
+  # a .env edited or restored from a Windows editor is CRLF: without this every value carries a
+  # trailing \r into the Caddyfile, the Cloudflare URLs and the ADMIN_HASH shape check
+  raw="${raw%$'\r'}"
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then
     raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'
     raw="${raw//"$bs$q"/$q}"
   fi
   printf '%s' "$raw"
 }
+# Returns non-zero when the value could not be stored. Every caller must check: a silent no-op
+# (full disk, root remounted read-only) used to leave .env and the running stack disagreeing
+# while the UI reported success — and trapped set_admin_password in an endless prompt.
 envset() {
-  mkdir -p "$STACK_DIR"; touch "$ENV_FILE"; chmod 600 "$ENV_FILE"
+  # one key = one line: a value carrying a newline writes a second, key-shaped line into .env
+  case "$2" in *$'\n'*) msg "A setting cannot contain a line break. Nothing was saved."; return 1;; esac
+  mkdir -p "$STACK_DIR" || return 1; touch "$ENV_FILE" || return 1; chmod 600 "$ENV_FILE" || return 1
   local v="$2" bs=\\ q=\'
   v="${v//"$q"/$bs$q}"
   # umask 077 in a subshell: the temp file holds every secret and must be 0600 from its first byte
-  ( umask 077; rm -f "$ENV_FILE.tmp"; { grep -vE "^$1=" "$ENV_FILE" || true; printf "%s='%s'\n" "$1" "$v"; } > "$ENV_FILE.tmp" )
-  mv "$ENV_FILE.tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
-  [ "$(id -u)" -eq 0 ] && chown root:root "$ENV_FILE"   # never readable by the containers' uid 1000
+  ( umask 077; rm -f "$ENV_FILE.tmp"; { grep -vE "^$1=" "$ENV_FILE" || true; printf "%s='%s'\n" "$1" "$v"; } > "$ENV_FILE.tmp" ) || return 1
+  mv "$ENV_FILE.tmp" "$ENV_FILE" || return 1
+  chmod 600 "$ENV_FILE" || return 1
+  # never readable by the containers' uid 1000; a failure here is not worth losing the value over
+  [ "$(id -u)" -eq 0 ] && { chown root:root "$ENV_FILE" || true; }
   return 0
 }
 envdefault(){ [ -n "$(envget "$1")" ] || envset "$1" "$2"; }
@@ -72,7 +94,10 @@ img(){ # IMG_X -> value from .env, else the pinned default
   local v kv; v=$(envget "$1"); [ -n "$v" ] && { printf '%s' "$v"; return 0; }
   for kv in $IMG_DEFAULTS; do [ "${kv%%=*}" = "$1" ] && printf '%s' "${kv#*=}"; done; }
 need()   { for v in "$@"; do [ -n "$(envget "$v")" ] || { msg "Missing $v. Run 'Configure' first."; return 1; }; done; }
-cf()     { curl -fsS -X "$1" "$CF_API$2" -H "Authorization: Bearer $(envget CF_API_TOKEN)" -H "Content-Type: application/json" "${@:3}"; }
+# -m 30: without a deadline an API that accepts the connection and then stops answering freezes
+# the whole TUI on a blank screen half-way through a zone's ~20 calls, with no way to tell what
+# was written. --retry covers a refused connection / 5xx blip.
+cf()     { curl -fsS -m 30 --retry 2 --retry-connrefused -X "$1" "$CF_API$2" -H "Authorization: Bearer $(envget CF_API_TOKEN)" -H "Content-Type: application/json" "${@:3}"; }
 # qBittorrent is opt-in (compose profile "torrents", Library -> Torrents): every compose call
 # that starts or stops the stack carries the profile while it is enabled.
 torrents_on(){ [ "$(envget TORRENTS_ENABLED)" = true ]; }
@@ -86,29 +111,66 @@ abs_ready(){ [ -n "$(envget ABS_TOKEN)" ]; }
 cwa_sql(){ docker exec -i calibre-web sqlite3 /config/cwa.db "$1"; } # CWA's own settings DB
 running(){ docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true; }
 portal_up(){ running librarian; }
-restart_portal(){ compose up -d librarian >/dev/null 2>&1 || true; }
+# `compose up -d librarian` RECREATES the container, which is what makes a changed .env value
+# reach the portal; `restart` would not. The exit status is returned, never swallowed: a
+# failure means the running gunicorn still holds the old setting (or the old session secret).
+restart_portal(){ compose up -d librarian >/dev/null 2>&1; }
+restart_portal_ok(){ # restart + say so when it did not work, so no step claims a setting is live
+  restart_portal && return 0
+  msg "The portal could NOT be restarted, so the setting you just changed is NOT active yet (Operations -> Logs -> librarian)."
+  return 1
+}
 admin_user(){ local u; u=$(envget ADMIN_USER); printf '%s' "${u:-admin}"; }   # the chosen CWA admin name (C10)
+# A truncated or partially written hash starts with '$2' too, and basic_auth then compares every
+# password against garbage: the admin is locked out of the tailnet-only tools with a plain
+# "wrong password". Match the real shape instead of the prefix.
+valid_admin_hash(){ case "$1" in '$2'?'$'??'$'?*) return 0;; '$argon2'*'$'*'$'?*) return 0;; *) return 1;; esac; }
 render_caddyfile(){
   # An empty hash would render "admin " inside basic_auth: Caddy rejects the config and every
   # site on the box stays down. Refuse here, where the cause is obvious.
-  case "$(envget ADMIN_HASH)" in '$2'*|'$argon2'*) ;;
-    *) msg "ADMIN_HASH is missing or invalid; the admin-gate password must be set first (Install -> Configure). Caddyfile NOT rendered."; return 1;; esac
+  valid_admin_hash "$(envget ADMIN_HASH)" \
+    || { msg "ADMIN_HASH is missing or invalid; the admin-gate password must be set first (Install -> Configure). Caddyfile NOT rendered."; return 1; }
   # the admin sites' tailnet_only matcher needs the tailnet IP; empty = a config error for every site
   [ -n "$(envget TAILSCALE_IP)" ] || { msg "TAILSCALE_IP is empty; run Install -> Tailscale (or Configure, which sets a placeholder) first. Caddyfile NOT rendered."; return 1; }
   local f="$STACK_DIR/caddy/Caddyfile" bind; bind=$(envget BIND_IP); bind="${bind:-$(envget PUBLIC_IP)}"
   [ -n "$bind" ] || { msg "Neither BIND_IP nor PUBLIC_IP is set; run Install -> Configure first. Caddyfile NOT rendered."; return 1; }
   # optional vhosts: their DNS name and upstream only exist while the feature is enabled
-  local drop=()
-  torrents_on || drop+=(-e '/# @TORRENTS_BEGIN@/,/# @TORRENTS_END@/d')
-  [ "$(envget EPHEMERA_ENABLED)" = true ] || drop+=(-e '/# @EPHEMERA_BEGIN@/,/# @EPHEMERA_END@/d')
+  local drop=""
+  torrents_on || drop="$drop TORRENTS"
+  [ "$(envget EPHEMERA_ENABLED)" = true ] || drop="$drop EPHEMERA"
+  [ "$(envget AUTHELIA_ENABLED)" = true ] || drop="$drop AUTHELIA"
   # keep the last good file: apply_caddy puts it back when the new one does not validate
   [ -s "$f" ] && cat "$f" > "$f.prev"
+  # Substitution is a plain string replace in python, NOT sed: on sed's replacement side '&' means
+  # "the whole match" and '|' ends the s||| expression, so a domain or contact address carrying
+  # one of them used to write a corrupted (or zero-byte) Caddyfile and still report success.
+  local rc=0
+  CFR_DOMAIN="$(envget DOMAIN)" CFR_ADMIN_EMAIL="$(envget ADMIN_EMAIL)" CFR_BIND_IP="$bind" \
+  CFR_TAILSCALE_IP="$(envget TAILSCALE_IP)" CFR_ADMIN_HASH="$(envget ADMIN_HASH)" \
+  python3 - "$STACK_DIR/caddy/Caddyfile.template" "$f.new" "$drop" <<'PYC' || rc=$?
+import os, sys
+tmpl, out, drop = sys.argv[1], sys.argv[2], sys.argv[3].split()
+s = open(tmpl).read()
+for name in drop:                       # a feature's whole vhost block, markers included
+    b, e = "# @%s_BEGIN@" % name, "# @%s_END@" % name
+    while b in s and e in s[s.index(b):]:
+        i = s.index(b); j = s.index(e, i) + len(e)
+        if j < len(s) and s[j] == "\n":
+            j += 1
+        s = s[:i] + s[j:]
+for k in ("DOMAIN", "ADMIN_EMAIL", "BIND_IP", "TAILSCALE_IP", "ADMIN_HASH"):
+    s = s.replace("@@%s@@" % k, os.environ["CFR_" + k])
+if "@@" in s:                           # a placeholder this script does not know about
+    sys.exit(2)
+open(out, "w").write(s)
+PYC
+  if [ "$rc" != 0 ] || [ ! -s "$f.new" ]; then
+    rm -f "$f.new"
+    msg "Could not render the Caddyfile from its template$([ "$rc" = 2 ] && printf ' (an @@PLACEHOLDER@@ was left unsubstituted)'). The previous one is untouched and Caddy keeps running unchanged.\n\nCheck Install -> Configure: the domain and admin e-mail must be a plain hostname and address."
+    return 1
+  fi
   # written in place (never mv): the running container bind-mounts this exact inode
-  sed ${drop[@]+"${drop[@]}"} \
-      -e "s|@@DOMAIN@@|$(envget DOMAIN)|g" -e "s|@@ADMIN_EMAIL@@|$(envget ADMIN_EMAIL)|g" \
-      -e "s|@@BIND_IP@@|$bind|g" -e "s|@@PUBLIC_IP@@|$bind|g" -e "s|@@TAILSCALE_IP@@|$(envget TAILSCALE_IP)|g" \
-      -e "s|@@ADMIN_HASH@@|$(envget ADMIN_HASH)|g" \
-      "$STACK_DIR/caddy/Caddyfile.template" > "$f"
+  cat "$f.new" > "$f"; rm -f "$f.new"
   chown root:root "$f"; chmod 644 "$f"      # read-only for the container; not writable by uid 1000
 }
 render_caddy_all(){ # Caddyfile + the Authelia gate when enabled
@@ -204,8 +266,18 @@ prune_shelfmark_placeholder(){ # J35: Shelfmark mkdirs its un-substituted INGEST
   return 0
 }
 # Shelfmark keeps a SIGNED client-side session and only consults CWA's app.db at login, so a
-# removed or re-passworded user stays signed in until the container restarts (J07).
-restart_shelfmark(){ compose restart shelfmark >/dev/null 2>&1 || true; prune_shelfmark_placeholder; }
+# removed or re-passworded user stays signed in (J07) — and a plain restart does NOT change that:
+# Shelfmark persists its Flask secret to CONFIG_DIR/.flask_secret, which compose bind-mounts, so
+# the same key verifies the same cookie after the restart. Deleting that file first is what
+# actually ends every Shelfmark session. Returns non-zero when the restart failed, in which case
+# the running process still holds the old key in memory and nobody has been signed out.
+restart_shelfmark(){ # [--end-sessions]
+  local rc=0
+  [ "${1:-}" = --end-sessions ] && rm -f "$STACK_DIR/shelfmark/config/.flask_secret"
+  compose restart shelfmark >/dev/null 2>&1 || rc=1
+  prune_shelfmark_placeholder
+  return $rc
+}
 inject_authelia_gate(){ # per-host bypass lists live in inject-gate.py (reads first, writes second)
   python3 "$STACK_DIR/scripts/inject-gate.py" "$STACK_DIR/caddy/Caddyfile" "$STACK_DIR/scripts/caddy-gate.snippet"
 }
@@ -262,8 +334,9 @@ net.ipv4.conf.all.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
 net.ipv4.tcp_syncookies = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-# Caddy binds the tailnet IP too: if tailscaled restarts or loses its address, a strict bind
-# would make Caddy fail to (re)start and take the PUBLIC sites down with it.
+# Caddy binds BIND_IP on the five public sites (the tailnet-only sites deliberately do not bind
+# at all — see the tailnet_only snippet in caddy/Caddyfile.template). Kept so that a BIND_IP
+# which is temporarily absent, e.g. an interface flap on a NAT'd VPS, cannot stop Caddy starting.
 net.ipv4.ip_nonlocal_bind = 1
 net.ipv6.ip_nonlocal_bind = 1
 # small-host tuning: prefer RAM over the swapfile; large libraries need many inotify watches (ABS)
@@ -317,8 +390,10 @@ SSH
 step_system() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq && apt-get -y -qq upgrade
-  # cron runs the disk watchdog and the Cloudflare allowlist refresh; minimal images lack it
-  apt-get -y -qq install ca-certificates curl jq ufw unattended-upgrades openssl rsync python3 systemd-timesyncd cron \
+  # cron runs the disk watchdog and the Cloudflare allowlist refresh; minimal images lack it.
+  # iproute2 (ip) backs route_src_ip/ip_on_host — without it BIND_IP falls back to the public
+  # address and the Lock-SSH guard can never pass; procps (free) sizes the swapfile.
+  apt-get -y -qq install ca-certificates curl jq ufw unattended-upgrades openssl rsync python3 systemd-timesyncd cron iproute2 procps \
     || { msg "Package installation failed (apt). Check the network and run System again."; return 1; }
   systemctl enable --now cron >/dev/null 2>&1 || true
   timedatectl set-ntp true 2>/dev/null || true   # TOTP, Kobo sync timestamps, ACME and Cloudflare mTLS all need a correct clock
@@ -392,6 +467,9 @@ suggest_admin_name(){ # "<mail-local-part>-admin", never the guessable "admin"
 }
 valid_username(){ [[ "$1" =~ ^[a-z0-9][a-z0-9._-]{1,31}$ ]]; }
 valid_email(){ [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
+# The domain is rendered into every Caddy site address and into the Cloudflare API URLs; a
+# character that does not belong in a hostname can only produce a config nobody can reach.
+valid_domain(){ [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]; }
 ensure_admin_name(){ # rename the CWA admin row to ADMIN_USER when it still has an older name (factory 'admin')
   # 0 = the admin is called ADMIN_USER now, 1 = could not tell (portal down), 2 = rename failed
   local want list src; want=$(admin_user)
@@ -407,8 +485,14 @@ ensure_admin_name(){ # rename the CWA admin row to ADMIN_USER when it still has 
   return 1
 }
 step_configure() {
+  # what the containers hold right now: a changed value only reaches them when they are RECREATED
+  local pre_d pre_tz pre_email pre_cf pre_dns pre_au
+  pre_d=$(envget DOMAIN); pre_tz=$(envget TZ); pre_email=$(envget ADMIN_EMAIL)
+  pre_cf=$(envget CF_API_TOKEN); pre_dns=$(envget CF_DNS_TOKEN); pre_au=$(envget ADMIN_USER)
   d=$(ask "Domain (zone in Cloudflare):" "$(envget DOMAIN)")                       ; [ -n "$d" ] || return 1
+  valid_domain "$d" || { msg "'$d' is not a hostname (letters, digits, hyphens and at least one dot, e.g. example.com). Nothing was changed."; return 1; }
   e=$(ask "Admin email (for Let's Encrypt notices):" "$(envget ADMIN_EMAIL)")     ; [ -n "$e" ] || return 1
+  valid_email "$e" || { msg "'$e' is not an e-mail address. Let's Encrypt would refuse the ACME account and no certificate would ever issue. Nothing was changed."; return 1; }
   tz=$(ask "Timezone:" "$(envget TZ)") || tz="$(envget TZ)"                       ; [ -n "$tz" ] || tz=UTC
   tok=$(askpw "Cloudflare API token (Zone:Read, DNS:Edit, Zone Settings:Edit, Config Rules:Edit, Cache Rules:Edit, Firewall Services:Edit). Leave blank to keep existing.") ; [ -n "$tok" ] || tok="$(envget CF_API_TOKEN)"
   [ -n "$tok" ] || { msg "A Cloudflare API token is required."; return 1; }
@@ -428,7 +512,10 @@ step_configure() {
   # Caddy's certificate token (C7): the separate one when given; else it follows the main token
   if [ -n "$dtok" ]; then envset CF_DNS_TOKEN "$dtok"
   elif [ -z "$(envget CF_DNS_TOKEN)" ] || [ "$(envget CF_DNS_TOKEN)" = "$old_tok" ]; then envset CF_DNS_TOKEN "$tok"; fi
-  if [ -n "$cur_au" ] && [ "$cur_au" != "$au" ]; then envset ADMIN_USER_PREV "$cur_au"; fi
+  # append-safe: ADMIN_USER_PREV is the only record of the name the CWA row still carries, and
+  # ensure_admin_name clears it once the rename lands. Overwriting it on a second rename (the
+  # portal was down for the first) loses the real old name and the rename can never succeed.
+  if [ -n "$cur_au" ] && [ "$cur_au" != "$au" ] && [ -z "$(envget ADMIN_USER_PREV)" ]; then envset ADMIN_USER_PREV "$cur_au"; fi
   envset ADMIN_USER "$au"
   # PUBLIC_IP = the DNS A records. Detected only when empty or when the admin agrees: a value set by
   # hand (1:1 NAT providers) is never silently replaced.
@@ -454,8 +541,10 @@ step_configure() {
     # caddy hash-password reads the password from stdin and needs the trailing newline
     # (without it caddy 2.11 exits "Error: EOF" and prints nothing)
     local h; h=$(printf '%s\n' "$pw" | docker run --rm -i "$CADDY_BASE" caddy hash-password 2>/dev/null) || h=""
-    case "$h" in '$2'*|'$argon2'*) envset ADMIN_HASH "$h";;
-      *) msg "Could not hash the admin-gate password (docker run $CADDY_BASE caddy hash-password failed). Nothing was changed; check Docker and run Configure again."; return 1;; esac
+    # the settings above are already in .env: say so, or the admin concludes the token and the
+    # admin username were not stored and stops looking for the half-written ADMIN_HASH
+    valid_admin_hash "$h" || { msg "Could not hash the admin-gate password (docker run $CADDY_BASE caddy hash-password failed). The other settings you typed WERE saved, but no Caddyfile was rendered — which is what the next step will complain about. Fix Docker and run Configure again."; return 1; }
+    envset ADMIN_HASH "$h"
   fi
 
   make_dirs
@@ -467,9 +556,37 @@ step_configure() {
   apply_caddy || return 1
   if portal_up && [ "$(envget ADMIN_PW_SET)" = true ]; then
     local rc=0; ensure_admin_name || rc=$?
-    [ "$rc" = 2 ] && msg "Could not rename the Calibre-Web admin account to '$au' (Operations -> Logs -> librarian). Deploy tries again."
+    case "$rc" in
+      2) msg "Could not rename the Calibre-Web admin account to '$au' (Operations -> Logs -> librarian). Deploy tries again.";;
+      # rc=1 used to be silent, so .env could name an account that does not exist while the
+      # Deploy summary, the qBittorrent save path and the Ephemera owner all trusted it
+      1) msg "Could not confirm the Calibre-Web admin account is called '$au' (the portal answered nothing, or no matching account was found). .env now says ADMIN_USER=$au — run Users -> List users to check which name really exists.";;
+    esac
   fi
-  msg "Configuration written to $STACK_DIR.\n\nPublic IP (DNS): $(envget PUBLIC_IP)   Caddy binds: $(envget BIND_IP)\nTailscale IP: $(envget TAILSCALE_IP)   Admin account: $(admin_user)\n\nRequests from family members are fulfilled at once (no admin approval). Turn approvals on under Library -> Sources if you want to review each request.\n\n(If Tailscale IP is 127.0.0.1, run the Tailscale step then Configure again.)"
+  # A changed DOMAIN / TZ / token only reaches a container when it is RECREATED. Reloading Caddy
+  # is not enough: caddy keeps the OLD CF_DNS_TOKEN in its environment, so ACME DNS-01 for the new
+  # zone is attempted with the old token and no certificate ever issues, and the portal keeps
+  # building every user-facing link from the old domain.
+  local applied=""
+  if [ "$(envget DOMAIN)" != "$pre_d" ] || [ "$(envget TZ)" != "$pre_tz" ] || [ "$(envget ADMIN_EMAIL)" != "$pre_email" ] \
+     || [ "$(envget CF_API_TOKEN)" != "$pre_cf" ] || [ "$(envget CF_DNS_TOKEN)" != "$pre_dns" ] || [ "$(envget ADMIN_USER)" != "$pre_au" ]; then
+    if running caddy || portal_up; then
+      clear; echo "Recreating the containers so they pick up the new settings..."
+      if stack_up_all >/dev/null 2>&1; then applied="\n\nThe containers were recreated, so caddy, the portal and Shelfmark now hold the new values."
+      else applied="\n\nWARNING: the containers could NOT be recreated, so they still hold the OLD domain, timezone and Cloudflare token — certificates for a new zone will not issue and the portal's links stay stale. Run Install -> 5 Deploy (Operations -> Logs shows why)."; fi
+    else
+      applied="\n\nNothing is running yet: Install -> 5 Deploy starts everything with these values."
+    fi
+    # jail.local bakes in the Cloudflare token and the abs-login filter bakes in the domain: an
+    # 'active' jail with a revoked token or the old hostname looks fine and bans nothing.
+    if [ "$(envget DOMAIN)" != "$pre_d" ] || [ "$(envget CF_API_TOKEN)" != "$pre_cf" ]; then
+      if command -v fail2ban-client >/dev/null 2>&1; then
+        render_fail2ban || true; systemctl restart fail2ban >/dev/null 2>&1 || true
+        applied="$applied\nfail2ban's jails were re-rendered with the new domain / Cloudflare token."
+      fi
+    fi
+  fi
+  msg "Configuration written to $STACK_DIR.\n\nPublic IP (DNS): $(envget PUBLIC_IP)   Caddy binds: $(envget BIND_IP)\nTailscale IP: $(envget TAILSCALE_IP)   Admin account: $(admin_user)$applied\n\nRequests from family members are fulfilled at once (no admin approval). Turn approvals on under Library -> Sources if you want to review each request.\n\n(If Tailscale IP is 127.0.0.1, run the Tailscale step then Configure again.)"
 }
 
 # ---------- 4. cloudflare ----------
@@ -520,9 +637,18 @@ step_cloudflare() {
   cf_zone || { msg "Zone $(envget DOMAIN) not found with this token."; return 1; }
   CF_FAILS=""
   local h pub ts; pub=$(envget PUBLIC_IP); ts=$(envget TAILSCALE_IP)
-  local public="books audio request shelf auth" private="monitor"
+  local public="books audio request shelf" private="monitor" privnote=""
+  # auth. only exists while Authelia runs; published unconditionally it is a public hostname that
+  # 502s and renews a certificate forever for a service nothing listens on.
+  [ "$(envget AUTHELIA_ENABLED)" = "true" ] && public="$public auth"
   torrents_on && private="$private dl"
   [ "$(envget EPHEMERA_ENABLED)" = "true" ] && private="$private ephemera"
+  # 127.0.0.1 is the placeholder Configure writes before Tailscale exists: publishing the admin
+  # hostnames pointing at it advertises them in the zone and the read-back would still "verify".
+  if [ "$ts" = 127.0.0.1 ]; then
+    privnote="\n- $private: DNS NOT created — TAILSCALE_IP is still the 127.0.0.1 placeholder. Run Install -> Tailscale, then this step again."
+    private=""
+  fi
   for h in $public; do cf_dns "$h" "$pub" true; done
   for h in $private; do cf_dns "$h" "$ts" false; done
   cf_dns_delete aria    # AriaNg/aria2 were removed from the stack
@@ -551,7 +677,9 @@ step_cloudflare() {
   chown root:root "$STACK_DIR/caddy/cf-origin-pull-ca.pem"; chmod 644 "$STACK_DIR/caddy/cf-origin-pull-ca.pem"
 
   "$STACK_DIR/scripts/cf-ips.sh" >/dev/null || cf_fail "firewall allowlist (scripts/cf-ips.sh) could not be applied"
-  write_cron bookstack-cfips "15 3 * * *" "$STACK_DIR/scripts/cf-ips.sh >/dev/null 2>&1"
+  # STACK_DIR= like the disk-watch cron: cf-ips.sh reads $STACK_DIR/.env for the alert channel, so
+  # without it a failed nightly refresh on a non-default STACK_DIR is completely silent.
+  write_cron bookstack-cfips "15 3 * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/cf-ips.sh >/dev/null 2>&1"
 
   # verify what matters instead of trusting the PATCH/PUT answers: with SSL not strict or
   # origin pulls off, Caddy's client-certificate check rejects Cloudflare and every site fails
@@ -567,7 +695,7 @@ Cache Rules:Edit, Firewall Services:Edit) or set them in the dashboard, then run
 The public sites will not work while SSL is not 'Full (strict)' or Authenticated Origin Pulls is off."
     return 1
   fi
-  msg "Cloudflare configured (read back and verified):\n- DNS: books/audio/request/shelf/auth -> proxied (orange); $private -> tailnet IP only\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n\nIn the dashboard: Security > WAF > Managed rules: ON.\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
+  msg "Cloudflare configured (read back and verified):\n- DNS: $(printf '%s' "$public" | tr ' ' '/') -> proxied (orange)$([ -n "$private" ] && printf '; %s -> tailnet IP only' "$private")$privnote\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n\nIn the dashboard: Security > WAF > Managed rules: ON.\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
 }
 
 # ---------- 5. deploy ----------
@@ -621,7 +749,10 @@ set_admin_password() {
     if ! apw=$(askpw2 "Set the password for your admin account '$au' (Calibre-Web, the portal and Shelfmark all use it). Replaces the factory default admin123.\n\nCancel = generate a random one and show it at the end."); then
       apw=$(openssl rand -base64 18); ADMIN_PW_GENERATED="$apw"
     fi
-    if printf '%s' "$apw" | lib passwd "$au" --password-stdin >/dev/null 2>&1; then envset ADMIN_PW_SET true
+    if printf '%s' "$apw" | lib passwd "$au" --password-stdin >/dev/null 2>&1; then
+      # the loop's only exit condition is this flag: a silent write failure (full disk, read-only
+      # root) used to re-prompt for the password forever with no Cancel path out
+      envset ADMIN_PW_SET true || { msg "Could not write $ENV_FILE (disk full, or the filesystem is read-only?). The password WAS set on the account but not recorded here, so Deploy cannot continue. Free some space and run Deploy again."; return 1; }
     else
       yesno "Could not set the admin password (is the portal up? Operations -> Logs -> librarian). Try again?" \
         || { msg "The admin password is still the factory default, so Caddy was NOT started: nothing is reachable from the internet. Fix the portal and run Deploy again."; return 1; }
@@ -659,7 +790,6 @@ step_deploy() {
   apply_library_defaults || echo "(could not apply library defaults yet — run Users → Repair later)"
   d=$(envget DOMAIN)
   set_admin_password || return 1
-  ru=$(envget ABS_ROOT_USER); absnote="Audiobookshelf: root user '${ru:-root}' (Library -> Audiobookshelf re-runs setup)"
   if ! abs_initialised; then
     msg "Audiobookshelf has no root user yet. Whoever opened https://audio.$d first would become its administrator, so it is set up now, before the site goes public."
     step_abs_setup || yesno "Audiobookshelf is still uninitialised: the first visitor of audio.$d would become root. Start Caddy anyway (NOT recommended)?" || { msg "Caddy was not started. Run Library -> Audiobookshelf, then Deploy again."; return 1; }
@@ -673,6 +803,9 @@ step_deploy() {
     privline="https://dl.$d  (qBittorrent)   $privline"; qline="  qBittorrent: admin / ${qpw:-<see: docker logs qbittorrent>}"
   fi
   adminline="the password you just set"; [ -n "${ADMIN_PW_GENERATED:-}" ] && adminline="GENERATED password: $ADMIN_PW_GENERATED  (change it under Users -> Reset password)"
+  # read AFTER the ABS branch above: on a fresh install step_abs_setup asks for this name a few
+  # seconds earlier in this same Deploy, and this summary is the screen the admin copies from
+  ru=$(envget ABS_ROOT_USER); absnote="Audiobookshelf: root user '${ru:-root}' (Library -> Audiobookshelf re-runs setup)"
   big "Stack is up" "Public (your users):
   https://request.$d   the portal: search, request, upload, My books, Devices
   https://books.$d     the library (Kobo/OPDS/Send-to-Kindle also live here)
@@ -696,9 +829,11 @@ Library -> Mail for Send-to-Kindle from the portal, Install -> Backups, Install 
 
 # ---------- 6. backups ----------
 RESTIC_ENV_FILE_REL=bookstack/restic.env   # under $ETC; the scripts read /etc/bookstack/restic.env
-restic_env(){ printf '%s' "$ETC/$RESTIC_ENV_FILE_REL"; }
-write_restic_env() { # prompts for repository / password / S3 keys and writes restic.env (0600 root)
-  local repo rpw k1="" k2="" cur
+# RESTIC_ENV_PATH lets step_backup try a CANDIDATE credential file against the repository before
+# it replaces the live one (that file is the only on-host copy of the repository key).
+restic_env(){ printf '%s' "${RESTIC_ENV_PATH:-$ETC/$RESTIC_ENV_FILE_REL}"; }
+write_restic_env() { # prompts for repository / password / S3 keys; writes restic.env.new (0600 root)
+  local repo rpw k1="" k2="" cur new="$(restic_env).new"
   command -v restic >/dev/null || apt-get -y -qq install restic
   cur=$(grep -E '^RESTIC_REPOSITORY=' "$(restic_env)" 2>/dev/null | cut -d= -f2- || true)
   repo=$(ask "restic repository (e.g. s3:s3.eu-central-003.backblazeb2.com/my-bucket, sftp:user@host:/path, or /mnt/backup):" "$cur") || return 1
@@ -708,14 +843,20 @@ write_restic_env() { # prompts for repository / password / S3 keys and writes re
     k1=$(ask "S3 / B2 key ID:") || return 1; k2=$(askpw "S3 / B2 application key:") || return 1
   fi
   mkdir -p "$ETC/bookstack"
+  # Written NEXT TO the live file, never over it: step_backup moves it into place only after the
+  # password has actually opened (or created) the repository. Overwriting first meant one typo —
+  # or a "rotation" typed here, which restic does not support (it needs `key add`) — left every
+  # existing snapshot permanently unreadable, with nothing on screen saying so.
   # shell-quoted (%q): the file is sourced by bash, so a password with $, spaces, & or quotes
   # must survive intact instead of being expanded or executed
-  { printf 'RESTIC_REPOSITORY=%q\nRESTIC_PASSWORD=%q\nSTACK_DIR=%q\n' "$repo" "$rpw" "$STACK_DIR"
-    [ -n "$k1" ] && printf 'AWS_ACCESS_KEY_ID=%q\n' "$k1"; [ -n "$k2" ] && printf 'AWS_SECRET_ACCESS_KEY=%q\n' "$k2"; true; } > "$(restic_env)"
-  chmod 600 "$(restic_env)"; chown root:root "$(restic_env)"
+  ( umask 077
+    { printf 'RESTIC_REPOSITORY=%q\nRESTIC_PASSWORD=%q\nSTACK_DIR=%q\n' "$repo" "$rpw" "$STACK_DIR"
+      [ -n "$k1" ] && printf 'AWS_ACCESS_KEY_ID=%q\n' "$k1"; [ -n "$k2" ] && printf 'AWS_SECRET_ACCESS_KEY=%q\n' "$k2"; true; } > "$new" ) \
+    || { msg "Could not write $new (disk full or read-only?). Nothing was changed."; return 1; }
+  chmod 600 "$new"; chown root:root "$new"
   # prove it reads back exactly before anyone relies on it
-  local back; back=$(bash -c 'set -a; . "$1"; printf "%s" "$RESTIC_PASSWORD"' _ "$(restic_env)")
-  [ "$back" = "$rpw" ] || { rm -f "$(restic_env)"; msg "Internal error: the backup password did not round-trip through restic.env. Nothing saved."; return 1; }
+  local back; back=$(bash -c 'set -a; . "$1"; printf "%s" "$RESTIC_PASSWORD"' _ "$new")
+  [ "$back" = "$rpw" ] || { rm -f "$new"; msg "Internal error: the backup password did not round-trip through restic.env. Nothing saved."; return 1; }
 }
 install_backup_units() { # backup nightly at 01:00 (before the 04:30 reboot window), restore test on the 1st at 13:00 (never
   # overlapping the backup's repository lock), both alert on failure
@@ -781,14 +922,30 @@ Rebuild on a new VPS: install Debian, run bookstack.sh -> System, Tailscale, Con
 (same domain), then Operations -> 'Restore from backup'. Kobo links, ABS accounts and
 Authelia users come back from the snapshot; only the Tailscale IP changes."
 }
-restic_run(){ ( set -a; . "$(restic_env)"; set +a; restic "$@" ); }
+# Debian 12 ships restic 0.14, which has no --retry-lock: passing it unconditionally makes every
+# call fail with "unknown flag". Probe it the way the restore path already probes --overwrite.
+restic_run(){ ( set -a; . "$(restic_env)"; set +a
+  local R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
+  restic ${R[@]+"${R[@]}"} "$@" ); }
 step_backup() {
-  write_restic_env || return 1
+  local live new
+  live="${RESTIC_ENV_PATH:-$ETC/$RESTIC_ENV_FILE_REL}"; new="$live.new"
+  write_restic_env || { rm -f "$new"; return 1; }
   # The repository is created here and only here. backup.sh never runs `restic init`: with a local
   # path on a volume that failed to mount it would quietly start a new repository on the root disk.
-  if ! restic_run cat config >/dev/null 2>&1; then
-    restic_run init || { msg "Could not open or create the backup repository. Check the address, keys and password, then run Backups again."; return 1; }
+  # Everything below runs against the CANDIDATE file; the live one is replaced only on success.
+  if ! RESTIC_ENV_PATH="$new" restic_run cat config >/dev/null 2>&1; then
+    if [ -s "$live" ] && ! yesno "That password did not open the repository, and $live still holds the CURRENT key — it was NOT overwritten.\n\nNote: a restic password cannot be changed by typing a new one here; restic needs 'key add' and every existing snapshot would otherwise become unreadable.\n\nIs this a brand-new, EMPTY repository that should be created now?"; then
+      rm -f "$new"; msg "Nothing was changed: $live still opens your existing backups. Run Backups again with the right password."; return 1
+    fi
+    if ! RESTIC_ENV_PATH="$new" restic_run init; then
+      rm -f "$new"
+      msg "Could not open or create the backup repository. Check the address, keys and password, then run Backups again.\n\n$([ -s "$live" ] && printf 'The existing %s was left unchanged.' "$live" || printf 'No credentials were stored.')"
+      return 1
+    fi
   fi
+  mv "$new" "$live" || { rm -f "$new"; msg "The repository opened, but $live could not be replaced (disk full or read-only?). Nothing was changed."; return 1; }
+  chmod 600 "$live"; chown root:root "$live"
   local ping; ping=$(ask "Optional: a dead-man's-switch ping URL (e.g. a free healthchecks.io check). backup.sh calls it after every good backup and URL/fail after a failed one, so you also hear about it when the server is gone. Blank = none." "$(envget BACKUP_PING_URL)") || ping="$(envget BACKUP_PING_URL)"
   envset BACKUP_PING_URL "$ping"
   install_backup_units
@@ -810,7 +967,7 @@ step_alerts() { # C1: one channel that reaches the admin even when the portal is
   [ -n "$url" ] || url="$cur"
   [ "$url" = none ] && url=""
   case "$url" in ""|https://*|http://*) ;; *) msg "That is not an http(s) URL. Nothing changed."; return 1;; esac
-  envset NOTIFY_WEBHOOK "$url"; restart_portal
+  envset NOTIFY_WEBHOOK "$url"; restart_portal_ok || true
   if [ -z "$url" ]; then
     msg "Alert webhook removed.$([ -z "$(envget SMTP_HOST)" ] && printf '\n\nWARNING: no SMTP either, so alerts only reach the journal (Self-test FAILS on this).')"; return 0
   fi
@@ -850,7 +1007,12 @@ restore_fits(){ # snapshot-id: in-place restore needs (restore size - what is al
   need=$(restic_run stats "$1" --mode restore-size --json 2>/dev/null | json 'd["total_size"]') || need=""
   [ -n "$need" ] || { echo "(could not read the snapshot's restore size; continuing)"; return 0; }
   have=$(df -Pk "$STACK_DIR" 2>/dev/null | awk 'NR==2{print $4}'); cur=$(du -sk "$STACK_DIR" 2>/dev/null | cut -f1)
-  local want_k=$(( need / 1024 - ${cur:-0} + 1048576 ))
+  # restic restore never DELETES a file the snapshot does not contain, so whatever is already
+  # here beyond the snapshot's own contents is NOT reclaimed. Credit at most the snapshot size,
+  # or an old snapshot restored onto a library that has since grown passes and then fills the disk.
+  local need_k=$(( need / 1024 )) cur_k=${cur:-0}
+  [ "$cur_k" -gt "$need_k" ] && cur_k=$need_k
+  local want_k=$(( need_k - cur_k + 1048576 ))
   RESTORE_NEED_GB=$(( (need / 1024 + 1048575) / 1048576 )); RESTORE_FREE_GB=$(( ${have:-0} / 1048576 ))
   [ "$want_k" -le "${have:-0}" ]
 }
@@ -861,7 +1023,7 @@ step_restore() {
   local mode
   mode=$(whiptail --title "Restore: what" --menu "Snapshot $SNAP_DESC" 14 80 2 \
     full   "Everything: configs, databases AND the library / audiobooks (new server)" \
-    config "Config + databases only (library files stay; e.g. roll back a bad update)" 3>&1 1>&2 2>&3) || return 1
+    config "Config + databases only (library and its catalog stay; roll back a bad update)" 3>&1 1>&2 2>&3) || return 1
   if [ "$mode" = full ] && ! restore_fits "$SNAP_ID"; then
     msg "Not enough disk space: the snapshot needs about ${RESTORE_NEED_GB} GB and only ${RESTORE_FREE_GB} GB are free under $STACK_DIR (plus 1 GB headroom). Nothing was stopped or changed.\n\nUse a larger disk, or restore 'config + databases only'."; return 1
   fi
@@ -886,6 +1048,13 @@ step_restore() {
   if [ -f "$STACK_DIR/.backup-snap/MANIFEST" ]; then
     while IFS=$'\t' read -r snap rel; do
       [ -n "$snap" ] && [ -f "$STACK_DIR/.backup-snap/$snap" ] || continue
+      # "config + databases only" promises the library files stay. library/books/metadata.db is
+      # the CATALOG of exactly those files: rolling it back would make every book imported since
+      # the snapshot vanish from Calibre-Web, the portal, Kobo sync and every reader's shelf
+      # while the files sit untouched on disk. Skip the whole library tree in that mode.
+      if [ "$mode" = config ]; then
+        case "$rel" in library/*) echo "  kept the live $rel (library files and their catalog stay in this mode)"; continue;; esac
+      fi
       mkdir -p "$(dirname "$STACK_DIR/$rel")"
       cp -f "$STACK_DIR/.backup-snap/$snap" "$STACK_DIR/$rel"; rm -f "$STACK_DIR/$rel-wal" "$STACK_DIR/$rel-shm"
       echo "  restored DB $rel"
@@ -910,8 +1079,16 @@ step_restore() {
 
 # ---------- 7. lock SSH ----------
 step_lock_ssh() {
+  local ts; ts=$(envget TAILSCALE_IP)
   tailscale status >/dev/null 2>&1 || { msg "Tailscale is not running. Not locking SSH."; return 1; }
-  yesno "This removes public SSH (port 22) and leaves it reachable only over Tailscale.\n\nConfirm you can ALREADY SSH to $(envget TAILSCALE_IP) (or 'tailscale ssh') from another machine before continuing." || return 1
+  # The same guard Quick install applies before it offers this (bookstack.sh's step_quick).
+  # Without it the prompt names 127.0.0.1 — the placeholder Configure writes before Tailscale is
+  # set up — which is trivially "reachable", invites a yes, and closes port 22 for good.
+  [ -n "$ts" ] && [ "$ts" != 127.0.0.1 ] \
+    || { msg "TAILSCALE_IP is ${ts:-empty}, the placeholder Configure writes before Tailscale exists — not a tailnet address. Run Install -> Tailscale first; SSH stays public."; return 1; }
+  ip_on_host "$ts" \
+    || { msg "TAILSCALE_IP ($ts) is not an address on this host — tailscaled is not up on it, or a re-auth assigned a new one. Run Install -> Tailscale first; SSH stays public."; return 1; }
+  yesno "This removes public SSH (port 22) and leaves it reachable only over Tailscale.\n\nConfirm you can ALREADY SSH to $ts (or 'tailscale ssh') from another machine before continuing." || return 1
   if ! ts_key_expiry_disabled; then
     yesno "$TS_EXPIRY_NOTE\n\nWith public SSH closed, an expired key locks you out of everything but the provider console.\n\nHave you disabled key expiry for THIS machine in the Tailscale admin console?" \
       || { msg "Do that first (admin console -> Machines -> ... -> Disable key expiry), then run this step again. SSH stays public for now."; return 1; }
@@ -950,16 +1127,25 @@ Start?" || return 0
 users_json() { lib list 2>/dev/null; }
 step_user_list() {
   portal_up || { msg "The portal is not running (Install -> Deploy first)."; return 1; }
+  # %-formatting, not f-strings: this block runs on the HOST, and nesting the same quote inside
+  # an f-string is python 3.12+ (PEP 701). Debian 12 ships 3.11 and raised a SyntaxError here.
   users_json | python3 -c '
-import sys,json
-u=json.load(sys.stdin)
-print(f"{"user":18} {"role":6} {"isolation":22} kindle")
-for x in u: print(f"{x["name"]:18} {"admin" if x["is_admin"] else "user":6} {("sees all" if x["is_admin"] else ("owner:"+x["name"] if x["isolated"] else "NOT ISOLATED")):22} {x.get("kindle_mail") or "-"}")
+import sys, json
+u = json.load(sys.stdin)
+row = "%-18s %-6s %-22s %s"
+print(row % ("user", "role", "isolation", "kindle"))
+for x in u:
+    iso = "sees all" if x["is_admin"] else ("owner:" + x["name"] if x["isolated"] else "NOT ISOLATED")
+    print(row % (x["name"], "admin" if x["is_admin"] else "user", iso, x.get("kindle_mail") or "-"))
 ' | whiptail --title "Library users" --textbox /dev/stdin 22 90
 }
 step_user_add() {
   portal_up || { msg "The portal is not running (Install -> Deploy first)."; return 1; }
   u=$(ask "Username (lowercase letters/digits . _ - ; this is also their owner tag):") ; [ -n "$u" ] || return 1
+  # The dropbox watcher skips folders whose name starts with '.', so a name like '.kim' produced
+  # a fully working account whose file intake was permanently dead (uploads confirmed, never
+  # imported), and '..' would have resolved the dropbox to $STACK_DIR/library itself.
+  valid_username "$u" || { msg "'$u' is not a valid username: 2-32 characters, starting with a lowercase letter or digit, then a-z 0-9 . _ - only. A name starting with a dot would never have its dropbox scanned. Nothing was created."; return 1; }
   # a REAL address (F49): Authelia sends 2FA enrolment / reset codes there, the portal its notices
   em=$(ask "$u's real e-mail address (2FA codes, password resets and portal notices go here; they can change it on their Devices page):" "") || return 1
   valid_email "$em" || { msg "'$em' is not an e-mail address. Nothing was created."; return 1; }
@@ -1016,24 +1202,36 @@ step_user_passwd() {
   if abs_ready; then printf '%s' "$pw" | absctl ensure-user "$u" --password-stdin >/dev/null 2>&1 && extra="\nAudiobookshelf: same password (account created if it was missing)." || extra="\nAudiobookshelf: could not update (is it set up? Library -> Audiobookshelf)."; fi
   # blank display name / e-mail = keep what Authelia already has (2FA reset mails keep working)
   if [ "$(envget AUTHELIA_ENABLED)" = "true" ]; then authelia_add_user "$u" "" "" "$pw" >/dev/null 2>&1 && extra="$extra\nAuthelia: same password (stored e-mail kept)." || extra="$extra\nAuthelia: not updated (no Authelia login for $u yet? Security -> Authelia: add or reset a user)."; fi
-  # J07: Shelfmark's session cookie is signed and only checked against app.db at login, so the
-  # old password keeps working there until the container restarts.
-  restart_shelfmark
-  msg "Password updated for $u (portal, Calibre-Web, Shelfmark).$extra\n\nShelfmark was restarted, so $u is signed out there and must use the new password.\n\nOpen Calibre-Web and Audiobookshelf sessions on devices they are already signed in on may SURVIVE this reset until they expire — have $u sign out there (or restart those apps) if the reset was because of a lost or shared password.\n\nTell $u to change their password ONLY in the portal (https://request.$(envget DOMAIN) -> Devices). A change made on Calibre-Web's own profile page (/me) never reaches Audiobookshelf, so their audiobook login would silently keep the old password."
+  # J07/V02: Shelfmark's session cookie is signed and only checked against app.db at login, and
+  # its signing key is persisted to config/.flask_secret — dropping that key is what ends the
+  # sessions; the restart alone would not.
+  local smnote
+  if restart_shelfmark --end-sessions; then
+    smnote="\n\nShelfmark was restarted with a NEW session key, so every Shelfmark session — including $u's — is dead and the new password is required there."
+  else
+    smnote="\n\nWARNING: Shelfmark could NOT be restarted, so it still holds its old session key: $u stays signed in there and could keep downloading. Operations -> Logs -> shelfmark, then run this reset again."
+  fi
+  msg "Password updated for $u (portal, Calibre-Web, Shelfmark).$extra$smnote\n\nOpen Calibre-Web and Audiobookshelf sessions on devices they are already signed in on may SURVIVE this reset until they expire — have $u sign out there (or restart those apps) if the reset was because of a lost or shared password.\n\nTell $u to change their password ONLY in the portal (https://request.$(envget DOMAIN) -> Devices). A change made on Calibre-Web's own profile page (/me) never reaches Audiobookshelf, so their audiobook login would silently keep the old password."
 }
 step_user_remove() {
   u=$(ask "Username to remove (their books and dropbox are kept):"); [ -n "$u" ] || return 1
-  yesno "Remove login '$u' from the library, portal, Audiobookshelf and Authelia?\n\nTheir books stay in the library; requests they still had queued are failed by the portal." || return 0
+  yesno "Remove login '$u' from the library, portal, Audiobookshelf and Authelia?\n\nTheir books stay in the library. Requests already being worked on are failed by the portal; requests still waiting for approval stay in the queue until you deny them there." || return 0
   out=$(lib remove-user "$u" 2>&1) || { msg "Failed:\n$out"; return 1; }
   abs_ready && absctl remove-user "$u" >/dev/null 2>&1 || true
   local anote=""
   if [ -f "$STACK_DIR/authelia/users_database.yml" ] && grep -q "^  $u:" "$STACK_DIR/authelia/users_database.yml"; then
     authelia_remove_user "$u" && anote="\nTheir Authelia login was removed too." || anote="\nCould NOT remove their Authelia login: delete '$u' from $STACK_DIR/authelia/users_database.yml."
   fi
-  # J07: without this the removed user's SIGNED Shelfmark cookie keeps working (Shelfmark reads
-  # CWA's app.db only at login), so they could still search and download after removal.
-  restart_shelfmark
-  msg "Removed $u. Books tagged owner:$u remain in the library (admin sees them).$anote\n\nShelfmark was restarted, so any session $u still had open there is dead.\n\nA browser tab already signed in to Calibre-Web or Audiobookshelf may keep working until that session expires; Security -> 'Rotate the portal session secret' ends every portal session at once if you need that now."
+  # J07/V02: without dropping the persisted signing key the removed user's SIGNED Shelfmark
+  # cookie keeps working (Shelfmark reads CWA's app.db only at login, and a plain restart
+  # re-reads the same key from config/.flask_secret), so they could still search and download.
+  local smnote
+  if restart_shelfmark --end-sessions; then
+    smnote="\n\nShelfmark was restarted with a NEW session key, so any session $u still had open there is dead."
+  else
+    smnote="\n\nWARNING: Shelfmark could NOT be restarted, so it still holds its old session key and $u can keep searching and downloading there. Operations -> Logs -> shelfmark, then run this removal again."
+  fi
+  msg "Removed $u. Books tagged owner:$u remain in the library (admin sees them).$anote$smnote\n\nA browser tab already signed in to Calibre-Web or Audiobookshelf may keep working until that session expires; Security -> 'Rotate the portal session secret' ends every portal session at once if you need that now."
 }
 step_user_repair() {
   portal_up || { msg "The portal is not running."; return 1; }
@@ -1088,7 +1286,7 @@ step_formats() {
   cwa_sql "UPDATE cwa_settings SET koreader_sync_enabled=$ko;" >/dev/null 2>&1 || true
   bk=0; yesno "Keep CWA's own copies of every imported/converted/fixed file (cwa/config/processed_books)?\n\nOFF is the default: they double disk use and restic already backs up the library." && bk=1
   cwa_sql "UPDATE cwa_settings SET auto_backup_imports=$bk, auto_backup_conversions=$bk, auto_backup_epub_fixes=$bk;" >/dev/null 2>&1 || true
-  envset KOSYNC_ENABLED "$([ "$ko" = 1 ] && echo true || echo false)"; restart_portal
+  envset KOSYNC_ENABLED "$([ "$ko" = 1 ] && echo true || echo false)"; restart_portal_ok || true
   msg "Saved. Applies to the next import.\n\nconvert=$on -> $fmt, keep=[$keep], kindle fixer=$fix, duplicates=$merge, KOReader sync=$ko\n\nUsers pick their own preferred DOWNLOAD format on the portal's Devices page; the library serves whichever formats exist.$([ "$ko" = 1 ] && echo ' KOReader instructions now appear on their Devices page.')"
 }
 
@@ -1105,7 +1303,7 @@ step_abs_setup() {
   out=$(printf '%s' "$rp" | absctl init --user "$ru" --password-stdin 2>&1) || { msg "Audiobookshelf setup failed:\n\n$out\n\nIf ABS was initialised in its web UI with a different root password, use that one."; return 1; }
   key=$(printf '%s' "$out" | json 'd["api_key"]'); [ -n "$key" ] || { msg "No API key returned:\n$out"; return 1; }
   envset ABS_TOKEN "$key"; envset ABS_ROOT_USER "$ru"
-  restart_portal; wait_for http://127.0.0.1:8090/healthz 45 || true
+  restart_portal_ok || true; wait_for http://127.0.0.1:8090/healthz 45 || true
   n=0; for u in $(users_json | json '" ".join(x["name"] for x in d if not x["is_admin"])'); do absctl ensure-user "$u" >/dev/null 2>&1 && n=$((n+1)); done
   local libname; libname=$(envget ABS_LIBRARY_NAME)
   big "Audiobookshelf ready" "Root user: $ru   Library: ${libname:-Audiobooks} -> /audiobooks   API key stored in .env (ABS_TOKEN)
@@ -1125,7 +1323,7 @@ username and password. You (admin) use the root account there."
 # ---------- M. mail (SMTP for Send-to-Kindle) ----------
 step_mail() {
   h=$(ask "SMTP host (blank disables Send-to-Kindle from the portal):" "$(envget SMTP_HOST)")
-  if [ -z "$h" ]; then envset SMTP_HOST ""; restart_portal
+  if [ -z "$h" ]; then envset SMTP_HOST ""; restart_portal_ok || true
     if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d authelia >/dev/null 2>&1 || true; fi
     msg "Portal mail disabled."; return 0; fi
   local dp; dp=$(envget SMTP_PORT)
@@ -1139,7 +1337,7 @@ step_mail() {
   local df; df=$(envget SMTP_FROM)
   from=$(ask "From address (users must add THIS to Amazon's approved senders):" "${df:-$u}") || return 1; [ -n "$from" ] || from="$u"
   envset SMTP_HOST "$h"; envset SMTP_PORT "$p"; envset SMTP_SECURITY "$sec"; envset SMTP_USER "$u"; envset SMTP_PASS "$pw"; envset SMTP_FROM "$from"
-  restart_portal; wait_for http://127.0.0.1:8090/healthz 30 || true
+  restart_portal_ok || true; wait_for http://127.0.0.1:8090/healthz 30 || true
   # Authelia mails enrolment / reset codes through the same SMTP (C9)
   if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d authelia >/dev/null 2>&1 || true; fi
   if t=$(ask "Send a test mail to (blank to skip):" "$(envget ADMIN_EMAIL)") && [ -n "$t" ]; then
@@ -1200,8 +1398,8 @@ step_sources() {
   else
     envset SRC_MYCATALOG false
   fi
-  restart_portal
-  msg "Sources updated and the portal restarted."
+  if restart_portal; then msg "Sources updated and the portal restarted."
+  else msg "Sources written to $ENV_FILE, but the portal could NOT be restarted, so it is still offering the OLD set of sources (Operations -> Logs -> librarian)."; return 1; fi
 }
 
 # ---------- 13. mail auth (SPF/DMARC) ----------
@@ -1232,13 +1430,17 @@ render_fail2ban() { # writes $ETC/fail2ban/{jail.local,filter.d/caddy-*.conf}; r
   sed -e "s|@@CADDY_JAIL@@|$on|" -e "s|@@CF_API_TOKEN@@|$(envget CF_API_TOKEN)|" -e "s|@@CF_ZONE@@|$zone|" -e "s|@@CADDY_LOG@@|$log|" \
       "$STACK_DIR/configs/fail2ban/jail.local" > "$ETC/fail2ban/jail.local"
   chmod 600 "$ETC/fail2ban/jail.local"
-  cp -f "$STACK_DIR/configs/fail2ban/caddy-auth.conf" "$STACK_DIR/configs/fail2ban/caddy-device-auth.conf" "$ETC/fail2ban/filter.d/"
-  # The Audiobookshelf jail is scoped to the audio. vhost, so its filter carries the domain
-  # (regex-escaped: a dot in a hostname must not match any character).
-  local dom rep
+  cp -f "$STACK_DIR/configs/fail2ban/caddy-device-auth.conf" "$ETC/fail2ban/filter.d/"
+  # Host-scoped jails carry the domain in their filter (regex-escaped: a dot in a hostname must
+  # not match any character). caddy-abs-login is scoped to audio.<domain>; caddy-auth is scoped
+  # to the non-audio hosts, so an Audiobookshelf app with a stale password cannot trip the
+  # stricter 2 h jail that locks the reader out of every site at once.
+  local dom rep flt
   dom=$(envget DOMAIN); dom=$(printf '%s' "$dom" | sed 's/[.[\*^$]/\\&/g')   # regex-escape
   rep=$(printf '%s' "${dom:-[^\"]+}" | sed 's/[\&|]/\\&/g')                  # then sed-RHS-escape
-  sed -e "s|@@DOMAIN@@|$rep|g" "$STACK_DIR/configs/fail2ban/caddy-abs-login.conf" > "$ETC/fail2ban/filter.d/caddy-abs-login.conf"
+  for flt in caddy-auth caddy-abs-login; do
+    sed -e "s|@@DOMAIN@@|$rep|g" "$STACK_DIR/configs/fail2ban/$flt.conf" > "$ETC/fail2ban/filter.d/$flt.conf"
+  done
   [ "$on" = true ]
 }
 step_fail2ban() {
@@ -1252,8 +1454,13 @@ step_fail2ban() {
 
 # ---------- 15. monitoring (Uptime Kuma) ----------
 step_monitoring() {
-  compose up -d uptime-kuma >/dev/null 2>&1 || true
   local d; d=$(envget DOMAIN)
+  # Kuma is what tells the admin when something ELSE breaks: a page of setup instructions for a
+  # container that never started is a monitoring blind spot, not a cosmetic bug.
+  compose up -d uptime-kuma >/dev/null 2>&1 \
+    || { msg "Uptime Kuma did not start (Operations -> Logs -> uptime-kuma). Nothing was changed."; return 1; }
+  wait_for http://127.0.0.1:3001 20 \
+    || { msg "Uptime Kuma was started but is not answering on http://127.0.0.1:3001 yet, so https://monitor.$d will not load. Give it a minute and try again; if it stays down, Operations -> Logs -> uptime-kuma."; return 1; }
   msg "Uptime Kuma runs at https://monitor.$d (Tailscale only). It uses the host network, so loopback monitors work.\n\nOpen it, create the admin account, then add HTTP(s) monitors for:\n  https://books.$d   https://audio.$d\n  https://request.$d https://shelf.$d\n  http://127.0.0.1:8090/healthz    http://127.0.0.1:8084/api/health\n  http://127.0.0.1:8084/api/auth/check  (keyword monitor: \"cwa\" = Shelfmark still uses library logins)\nAdd a notification (ntfy/email/Telegram) so a dead container or expired cert pings you.\n\nKuma runs ON this server, so it cannot tell you when the whole VPS is down: add a free external check too (healthchecks.io via Backups' ping URL, or UptimeRobot on https://request.$d)."
 }
 
@@ -1354,16 +1561,24 @@ step_authelia() {
     composeA stop authelia >/dev/null 2>&1 || true
     msg "The Authelia gate could NOT be put in front of the sites (see the error above). Caddy keeps the previous configuration and Authelia stays disabled."; return 1
   fi
+  # The portal reads AUTHELIA_ENABLED at start-up, and that is what stops /admin from offering
+  # "Add a user" — an account created there would have no Authelia login and could sign in
+  # nowhere. Without this restart the guard written for exactly this case stays inert.
+  local pnote=""
+  restart_portal || pnote="\n\nNOTE: the portal could not be restarted, so its /admin page still offers 'Add a user'. A user added there would have NO Authelia login and could not sign in anywhere — add users from Users -> Add here until the portal is back (Operations -> Logs -> librarian)."
   local mailnote="Enrolment and reset codes are e-mailed through your SMTP server (Library -> Mail)."
   [ -n "$(envget SMTP_HOST)" ] || mailnote="No SMTP is configured, so enrolment/reset codes are NOT e-mailed: they are written to $STACK_DIR/authelia/notification.txt on this server (read it with: cat $STACK_DIR/authelia/notification.txt). Set up Library -> Mail to e-mail them instead."
-  msg "Authelia enabled and the gate is live.\n\nTEST NOW: open https://books.$(envget DOMAIN) — you should meet the Authelia login before the app.\n\nUsers log in at https://auth.$(envget DOMAIN) and enrol TOTP or a passkey on first login. $mailnote\n\nIf anything misbehaves, 'Authelia: disable' removes the gate immediately."
+  msg "Authelia enabled and the gate is live.$pnote\n\nTEST NOW: open https://books.$(envget DOMAIN) — you should meet the Authelia login before the app.\n\nUsers log in at https://auth.$(envget DOMAIN) and enrol TOTP or a passkey on first login. $mailnote\n\nIf anything misbehaves, 'Authelia: disable' removes the gate immediately."
 }
 step_authelia_off() {
   envset AUTHELIA_ENABLED false
-  render_caddyfile || return 1
+  render_caddy_all || return 1
   apply_caddy || return 1
   composeA stop authelia >/dev/null 2>&1 || true
-  msg "Gate removed — apps are back to their own logins. Authelia container stopped.\nRe-enable any time (your users and secrets are kept)."
+  # without this the portal keeps AUTHELIA_ENABLED=true and still shows a dead 'Authelia' link
+  local pnote=""
+  restart_portal || pnote="\nThe portal could not be restarted, so its /admin page still links to the (now stopped) Authelia — Operations -> Logs -> librarian."
+  msg "Gate removed — apps are back to their own logins. Authelia container stopped.$pnote\nRe-enable any time (your users and secrets are kept)."
 }
 authelia_add_user() { # name displayname email password (blank displayname/email = keep the stored ones; a NEW user needs an e-mail)
   local hash f
@@ -1446,11 +1661,13 @@ step_intake() {
       5 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in
       1) u=$(ask "Username to create a dropbox for (match their library username):"); [ -n "$u" ] || continue
+         # '.foo' is never scanned by the watcher and '..' would resolve to library/ itself
+         valid_username "$u" || { msg "'$u' is not a valid library username (2-32 characters, starting with a lowercase letter or digit, then a-z 0-9 . _ -). A folder starting with a dot is never scanned. Nothing was created."; continue; }
          install -d -o 1000 -g 1000 "$STACK_DIR/library/dropbox/$u"
          msg "Dropbox ready: $STACK_DIR/library/dropbox/$u\n\nAnything dropped there (scp/rsync/Syncthing/WebDAV) is tagged owner:$u and ingested automatically." ;;
       2) step_intake_webhook || true ;;
       3) m=$(ask "Gutenberg mirror base URL (e.g. https://gutenberg.pglaf.org). Blank to clear:" "$(envget GUTENBERG_MIRROR)")
-         envset GUTENBERG_MIRROR "$m"; restart_portal
+         envset GUTENBERG_MIRROR "$m"; restart_portal_ok || true
          msg "Gutenberg source will now pull EPUBs from: ${m:-<official site>}" ;;
       4) h=$(ask "IMAP host (blank to disable):" "$(envget IMAP_HOST)")
          if [ -n "$h" ]; then
@@ -1464,7 +1681,7 @@ step_intake() {
          else
            envset IMAP_HOST ""; msg "Email-to-library disabled."
          fi
-         restart_portal ;;
+         restart_portal_ok || true ;;
       5) return 0 ;;
     esac
   done
@@ -1474,9 +1691,9 @@ step_intake_webhook() { # C11: off (empty token, the portal answers 404) until t
   local d; d=$(envget DOMAIN)
   if [ -z "$(envget INTAKE_TOKEN)" ]; then
     yesno "The intake webhook is OFF (POST https://request.$d/intake answers 404).\n\nTurn it on? It lets automation you control (a script, an RSS/OPDS feed watcher) push a legal book URL into a user's library with a secret token." || return 0
-    envset INTAKE_TOKEN "$(openssl rand -hex 24)"; restart_portal
+    envset INTAKE_TOKEN "$(openssl rand -hex 24)"; restart_portal_ok || true
   elif yesno "The intake webhook is ON.\n\nYes = show the token and usage.\nNo = turn it OFF (the token stops working)."; then :
-  else envset INTAKE_TOKEN ""; restart_portal; msg "Intake webhook turned off."; return 0; fi
+  else envset INTAKE_TOKEN ""; restart_portal_ok || true; msg "Intake webhook turned off."; return 0; fi
   msg "Intake webhook (for authorized legal-source automation):\n\n  POST https://request.$d/intake\n  Header:  X-Intake-Token: $(envget INTAKE_TOKEN)\n  JSON:    {\"user\":\"alice\",\"url\":\"https://.../book.epub\",\"kind\":\"ebook\"}\n\nIt pulls the exact URL you give and maps it to that user. Turn it off again from this menu."
 }
 
@@ -1515,8 +1732,11 @@ step_torrents() { # C5: qBittorrent runs only while enabled (compose profile), 6
     compose stop qbittorrent >/dev/null 2>&1 || true; compose rm -f qbittorrent >/dev/null 2>&1 || true
     envset TORRENTS_ENABLED false
     torrent_port close
-    render_caddy_all && apply_caddy || true
-    msg "qBittorrent disabled and removed; port 6881 closed."; return 0
+    local cnote="" pnote=""
+    { render_caddy_all && apply_caddy; } || cnote="\n\nCaddy did not pick the change up, so https://dl.$d may still be configured there (Operations -> Logs -> caddy)."
+    # the portal reads TORRENTS_ENABLED at start-up to decide whether /admin shows the link
+    restart_portal || pnote="\nThe portal could not be restarted, so its /admin page still links to qBittorrent."
+    msg "qBittorrent disabled and removed; port 6881 closed.$pnote$cnote"; return 0
   fi
   yesno "Enable qBittorrent (admin-only torrent client at https://dl.$d, Tailscale only)?\n\nIt opens peer port 6881 to the internet, which also shows this server's IP to every swarm it joins. Download only what you are allowed to.\n\nEnable?" || return 0
   envset TORRENTS_ENABLED true
@@ -1525,11 +1745,18 @@ step_torrents() { # C5: qBittorrent runs only while enabled (compose profile), 6
   qbt_seed_config
   torrent_port open
   if [ -n "$(envget CF_API_TOKEN)" ] && cf_zone; then cf_dns dl "$(envget TAILSCALE_IP)" false || true; fi
-  render_caddy_all && apply_caddy || true
+  # the success screen below hands out a URL and a password: say so when Caddy has no such site
+  local cnote=""
+  { render_caddy_all && apply_caddy; } || cnote="WARNING: Caddy did NOT pick up the dl. site (an invalid Caddyfile, or ADMIN_HASH is not set — Install -> Configure), so https://dl.$d will not answer yet. Operations -> Logs -> caddy.
+
+"
   compose up -d qbittorrent || { msg "qBittorrent did not start (Operations -> Logs -> qbittorrent). It stays enabled; run this again after fixing it, or disable it."; return 1; }
+  restart_portal || cnote="${cnote}NOTE: the portal could not be restarted, so its /admin page does not show the qBittorrent link yet.
+
+"
   sleep 5
   local qpw; qpw=$(docker logs qbittorrent 2>&1 | grep -oE 'temporary password.*: *[A-Za-z0-9]+' | tail -1 | awk '{print $NF}')
-  big "qBittorrent enabled" "Open https://dl.$d (Tailscale on; admin-gate password first).
+  big "qBittorrent enabled" "${cnote}Open https://dl.$d (Tailscale on; admin-gate password first).
 Web UI login: admin / ${qpw:-<see: docker logs qbittorrent>}  -> change it under Tools -> Options -> Web UI.
 
 Default save path is /dropbox/$(admin_user) (your own library). So downloads land in the right
@@ -1609,8 +1836,10 @@ Build takes several minutes (Node toolchain). Proceed?" 24 84 || return 1
   if [ -n "$(envget CF_API_TOKEN)" ] && cf_zone; then cf_dns ephemera "$(envget TAILSCALE_IP)" false; fi
   clear; echo "Building Ephemera from the pinned source (several minutes)..."
   if composeE build ephemera && composeE up -d flaresolverr ephemera; then
-    render_caddy_all && apply_caddy || true     # the ephemera. vhost exists only while it is enabled
-    msg "Ephemera is up at https://ephemera.$(envget DOMAIN) (Tailscale only; admin gate password).\n\nDownloads are filed to '$own' (owner:$own) via library/dropbox/$own.\nDisable any time under Operations."
+    # the ephemera. vhost exists only while it is enabled; without it the URL below answers nothing
+    local cnote=""
+    { render_caddy_all && apply_caddy; } || cnote="\n\nWARNING: Caddy did NOT pick up the ephemera. site, so that URL will not answer yet (Operations -> Logs -> caddy)."
+    msg "Ephemera is up at https://ephemera.$(envget DOMAIN) (Tailscale only; admin gate password).\n\nDownloads are filed to '$own' (owner:$own) via library/dropbox/$own.\nDisable any time under Operations.$cnote"
   else
     envset EPHEMERA_ENABLED false
     msg "Ephemera build or start failed — left disabled. Check the output above (the pinned source must still be reachable on GitHub)."
@@ -1620,8 +1849,9 @@ step_ephemera_off() {
   composeE stop ephemera flaresolverr >/dev/null 2>&1 || true
   composeE rm -f ephemera flaresolverr >/dev/null 2>&1 || true
   envset EPHEMERA_ENABLED false
-  render_caddy_all && apply_caddy || true
-  msg "Ephemera and FlareSolverr stopped and removed. Its data (ephemera/) and settings are kept; re-enable any time."
+  local cnote=""
+  { render_caddy_all && apply_caddy; } || cnote="\n\nCaddy did not pick the change up, so https://ephemera.$(envget DOMAIN) may still be configured there (Operations -> Logs -> caddy)."
+  msg "Ephemera and FlareSolverr stopped and removed. Its data (ephemera/) and settings are kept; re-enable any time.$cnote"
 }
 
 # ---------- operations ----------
@@ -1709,8 +1939,13 @@ local_checks() { # the update gate: what an update can break. Not disk, NTP, Tai
 tag_images() { # from to: bookstack/{caddy,librarian}:from -> :to (a rebuilt :latest keeps its predecessor)
   local i; for i in $BUILT_IMAGES; do docker image inspect "$i:$1" >/dev/null 2>&1 && docker image tag "$i:$1" "$i:$2"; done; return 0
 }
+UPDATE_MARKER_REL=.update-in-progress   # set by update_failed, cleared on a clean update or rollback
 step_update() {
-  local k cur new changed="" f="$(restic_env)"
+  local k cur new changed="" f="$(restic_env)" mark="$STACK_DIR/$UPDATE_MARKER_REL" keep=0
+  # "investigate, then retry" is the most natural thing to do after a failed update — and it used
+  # to write the BROKEN tags over the last-known-good ones and re-point :prev at the broken build,
+  # leaving nothing to roll back to. While the marker exists, the rollback point is frozen.
+  [ -f "$mark" ] && keep=1
   # (a) a restorable point before anything moves
   if [ -f "$f" ]; then
     clear; echo "Pre-update backup (tag pre-update)..."
@@ -1718,8 +1953,12 @@ step_update() {
   else
     yesno "No backup repository is configured (Install -> Backups). Update WITHOUT a pre-update backup?" || return 1
   fi
-  # (b) remember what runs now
-  { for k in $IMG_KEYS; do printf '%s=%s\n' "$k" "$(img "$k")"; done; } > "$STACK_DIR/.env.images.prev"; chmod 600 "$STACK_DIR/.env.images.prev"
+  # (b) remember what runs now — unless an earlier update is still unresolved (see $mark)
+  if [ "$keep" = 0 ]; then
+    { for k in $IMG_KEYS; do printf '%s=%s\n' "$k" "$(img "$k")"; done; } > "$STACK_DIR/.env.images.prev"; chmod 600 "$STACK_DIR/.env.images.prev"
+  else
+    msg "A previous update did not finish and you chose not to roll it back, so the last known-good image tags in $STACK_DIR/.env.images.prev and the bookstack/*:prev images are KEPT as they are. This run will not overwrite them."
+  fi
   # (c) which tags
   if yesno "Change image versions? (No = re-pull the current tags and rebuild caddy/librarian; Yes = type a new tag per image, Cancel keeps one)"; then
     for k in $IMG_KEYS; do
@@ -1732,7 +1971,7 @@ step_update() {
   clear
   local cf="$STACK_DIR/caddy/Caddyfile"
   [ -s "$cf" ] && cat "$cf" > "$cf.pre-update"
-  tag_images latest prev
+  [ "$keep" = 0 ] && tag_images latest prev
   copy_code_trees; own_data_dirs
   render_caddy_all || { update_failed "the new Caddyfile could not be rendered"; return 1; }
   # the rebuilt images carry this checkout's version (J03); Self-test compares it with .version
@@ -1747,7 +1986,8 @@ step_update() {
   if [ -n "$GATE_FAILS" ]; then update_failed "local checks failed:$GATE_FAILS"; return 1; fi
   # the full self-test is information, not a rollback reason (disk, NTP, Tailscale, edge...)
   local st=0; STACK_DIR="$STACK_DIR" bash "$STACK_DIR/scripts/selftest.sh" > "${TMPDIR:-/tmp}/bookstack-selftest.log" 2>&1 || st=$?
-  # (g) only now free old layers
+  # (g) only now free old layers; the update landed, so the frozen rollback point is released
+  rm -f "$mark"
   docker system prune -f --filter until=72h >/dev/null 2>&1 || true
   msg "Updated and healthy (deployed $(deployed_version)).$([ -n "$changed" ] && printf '\n\nNew tags:%b' "$changed")$([ "$st" != 0 ] && printf '\n\nThe full self-test reports %s failure(s) unrelated to the update gate: Operations -> Self-test.' "$st")"
 }
@@ -1756,16 +1996,20 @@ rollback_images() { # restore the IMG_* values saved by step_update
   local line; while IFS= read -r line; do [ -n "$line" ] && envset "${line%%=*}" "${line#*=}"; done < "$STACK_DIR/.env.images.prev"
 }
 update_failed() { # (f) offer the rollback: previous tags, previous caddy/librarian builds, previous Caddyfile
+  # Freeze the rollback point first: whatever the admin answers, the record of the last known-good
+  # build must survive a retry of this update (step_update honours the marker).
+  touch "$STACK_DIR/$UPDATE_MARKER_REL" 2>/dev/null || true
   if yesno "Update problem: $1.\n\nRoll back to the previous image tags and the previous caddy/librarian builds?"; then
     rollback_images; tag_images prev latest
     local cf="$STACK_DIR/caddy/Caddyfile"; [ -s "$cf.pre-update" ] && cat "$cf.pre-update" > "$cf"
+    rm -f "$STACK_DIR/$UPDATE_MARKER_REL"      # back on the known-good build: nothing left to protect
     if stack_up_all; then
       msg "Rolled back to the previous images.\n\nIf the new version already migrated a database, restore the pre-update snapshot: Operations -> Restore from backup -> pick the snapshot tagged 'pre-update' -> 'Config + databases only'."
     else
       msg "Rollback started but some containers did not come up: Operations -> Logs. The pre-update snapshot is under Operations -> Restore from backup (tag 'pre-update')."
     fi
   else
-    msg "Left as is. Operations -> Logs / Self-test to investigate; the previous tags are in $STACK_DIR/.env.images.prev."
+    msg "Left as is. Operations -> Logs / Self-test to investigate; the previous tags are in $STACK_DIR/.env.images.prev.\n\nThat file and the bookstack/*:prev images are now FROZEN: running Update again will not overwrite them, so this rollback point stays available until an update succeeds or you take it."
   fi
 }
 
@@ -1822,8 +2066,16 @@ menu_security() {
 }
 step_rotate_secret() {
   yesno "Rotate the portal's session-signing secret? Every portal session (all users, all devices) is logged out immediately; Kobo/OPDS/Kindle are unaffected." || return 0
-  envset LIBRARIAN_SECRET "$(openssl rand -hex 32)"; restart_portal
-  msg "Portal secret rotated and the portal restarted. Users simply sign in again."
+  envset LIBRARIAN_SECRET "$(openssl rand -hex 32)" \
+    || { msg "Could not write $ENV_FILE, so the secret was NOT rotated and every session is still valid."; return 1; }
+  # This is the step an admin reaches for after a leaked password, and a swallowed restart
+  # failure means the OLD gunicorn keeps signing and accepting the cookies it is meant to kill.
+  # Confirm the new process answers before claiming anyone was logged out.
+  if ! restart_portal || ! wait_for http://127.0.0.1:8090/healthz 30; then
+    msg "The new secret is in $ENV_FILE but the portal did NOT come back up, so the OLD secret is still signing and accepting session cookies: NOBODY has been logged out yet. Fix the portal (Operations -> Logs -> librarian) and run this again."
+    return 1
+  fi
+  msg "Portal secret rotated and the portal restarted (confirmed on /healthz). Every portal session is dead; users simply sign in again."
 }
 menu_ops() {
   while true; do

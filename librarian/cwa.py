@@ -145,6 +145,11 @@ def add_user(name, password, email="", admin=False):
     if get_user(name):
         raise CwaError(f"user '{name}' already exists")
     with _conn() as c:
+        # CWA keeps user.email UNIQUE. A family plausibly shares one address (a parent's for a
+        # child's account), and the raw IntegrityError came out as a Flask 500 on /admin and a
+        # traceback in the TUI's whiptail box. Same check set_email() already makes.
+        if email and c.execute("SELECT 1 FROM user WHERE email=? COLLATE NOCASE", (email,)).fetchone():
+            raise CwaError("that e-mail address is already used by another account")
         have = set(_columns(c, "user"))
         sidebar = ADMIN_SIDEBAR if admin else int(_setting(c, "config_default_show", USER_SIDEBAR))
         values = {
@@ -157,8 +162,11 @@ def add_user(name, password, email="", admin=False):
             "allow_additional_ereader_emails": 1,
         }
         cols = [k for k in values if k in have]
-        c.execute(f"INSERT INTO user({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
-                  [values[k] for k in cols])
+        try:
+            c.execute(f"INSERT INTO user({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+                      [values[k] for k in cols])
+        except sqlite3.IntegrityError as e:   # any future UNIQUE column degrades to a flash, not a 500
+            raise CwaError(str(e))
     _checkpoint()
     return get_user(name)
 
@@ -323,6 +331,27 @@ def _audit(event, name, detail=None):
     except Exception:
         pass
 
+def _abs_sync(action, name, password=None):
+    """Audiobookshelf keeps its OWN credential store, so a user lifecycle change that only
+    touches app.db leaves it behind: a removed account kept a working audio login and a reset
+    password still opened ABS. The portal's /admin path and the TUI both compensate; this CLI
+    (which the module docstring advertises) did not. Non-fatal — the outcome is reported in the
+    JSON so the caller can see it failed instead of believing {"ok": true}."""
+    import abs as absapi
+    if not absapi.configured():
+        return None
+    done = {"remove": "removed", "passwd": "updated", "create": "created"}[action]
+    try:
+        if action == "remove":
+            absapi.remove_user(name)
+        elif action == "passwd":
+            absapi.set_password(name, password)
+        else:
+            absapi.ensure_user(name, password)
+        return done
+    except Exception as e:
+        return f"NOT {done}: {e.__class__.__name__}: {str(e)[:100]}"
+
 def note_password_synced(name):
     """Remember the password hash the portal knows about, so the housekeeping drift check does
     not report a change the portal (or the TUI) made itself."""
@@ -351,9 +380,17 @@ def _cli(argv=None):
     args = p.parse_args(argv)
     try:
         if args.cmd == "add-user":
-            u = add_user(args.name, read_password(args), args.email, args.admin)
+            pw = read_password(args)
+            u = add_user(args.name, pw, args.email, args.admin)
             _audit("user_add", u["name"], "admin" if args.admin else "user")
-            print(json.dumps({"ok": True, "user": u["name"], "id": u["id"], "kobo_url": kobo_url(u["name"])}))
+            out = {"ok": True, "user": u["name"], "id": u["id"], "kobo_url": kobo_url(u["name"])}
+            # admins see every audiobook through ABS's own admin role; only end users get an
+            # ABS account here, matching what /admin and the TUI create
+            if not (u["role"] or 0) & ROLE_ADMIN:
+                a = _abs_sync("create", u["name"], pw)
+                if a:
+                    out["abs"] = a
+            print(json.dumps(out))
         elif args.cmd == "list":
             print(json.dumps(list_users(), indent=1))
         elif args.cmd == "kindle":
@@ -365,12 +402,22 @@ def _cli(argv=None):
                 _audit("kobo_reset", args.name)
             print(reset_kobo_token(args.name) and kobo_url(args.name) if args.reset else kobo_url(args.name))
         elif args.cmd == "passwd":
-            set_password(args.name, read_password(args))
+            pw = read_password(args)
+            set_password(args.name, pw)
             note_password_synced(args.name)
             _audit("password_reset", args.name)
-            print(json.dumps({"ok": True}))
+            out = {"ok": True}
+            a = _abs_sync("passwd", args.name, pw)      # else the OLD password still opens ABS
+            if a:
+                out["abs"] = a
+            print(json.dumps(out))
         elif args.cmd == "remove-user":
-            remove_user(args.name); _audit("user_remove", args.name); print(json.dumps({"ok": True}))
+            remove_user(args.name); _audit("user_remove", args.name)
+            out = {"ok": True}
+            a = _abs_sync("remove", args.name)          # else the audiobook login survives
+            if a:
+                out["abs"] = a
+            print(json.dumps(out))
         elif args.cmd == "rename-user":
             out = rename_user(args.old, args.new)
             _audit("user_rename", out["new"], f"was {out['old']}")
