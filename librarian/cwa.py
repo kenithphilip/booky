@@ -13,7 +13,7 @@ live immediately. Also usable as a CLI (bookstack.sh menu "Users" calls it):
     python -m cwa remove-user alice | enable-kobo-sync | rename-user admin kenith-admin
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 """
-import sqlite3, os, sys, json, argparse
+import sqlite3, os, sys, json, argparse, re
 from binascii import hexlify
 from werkzeug.security import generate_password_hash
 import config
@@ -83,8 +83,16 @@ def _hash(pw):
     # pbkdf2 is understood by every Werkzeug version CWA has shipped with.
     return generate_password_hash(pw, method="pbkdf2:sha256")
 
+# Shape only, deliberately case-insensitive: existing CWA accounts may carry a capital, and the
+# dropbox watcher resolves a folder named 'Alice' to the user 'alice'. Lowercase is required
+# when an account is CREATED — that is _check_name's job, just below.
+_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
+
 def _valid_name(name):
-    return bool(name) and name == name.strip() and all(ch.isalnum() or ch in "._-" for ch in name)
+    """The one shape rule, for every caller. A leading dot (or a bare '..') used to pass here,
+    and the resulting account looked complete while its dropbox was never scanned: the watcher
+    skips dot-directories, so everything the reader dropped or uploaded vanished silently."""
+    return bool(name) and bool(_NAME_RE.match(name))
 
 NAME_RULE = ("username: lowercase letters, digits, dot, dash, underscore only; no spaces "
              "(Shelfmark matches names case-sensitively, so a capital letter locks that account "

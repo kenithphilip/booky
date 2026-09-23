@@ -107,6 +107,14 @@ composeA(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && doc
 composeE(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.ephemera.yml ${p[@]+"${p[@]}"} "$@"); }
 lib()    { docker exec -i librarian python -m cwa "$@"; }          # user/device management lives in the portal image
 absctl() { docker exec -i librarian python -m abs "$@"; }          # Audiobookshelf automation (needs ABS_TOKEN after setup)
+# The three things that live only inside the portal's own database / dropbox tree and had no
+# console path at all: login lockouts, the request queue past the newest 200 rows, and files
+# parked in dropbox/<user>/.failed. Every arm prints ONE line of JSON and exits non-zero with
+# {"ok":false,"error":"..."} on failure (librarian/admin_cli.py).
+admin_cli(){ docker exec -i librarian python -m admin_cli "$@"; }
+# the error sentence out of an admin_cli answer; the raw output when it is not JSON at all
+cli_err(){ local e; e=$(printf '%s' "$1" | json 'd.get("error") or ""') || e=""
+  printf '%s' "${e:-$(printf '%s' "${1:-}" | tail -3)}"; }
 abs_ready(){ [ -n "$(envget ABS_TOKEN)" ]; }
 cwa_sql(){ docker exec -i calibre-web sqlite3 /config/cwa.db "$1"; } # CWA's own settings DB
 running(){ docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true; }
@@ -286,6 +294,18 @@ reload_caddy(){ compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
 route_src_ip(){ ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}'; }
 public_ip(){ curl -4 -fsS -m 10 https://api.ipify.org 2>/dev/null || route_src_ip; }
 ip_on_host(){ ip -o addr show 2>/dev/null | grep -qF " $1/"; }
+# Shape check only (fail2ban and Cloudflare do the real validation): enough to keep a typo out
+# of an API URL and out of `fail2ban-client set <jail> unbanip`.
+valid_ip(){ [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]]; }; }
+# The address this SSH session comes FROM. After a Cloudflare ban that is almost always the one
+# that has to be released: the whole household shares one public address, so the admin is locked
+# out of the sites together with everyone else. Over Tailscale it is a 100.64/10 tailnet address,
+# which is never what Cloudflare banned — the caller then picks from the banned list instead.
+caller_ip(){
+  local c="${SSH_CLIENT:-${SSH_CONNECTION:-}}"; c="${c%% *}"
+  case "$c" in 100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|127.*|"") c="";; esac
+  printf '%s' "$c"
+}
 json(){ python3 -c "import sys,json; d=json.load(sys.stdin); print($1)" 2>/dev/null; }
 wait_for(){ # url seconds
   local i; for i in $(seq 1 "$2"); do curl -fsS -m 3 "$1" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
@@ -935,7 +955,7 @@ step_backup() {
   # path on a volume that failed to mount it would quietly start a new repository on the root disk.
   # Everything below runs against the CANDIDATE file; the live one is replaced only on success.
   if ! RESTIC_ENV_PATH="$new" restic_run cat config >/dev/null 2>&1; then
-    if [ -s "$live" ] && ! yesno "That password did not open the repository, and $live still holds the CURRENT key — it was NOT overwritten.\n\nNote: a restic password cannot be changed by typing a new one here; restic needs 'key add' and every existing snapshot would otherwise become unreadable.\n\nIs this a brand-new, EMPTY repository that should be created now?"; then
+    if [ -s "$live" ] && ! yesno "That password did not open the repository, and $live still holds the CURRENT key — it was NOT overwritten.\n\nNote: a restic password cannot be changed by typing a new one here; restic needs 'key add' and every existing snapshot would otherwise become unreadable. Operations -> 'Rotate the backup repository password' does exactly that, safely.\n\nIs this a brand-new, EMPTY repository that should be created now?"; then
       rm -f "$new"; msg "Nothing was changed: $live still opens your existing backups. Run Backups again with the right password."; return 1
     fi
     if ! RESTIC_ENV_PATH="$new" restic_run init; then
@@ -958,6 +978,53 @@ step_backup() {
     msg "Backups scheduled nightly at 01:00 (restore test on the 1st of each month; $alertnote)."
   fi
   offsite_checklist
+}
+# The safe counterpart to the Backups prompt above, which REFUSES a new password: restic wraps
+# one data key per password, so a password is changed by adding a second key and removing the
+# first — never by editing RESTIC_PASSWORD, which would leave every snapshot unreadable.
+# Order matters and is the whole point: add the new key against the OLD credential, prove the new
+# credential opens the repository, remove the old key THROUGH the new one, and only then replace
+# /etc/bookstack/restic.env. Any failure leaves the working credential file untouched.
+step_restic_rotate() {
+  local live new npw pf old_id rc=0 rmnote
+  live="${RESTIC_ENV_PATH:-$ETC/$RESTIC_ENV_FILE_REL}"; new="$live.new"
+  [ -s "$live" ] || { msg "No backup repository is configured yet, so there is no password to rotate. Install -> Backups first."; return 1; }
+  restic_run cat config >/dev/null 2>&1 \
+    || { msg "The credential in $live does not open the repository right now, so there is nothing safe to rotate FROM (a rotation needs the working password). Fix Install -> Backups, or the network / S3 keys, and try again."; return 1; }
+  yesno "Rotate the backup repository password?\n\nWhat happens, in this order:\n  1. a SECOND key with the new password is added to the repository\n  2. the new key is tested against the live repository\n  3. only then is the old key removed and $live rewritten\n\nEvery existing snapshot stays readable: restic encrypts the data once and wraps that key per password, so nothing is re-encrypted and no snapshot is rewritten.\n\nKeep the OLD password written down until you have run a restore test with the new one.\n\nContinue?" || return 0
+  npw=$(askpw2 "NEW repository password (STORE IT SAFELY — without it the backups are unreadable):") || return 1
+  pf=$(mktemp "${TMPDIR:-/tmp}/bookstack-newkey.XXXXXX") || { msg "Could not create a temporary file for the new key. Nothing was changed."; return 1; }
+  chmod 600 "$pf"; printf '%s' "$npw" > "$pf"
+  clear; echo "Adding the new key to the repository..."
+  # `key add` runs against the OLD credential: it is the only one that can open the repository now
+  if ! restic_run key add --new-password-file "$pf" >/dev/null 2>&1; then
+    rm -f "$pf"
+    msg "restic refused to add the new key, so NOTHING was changed: $live still holds the working password and every snapshot is still readable exactly as before.\n\n(A repository on read-only storage, or an S3 key without write access, is the usual cause.)"; return 1
+  fi
+  rm -f "$pf"
+  # the candidate credential: same repository and S3 keys, the new password. Written NEXT TO the
+  # live file the way write_restic_env does, so a failure below cannot cost the working one.
+  ( umask 077; { grep -vE '^RESTIC_PASSWORD=' "$live" || true; printf 'RESTIC_PASSWORD=%q\n' "$npw"; } > "$new" ) \
+    || { rm -f "$new"; msg "Could not write $new (disk full or read-only?).\n\nThe new key IS in the repository now, and $live still holds the old password, so backups keep working. Free some space and run this step again."; return 1; }
+  chmod 600 "$new"; chown root:root "$new"
+  if ! RESTIC_ENV_PATH="$new" restic_run cat config >/dev/null 2>&1; then
+    rm -f "$new"
+    msg "The new password does NOT open the repository, so nothing was replaced: $live still holds the working one and no key was removed.\n\nA key carrying the new password may have been added; 'restic key list' shows it and 'restic key remove <id>' takes it out again."; return 1
+  fi
+  # which key the OLD password unlocks — read BEFORE the file is replaced, while it is current
+  old_id=$(restic_run key list --json 2>/dev/null | json '"".join(k["id"] for k in d if k.get("current"))') || old_id=""
+  if [ -n "$old_id" ]; then
+    # removed through the NEW credential: restic refuses to remove the key it is authenticating with
+    RESTIC_ENV_PATH="$new" restic_run key remove "$old_id" >/dev/null 2>&1 \
+      && rmnote="The old key was removed, so the old password no longer opens the repository." \
+      || { rc=1; rmnote="WARNING: the OLD key could NOT be removed, so the old password still opens the repository. Remove it by hand: restic key list, then restic key remove $old_id."; }
+  else
+    rc=1; rmnote="WARNING: restic did not say which key the old password used, so the OLD key was left in place and that password still opens the repository. Check 'restic key list' and remove it by hand."
+  fi
+  mv "$new" "$live" || { rm -f "$new"; msg "The new key works and the old one is dealt with, but $live could not be replaced (disk full or read-only?).\n\nThe NIGHTLY BACKUP WILL FAIL until you put the new password into $live by hand (RESTIC_PASSWORD=...)."; return 1; }
+  chmod 600 "$live"; chown root:root "$live"
+  msg "Repository password rotated. $rmnote\n\n$live now holds the new password and every existing snapshot is still readable with it.\n\nDo this next: Operations -> 'Backup restore test' proves the new credential really restores, and put the new password in your password manager (Install -> Backups shows the off-site checklist)."
+  return $rc
 }
 
 # ---------- 6a. alerts ----------
@@ -1076,6 +1143,38 @@ step_restore() {
   msg "Restored $SNAP_DESC and started.\n\nRun Operations -> Self-test now. Users' Kobo links, Audiobookshelf accounts and Authelia logins came back with the databases; the Tailscale IP of this server is new (monitor./dl.)."
   offsite_checklist
 }
+# One file (or one folder) out of a snapshot, next to the stack instead of over it. Getting a
+# single accidentally deleted book back used to mean a full in-place restore with the whole stack
+# down; restic restores a path natively, so nothing has to stop and nothing live is overwritten.
+step_restore_file() {
+  [ -f "$(restic_env)" ] || { msg "No backup repository is configured on this machine (Install -> Backups)."; return 1; }
+  pick_snapshot || return 1
+  local p abs stage
+  p=$(ask "Path to restore out of $SNAP_DESC — a full path, or one relative to $STACK_DIR, e.g.\n  library/books/Jane Doe/A Title/A Title.epub\nA folder works too (everything under it comes back):") || return 1
+  [ -n "$p" ] || return 1
+  case "$p" in /*) abs="$p";; *) abs="$STACK_DIR/$p";; esac
+  case "$abs" in "$STACK_DIR"/*) ;; *) msg "'$abs' is outside $STACK_DIR, and $STACK_DIR is the only tree the snapshots contain. Nothing was restored."; return 1;; esac
+  stage="$(dirname "$STACK_DIR")/bookstack-restored-$(date -u +%Y%m%d-%H%M%S)"
+  yesno "Restore\n  $abs\nfrom snapshot $SNAP_DESC into\n  $stage\n\nNothing inside $STACK_DIR is touched and nothing is stopped: the file is written BESIDE the stack and you copy back what you want after looking at it.\n\nContinue?" || return 0
+  mkdir -p "$stage" || { msg "Could not create $stage (disk full, or the parent is read-only?). Nothing was restored."; return 1; }
+  clear; echo "Restoring $abs into $stage ..."
+  if ! restic_run restore "$SNAP_ID" --target "$stage" --include "$abs"; then
+    # rmdir only succeeds on an empty directory: a restore that died part-way leaves a partial
+    # tree, and claiming it was cleaned up hides a copy of the library beside the stack.
+    if rmdir "$stage" 2>/dev/null; then
+      msg "restic could not restore from $SNAP_DESC (see the output above). Nothing was changed; $stage was removed again."
+    else
+      msg "restic could not restore from $SNAP_DESC (see the output above). Nothing in $STACK_DIR was changed, but a PARTIAL restore was left in\n  $stage\n\nLook at it, then delete it — it sits outside the backup and outside the disk watchdog."
+    fi
+    return 1
+  fi
+  # restic exits 0 when an --include matches nothing at all, so an empty target is the real answer
+  if [ -z "$(find "$stage" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    rmdir "$stage" 2>/dev/null || true
+    msg "That snapshot contains nothing at\n  $abs\n\nrestic reports success even when the path matches no file, so nothing landed. Check the exact spelling (it is case-sensitive) and the snapshot date, then try again."; return 1
+  fi
+  msg "Restored into:\n  $stage$abs\n\nNothing in $STACK_DIR was touched and the stack kept running. Copy back what you need (files under library/ must end up owned by uid 1000: chown -R 1000:1000), then delete $stage — it sits beside the stack, so the nightly backup does not pick it up and the disk watchdog does not clean it either."
+}
 
 # ---------- 7. lock SSH ----------
 step_lock_ssh() {
@@ -1095,7 +1194,22 @@ step_lock_ssh() {
   fi
   ufw --force delete allow 22/tcp >/dev/null 2>&1 || true
   envset SSH_LOCKED true      # System re-runs keep port 22 closed from now on
-  msg "Public SSH closed. Use: ssh root@$(envget TAILSCALE_IP)\n\nYour VPS provider's web console remains a fallback. Re-running System keeps it closed; to reopen: ufw allow 22/tcp and set SSH_LOCKED='false' in $ENV_FILE."
+  msg "Public SSH closed. Use: ssh root@$(envget TAILSCALE_IP)\n\nYour VPS provider's web console remains a fallback. Re-running System keeps it closed; Security -> 'Reopen public SSH' undoes this from here."
+}
+# The reverse of Lock SSH, and the reason it exists: setup_firewall re-deletes the rule on every
+# System run while SSH_LOCKED is true, so an admin whose Tailscale account is locked or whose node
+# key expired had to reach the provider's serial console and hand-edit $ENV_FILE — the only
+# file-edit instruction in the whole TUI, needed exactly when experimenting is hardest.
+step_unlock_ssh() {
+  if [ "$(envget SSH_LOCKED)" != true ]; then
+    msg "Public SSH is not locked: SSH_LOCKED is '$(envget SSH_LOCKED)', so Install -> System already allows port 22.\n\nIf port 22 still does not answer, the cause is elsewhere: check 'ufw status' and your VPS provider's own firewall."
+    return 0
+  fi
+  yesno "Reopen public SSH (port 22) to the internet?\n\nufw allows 22/tcp again and SSH_LOCKED is set to false, so re-running Install -> System keeps it open instead of closing it.\n\nKey-only authentication still applies: password logins stay OFF (the 01-bookstack.conf drop-in sets PasswordAuthentication no), so anyone reaching port 22 still needs your private key. fail2ban's sshd jail keeps watching it.\n\nReopen it?" || return 0
+  ufw allow 22/tcp >/dev/null || { msg "ufw refused to open port 22, so nothing was changed. Check 'ufw status' on the server."; return 1; }
+  envset SSH_LOCKED false \
+    || { msg "Port 22 is open in ufw NOW, but $ENV_FILE could not be written (disk full or read-only?), so SSH_LOCKED is still true and the next Install -> System run will close it again. Free some space and run this step again."; return 1; }
+  msg "Public SSH is open again: ufw allows 22/tcp and SSH_LOCKED is false, so System re-runs leave it open.\n\nKey-only authentication still applies — passwords are refused, your key is required. Run Security -> 'Lock SSH to Tailscale only' again once Tailscale works, and Operations -> Self-test to confirm the rest of the firewall is unchanged."
 }
 
 # ---------- Q. quick install ----------
@@ -1243,9 +1357,59 @@ step_user_repair() {
   apply_library_defaults || true
   msg "Re-applied owner-tag isolation to $n non-admin user(s); registration OFF, Kobo sync ON, format defaults confirmed.\nAudiobookshelf accounts aligned: $a $(abs_ready || echo '(ABS not set up yet: Library -> Audiobookshelf)')"
 }
+# A portal login lockout could be SEEN nowhere and cleared nowhere: it shows up only as a
+# 'login_locked' row in the audit trail. The bare-IP key is the sharp edge — a family behind one
+# NAT shares one address, so enough wrong passwords from anywhere in the house lock out everybody,
+# the admin included, and the only cure was waiting LOCKOUT_SECONDS out.
+step_lockout() {
+  portal_up || { msg "The portal is not running (Install -> Deploy first), so its login lockouts cannot be read."; return 1; }
+  local out txt ch u i what rc=0
+  out=$(admin_cli lockout status 2>&1) || rc=$?
+  [ "$rc" = 0 ] || { msg "Could not read the lockouts from the portal:\n\n$(cli_err "$out")"; return 1; }
+  # %-formatting, not f-strings: this runs on the HOST and Debian 12 ships python 3.11 (PEP 701)
+  txt=$(printf '%s' "$out" | python3 -c '
+import sys, json, time
+d = json.load(sys.stdin)
+now = time.time()
+users, ips = d.get("users") or [], d.get("ips") or []
+if not users and not ips:
+    print("Nobody is locked out right now.")
+for x in users:
+    print("user     %-16s from %-32s %3d min left" % (x.get("user") or "?", x.get("ip") or "?", max(0, x["until"] - now) // 60 + 1))
+for x in ips:
+    print("ADDRESS  %-53s %3d min left  (EVERY account from it)" % (x.get("ip") or "?", max(0, x["until"] - now) // 60 + 1))
+' 2>/dev/null) || txt="(the portal answered something this version cannot read: $out)"
+  big "Portal login lockouts" "$txt
+
+A 'user' row locks that name from that one address. An 'ADDRESS' row locks the address itself,
+so every account behind it is refused — that is the one that takes the whole household down.
+Both expire on their own after LOCKOUT_SECONDS (Operations -> Advanced settings -> lockout).
+
+Clearing a lockout only forgets the failed attempts; it does not change anyone's password."
+  ch=$(whiptail --title "Clear a login lockout" --menu "Nothing is cleared until you pick one." 14 78 4 \
+    U "Release one user (from every address)" \
+    I "Release one address (and every account locked from it)" \
+    A "Release EVERYTHING" \
+    0 "Back" 3>&1 1>&2 2>&3) || return 0
+  case "$ch" in
+    U) u=$(ask "Username to release:") || return 0; [ -n "$u" ] || return 0
+       out=$(admin_cli lockout clear --user "$u" 2>&1) || { msg "Could not clear the lockout for '$u':\n\n$(cli_err "$out")"; return 1; }
+       what="user '$u'";;
+    I) i=$(ask "Address to release (this releases every account locked from it):" "$(caller_ip)") || return 0
+       [ -n "$i" ] || return 0
+       valid_ip "$i" || { msg "'$i' does not look like an IP address. Nothing was cleared."; return 1; }
+       out=$(admin_cli lockout clear --ip "$i" 2>&1) || { msg "Could not clear the lockout for $i:\n\n$(cli_err "$out")"; return 1; }
+       what="address $i";;
+    A) yesno "Release EVERY portal login lockout, for every user and every address?\n\nThe record of recent failed logins is deleted with them, so a brute-force attempt in progress starts counting from zero again. Prefer releasing just the address your family is behind." || return 0
+       out=$(admin_cli lockout clear --all 2>&1) || { msg "Could not clear the lockouts:\n\n$(cli_err "$out")"; return 1; }
+       what="everything";;
+    *) return 0;;
+  esac
+  msg "Released $(printf '%s' "$out" | json 'd.get("cleared", 0)') lockout key(s) for $what.\n\nThey can sign in again immediately. If it happens repeatedly, raise LOCKOUT_FAILS / LOCKOUT_IP_FAILS under Operations -> Advanced settings — one household shares one address, so the per-address counter is reached much sooner than it looks."
+}
 menu_users() {
   while true; do
-    ch=$(whiptail --title "Users & devices" --menu "Every user gets an isolated library account (owner tag) usable in the portal, Calibre-Web and Shelfmark, plus their own Kobo link and Kindle address." 20 86 9 \
+    ch=$(whiptail --title "Users & devices" --menu "Every user gets an isolated library account (owner tag) usable in the portal, Calibre-Web and Shelfmark, plus their own Kobo link and Kindle address." 22 86 10 \
       1 "List users (role, isolation, Kindle)" \
       2 "Add a user (account + isolation + Kobo link + Authelia if on)" \
       3 "Set a user's Kindle e-mail" \
@@ -1254,10 +1418,12 @@ menu_users() {
       6 "Remove a user" \
       7 "Repair: re-apply isolation + secure defaults to everyone" \
       8 "How isolation works (guide)" \
+      9 "Login lockouts: who is locked out, and release them" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in
       1) step_user_list || true;; 2) step_user_add || true;; 3) step_user_kindle || true;; 4) step_user_kobo || true;;
-      5) step_user_passwd || true;; 6) step_user_remove || true;; 7) step_user_repair || true;; 8) step_isolation || true;; 0) return 0;;
+      5) step_user_passwd || true;; 6) step_user_remove || true;; 7) step_user_repair || true;; 8) step_isolation || true;;
+      9) step_lockout || true;; 0) return 0;;
     esac
   done
 }
@@ -1318,6 +1484,17 @@ What is now automatic:
 
 Users sign in to https://audio.$(envget DOMAIN) or the Audiobookshelf app with their library
 username and password. You (admin) use the root account there."
+}
+# absctl has wrapped the scan API since Audiobookshelf was added, but no menu entry called it, so
+# the only way to rescan was knowing the invocation by heart.
+step_abs_scan() {
+  portal_up || { msg "The portal is not running; the Audiobookshelf helper runs inside it (Install -> Deploy first)."; return 1; }
+  abs_ready || { msg "Audiobookshelf has no API key yet, so nothing here can talk to it. Run Library -> Audiobookshelf first."; return 1; }
+  yesno "Ask Audiobookshelf to rescan its library now?\n\nUse this when an audiobook was copied straight into $STACK_DIR/library/audiobooks by hand (scp/rsync) and has not appeared. Anything the portal imported — requests, uploads, dropboxes, Shelfmark — is scanned and tagged automatically and needs no rescan.\n\nAudiobookshelf reads every folder; on a large library that takes minutes, and it stays usable while it works.\n\nStart the rescan?" || return 0
+  clear; echo "Asking Audiobookshelf to rescan..."
+  local out
+  out=$(absctl scan 2>&1) || { msg "The rescan could not be started:\n\n$out\n\nIs ABS_TOKEN still valid (Library -> Audiobookshelf re-runs setup)? Operations -> Logs -> audiobookshelf shows the other side."; return 1; }
+  msg "Rescan started: $(printf '%s' "$out" | json 'd.get("note") or "accepted"')\n\nItems appear in Audiobookshelf as it works; watch it at https://audio.$(envget DOMAIN).\n\nA file you copied in by hand carries no owner:<user> tag, so only admins see it until you tag it in Audiobookshelf (Library -> 'How per-user isolation works')."
 }
 
 # ---------- M. mail (SMTP for Send-to-Kindle) ----------
@@ -1449,7 +1626,65 @@ step_fail2ban() {
   else note="Caddy jail OFF (no Cloudflare token/zone yet — run Configure + Cloudflare, then this step again)."; fi
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban || { msg "fail2ban did NOT start: journalctl -u fail2ban shows why."; return 1; }
-  msg "fail2ban active: SSH brute-force jail (local firewall).\n\n$note\n\nCheck with: fail2ban-client status caddy-auth (also caddy-device-auth, caddy-abs-login)"
+  msg "fail2ban active: SSH brute-force jail (local firewall).\n\n$note\n\nCheck with: fail2ban-client status caddy-auth (also caddy-device-auth, caddy-abs-login).\nSecurity -> 'Bans: show and release an address' undoes a ban, at fail2ban AND at Cloudflare."
+}
+# Every jail bookstack installs. sshd bans in the local firewall; the caddy-* ones ban at
+# Cloudflare, because web logins arrive through the edge and the local firewall never sees them.
+F2B_JAILS="sshd caddy-auth caddy-abs-login caddy-device-auth"
+f2b_banned(){ # <jail> -> the addresses it currently holds banned, one per line
+  fail2ban-client status "$1" 2>/dev/null | sed -n 's/.*Banned IP list:[[:space:]]*//p' | tr ' \t' '\n\n' | grep -v '^$' || true
+}
+# The local unban does NOT remove the Cloudflare IP Access Rule the cloudflare-token action
+# created, and that rule is what actually cuts the household off — at the edge, before the
+# request ever reaches this server. Both halves or the ban is still in force.
+cf_unban(){ # <ip> -> prints one sentence describing what happened at Cloudflare
+  local ids id n=0
+  [ -n "$(envget CF_API_TOKEN)" ] || { printf 'no Cloudflare token is configured, so no access rule was looked up'; return 1; }
+  cf_zone 2>/dev/null || { printf 'the Cloudflare zone could not be read with the stored token, so its access rules were NOT touched'; return 1; }
+  # cf() is `curl -fsS`: a 403 (token without Firewall Services -> Read), a rate limit or a
+  # network blip all yield empty output. Reporting that as "no rule exists" is the worst
+  # possible answer here — the household stays banned while the screen says it is released.
+  local body
+  body=$(cf GET "/zones/$ZONE/firewall/access_rules/rules?mode=block&configuration_target=ip&configuration_value=$1&match=all&per_page=50" 2>/dev/null) \
+    || { printf 'the Cloudflare access rules could NOT be read (token permissions or network), so a block rule may still be in place'; return 1; }
+  ids=$(printf '%s' "$body" | jq -r '.result[]?.id // empty' 2>/dev/null) || ids=""
+  [ -n "$ids" ] || { printf 'Cloudflare held no block rule for that address'; return 0; }
+  for id in $ids; do cf DELETE "/zones/$ZONE/firewall/access_rules/rules/$id" >/dev/null 2>&1 && n=$((n+1)); done
+  if [ "$n" = 0 ]; then printf 'a Cloudflare block rule exists for that address but could NOT be deleted (the token needs Zone -> Firewall Services -> Edit)'; return 1; fi
+  printf '%s Cloudflare block rule(s) for that address were deleted' "$n"
+}
+# The urgent-when-it-happens case: one reader mistypes their password eight times and the
+# household's single NAT address is banned at Cloudflare for two hours — every family member, on
+# every device, including the admin's own browser. Nothing anywhere released it.
+step_unban() {
+  command -v fail2ban-client >/dev/null 2>&1 \
+    || { msg "fail2ban is not installed on this server, so nothing here is banned by it. Security -> fail2ban installs it."; return 1; }
+  local j b list="" first="" ip cfnote local_note="" cleared="" rc=0
+  for j in $F2B_JAILS; do
+    b=$(f2b_banned "$j" | tr '\n' ' ')
+    list="$list\n  $j: ${b:-(nothing)}"
+    [ -n "$first" ] || first="${b%% *}"
+  done
+  big "Banned addresses" "What each jail holds right now:
+$(printf '%b' "$list")
+
+The caddy-* jails ban at CLOUDFLARE (an IP Access Rule on the zone), not in this server's
+firewall, so the address is refused at the edge before it ever reaches here. sshd bans locally.
+
+Your household shares ONE public address, so a single reader's typo locks out everybody.
+Releasing an address below clears it in every jail AND deletes its Cloudflare rule."
+  ip=$(ask "Address to release (it is cleared from every jail above and from Cloudflare):" "${first:-$(caller_ip)}") || return 0
+  [ -n "$ip" ] || return 0
+  valid_ip "$ip" || { msg "'$ip' does not look like an IP address. Nothing was released."; return 1; }
+  yesno "Release $ip?\n\n  - fail2ban-client set <jail> unbanip $ip, for: $F2B_JAILS\n  - delete the Cloudflare IP Access Rule blocking $ip on zone $(envget DOMAIN)\n\nNothing else changes: the jails stay enabled and the address can be banned again by the next round of failures.\n\nRelease it?" || return 0
+  clear; echo "Releasing $ip..."
+  for j in $F2B_JAILS; do
+    fail2ban-client set "$j" unbanip "$ip" >/dev/null 2>&1 && cleared="$cleared $j"
+  done
+  [ -n "$cleared" ] && local_note="Released locally in:$cleared." || local_note="fail2ban held no ban on $ip in any jail (it may have expired, or the ban is only at Cloudflare)."
+  cfnote=$(cf_unban "$ip") || rc=1
+  msg "$ip\n\n$local_note\n\nCloudflare: $cfnote.\n\nAsk them to try again now — the edge rule is gone immediately, no cache to wait for.$([ "$rc" != 0 ] && printf '\n\nSomething above did not fully succeed; check https://dash.cloudflare.com -> Security -> WAF -> Tools (IP Access Rules) for a leftover rule.')\n\nIf the household keeps locking itself out, the portal's own counters are the usual cause: Operations -> Advanced settings -> lockout, and Users & devices -> 'Login lockouts'."
+  return $rc
 }
 
 # ---------- 15. monitoring (Uptime Kuma) ----------
@@ -1695,6 +1930,106 @@ step_intake_webhook() { # C11: off (empty token, the portal answers 404) until t
   elif yesno "The intake webhook is ON.\n\nYes = show the token and usage.\nNo = turn it OFF (the token stops working)."; then :
   else envset INTAKE_TOKEN ""; restart_portal_ok || true; msg "Intake webhook turned off."; return 0; fi
   msg "Intake webhook (for authorized legal-source automation):\n\n  POST https://request.$d/intake\n  Header:  X-Intake-Token: $(envget INTAKE_TOKEN)\n  JSON:    {\"user\":\"alice\",\"url\":\"https://.../book.epub\",\"kind\":\"ebook\"}\n\nIt pulls the exact URL you give and maps it to that user. Turn it off again from this menu."
+}
+
+# ---------- 21a. request queue & parked files ----------
+# The portal's /status page shows the newest 200 rows and nothing else, so with approvals on a
+# request could sit at "waiting for approval" forever once 200 newer rows existed: unreachable
+# from the web console AND from here. This pages through the whole table instead of capping it.
+REQ_PAGE=20
+step_requests() {
+  portal_up || { msg "The portal is not running (Install -> Deploy first), so the request queue cannot be read."; return 1; }
+  local st out total rows=() items=() ch off=0 shown
+  st=$(whiptail --title "Request queue" --menu "Which rows? /status in the browser only ever shows the newest 200 — everything older is reachable only here." 17 78 6 \
+    pending   "Waiting for your approval" \
+    error     "Failed downloads and imports" \
+    needs-tag "Imported but not tagged yet" \
+    done      "Completed" \
+    all       "Everything" \
+    0         "Back" 3>&1 1>&2 2>&3) || return 0
+  [ "$st" = 0 ] && return 0
+  [ "$st" = all ] && st=""
+  while true; do
+    out=$(admin_cli requests list ${st:+--status "$st"} --limit "$REQ_PAGE" --offset "$off" 2>&1) \
+      || { msg "Could not read the request queue:\n\n$(cli_err "$out")"; return 1; }
+    total=$(printf '%s' "$out" | json 'd.get("total", 0)') || total=0
+    mapfile -t rows < <(printf '%s' "$out" | python3 -c '
+import sys, json
+for r in (json.load(sys.stdin).get("rows") or []):
+    print(r["rid"])
+    print("%-10s %-9s %-40s %s" % ((r.get("user") or "-")[:10], (r.get("status") or "-")[:9],
+                                   (r.get("title") or "(no title)")[:40], (r.get("detail") or "")[:34]))
+' 2>/dev/null)
+    shown=$(( ${#rows[@]} / 2 ))
+    if [ "$shown" = 0 ]; then
+      msg "No ${st:-} requests at that point in the queue (${total:-0} in total)."
+      [ "$off" = 0 ] && return 0
+      off=0; continue
+    fi
+    items=(${rows[@]+"${rows[@]}"})
+    [ "$off" -gt 0 ] && items+=(P "<-- previous $REQ_PAGE")
+    [ $(( off + REQ_PAGE )) -lt "${total:-0}" ] && items+=(N "next $REQ_PAGE -->")
+    items+=(0 "Back")
+    ch=$(whiptail --title "Request queue: ${st:-everything}" --menu "Rows $((off+1))-$((off+shown)) of ${total:-0}. Pick one to retry or dismiss it." 22 96 12 "${items[@]}" 3>&1 1>&2 2>&3) || return 0
+    case "$ch" in
+      0) return 0;;
+      P) off=$(( off - REQ_PAGE )); [ "$off" -lt 0 ] && off=0; continue;;
+      N) off=$(( off + REQ_PAGE )); continue;;
+      *) step_request_row "$ch" || true;;
+    esac
+  done
+}
+step_request_row() { # <rid>
+  local a out
+  a=$(whiptail --title "Request #$1" --menu "What should happen to request #$1?" 14 76 3 \
+    R "Retry it (fetch the source again)" \
+    D "Dismiss it (take it off the queue for good)" \
+    0 "Back" 3>&1 1>&2 2>&3) || return 0
+  case "$a" in
+    R) out=$(admin_cli requests retry "$1" 2>&1) || { msg "Could not retry #$1:\n\n$(cli_err "$out")"; return 1; }
+       msg "#$1 is back in the queue. The portal picks it up within a minute; watch it on https://request.$(envget DOMAIN)/status.";;
+    D) yesno "Dismiss request #$1?\n\nIt leaves the queue permanently. No file is deleted and the user is not notified — a request still waiting for approval is simply cancelled.\n\nDismiss it?" || return 0
+       out=$(admin_cli requests dismiss "$1" 2>&1) || { msg "Could not dismiss #$1:\n\n$(cli_err "$out")"; return 1; }
+       msg "#$1 dismissed.";;
+  esac
+}
+# Files in dropbox/<user>/.failed had no console path at all: SSH plus mv/rm was the only route,
+# so they accumulated forever, occupying disk and going into every nightly restic snapshot.
+step_parked() {
+  portal_up || { msg "The portal is not running (Install -> Deploy first), so the parked files cannot be listed."; return 1; }
+  local out items=() ch
+  while true; do
+    out=$(admin_cli parked list 2>&1) || { msg "Could not list the parked files:\n\n$(cli_err "$out")"; return 1; }
+    mapfile -t items < <(printf '%s' "$out" | python3 -c '
+import sys, json
+for r in (json.load(sys.stdin).get("rows") or []):
+    print(r["token"])
+    print("%-9s %-32s %8.1f MB  %s" % ((r.get("user") or "-")[:9], (r.get("name") or "?")[:32],
+                                       (r.get("bytes") or 0) / 1048576.0,
+                                       (r.get("reason") or "no reason recorded")[:36]))
+' 2>/dev/null)
+    if [ "${#items[@]}" = 0 ]; then
+      msg "Nothing is parked: every $STACK_DIR/library/dropbox/<user>/.failed folder is empty.\n\nFiles land there when the importer cannot use them — a mixed or empty folder, an unreadable archive, a file past the size ceiling (Operations -> Advanced settings -> uploads)."
+      return 0
+    fi
+    ch=$(whiptail --title "Parked files (dropbox/<user>/.failed)" --menu "Files the importer could not use. They stay here forever and go into every nightly backup until you deal with them." 22 96 12 "${items[@]}" 0 "Back" 3>&1 1>&2 2>&3) || return 0
+    [ "$ch" = 0 ] && return 0
+    step_parked_one "$ch" || true
+  done
+}
+step_parked_one() { # <token>
+  local a out
+  a=$(whiptail --title "Parked file" --menu "What should happen to it?" 14 78 3 \
+    R "Retry: move it back into the dropbox so the importer tries again" \
+    D "Delete it from the server, permanently" \
+    0 "Back" 3>&1 1>&2 2>&3) || return 0
+  case "$a" in
+    R) out=$(admin_cli parked retry "$1" 2>&1) || { msg "Could not move it back:\n\n$(cli_err "$out")"; return 1; }
+       msg "Moved back to:\n  $(printf '%s' "$out" | json 'd.get("moved") or "the dropbox"')\n\nThe watcher picks it up within about 15 seconds. If it fails for the same reason it is parked again — the reason is on the list you came from.";;
+    D) yesno "DELETE this parked file from the server?\n\nIt is removed from disk immediately and cannot be undone from here: only a restic snapshot taken BEFORE now still holds it (Operations -> 'Restore a single file').\n\nReally delete it?" || return 0
+       out=$(admin_cli parked delete "$1" 2>&1) || { msg "Could not delete it:\n\n$(cli_err "$out")"; return 1; }
+       msg "Deleted. The disk space is free again; the next nightly snapshot no longer carries it.";;
+  esac
 }
 
 # ---------- T. torrents (qBittorrent, opt-in) ----------
@@ -2013,6 +2348,142 @@ update_failed() { # (f) offer the rollback: previous tags, previous caddy/librar
   fi
 }
 
+# ---------- operations: one service, and the tunables ----------
+# Authelia and Ephemera exist only in their overlay compose files: plain `compose` can neither
+# see nor start them, so every action has to go through the wrapper that owns the service.
+compose_for(){ case "$1" in authelia) printf 'composeA';; ephemera|flaresolverr) printf 'composeE';; *) printf 'compose';; esac; }
+stack_services(){ # what compose knows about, with the optional services appended when enabled
+  local s; s=$(compose ps --services 2>/dev/null | tr -d '\r' | grep -v '^$' || true)
+  # a stack that has never been started lists nothing; the admin still needs the menu
+  [ -n "$s" ] || s="caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma"
+  [ "$(envget AUTHELIA_ENABLED)" = true ] && s="$s authelia"
+  [ "$(envget EPHEMERA_ENABLED)" = true ] && s="$s ephemera flaresolverr"
+  printf '%s\n' $s | awk '!seen[$0]++'
+}
+# "Restart audiobookshelf, it's wedged" is the commonest thing an admin does to a stack like this
+# and it was not in the console at all — which also meant there was no console path to make a
+# setting this TUI wrote actually reach its container.
+step_service() {
+  local svcs=() items=() s st act cw rc=0 note=""
+  mapfile -t svcs < <(stack_services)
+  [ "${#svcs[@]}" -gt 0 ] || { msg "No services found. Is $STACK_DIR/docker-compose.yml in place (Install -> Deploy)?"; return 1; }
+  for s in "${svcs[@]}"; do
+    running "$s" && st="running" || st="NOT running"
+    items+=("$s" "$st")
+  done
+  s=$(whiptail --title "Restart / stop / start a service" --menu "One service at a time. Operations -> Status shows the same list with images and uptime." 20 76 11 "${items[@]}" 0 "Back" 3>&1 1>&2 2>&3) || return 0
+  [ "$s" = 0 ] && return 0
+  act=$(whiptail --title "$s" --menu "What should happen to $s?" 14 76 4 \
+    R "Restart it (recreated, so .env and image changes are picked up)" \
+    S "Stop it (it stays stopped until you start it here)" \
+    U "Start it" \
+    0 "Back" 3>&1 1>&2 2>&3) || return 0
+  cw=$(compose_for "$s")
+  case "$act" in
+    R) yesno "Restart $s?\n\nThe container is RECREATED rather than just restarted, so anything this TUI wrote to $ENV_FILE and any changed image tag take effect. $s is unavailable for a few seconds.\n\nRestart it?" || return 0
+       clear; echo "Recreating $s..."; $cw up -d --force-recreate "$s" || rc=1;;
+    S) # caddy is the only process that answers from the internet, and nothing restarts it by itself
+       if [ "$s" = caddy ]; then
+         yesno "STOP caddy?\n\ncaddy is the ONLY process that answers from the internet. While it is stopped, books., audio., request. and shelf. answer nothing at all — for everyone, on every device — and nothing brings it back by itself: you have to come back to this menu and start it.\n\nTailscale-only tools (monitor., dl., ephemera.) go down with it too.\n\nReally stop caddy?" || return 0
+       else
+         yesno "Stop $s?\n\nIt stays stopped until you start it again here or the server reboots. Nothing else is changed.\n\nStop it?" || return 0
+       fi
+       clear; echo "Stopping $s..."; $cw stop "$s" || rc=1;;
+    U) clear; echo "Starting $s..."
+       # `up -d`, never `start`: a container that was REMOVED (Update, Restore, a disabled feature)
+       # cannot be started, only recreated — and this is where the admin comes to fix exactly that
+       $cw up -d "$s" || rc=1;;
+    *) return 0;;
+  esac
+  if [ "$rc" != 0 ]; then
+    msg "compose could not do that to $s (Operations -> Logs -> $s shows why). The service was left as it was."
+    [ "$s" = caddy ] && [ "$act" != S ] && msg "WARNING: caddy is the only public listener. Check Operations -> Status: if it is not running, no public site answers."
+    return 1
+  fi
+  case "$act" in
+    S) note=""
+       [ "$s" = caddy ] && note="\n\nEVERY public site is down until you start caddy again from this menu."
+       msg "$s is stopped.$note";;
+    *) wait_healthy 90 || note="\n\nSomething in the stack is not reporting healthy yet — give it a minute, then Operations -> Status."
+       running "$s" || note="\n\nWARNING: $s is NOT running after that command. Operations -> Logs -> $s."
+       msg "$s was $([ "$act" = R ] && printf recreated || printf started).$note";;
+  esac
+}
+# Settings the code reads from the environment but nothing ever wrote. Fields:
+#   group|KEY|default|kind|one-line explanation
+# The defaults MUST match docker-compose.yml's ${KEY:-default} and .env.example, or this screen
+# shows a value the container is not actually using.
+ADV_SETTINGS='lockout|LOCKOUT_FAILS|5|int|Wrong passwords for one user from one address before that pair is locked
+lockout|LOCKOUT_WINDOW|900|int|Seconds those failures are counted over
+lockout|LOCKOUT_SECONDS|900|int|How long a lockout lasts, in seconds
+lockout|LOCKOUT_IP_FAILS|20|int|Wrong passwords from ONE address across all accounts before the address is locked
+lockout|SESSION_HOURS|12|int|How long a portal login stays signed in, in hours
+uploads|MAX_UPLOAD_MB|95|int|Largest file the portal browser form takes (Cloudflare refuses bodies over 100 MB)
+uploads|MAX_EBOOK_MB|200|int|Largest ebook the worker downloads or imports
+uploads|MAX_AUDIO_MB|2048|int|Largest audiobook (a LibriVox zip of a long book runs past 1 GB)
+uploads|MAX_PDF_MB|250|int|Largest PDF; bigger ones are parked, because tagging renders them in memory
+uploads|MAX_MAIL_MB|40|int|Largest mailed-in attachment; a message is parsed in memory at ~12x its size, so keep this well under the upload cap
+uploads|KINDLE_MAX_MB|45|int|Largest Send-to-Kindle attachment (Amazon refuses bigger ones)
+mail|IMAP_PORT|0|int|IMAP port; 0 = the default for the mode (993 implicit TLS, 143 STARTTLS)
+mail|IMAP_SSL|true|bool|true = implicit TLS on 993; false = STARTTLS on 143, for a local relay
+mail|IMAP_FOLDER|INBOX|text|Mailbox the e-mail-to-library poller reads
+mail|NOTIFY_WEBHOOK_FORMAT|auto|text|How alerts are posted: auto (ntfy style for an ntfy host), ntfy or json
+mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files audiobooks into
+disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
+disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
+disk|DISK_RESUME_PCT|80|pct|Disk use they are started again below
+backup|RESTIC_KEEP_DAILY|7|int|Daily snapshots the nightly forget --prune keeps
+backup|RESTIC_KEEP_WEEKLY|4|int|Weekly snapshots kept
+backup|RESTIC_KEEP_MONTHLY|6|int|Monthly snapshots kept'
+adv_rows(){ printf '%s\n' "$ADV_SETTINGS" | grep "^$1|" || true; }
+adv_value(){ local v; v=$(envget "$1"); printf '%s' "${v:-$2}"; }   # what the stack really uses now
+step_advanced() {
+  local g key def kind help cur new line items=() w s r
+  while true; do
+    g=$(whiptail --title "Advanced settings" --menu "Values the stack reads from $ENV_FILE. A key that is not set uses the built-in default, and that is what this screen shows — so the number you see is always the one in force.\n\nEditing docker-compose.yml instead does NOT work: every Deploy and Update rewrites it." 20 88 6 \
+      lockout "Login lockout thresholds and session length" \
+      uploads "Size ceilings for uploads, imports and Send-to-Kindle" \
+      mail    "IMAP intake, alert format, Audiobookshelf library name" \
+      disk    "Disk watchdog thresholds" \
+      backup  "restic snapshot retention" \
+      0       "Back" 3>&1 1>&2 2>&3) || return 0
+    [ "$g" = 0 ] && return 0
+    while true; do
+      items=()
+      while IFS='|' read -r _ key def kind help; do
+        [ -n "${key:-}" ] || continue
+        items+=("$key" "$(adv_value "$key" "$def")  -  ${help:0:56}")
+      done <<< "$(adv_rows "$g")"
+      [ "${#items[@]}" -gt 0 ] || break
+      key=$(whiptail --title "Advanced: $g" --menu "The value shown is the one in force right now." 20 104 10 "${items[@]}" 0 "Back" 3>&1 1>&2 2>&3) || break
+      [ "$key" = 0 ] && break
+      line=$(printf '%s\n' "$ADV_SETTINGS" | grep "^$g|$key|" | head -1)
+      IFS='|' read -r _ key def kind help <<< "$line"
+      cur=$(adv_value "$key" "$def")
+      new=$(ask "$key — $help\n\nBuilt-in default: $def" "$cur") || continue
+      [ -n "$new" ] || { msg "Nothing was changed ($key is still $cur)."; continue; }
+      [ "$new" = "$cur" ] && { msg "$key is already $cur. Nothing was changed."; continue; }
+      case "$kind" in
+        int) case "$new" in ''|*[!0-9]*) msg "$key must be a whole number. Nothing was changed."; continue;; esac;;
+        pct) case "$new" in ''|*[!0-9]*) msg "$key is a percentage. Nothing was changed."; continue;; esac
+             { [ "$new" -ge 1 ] && [ "$new" -le 99 ]; } || { msg "$key must be between 1 and 99. Nothing was changed."; continue; };;
+        bool) case "$new" in true|false) ;; *) msg "$key must be exactly true or false. Nothing was changed."; continue;; esac;;
+      esac
+      envset "$key" "$new" || { msg "Could not write $ENV_FILE, so $key was NOT changed."; continue; }
+      case "$g" in
+        backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;
+        disk)   w=$(adv_value DISK_WARN_PCT 85); s=$(adv_value DISK_STOP_PCT 95); r=$(adv_value DISK_RESUME_PCT 80)
+                { [ "$r" -lt "$s" ] && [ "$w" -le "$s" ]; } \
+                  || msg "WARNING: the thresholds now read warn=$w stop=$s resume=$r. They only work as resume < stop and warn <= stop — otherwise the watchdog either stops the downloaders before it ever warns you, or never starts them again."
+                if restart_portal; then msg "$key is now $new.\n\nThe hourly watchdog reads $ENV_FILE when it runs, and the portal was recreated so its own copy of the thresholds matches."
+                else msg "$key is now $new in $ENV_FILE and the hourly watchdog will use it, but the portal could NOT be restarted, so the portal still pauses its imports at the OLD threshold (Operations -> Logs -> librarian)."; fi;;
+        *)      if restart_portal; then msg "$key is now $new and the portal was recreated, so it is live."
+                else msg "$key is now $new in $ENV_FILE, but the portal could NOT be restarted, so it is NOT in force yet (Operations -> Logs -> librarian)."; fi;;
+      esac
+    done
+  done
+}
+
 # ---------- menus ----------
 # Every arm ends in `|| true`: under errexit a failed step, a whiptail Esc (255) or a non-zero
 # self-test must return to the menu, never drop the admin to the shell.
@@ -2034,7 +2505,7 @@ menu_install() {
 }
 menu_library() {
   while true; do
-    ch=$(whiptail --title "Library" --menu "What the library does with books, and where they come from." 22 88 11 \
+    ch=$(whiptail --title "Library" --menu "What the library does with books, and where they come from." 24 88 13 \
       F "Formats & conversion: convert to EPUB on import, kept formats, Kindle fixer, duplicates" \
       A "Audiobookshelf: root + API key + library; per-user audiobook isolation ($(abs_ready && echo set up || echo not set up))" \
       M "Mail: SMTP so the portal can Send-to-Kindle (and test it)" \
@@ -2042,26 +2513,33 @@ menu_library() {
       H "Shelfmark: extended search settings + first-run checklist" \
       I "Intake & dropboxes: webhook, Gutenberg mirror, email-to-library" \
       T "Torrents (qBittorrent): enable/disable ($(torrents_on && echo on || echo off))" \
+      Q "Request queue: approvals and failures, all of them, retry / dismiss" \
+      P "Parked files: what the importer could not use, retry / delete" \
+      R "Audiobookshelf: rescan the library now" \
       G "How per-user isolation works (guide)" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in F) step_formats || true;; A) step_abs_setup || true;; M) step_mail || true;; S) step_sources || true;; H) step_shelfmark || true;;
-      I) step_intake || true;; T) step_torrents || true;; G) step_isolation || true;; 0) return 0;; esac
+      I) step_intake || true;; T) step_torrents || true;; Q) step_requests || true;; P) step_parked || true;; R) step_abs_scan || true;;
+      G) step_isolation || true;; 0) return 0;; esac
   done
 }
 menu_security() {
   while true; do
-    ch=$(whiptail --title "Security" --menu "Authelia gate: $([ "$(envget AUTHELIA_ENABLED)" = true ] && echo ON || echo off)" 20 84 9 \
+    ch=$(whiptail --title "Security" --menu "Authelia gate: $([ "$(envget AUTHELIA_ENABLED)" = true ] && echo ON || echo off)   Public SSH: $([ "$(envget SSH_LOCKED)" = true ] && echo LOCKED || echo open)" 22 84 11 \
       A "Authelia: enable self-hosted SSO + 2FA in front of the public apps" \
       D "Authelia: disable the gate" \
       U "Authelia: add or reset a user" \
       L "Lock SSH to Tailscale only" \
+      O "Reopen public SSH (undo Lock SSH; key-only auth stays)" \
       F "fail2ban: brute-force protection (SSH + login pages)" \
+      B "Bans: show what is banned and release an address (fail2ban + Cloudflare)" \
       M "Mail auth: SPF/DMARC records for Send-to-Kindle deliverability" \
       C "Cloudflare Access: hosted SSO + 2FA alternative (guide)" \
       R "Rotate the portal session secret (logs every portal user out)" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in A) step_authelia || true;; D) step_authelia_off || true;; U) step_authelia_user || true;; L) step_lock_ssh || true;;
-      F) step_fail2ban || true;; M) step_mailauth || true;; C) step_cfaccess || true;; R) step_rotate_secret || true;; 0) return 0;; esac
+      O) step_unlock_ssh || true;; F) step_fail2ban || true;; B) step_unban || true;; M) step_mailauth || true;;
+      C) step_cfaccess || true;; R) step_rotate_secret || true;; 0) return 0;; esac
   done
 }
 step_rotate_secret() {
@@ -2079,22 +2557,28 @@ step_rotate_secret() {
 }
 menu_ops() {
   while true; do
-    ch=$(whiptail --title "Operations" --menu "Ephemera: $([ "$(envget EPHEMERA_ENABLED)" = true ] && echo ON || echo off)" 24 84 14 \
+    ch=$(whiptail --title "Operations" --menu "Ephemera: $([ "$(envget EPHEMERA_ENABLED)" = true ] && echo ON || echo off)   (the list scrolls)" 24 88 15 \
       T "Self-test: containers, endpoints, configs, firewall, TLS, isolation, backups" \
       S "Status: all containers" \
+      V "Restart / stop / start ONE service" \
       L "Logs: follow a service" \
+      D "Advanced settings: lockout, upload caps, mail, disk, retention" \
       C "Check for updates: current vs newest image tags" \
       U "Update: backup first, deploy this code, pull/bump tags, health gate, rollback" \
       B "Backups: configure / change" \
+      K "Rotate the backup repository password (restic key add + remove)" \
       A "Alerts: phone notification (ntfy / webhook)" \
       R "Backup restore test" \
       W "Restore from backup: pick a snapshot, everything or config + databases" \
+      F "Restore a SINGLE file from a snapshot (beside the stack, nothing stops)" \
       M "Monitoring: Uptime Kuma + external check" \
       E "Ephemera: enable (Tailscale-only, unmaintained upstream — read notice)" \
       X "Ephemera: disable" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
-    case "$ch" in T) step_selftest || true;; S) step_status || true;; L) step_logs || true;; C) step_check_updates || true;; U) step_update || true;;
-      B) step_backup || true;; A) step_alerts || true;; R) step_restore_test || true;; W) step_restore || true;; M) step_monitoring || true;;
+    case "$ch" in T) step_selftest || true;; S) step_status || true;; V) step_service || true;; L) step_logs || true;;
+      D) step_advanced || true;; C) step_check_updates || true;; U) step_update || true;;
+      B) step_backup || true;; K) step_restic_rotate || true;; A) step_alerts || true;; R) step_restore_test || true;;
+      W) step_restore || true;; F) step_restore_file || true;; M) step_monitoring || true;;
       E) step_ephemera || true;; X) step_ephemera_off || true;; 0) return 0;; esac
   done
 }

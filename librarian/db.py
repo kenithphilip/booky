@@ -361,15 +361,21 @@ def counts_by_status():
     with _conn() as c:
         return {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM requests GROUP BY status")}
 
-def rows_by_status(statuses, limit=500):
-    """All rows in these statuses (needs-tag list, retry-all, the import reconciliation)."""
+def rows_by_status(statuses, limit=None):
+    """All rows in these statuses (needs-tag list, retry-all, the import reconciliation).
+    limit=None really means all of them: an admin list that silently stops at N hides exactly
+    the oldest pending approval or failure that most needs acting on."""
     statuses = tuple(statuses)
     if not statuses:
         return []
     marks = ",".join("?" * len(statuses))
+    sql = f"SELECT * FROM requests WHERE status IN ({marks}) ORDER BY id DESC"
+    args = statuses
+    if limit is not None:
+        sql += " LIMIT ?"
+        args = (*statuses, limit)
     with _conn() as c:
-        return [dict(r) for r in c.execute(
-            f"SELECT * FROM requests WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?", (*statuses, limit))]
+        return [dict(r) for r in c.execute(sql, args)]
 
 def list_requests(status=None, limit=50, offset=0):
     """A page of the queue for the admin console, oldest-first within the newest-first order.

@@ -39,13 +39,13 @@ free_h=$(df -h "$STACK_DIR" 2>/dev/null | awk 'NR==2{print $4}')
 
 if [ "$pct" -ge "$STOP_PCT" ]; then
   if [ "$(state_get paused)" != 1 ]; then
-    stopped="shelfmark"; nostop=""
-    compose stop shelfmark >/dev/null 2>&1 || nostop="shelfmark"
+    stopped=""; nostop=""
+    if compose stop shelfmark >/dev/null 2>&1; then stopped="shelfmark"; else nostop="shelfmark"; fi
     if running qbittorrent; then
-      if compose stop qbittorrent >/dev/null 2>&1; then stopped="$stopped, qbittorrent"; else nostop="${nostop:+$nostop, }qbittorrent"; fi
+      if compose stop qbittorrent >/dev/null 2>&1; then stopped="${stopped:+$stopped, }qbittorrent"; else nostop="${nostop:+$nostop, }qbittorrent"; fi
     fi
     state_set paused 1
-    "$ALERT" "Disk ${pct}% full on $(hostname)" "Only $free_h free under $STACK_DIR. Downloaders stopped ($stopped)${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too. Free space, then they restart automatically below ${RESUME_PCT}%." high
+    "$ALERT" "Disk ${pct}% full on $(hostname)" "Only $free_h free under $STACK_DIR. Downloaders stopped (${stopped:-none})${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too. Free space, then they restart automatically below ${RESUME_PCT}%." high
     state_set last_alert "$now"
   fi
 elif [ "$pct" -ge "$WARN_PCT" ]; then
@@ -85,7 +85,9 @@ fi
 
 # growers
 find "$STACK_DIR/downloads/incomplete" "$STACK_DIR/library/staging" -type f -mtime +14 -delete 2>/dev/null
-find "$STACK_DIR/library/ingest" -name '*.part' -mmin +1440 -delete 2>/dev/null
+# A .part is renamed to its real extension immediately after tagging, so none survives 15
+# minutes legitimately; a day-wide backstop leaves the last free bytes of a full disk pinned.
+find "$STACK_DIR/library/ingest" -name '*.part' -mmin +15 -delete 2>/dev/null
 journalctl --vacuum-size=200M >/dev/null 2>&1
 docker builder prune -f --filter until=168h >/dev/null 2>&1
 if [ -f /etc/bookstack/restic.env ]; then ( set -a; . /etc/bookstack/restic.env; set +a; restic cache --cleanup >/dev/null 2>&1 ); fi

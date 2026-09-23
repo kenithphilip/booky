@@ -521,6 +521,7 @@ def test_admin_cli_requests_retry_and_dismiss(capsys):
 
     # a stranded pending row (its owner was removed) must be clearable without a fake denial
     assert admin_cli.main(["requests", "dismiss", str(pending)]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
     assert db.get(pending)["status"] == "dismissed"
 
     assert admin_cli.main(["requests", "retry", "99999"]) == 1

@@ -2,7 +2,7 @@
 # Placeholders: @@DOMAIN@@ @@ADMIN_EMAIL@@ @@BIND_IP@@ (local address the public sites listen on;
 # differs from the DNS address behind a 1:1 NAT) @@TAILSCALE_IP@@ @@ADMIN_HASH@@.
 # Optional blocks the installer deletes when the feature is off (sed '/BEGIN/,/END/d'):
-# TORRENTS (dl.), EPHEMERA (ephemera.).
+# TORRENTS (dl.), EPHEMERA (ephemera.), AUTHELIA (auth.).
 {
 	email @@ADMIN_EMAIL@@
 	# Admin API on a unix socket inside the container only (never 127.0.0.1:2019 on the host
@@ -302,6 +302,7 @@ shelf.@@DOMAIN@@ {
 
 # ---- PUBLIC: Authelia SSO portal (only used when the gate is enabled) --------
 
+# @AUTHELIA_BEGIN@
 auth.@@DOMAIN@@ {
 	bind @@BIND_IP@@
 	import public_tls
@@ -323,6 +324,7 @@ auth.@@DOMAIN@@ {
 		header_up X-Real-IP {client_ip}
 	}
 }
+# @AUTHELIA_END@
 
 # ---- PRIVATE: uptime monitoring (Tailscale only) ----------------------------
 

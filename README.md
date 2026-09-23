@@ -374,13 +374,18 @@ checks the posture.
 
 ## Security & ops menu (what's where)
 - **Install & deploy**: Quick install, System, Tailscale, Configure, Cloudflare, Deploy, Backups, Alerts.
-- **Users & devices**: list / add / Kindle / Kobo link / password / remove / repair / guide.
+- **Users & devices**: list / add / Kindle / Kobo link / password / remove / repair / guide,
+  Login lockouts (who is locked out of the portal, and release them).
 - **Library**: Formats & conversion, Mail (SMTP + test), Sources & approvals, Shelfmark,
-  Intake & dropboxes (webhook enable/show/disable), Torrents, isolation guide.
+  Intake & dropboxes (webhook enable/show/disable), Torrents, Request queue, Parked files,
+  Audiobookshelf rescan, isolation guide.
 - **Security**: Authelia enable / disable / add user, Lock SSH to Tailscale, Reopen public SSH,
-  fail2ban, Bans — list and release, Clear a login lockout, SPF/DMARC, Cloudflare Access guide.
-- **Operations**: Self-test, Status, Logs, Restart a service, Update, Backups, Restore test,
-  Restore from backup, Restore a single file, Alerts, Monitoring, Ephemera enable / disable.
+  fail2ban, Bans — list and release, SPF/DMARC, Cloudflare Access guide, Rotate the portal
+  session secret.
+- **Operations**: Self-test, Status, Restart / stop / start one service, Logs, Advanced settings,
+  Check for updates, Update, Backups, Rotate the backup repository password, Alerts,
+  Restore test, Restore from backup, Restore a single file, Monitoring,
+  Ephemera enable / disable.
 
 Backups are encrypted restic (7 daily / 4 weekly / 6 monthly by default — `RESTIC_KEEP_DAILY`
 / `_WEEKLY` / `_MONTHLY` in `.env`; `pre-update` snapshots kept 90 days; `restic check` weekly;
@@ -420,7 +425,7 @@ Audiobookshelf apps holding a stale password are the usual cause — fix the sav
 the app, or the ban comes straight back.
 
 **"Too many attempts, try again later" on the portal.** That is the portal's own lockout
-(`LOCKOUT_*` in `.env`), separate from fail2ban. **Security → Clear a login lockout** releases
+(`LOCKOUT_*` in `.env`), separate from fail2ban. **Users & devices → Login lockouts** releases
 a user or an address immediately; it expires by itself after `LOCKOUT_SECONDS`.
 
 **A service is wedged.** **Operations → Restart a service**. It recreates the container

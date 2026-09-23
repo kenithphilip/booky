@@ -123,6 +123,8 @@ def poll_once():
     cap = config.MAX_MAIL_MB * 1024 * 1024
     limit = _over_limit(cap)
     filed = 0
+    if worker._disk_paused():   # mail waits, unseen, until the disk watchdog clears the flag
+        return 0
     M = _connect()
     try:
         M.select(config.IMAP_FOLDER)
@@ -139,6 +141,12 @@ def poll_once():
             # parsed is still unseen afterwards and is retried instead of being lost.
             _, d = M.fetch(num, "(BODY.PEEK[])")
             raw = d[0][1] if d and d[0] and not isinstance(d[0], bytes) else b""
+            if not raw:
+                # an unexpected FETCH shape would otherwise parse as an empty message, file
+                # nothing, and — still unseen — come back every 60 s for ever
+                log.warning("mail #%s: unreadable FETCH response, skipping", num)
+                M.store(num, "+FLAGS", "\\Seen")
+                continue
             # Second, exact gate: the raw bytes cost 1x, message_from_bytes + get_payload cost
             # ~12x. A server that does not answer RFC822.SIZE (so `size` is None) previously
             # got us here with 94 MB in hand, and the parse SIGKILLed the container — after

@@ -131,6 +131,9 @@ if h.get("restart_cwa"):
 r = lib("harden"); check((jload(r.stdout) or {}).get("changed") is False, "harden is idempotent (no second restart)")
 r = lib("passwd", "admin", "--password", ADMIN_PW); check(r.returncode == 0, "admin password set", r.stderr)
 r = lib("add-user", "alice", "--email", "alice@example.test", "--password", ALICE_PW); check(r.returncode == 0, "add-user alice", r.stderr)
+# `cwa add-user` now provisions the Audiobookshelf account too (it used to leave the CLI path
+# behind /admin and the TUI, so a CLI-created user had no audio login).
+check((jload(r.stdout) or {}).get("abs") == "created", "add-user also created the Audiobookshelf account", r.stdout[:160])
 r = lib("add-user", "bob", "--password", BOB_PW); check(r.returncode == 0, "add-user bob", r.stderr)
 r = lib("list"); users = jload(r.stdout) or []
 check({u["name"] for u in users} >= {"admin", "alice", "bob"}, "list shows admin/alice/bob")
@@ -442,7 +445,11 @@ st, h, b = a.get(ABS + "/status"); check((jload(b) or {}).get("isInit") is True,
 st, h, b = a.post(ABS + "/login", json_body={"username": "root", "password": "rootpass-e2e1"}); root = (jload(b) or {}).get("user") or {}
 root_tok = root.get("token") or root.get("accessToken"); check(bool(root_tok), "ABS root login with the password given to abs init", str(st))
 r = absctl("status"); check(r.returncode == 0 and '"isInit": true' in r.stdout.replace(" ", " "), "portal container reaches ABS with ABS_TOKEN", r.stderr[:100])
-r = absctl("ensure-user", "alice", "--password", ALICE_PW); check(r.returncode == 0 and '"created"' in r.stdout, "abs ensure-user alice (what Users -> Add runs)", r.stderr[:120] or r.stdout[:120])
+# "created" or "updated": `cwa add-user` provisions the ABS account itself now, so by the time
+# this runs alice usually already has one. Both outcomes prove Users -> Add reaches ABS; the
+# next line is the one that pins the idempotent/re-align behaviour.
+r = absctl("ensure-user", "alice", "--password", ALICE_PW)
+check(r.returncode == 0 and ('"created"' in r.stdout or '"updated"' in r.stdout), "abs ensure-user alice (what Users -> Add runs)", r.stderr[:120] or r.stdout[:120])
 r = absctl("ensure-user", "bob", "--password", BOB_PW); check(r.returncode == 0, "abs ensure-user bob", r.stderr[:120])
 r = absctl("ensure-user", "alice"); check(r.returncode == 0 and '"updated"' in r.stdout, "ensure-user is idempotent / re-aligns (Users -> Repair)", r.stdout[:120])
 r = absctl("list-users"); ul = jload(r.stdout) or []

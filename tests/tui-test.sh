@@ -19,6 +19,10 @@ echo "== syntax"
 bash -n "$REPO/bookstack.sh" && ok "bash -n bookstack.sh" || bad "bash -n bookstack.sh"
 for f in "$REPO"/scripts/*.sh "$REPO"/tests/*.sh; do bash -n "$f" || bad "bash -n $f"; done; ok "bash -n scripts/tests"
 command -v shellcheck >/dev/null && { shellcheck -S error "$REPO/bookstack.sh" "$REPO"/scripts/*.sh && ok "shellcheck (errors)" || bad "shellcheck"; }
+# A19: the inline python blocks run on the HOST. Nesting the same quote inside an f-string is
+# python 3.12+ (PEP 701) and Debian 12 ships 3.11, where it is a SyntaxError.
+if grep -nE 'f"[^"]*\{[^}]*"' "$REPO/bookstack.sh"; then bad "PEP 701 f-string (3.12-only) in bookstack.sh: Debian 12 python3.11 cannot parse it"
+else ok "no python3.12-only f-string quoting in bookstack.sh's host-side python (A19)"; fi
 
 # shellcheck source=../bookstack.sh
 source "$REPO/bookstack.sh"
@@ -68,6 +72,15 @@ docker() {
     *"python -m abs ensure-user"*) echo '{"ok": true, "user": "alice", "result": "created"}';;
     *"python -m abs status"*) echo "{\"isInit\": ${ABS_INIT:-true}, \"app\": \"audiobookshelf\"}";;
     *"python -m abs "*) echo '{"ok": true}';;
+    # admin_cli = the portal's admin back end (librarian/admin_cli.py). Its answers are variables
+    # so a test can hand back a page, an empty page or a failure; CLI_FAIL makes every arm fail
+    # the way the real one does (non-zero + one line of {"ok": false, "error": ...}).
+    *"python -m admin_cli lockout status"*) [ "$CLI_FAIL" = 1 ] && { echo '{"ok": false, "error": "the portal database is locked"}'; return 1; }; echo "$CLI_LOCKOUT";;
+    *"python -m admin_cli lockout clear"*)  [ "$CLI_FAIL" = 1 ] && { echo '{"ok": false, "error": "no such user"}'; return 1; }; echo "$CLI_CLEAR";;
+    *"python -m admin_cli requests list"*)  [ "$CLI_FAIL" = 1 ] && { echo '{"ok": false, "error": "cannot read the queue"}'; return 1; }; echo "$CLI_REQUESTS";;
+    *"python -m admin_cli parked list"*)    [ "$CLI_FAIL" = 1 ] && { echo '{"ok": false, "error": "the dropbox is unreadable"}'; return 1; }; echo "$CLI_PARKED";;
+    *"python -m admin_cli"*)                [ "$CLI_FAIL$CLI_ACT_FAIL" = 00 ] || { echo '{"ok": false, "error": "that request has no re-fetchable source"}'; return 1; }; echo "$CLI_ACT";;
+    *"ps --services"*) printf '%s\n' ${PS_SERVICES-caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma};;
     *"sqlite3 /config/cwa.db SELECT"*) echo '1|epub|new_record|1||0';;
     *"logs --tail"*) [ "${FAIL_LOGS:-0}" = 1 ] && return 1; :;;
     *"inspect -f"*) echo true;;
@@ -78,6 +91,14 @@ docker() {
     *) :;;
   esac
 }
+# canned admin_cli answers; each test sets the ones it needs and resets CLI_FAIL
+CLI_FAIL=0
+CLI_LOCKOUT='{"ok": true, "users": [], "ips": []}'
+CLI_CLEAR='{"ok": true, "cleared": 0}'
+CLI_REQUESTS='{"ok": true, "total": 0, "rows": []}'
+CLI_PARKED='{"ok": true, "rows": []}'
+CLI_ACT='{"ok": true}'
+CLI_ACT_FAIL=0
 curl(){ echo "curl: $*" >> "$LOG"; case "$*" in *ipify*) echo "${IPIFY:-203.0.113.5}";;
   *127.0.0.1:8090/healthz*) [ "${FAIL_HEALTHZ:-0}" = 1 ] && return 22; return 0;;
   *127.0.0.1:9091/api/health*) [ "${FAIL_AUTHELIA_HEALTH:-0}" = 1 ] && return 7; return 0;;
@@ -144,6 +165,17 @@ mv(){ [ "${1##*/}" = .env.tmp ] && { stat -c %a "$1" 2>/dev/null || stat -f %Lp 
 ( umask 022; envset K_UMASK x ); unset -f mv
 expect '[ "$(cat "$T/tmpmode")" = 600 ]' "envset writes .env.tmp with mode 600 even under umask 022 (F37)"
 printf 'LEGACY=bare$value\n' >> "$ENV_FILE"; expect '[ "$(envget LEGACY)" = "bare\$value" ]' "bare legacy values still read"
+# A21: whiptail cannot return a newline, but a hand-edited or pasted .env value can carry one,
+# and envset would then write a second, key-shaped line
+reset; envset K_NL "$(printf 'one\ntwo')"; rc=$?
+expect '[ $rc = 1 ] && [ -z "$(envget K_NL)" ] && ! grep -q "^K_NL=" "$ENV_FILE" && grep -F msgbox "$LOG" | grep -q "line break"' "envset refuses a value containing a line break instead of corrupting .env (A21)"
+# A22: a .env written by a Windows editor (or restored from one) is CRLF
+printf 'K_CR=value\r\n' >> "$ENV_FILE"; printf "K_CRQ='quoted'\r\n" >> "$ENV_FILE"
+expect '[ "$(envget K_CR)" = value ] && [ "$(envget K_CRQ)" = quoted ]' "a CRLF .env yields clean values, quoted ones included (A22)"
+# A11: a write that cannot happen must be reported, not silently swallowed
+touch "$T/notadir"
+( STACK_DIR="$T/notadir/sub"; ENV_FILE="$STACK_DIR/.env"; envset X y ) 2>/dev/null; rc=$?
+expect '[ $rc != 0 ]' "envset returns non-zero when .env cannot be written (full disk / read-only root) (A11)"
 envdefault K1 'ignored'; envdefault KNEW 'set'; expect '[ "$(envget K1)" = changed ] && [ "$(envget KNEW)" = set ]' "envdefault only fills blanks"
 expect '[ "$(img IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.6 ]' "img() falls back to the pinned default"
 envset IMG_CWA x/y:1; expect '[ "$(img IMG_CWA)" = x/y:1 ]' "img() prefers .env"; envset IMG_CWA ""
@@ -180,6 +212,15 @@ for k, v in defaults.items():
 print("\n".join("     " + b for b in bad)); sys.exit(1 if bad else 0)
 PY
 expect 'grep -q "^MAX_UPLOAD_MB=95" "$REPO/.env.example" && grep -q "^SHELFMARK_CONCURRENCY=1" "$REPO/.env.example"' ".env.example: 95 MB upload cap, Shelfmark concurrency 1"
+echo "== entry-point guards and helper hygiene"
+expect 'grep -A3 "command -v whiptail" "$REPO/bookstack.sh" | grep -q "Could not install whiptail"' "the whiptail bootstrap explains a busy dpkg lock instead of exiting on a raw apt error (A20)"
+expect 'grep -q "flock -n 9" "$REPO/bookstack.sh" && grep -q "Another bookstack.sh is already running" "$REPO/bookstack.sh"' "a second concurrent TUI session is refused with flock, so two envsets cannot lose each other (A23)"
+expect 'declare -f step_system | grep -q "iproute2 procps"' "System installs iproute2 (ip) and procps (free), which the TUI's own helpers call (A26)"
+expect 'declare -f cf | grep -q -- "-m 30 --retry 2"' "Cloudflare API calls carry a max-time, so an outage cannot freeze the TUI indefinitely (A32)"
+expect '! declare -f render_caddyfile | grep -q "PUBLIC_IP@@" && ! grep -q "@@PUBLIC_IP@@" "$REPO/caddy/Caddyfile.template"' "the dead @@PUBLIC_IP@@ substitution is gone (A28)"
+expect 'declare -f write_sysctl | grep -q "temporarily absent" && ! declare -f write_sysctl | grep -q "Caddy binds the tailnet IP too"' "the ip_nonlocal_bind comment no longer claims Caddy binds the tailnet IP (A29)"
+valid_admin_hash '$2a$14$STUBHASH/abc'; a=$?; valid_admin_hash '$2'; b=$?; valid_admin_hash ''; c=$?; valid_admin_hash '$argon2id$v=19$m=65536$salt$hash'; d=$?
+expect '[ $a = 0 ] && [ $b = 1 ] && [ $c = 1 ] && [ $d = 0 ]' "the ADMIN_HASH guard matches the real hash shape, so a truncated '\$2' is refused (A24)"
 
 echo "== system step pieces"
 reset; write_docker_daemon_json && ok "write_docker_daemon_json" || bad "write_docker_daemon_json failed"
@@ -300,6 +341,61 @@ expect '[ "$rc" != 0 ] && [ "$before" = "$after" ]' "cancel at the first prompt 
 # hash-password failure path: the stub returns garbage -> nothing stored, Configure reports failure
 reset "example.test" "admin@example.test" "UTC" "" "no" "bad-12345" "bad-12345"; HASH_STUB_BROKEN=1 step_configure; rc=$?
 expect '[ "$rc" != 0 ] && [ "$(envget ADMIN_HASH)" = "\$2a\$14\$STUBHASH/abc" ] && grep -F "msgbox" "$LOG" | grep -q "Could not hash"' "a failed caddy hash-password keeps the old hash and reports the failure"
+expect 'grep -F "msgbox" "$LOG" | grep -q "WERE saved"' "and it says the other settings were already written, instead of claiming a no-op (A30)"
+
+echo "== Caddyfile templating: no sed metacharacters (A12/A13)"
+dbak=$(envget DOMAIN)
+envset DOMAIN 'ex&ample.com'; reset; render_caddyfile; rc=$?
+expect '[ $rc = 0 ] && grep -q "^books.ex&ample.com {" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@" "$STACK_DIR/caddy/Caddyfile"' "an & in the domain is substituted literally, not as sed's whole-match (A13)"
+envset DOMAIN 'mf|data.in'; reset; render_caddyfile; rc=$?
+expect '[ $rc = 0 ] && [ -s "$STACK_DIR/caddy/Caddyfile" ] && grep -q "^books.mf|data.in {" "$STACK_DIR/caddy/Caddyfile"' "a | in the domain no longer produces a zero-byte Caddyfile reported as success (A12)"
+envset DOMAIN 'ex\1ample.com'; reset; render_caddyfile; rc=$?
+expect '[ $rc = 0 ] && grep -qF "books.ex\\1ample.com {" "$STACK_DIR/caddy/Caddyfile"' "a backslash reference in the domain is substituted literally (A12)"
+envset DOMAIN "$dbak"; render_caddyfile; cp "$STACK_DIR/caddy/Caddyfile" "$T/cf.good2"
+cp "$STACK_DIR/caddy/Caddyfile.template" "$T/tmpl.keep"; printf '\n# @@NEW_THING@@\n' >> "$STACK_DIR/caddy/Caddyfile.template"
+reset; render_caddyfile; rc=$?
+expect '[ $rc = 1 ] && cmp -s "$STACK_DIR/caddy/Caddyfile" "$T/cf.good2" && [ ! -e "$STACK_DIR/caddy/Caddyfile.new" ] && grep -F msgbox "$LOG" | grep -q "unsubstituted"' "a placeholder the renderer does not know refuses the render and leaves the live Caddyfile alone"
+cp "$T/tmpl.keep" "$STACK_DIR/caddy/Caddyfile.template"; render_caddyfile
+# A34: the auth. vhost is dropped while the gate is off, the way dl. and ephemera. are. This
+# reads the SHIPPED template on purpose — an earlier version injected the markers into a copy,
+# which passed happily while the real template carried no markers at all and nothing was dropped.
+expect 'grep -q "^# @AUTHELIA_BEGIN@" "$STACK_DIR/caddy/Caddyfile.template" && grep -q "^# @AUTHELIA_END@" "$STACK_DIR/caddy/Caddyfile.template"' "the shipped template really wraps the auth. vhost in @AUTHELIA_BEGIN@/@AUTHELIA_END@ (A34)"
+abak=$(envget AUTHELIA_ENABLED); envset AUTHELIA_ENABLED false; render_caddyfile
+expect '! grep -q "^auth\.example\.test {" "$STACK_DIR/caddy/Caddyfile"' "auth. is not rendered while the gate is off (A34)"
+envset AUTHELIA_ENABLED true; render_caddyfile
+expect 'grep -q "^auth\.example\.test {" "$STACK_DIR/caddy/Caddyfile"' "and is rendered while it is on (A34)"
+envset AUTHELIA_ENABLED "$abak"; render_caddyfile
+hbak=$(envget ADMIN_HASH); envset ADMIN_HASH '$2'; reset; render_caddyfile; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "ADMIN_HASH is missing or invalid"' "a truncated ADMIN_HASH is refused instead of rendering a gate nobody can open (A24)"
+envset ADMIN_HASH "$hbak"; render_caddyfile
+
+echo "== Configure: input validation, rename marker, container recreation"
+before=$(md5 -q "$ENV_FILE" 2>/dev/null || md5sum "$ENV_FILE" | cut -d' ' -f1)
+reset "not a domain!"; step_configure; rc=$?
+after=$(md5 -q "$ENV_FILE" 2>/dev/null || md5sum "$ENV_FILE" | cut -d' ' -f1)
+expect '[ $rc = 1 ] && [ "$before" = "$after" ] && grep -F msgbox "$LOG" | grep -q "is not a hostname"' "a domain that is not a hostname is refused before anything is written (A12)"
+reset "example.test" "not-an-email"; step_configure; rc=$?
+after=$(md5 -q "$ENV_FILE" 2>/dev/null || md5sum "$ENV_FILE" | cut -d' ' -f1)
+expect '[ $rc = 1 ] && [ "$before" = "$after" ] && grep -F msgbox "$LOG" | grep -q "is not an e-mail address"' "the Let's Encrypt contact address is validated too (A27)"
+# A10: ADMIN_USER_PREV is the only record of the name the CWA row still has
+envset ADMIN_USER libadmin; envset ADMIN_USER_PREV ""
+reset "example.test" "admin@example.test" "UTC" "" "yes" "first-admin"; step_configure >/dev/null
+expect '[ "$(envget ADMIN_USER_PREV)" = libadmin ] && [ "$(envget ADMIN_USER)" = first-admin ]' "a rename records the previous admin name"
+reset "example.test" "admin@example.test" "UTC" "" "yes" "second-admin"; step_configure >/dev/null
+expect '[ "$(envget ADMIN_USER_PREV)" = libadmin ] && [ "$(envget ADMIN_USER)" = second-admin ]' "a SECOND rename does not clobber it, so the real old name is not lost (A10)"
+envset ADMIN_USER libadmin; envset ADMIN_USER_PREV ""
+# A06: .env only reaches a container when it is recreated; a reload of Caddy is not enough
+envset TZ UTC; reset "example.test" "admin@example.test" "Europe/Oslo" "" "yes"; step_configure >/dev/null
+expect 'seen "docker: compose up -d" && grep -F msgbox "$LOG" | grep -q "containers were recreated"' "a changed timezone/domain/token recreates the containers, not just reloads Caddy (A06)"
+reset "example.test" "admin@example.test" "Europe/Oslo" "" "yes"; step_configure >/dev/null
+expect '! grep -qE "^docker: compose( --profile torrents)? up -d$" "$LOG" && ! grep -F msgbox "$LOG" | grep -q "containers were recreated"' "re-running Configure with the same answers recreates nothing"
+# A08: jail.local bakes in the Cloudflare token, the abs-login filter the domain
+fail2ban-client(){ :; }
+reset "example.test" "admin@example.test" "Europe/Oslo" "cf-token-ROTATED" "yes"; step_configure >/dev/null
+expect 'seen "systemctl: restart fail2ban" && grep -q "cf-token-ROTATED" "$T/etc/fail2ban/jail.local"' "rotating the Cloudflare token re-renders fail2ban, so its bans do not silently stop working (A08)"
+unset -f fail2ban-client
+envset CF_API_TOKEN cf-token-123; envset TZ UTC
+reset "example.test" "admin@example.test" "UTC" "cf-token-123" "yes"; step_configure >/dev/null
 
 echo "== Authelia gate + users"
 inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 4 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && grep -qE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile"' "gate injected into 4 vhosts (shelf without a bypass matcher)"
@@ -356,7 +452,11 @@ FAIL_AUTHELIA_HEALTH=1; reset "yes"; step_authelia; rc=$?; FAIL_AUTHELIA_HEALTH=
 expect '[ $rc = 1 ] && [ "$(envget AUTHELIA_ENABLED)" = false ] && ! seen "askpw:" && grep -F msgbox "$LOG" | grep -q "did not become healthy"' "Authelia unhealthy -> gate NOT enabled, no users asked"
 reset "yes" "adminpw-123" "adminpw-123" "boss@mail.example" "<cancel>" "<cancel>"; step_authelia; rc=$?
 expect '[ $rc = 0 ] && [ "$(envget AUTHELIA_ENABLED)" = true ] && grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" && grep -q "^  admin:" "$f" && [ "$(line_of "authelia crypto hash")" -lt "$(line_of "caddy reload")" ] && grep -F msgbox "$LOG" | grep -q "notification.txt"' "one user created -> gate injected and Caddy reloaded afterwards; no SMTP -> admin told where codes go"
+# A17: the portal reads AUTHELIA_ENABLED at start-up; that flag is what stops /admin offering
+# "Add a user", which would create an account with no Authelia login and no way in anywhere
+expect 'seen "compose up -d librarian" && [ "$(line_of "caddy reload")" -lt "$(line_of "compose up -d librarian")" ]' "enabling Authelia restarts the portal, so its add-user guard rail is actually live (A17)"
 step_authelia_off >/dev/null; expect '[ "$(envget AUTHELIA_ENABLED)" = false ] && ! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Authelia disable removes the gate"
+reset; step_authelia_off >/dev/null; expect 'seen "compose up -d librarian"' "disabling it restarts the portal too, so /admin stops linking to a stopped Authelia (A17)"
 cp "$T/users.keep" "$f"; envset AUTHELIA_ENABLED true; render_caddy_all
 
 echo "== users & devices menu"
@@ -372,6 +472,15 @@ reset "boss" "boss@mail.example" "bosspass-123" "bosspass-123" "yes" "k@kindle.c
 expect 'seen "add-user boss --email boss@mail.example --password-stdin --admin" && ! grep -q "ask: .*e-mail.*boss@example.test" "$LOG"' "admin flag; the e-mail is asked, not pre-filled as <user>@DOMAIN (F49)"
 expect 'seen "cwa kindle boss k@kindle.com"' "Kindle set during creation"
 reset "nomail" ""; step_user_add; expect '[ $? = 1 ] && ! seen "add-user nomail"' "blank e-mail refused (F49)"
+# A15: the dropbox watcher skips folders starting with '.', so such an account can never import
+reset ".kim"; step_user_add; rc=$?
+expect '[ $rc = 1 ] && ! seen "add-user .kim" && [ ! -d "$STACK_DIR/library/dropbox/.kim" ] && grep -F msgbox "$LOG" | grep -q "never have its dropbox scanned"' "a username starting with a dot is refused before anything is created (A15)"
+reset ".."; step_user_add; rc=$?
+expect '[ $rc = 1 ] && ! seen "add-user .."' "'..' — whose dropbox would resolve to library/ itself — is refused too (A15)"
+reset "Alice"; step_user_add; rc=$?
+expect '[ $rc = 1 ] && ! seen "add-user Alice"' "an uppercase name is refused with an explanation instead of a raw backend error (A15)"
+reset "1" ".hidden" "5"; step_intake; rc=$?
+expect '[ ! -d "$STACK_DIR/library/dropbox/.hidden" ] && grep -F msgbox "$LOG" | grep -q "never scanned"' "Intake -> create a dropbox applies the same rule (A15)"
 reset "carl" "carl@mail.example" "carlpass-1234" "carlpass-1234" "no" "<cancel>"; step_user_add; expect '! seen "cwa kindle" && seen "User carl created"' "Cancel at the Kindle prompt during Add still finishes the user"
 reset "alice" "kindle@x.com"; step_user_kindle; expect 'seen "cwa kindle alice kindle@x.com"' "set Kindle address"
 reset "alice" "<cancel>"; step_user_kindle; expect '! seen "cwa kindle"' "Cancel at the Kindle prompt leaves the address unchanged"
@@ -382,7 +491,10 @@ reset "alice" "yes"; step_user_kobo; expect '! seen "--reset"' "Kobo link show (
 reset "alice" "newpass-1234" "newpass-1234"; step_user_passwd; expect 'seen "cwa passwd alice --password-stdin" && seen "docker-stdin: newpass-1234"' "password reset via stdin"
 expect '! seen "python -m abs"' "no Audiobookshelf calls while ABS is not set up"
 # J07: Shelfmark only reads app.db at login and keeps a SIGNED cookie -> restart it after a reset
-expect 'seen "docker: compose restart shelfmark"' "a password reset restarts Shelfmark so its signed sessions die (J07)"
+# V02: a plain restart does NOT end Shelfmark sessions — it re-reads the same signing key from
+# config/.flask_secret, which compose bind-mounts. Dropping that file first is the whole fix.
+expect 'seen "docker: compose restart shelfmark" && [ ! -e "$STACK_DIR/shelfmark/config/.flask_secret" ]' "a password reset drops Shelfmark's persisted session key and restarts it (V02)"
+expect 'grep -F msgbox "$LOG" | grep -q "NEW session key"' "and the message describes what actually ends the session, not just 'restarted' (V02)"
 expect 'grep -F msgbox "$LOG" | grep -q "may SURVIVE this reset until they expire"' "the reset message says open Calibre-Web / Audiobookshelf sessions can outlive the reset (J07)"
 # J14: a password changed on CWA's own /me page never reaches Audiobookshelf
 expect 'grep -F msgbox "$LOG" | grep -q "ONLY in the portal" && grep -F msgbox "$LOG" | grep -q "never reaches Audiobookshelf"' "the reset message tells the admin that users must change passwords only in the portal (J14)"
@@ -401,12 +513,21 @@ reset "alice" "yes"; step_user_remove; expect 'seen "python -m abs remove-user a
 reset; step_user_repair; expect 'seen "python -m abs ensure-user bob" && ! seen "abs ensure-user admin"' "repair aligns ABS accounts for non-admins"
 reset "yes" "root" "rootpass-1234" "rootpass-1234"; step_abs_setup; expect 'seen "yesno: Audiobookshelf is already set up"' "re-running setup asks first"
 reset "alice" "yes"; step_user_remove; expect 'seen "cwa remove-user alice"' "remove user after confirmation"
+# A25: only rows the worker has CLAIMED are failed; a row still waiting for approval is not
+expect 'grep -F "yesno: " "$LOG" | grep -q "waiting for approval stay in the queue"' "the removal prompt no longer says every queued request is failed (A25)"
 reset "alice" "no"; step_user_remove; expect '! seen "cwa remove-user"' "remove user aborted on No"
 expect '! seen "compose restart shelfmark"' "an aborted removal does not restart anything"
 # J07: the removed user's signed Shelfmark cookie keeps working until the container restarts
 reset "alice" "yes"; step_user_remove
-expect 'seen "docker: compose restart shelfmark" && [ "$(line_of "cwa remove-user alice")" -lt "$(line_of "compose restart shelfmark")" ]' "removing a user restarts Shelfmark afterwards, killing their session (J07)"
-expect 'grep -F msgbox "$LOG" | grep -q "any session .* still had open there is dead" && grep -F msgbox "$LOG" | grep -q "until that session expires"' "the removal message explains the Shelfmark restart and the app sessions that may linger (J07)"
+expect 'seen "docker: compose restart shelfmark" && [ "$(line_of "cwa remove-user alice")" -lt "$(line_of "compose restart shelfmark")" ] && [ ! -e "$STACK_DIR/shelfmark/config/.flask_secret" ]' "removing a user drops Shelfmark's session key and restarts it, so their cookie stops verifying (V02)"
+expect 'grep -F msgbox "$LOG" | grep -q "NEW session key" && grep -F msgbox "$LOG" | grep -q "any session .* still had open there is dead" && grep -F msgbox "$LOG" | grep -q "until that session expires"' "the removal message names the new session key and the app sessions that may linger (V02/J07)"
+# and it must NOT claim the session is dead when the restart failed
+mkdir -p "$STACK_DIR/shelfmark/config"; : > "$STACK_DIR/shelfmark/config/.flask_secret"
+eval "real_compose() $(declare -f compose | sed '1d')"
+compose(){ case "$*" in *"restart shelfmark"*) echo "docker: compose $*" >> "$LOG"; return 1;; esac; real_compose "$@"; }
+reset "bob" "yes"; step_user_remove
+expect 'grep -F msgbox "$LOG" | grep -q "still holds its old session key"' "a failed Shelfmark restart is reported instead of claiming the session is dead (V02)"
+unset -f compose; eval "compose() $(declare -f real_compose | sed '1d')"; unset -f real_compose
 reset; step_user_repair; expect 'seen "cwa isolate bob" && seen "cwa isolate alice" && ! seen "cwa isolate admin" && seen "cwa harden"' "repair re-isolates every non-admin (never admins) + hardens"
 
 echo "== formats, mail, defaults"
@@ -454,6 +575,10 @@ cf(){ echo "cf: $*" >> "$LOG"; local m="$1" path="$2" data="" n
     "GET "*"/dns_records?type=A&name="*) n="${path##*name=}"
        if [ -f "$CFSTORE/dns_$n" ]; then printf '{"result":[%s]}\n' "$(command jq -c '. + {id:"rec-STUB"}' "$CFSTORE/dns_$n")"; else echo '{"result":[]}'; fi;;
     "PUT "*/dns_records/*|"POST "*/dns_records) n=$(printf '%s' "$data" | command jq -r .name); printf '%s' "$data" > "$CFSTORE/dns_$n"; echo '{"success":true}';;
+    # IP Access Rules: what the fail2ban cloudflare-token action creates, and what a local
+    # unban does NOT remove. "$CFSTORE/ban" stands in for one existing block rule.
+    "GET "*/firewall/access_rules/rules?*) [ -f "$CFSTORE/ban" ] && echo '{"result":[{"id":"rule-STUB"}]}' || echo '{"result":[]}';;
+    "DELETE "*/firewall/access_rules/rules/*) [ "${CF_UNBAN_RC:-0}" = 0 ] || return 22; rm -f "$CFSTORE/ban"; echo '{"success":true}';;
     *) echo '{"result":[]}';;
   esac; }
 jq(){ command jq "$@"; }
@@ -523,6 +648,16 @@ expect 'seen "cf: PATCH /zones/zone-STUB/settings/browser_check --data {\"value\
 expect 'seen "cf: PUT /zones/zone-STUB/rulesets/phases/http_request_cache_settings/entrypoint" && grep -F "http_request_cache_settings/entrypoint --data" "$LOG" | grep -q "\"cache\":false" && grep -F "cache_settings/entrypoint --data" "$LOG" | grep -q "books.example.test"' "no-cache Cache Rule for the four public hosts"
 expect '! seen "Bot Fight Mode: ON" && grep -F "msgbox" "$LOG" | grep -q "Do NOT enable Bot Fight Mode"' "Bot Fight Mode advice: must stay OFF"
 expect '[ -f "$T/etc/cron.d/bookstack-cfips" ] && grep -q "^PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin$" "$T/etc/cron.d/bookstack-cfips" && grep -q "cf-ips.sh" "$T/etc/cron.d/bookstack-cfips"' "cf-ips cron installed with a full PATH (ufw is in /usr/sbin, F31)"
+expect 'grep -q "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/cf-ips.sh" "$T/etc/cron.d/bookstack-cfips"' "the cf-ips cron line carries STACK_DIR, so a failed nightly refresh can still find the alert channel (V09)"
+# A34: auth. is published only while Authelia runs; otherwise it is a public hostname that 502s
+expect '! grep -q "name\":\"auth.example.test" "$LOG"' "auth. is NOT published while Authelia is off (A34)"
+envset AUTHELIA_ENABLED true; rm -f "$CFSTORE"/*; reset; step_cloudflare >/dev/null
+expect 'grep -q "name\":\"auth.example.test" "$LOG"' "with Authelia on it IS published (A34)"
+envset AUTHELIA_ENABLED false
+# A33: 127.0.0.1 is the placeholder Configure writes before Tailscale exists
+tsbak3=$(envget TAILSCALE_IP); envset TAILSCALE_IP 127.0.0.1; rm -f "$CFSTORE"/*; reset; step_cloudflare; rc=$?
+expect '[ $rc = 0 ] && ! grep -q "name\":\"monitor.example.test" "$LOG" && grep -F msgbox "$LOG" | grep -q "127.0.0.1 placeholder"' "no tailnet IP yet: monitor./dl./ephemera. are NOT published and the summary says so (A33)"
+envset TAILSCALE_IP "$tsbak3"; rm -f "$CFSTORE"/*; reset; step_cloudflare >/dev/null
 expect 'seen "cf: POST /zones/zone-STUB/dns_records --data {\"type\":\"A\",\"name\":\"monitor.example.test\",\"content\":\"100.64.0.1\",\"ttl\":1,\"proxied\":false}" && ! grep -q "name\":\"dl.example.test" "$LOG" && ! grep -q "name\":\"aria.example.test" "$LOG" && seen "dns_records?type=A&name=aria.example.test"' "tailnet-only hosts grey-clouded; no dl. while torrents are off; stale aria. looked up for deletion"
 expect 'seen "cf: GET /zones/zone-STUB/settings/ssl" && seen "cf: GET /zones/zone-STUB/settings/tls_client_auth" && grep -F msgbox "$LOG" | grep -q "read back and verified"' "SSL mode and origin pulls are read back before success is claimed (F13)"
 rm -f "$CFSTORE"/*; CF_FAIL_SETTING=tls_client_auth; reset; step_cloudflare; rc=$?; CF_FAIL_SETTING=""
@@ -573,6 +708,18 @@ expect '[ $rc = 1 ] && ! seen "compose up -d caddy" && [ "$(envget ADMIN_PW_SET)
 envset ADMIN_PW_SET false
 ABS_INIT=false; reset "adminpass-1234" "adminpass-1234" "root" "rootpass-1234" "rootpass-1234"; step_deploy; rc=$?; ABS_INIT=true
 expect '[ $rc = 0 ] && seen "python -m abs init --user root --password-stdin" && [ "$(line_of "abs init")" -lt "$(line_of "compose up -d caddy")" ] && [ "$(envget ABS_TOKEN)" = abs-key-STUB ]' "uninitialised ABS gets its root user BEFORE caddy starts"
+# A31: the summary is the screen the admin copies credentials from
+envset ADMIN_PW_SET false; envset ABS_TOKEN ""; envset ABS_ROOT_USER ""
+ABS_INIT=false; reset "adminpass-1234" "adminpass-1234" "abshero" "rootpass-1234" "rootpass-1234"; step_deploy >/dev/null; ABS_INIT=true
+expect 'grep -q "root user .abshero." "$LOG" && ! grep -q "root user .root." "$LOG"' "the Stack-is-up summary names the ABS root user chosen during THIS Deploy, not 'root' (A31)"
+# A11: ADMIN_PW_SET is the loop's only exit; a silent write failure prompted forever
+envset ADMIN_PW_SET false
+eval "real_envset() $(declare -f envset | sed '1d')"
+envset(){ [ "$1" = ADMIN_PW_SET ] && return 1; real_envset "$@"; }
+reset "looppass-1234" "looppass-1234"; set_admin_password; rc=$?
+unset -f envset; eval "envset() $(declare -f real_envset | sed '1d')"; unset -f real_envset
+expect '[ $rc = 1 ] && [ "$(grep -c "askpw: Set the password" "$LOG")" = 1 ] && grep -F msgbox "$LOG" | grep -q "Could not write"' "an unwritable .env ends set_admin_password with a message instead of prompting forever (A11)"
+envset ADMIN_PW_SET false; envset ABS_TOKEN ""
 envset ADMIN_PW_SET false; envset ABS_TOKEN ""
 ABS_INIT=false; reset "adminpass-1234" "adminpass-1234" "<cancel>" "no"; step_deploy; rc=$?; ABS_INIT=true
 expect '[ $rc = 1 ] && ! seen "compose up -d caddy"' "ABS setup cancelled + 'start anyway' declined -> Caddy NOT started"
@@ -601,7 +748,15 @@ case "${1:-}" in
   # `restic backup --help` is how both bookstack.sh and scripts/backup.sh probe for --retry-lock
   # (restic 0.16+). RESTIC_NO_RETRY_LOCK=1 plays the Debian 12 restic 0.14 that lacks it.
   backup) [ "${2:-}" = --help ] && { [ "${RESTIC_NO_RETRY_LOCK:-0}" = 1 ] || echo "      --retry-lock duration   retry to lock the repository"; exit 0; };;
-  cat) [ "${RESTIC_NOREPO:-0}" = 1 ] && exit 1;;
+  # RESTIC_BAD_PW plays a password that does not open the repository, so the rotation can be
+  # tested at the exact point where the CANDIDATE credential must be rejected.
+  cat) [ "${RESTIC_NOREPO:-0}" = 1 ] && exit 1
+       [ -n "${RESTIC_BAD_PW:-}" ] && [ "${RESTIC_PASSWORD:-}" = "$RESTIC_BAD_PW" ] && exit 1;;
+  key) case "${2:-}" in
+         list) echo '[{"id":"0a1b2c3doldkey","userName":"root","current":true},{"id":"9f8e7d6cnewkey","userName":"root","current":false}]';;
+         add) echo "restic-key-add-pw: $(cat "${4:-/dev/null}" 2>/dev/null)" >> "$RLOG"; [ "${RESTIC_KEYADD_RC:-0}" = 0 ] || exit 1;;
+         remove) echo "restic-key-remove-pw: ${RESTIC_PASSWORD:-}" >> "$RLOG"; [ "${RESTIC_KEYRM_RC:-0}" = 0 ] || exit 1;;
+       esac;;
   restore) [ "${2:-}" = --help ] && exit 0
     tgt=""; incs=(); shift 2
     while [ $# -gt 0 ]; do case "$1" in --target) tgt="$2"; shift;; --include) incs+=("$2"); shift;; esac; shift; done
@@ -685,6 +840,24 @@ expect '[ $rc = 1 ] && ! grep -q "restore abc12345" "$RLOG" && ! seen "compose d
 reset "abc12345" "full" "yes" "no"; : > "$RLOG"
 step_restore; rc=$?
 expect '[ "$rc" != 0 ] && ! grep -q "restore abc12345" "$RLOG" && ! seen "compose down"' "second confirmation declined -> nothing restored, stack not stopped"
+# A16: "config + databases only" promises the library files stay — metadata.db is their CATALOG
+printf 'library_books_metadata.db\tlibrary/books/metadata.db\n' >> "$T/fakesnap$STACK_DIR/.backup-snap/MANIFEST"
+printf 'SNAPSHOT-CATALOG' > "$T/fakesnap$STACK_DIR/.backup-snap/library_books_metadata.db"
+mkdir -p "$STACK_DIR/library/books"; printf 'LIVE-CATALOG' > "$STACK_DIR/library/books/metadata.db"
+: > "$RLOG"; reset "abc12345" "config" "yes" "yes"; step_restore >/dev/null
+expect '[ "$(cat "$STACK_DIR/library/books/metadata.db")" = LIVE-CATALOG ]' "'config + databases only' keeps the live Calibre catalog, so books imported since the snapshot do not vanish (A16)"
+: > "$RLOG"; reset "abc12345" "full" "yes" "yes"; step_restore >/dev/null
+expect '[ "$(cat "$STACK_DIR/library/books/metadata.db")" = SNAPSHOT-CATALOG ]' "a FULL restore does bring the catalog back with the library"
+# V05: restic restore never deletes files the snapshot lacks, so what is already here beyond the
+# snapshot's own size is not reclaimed and must not be credited against the space needed
+df(){ printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/x 100 100 %s 50%% /\n' "${DF_AVAIL_K:-0}"; }
+du(){ printf '%s\t%s\n' "${DU_K:-0}" "${2:-}"; }
+export RESTIC_STATS_SIZE=$((5*1024*1024*1024))
+DF_AVAIL_K=500000 DU_K=$((50*1024*1024)) restore_fits abc12345; rc=$?
+expect '[ $rc != 0 ]' "a 5 GB snapshot with 0.5 GB free is refused even though 50 GB is already on disk (V05)"
+DF_AVAIL_K=$((7*1024*1024)) DU_K=$((50*1024*1024)) restore_fits abc12345; rc=$?
+expect '[ $rc = 0 ]' "and it still passes once the snapshot plus 1 GB headroom really fits"
+unset RESTIC_STATS_SIZE; unset -f df du
 reset "<cancel>"; step_restore; expect '[ $? != 0 ] && ! seen "compose down"' "Cancel in the snapshot picker changes nothing"
 unset -f fail2ban-client
 
@@ -716,6 +889,31 @@ FAIL_HEALTHZ=1; reset "yes" "x/y:new" $C6 "yes" "yes"; step_update; FAIL_HEALTHZ
 expect '[ "$(envget IMG_CWA)" = x/y:old ] && [ "$(grep -c "docker: compose up -d" "$LOG")" -ge 2 ] && seen "docker: image tag bookstack/caddy:prev bookstack/caddy:latest" && [ "$(cat "$STACK_DIR/caddy/Caddyfile")" = "# before update" ]' "rollback restores the previous tags, the previous caddy/librarian builds and the previous Caddyfile"
 expect 'grep -F msgbox "$LOG" | grep -q "tagged .pre-update. -> .Config + databases only."' "rollback advice names the pre-update snapshot and the config + databases restore (F16)"
 rm -f "$renv"; reset "no"; step_update; expect '[ $? = 1 ] && seen "yesno: No backup repository is configured"' "without backups, Update asks and stops on No"
+# A07: "investigate, then retry" must not overwrite the record of the last known-good build
+rm -f "$STACK_DIR/.update-in-progress"; envset IMG_CWA good/img:1
+printf '#!/usr/bin/env bash\necho "backup.sh $*" >> "%s"\nexit 0\n' "$LOG" > "$STACK_DIR/scripts/backup.sh"; chmod +x "$STACK_DIR/scripts/backup.sh"
+printf 'RESTIC_REPOSITORY=/mnt/backup\n' > "$renv"
+FAIL_HEALTHZ=1; reset "yes" "broken/img:2" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
+expect '[ -f "$STACK_DIR/.update-in-progress" ] && grep -q "^IMG_CWA=good/img:1$" "$STACK_DIR/.env.images.prev"' "a declined rollback freezes the rollback point and records the known-good tag (A07)"
+FAIL_HEALTHZ=1; reset "yes" "worse/img:3" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
+expect 'grep -q "^IMG_CWA=good/img:1$" "$STACK_DIR/.env.images.prev" && ! grep -q "broken/img:2" "$STACK_DIR/.env.images.prev" && [ "$(grep -c "docker: image tag bookstack/caddy:latest bookstack/caddy:prev" "$LOG")" = 0 ]' "a SECOND update neither overwrites .env.images.prev nor re-points :prev at the broken build (A07)"
+expect 'grep -F msgbox "$LOG" | grep -q "will not overwrite them"' "and it says so, so the admin knows the rollback point is still intact (A07)"
+reset "no" "yes" "yes"; step_update >/dev/null
+expect '[ ! -f "$STACK_DIR/.update-in-progress" ]' "a successful update releases the frozen rollback point (A07)"
+envset IMG_CWA ""
+# A09: the step an admin reaches for after a leaked password must not claim sessions were ended
+reset "yes"; step_rotate_secret; rc=$?
+expect '[ $rc = 0 ] && seen "compose up -d librarian" && grep -F msgbox "$LOG" | grep -q "confirmed on /healthz"' "rotating the portal secret restarts the portal and confirms it came back (A09)"
+sbak=$(envget LIBRARIAN_SECRET)
+FAIL_HEALTHZ=1; reset "yes"; step_rotate_secret; rc=$?; FAIL_HEALTHZ=0
+expect '[ $rc = 1 ] && [ "$(envget LIBRARIAN_SECRET)" != "$sbak" ] && grep -F msgbox "$LOG" | grep -q "NOBODY has been logged out"' "when the portal does not come back it says the OLD secret is still accepting cookies (A09)"
+# A18: Monitoring hands out a page of instructions for a container that must actually be up
+reset; step_monitoring; expect '[ $? = 0 ] && grep -F msgbox "$LOG" | grep -q "Uptime Kuma runs at"' "Monitoring prints its instructions once Kuma answers"
+eval "real_compose2() $(declare -f compose | sed '1d')"
+compose(){ case "$*" in *"up -d uptime-kuma"*) echo "docker: compose $*" >> "$LOG"; return 1;; esac; real_compose2 "$@"; }
+reset; step_monitoring; rc=$?
+unset -f compose; eval "compose() $(declare -f real_compose2 | sed '1d')"; unset -f real_compose2
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "did not start" && ! grep -F msgbox "$LOG" | grep -q "Uptime Kuma runs at"' "a Kuma that never started is reported instead of a page of instructions for nothing (A18)"
 unset -f copy_code_trees; source <(sed -n '/^copy_code_trees(){/,/^}/p' "$REPO/bookstack.sh")
 
 echo "== menus survive failures (F34)"
@@ -823,6 +1021,10 @@ reset "yes" "https://archive.example" "" "" "alice"; step_ephemera
 expect '[ "$(envget EPHEMERA_ENABLED)" = true ] && [ "$(envget EPHEMERA_OWNER)" = alice ] && [ -d "$STACK_DIR/library/dropbox/alice" ] && seen "compose -f docker-compose.yml -f docker-compose.ephemera.yml build ephemera"' "ephemera enabled, owner dropbox, pinned build"
 expect 'grep -q "^ephemera.example.test {" "$STACK_DIR/caddy/Caddyfile" && seen "caddy reload"' "enabling Ephemera renders its vhost and reloads Caddy (C6)"
 reset; step_ephemera_off; expect '[ "$(envget EPHEMERA_ENABLED)" = false ] && seen "stop ephemera flaresolverr" && ! grep -q "^ephemera.example.test {" "$STACK_DIR/caddy/Caddyfile" && seen "caddy reload"' "ephemera disabled; vhost removed and Caddy reloaded"
+hbak3=$(envget ADMIN_HASH); envset ADMIN_HASH ""
+reset "yes" "https://archive.example" "" "" "alice"; step_ephemera >/dev/null
+expect 'grep -q "Caddy did NOT pick up the ephemera. site" "$LOG"' "Ephemera enabled but its vhost was not rendered: the success message says so (A18/V10)"
+envset ADMIN_HASH "$hbak3"; reset; step_ephemera_off >/dev/null; render_caddyfile
 envset EPHEMERA_OWNER ""; envset ADMIN_USER famadmin; reset "yes" "https://archive.example" "" "" ""; step_ephemera >/dev/null
 expect '[ "$(envget EPHEMERA_OWNER)" = famadmin ]' "Ephemera's default owner is the chosen admin account, not 'admin'"
 step_ephemera_off >/dev/null
@@ -831,17 +1033,295 @@ echo "== torrents (qBittorrent opt-in, C5)"
 rm -rf "$STACK_DIR/qbt/config/qBittorrent"; envset TORRENTS_ENABLED false
 reset "yes"; step_torrents; rc=$?; qc="$STACK_DIR/qbt/config/qBittorrent/qBittorrent.conf"
 expect '[ $rc = 0 ] && [ "$(envget TORRENTS_ENABLED)" = true ] && seen "ufw: allow 6881/tcp" && seen "docker: compose --profile torrents up -d qbittorrent" && grep -q "^dl.example.test {" "$STACK_DIR/caddy/Caddyfile"' "enable: profile start, port 6881 opened, dl. vhost rendered"
+# A17: the portal reads TORRENTS_ENABLED at start-up to decide whether /admin shows the link
+expect 'seen "compose --profile torrents up -d librarian"' "enabling torrents restarts the portal, so its qBittorrent link appears (A17)"
+expect '! grep -F "whiptail: " "$LOG" | grep -q "will not answer yet"' "with Caddy happy the success screen makes no warning noise"
 expect 'grep -q "^\[BitTorrent\]" "$qc" && grep -qF "Session\\DefaultSavePath=/dropbox/$(envget ADMIN_USER)" "$qc" && grep -qF "Session\\TempPath=/downloads/incomplete" "$qc" && grep -qF "Session\\TempPathEnabled=true" "$qc"' "qBittorrent.conf seeded: default save path = the admin's dropbox, partials in /downloads/incomplete"
 printf '[BitTorrent]\nSession\\DefaultSavePath=/downloads\nSession\\Port=6881\n\n[Preferences]\nWebUI\\Port=8080\n' > "$qc"; qbt_seed_config
 expect '[ "$(grep -c "DefaultSavePath" "$qc")" = 1 ] && grep -qF "Session\\DefaultSavePath=/dropbox/" "$qc" && grep -qF "Session\\Port=6881" "$qc" && grep -qF "WebUI\\Port=8080" "$qc" && [ "$(grep -c "^\[BitTorrent\]" "$qc")" = 1 ]' "existing qBittorrent.conf: keys replaced in place, other settings kept"
 expect 'grep -q "Save path: /dropbox/alice" "$LOG"' "admin told to point per-user categories at /dropbox/<user>"
 reset "yes"; step_torrents
 expect '[ "$(envget TORRENTS_ENABLED)" = false ] && seen "ufw: --force delete allow 6881/tcp" && seen "rm -f qbittorrent" && ! grep -q "^dl.example.test {" "$STACK_DIR/caddy/Caddyfile"' "disable: container removed, 6881 closed, dl. vhost gone"
+expect 'seen "compose up -d librarian"' "disabling torrents restarts the portal too (A17)"
+# A18/V10: the success screen hands out a URL and a password, so a Caddy that did not pick the
+# site up must be said out loud instead of contradicted
+hbak2=$(envget ADMIN_HASH); envset ADMIN_HASH ""
+reset "yes"; step_torrents >/dev/null; rc=$?
+expect 'grep -q "will not answer yet" "$LOG"' "torrents enabled but Caddy has no dl. site: the screen says the URL will not answer (A18/V10)"
+envset ADMIN_HASH "$hbak2"; reset "yes"; step_torrents >/dev/null; render_caddyfile
 expect 'declare -f menu_library | grep -q step_torrents' "Torrents item in the Library menu"
 
 echo "== intake webhook (C11)"
 envset INTAKE_TOKEN ""; reset "yes"; step_intake_webhook
 tok=$(envget INTAKE_TOKEN); expect '[ ${#tok} -ge 32 ] && seen "compose up -d librarian" && grep -F msgbox "$LOG" | grep -q "X-Intake-Token: $tok"' "intake webhook off until enabled here; enabling generates a token and restarts the portal"
 reset "no"; step_intake_webhook; expect '[ -z "$(envget INTAKE_TOKEN)" ]' "and it can be turned off again"
+
+echo "== FEAT-4: reopen public SSH (the reverse of Lock SSH)"
+envset SSH_LOCKED false
+reset; step_unlock_ssh; rc=$?
+expect '[ $rc = 0 ] && ! seen "ufw: allow 22/tcp" && grep -F msgbox "$LOG" | grep -q "not locked"' "SSH is not locked: the step says so and touches nothing (FEAT-4)"
+envset SSH_LOCKED true
+reset "no"; step_unlock_ssh; rc=$?
+expect '[ $rc = 0 ] && ! seen "ufw: allow 22/tcp" && [ "$(envget SSH_LOCKED)" = true ]' "declining the confirmation leaves port 22 closed (FEAT-4)"
+reset "yes"; step_unlock_ssh; rc=$?
+expect '[ $rc = 0 ] && seen "ufw: allow 22/tcp" && [ "$(envget SSH_LOCKED)" = false ]' "confirmed: ufw allows 22/tcp again and SSH_LOCKED is cleared (FEAT-4)"
+expect 'grep -F msgbox "$LOG" | grep -q "[Kk]ey-only" && grep -F "yesno: " "$LOG" | grep -q "PasswordAuthentication no"' "and it says plainly that key-only authentication still applies (FEAT-4)"
+# the whole point: System must stop re-closing the port on every run
+reset; setup_firewall; expect 'seen "ufw: allow 22/tcp" && ! seen "ufw: --force delete allow 22/tcp"' "after reopening, Install -> System keeps port 22 open instead of deleting the rule again (FEAT-4)"
+# an unwritable .env must not leave the admin believing the change survives the next System run
+envset SSH_LOCKED true
+eval "real_envset3() $(declare -f envset | sed '1d')"
+envset(){ [ "$1" = SSH_LOCKED ] && return 1; real_envset3 "$@"; }
+reset "yes"; step_unlock_ssh; rc=$?
+unset -f envset; eval "envset() $(declare -f real_envset3 | sed '1d')"; unset -f real_envset3
+expect '[ $rc = 1 ] && seen "ufw: allow 22/tcp" && grep -F msgbox "$LOG" | grep -q "will close it again"' "an unwritable .env is reported: the port is open now but System would close it again (FEAT-4)"
+envset SSH_LOCKED false
+
+echo "== FEAT-1: release a banned address (fail2ban AND Cloudflare)"
+reset; step_unban; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "fail2ban is not installed"' "no fail2ban on the server: the step refuses instead of pretending (FEAT-1)"
+# a jail that holds the household's address, and a Cloudflare IP Access Rule for the same one
+fail2ban-client(){ echo "fail2ban-client: $*" >> "$LOG"
+  case "$*" in
+    "status caddy-auth") printf 'Status for the jail: caddy-auth\n`- Actions\n   |- Currently banned: 1\n   `- Banned IP list:\t%s\n' "${F2B_BANNED-203.0.113.9}";;
+    "status "*) printf 'Status for the jail: x\n   `- Banned IP list:\t\n';;
+    "set "*" unbanip "*) [ "${F2B_UNBAN_RC:-0}" = 0 ] || return 1;;
+  esac; return 0; }
+envset CF_API_TOKEN cf-token-123; envset DOMAIN example.test
+touch "$CFSTORE/ban"; reset "" "yes"; step_unban; rc=$?
+expect '[ $rc = 0 ] && seen "fail2ban-client: set caddy-auth unbanip 203.0.113.9" && seen "fail2ban-client: set sshd unbanip 203.0.113.9" && seen "fail2ban-client: set caddy-abs-login unbanip 203.0.113.9" && seen "fail2ban-client: set caddy-device-auth unbanip 203.0.113.9"' "the banned address is offered as the default and released in EVERY bookstack jail (FEAT-1)"
+expect 'seen "cf: DELETE /zones/zone-STUB/firewall/access_rules/rules/rule-STUB" && [ ! -f "$CFSTORE/ban" ]' "and its Cloudflare IP Access Rule is deleted — the local unban alone would leave the edge ban in force (FEAT-1)"
+expect 'grep -q "caddy-auth: 203.0.113.9" "$LOG" && [ "$(line_of "caddy-auth: 203.0.113.9")" -lt "$(line_of "ask: Address to release")" ]' "the currently banned addresses are shown BEFORE anything is asked (FEAT-1)"
+reset "" "no"; touch "$CFSTORE/ban"; step_unban; rc=$?
+expect '[ $rc = 0 ] && ! seen "fail2ban-client: set" && [ -f "$CFSTORE/ban" ]' "declining the confirmation releases nothing, locally or at Cloudflare (FEAT-1)"
+reset "not.an.address.at.all" ; step_unban; rc=$?
+expect '[ $rc = 1 ] && ! seen "fail2ban-client: set" && grep -F msgbox "$LOG" | grep -q "does not look like an IP"' "a typo is refused before it reaches fail2ban or the Cloudflare API (FEAT-1)"
+touch "$CFSTORE/ban"; reset "203.0.113.9" "yes"; CF_UNBAN_RC=22; step_unban; rc=$?; CF_UNBAN_RC=0
+expect '[ $rc = 1 ] && seen "fail2ban-client: set caddy-auth unbanip 203.0.113.9" && grep -F msgbox "$LOG" | grep -q "Firewall Services"' "a Cloudflare rule that cannot be deleted is reported (token scope), after the local unban ran (FEAT-1)"
+rm -f "$CFSTORE/ban"
+tokbak=$(envget CF_API_TOKEN); envset CF_API_TOKEN ""
+reset "203.0.113.9" "yes"; step_unban; rc=$?
+expect '[ $rc = 1 ] && seen "fail2ban-client: set caddy-auth unbanip 203.0.113.9" && grep -F msgbox "$LOG" | grep -q "no Cloudflare token"' "without a Cloudflare token the local unban still happens and the missing half is named (FEAT-1)"
+envset CF_API_TOKEN "$tokbak"
+F2B_BANNED=""; F2B_UNBAN_RC=1; touch "$CFSTORE/ban"; reset "198.51.100.44" "yes"; step_unban >/dev/null; F2B_UNBAN_RC=0
+expect 'seen "fail2ban-client: set sshd unbanip 198.51.100.44" && [ ! -f "$CFSTORE/ban" ] && grep -F msgbox "$LOG" | grep -q "held no ban"' "an address no jail holds is still released at Cloudflare, and the difference is stated (FEAT-1)"
+unset F2B_BANNED
+expect 'declare -f menu_security | grep -q step_unban && declare -f menu_security | grep -q step_unlock_ssh' "both Security entries are wired into the menu (FEAT-1, FEAT-4)"
+unset -f fail2ban-client
+
+echo "== FEAT-2: clear a portal login lockout"
+eval "real_portal_up() $(declare -f portal_up | sed '1d')"
+portal_up(){ [ "${PORTAL_DOWN:-0}" = 0 ]; }
+PORTAL_DOWN=1; reset; step_lockout; rc=$?; PORTAL_DOWN=0
+expect '[ $rc = 1 ] && ! seen "admin_cli" && grep -F msgbox "$LOG" | grep -q "portal is not running"' "portal down: the step refuses instead of showing an empty list (FEAT-2)"
+CLI_FAIL=1; reset; step_lockout; rc=$?; CLI_FAIL=0
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "the portal database is locked"' "an admin_cli failure surfaces its error sentence, not a traceback (FEAT-2)"
+CLI_LOCKOUT='{"ok": true, "users": [{"user": "alice", "ip": "203.0.113.9", "until": 99999999999, "seconds": 600}], "ips": [{"ip": "203.0.113.9", "until": 99999999999, "seconds": 600}]}'
+reset "0"; step_lockout; rc=$?
+expect '[ $rc = 0 ] && seen "docker: exec -i librarian python -m admin_cli lockout status" && grep -F "msgbox" "$LOG" | grep -q "" && grep -F "whiptail: " "$LOG" | grep -q "Portal login lockouts"' "who is locked out is read from admin_cli and shown before anything is cleared (FEAT-2)"
+CLI_CLEAR='{"ok": true, "cleared": 3}'
+reset "U" "alice"; step_lockout; rc=$?
+expect '[ $rc = 0 ] && seen "admin_cli lockout clear --user alice" && grep -F msgbox "$LOG" | grep -q "Released 3"' "clear one user: the right arm is called and the count reported (FEAT-2)"
+reset "I" "203.0.113.9"; step_lockout
+expect 'seen "admin_cli lockout clear --ip 203.0.113.9"' "clear one address — the key that takes the whole household down (FEAT-2)"
+reset "I" "nonsense"; step_lockout; rc=$?
+expect '[ $rc = 1 ] && ! seen "lockout clear --ip" && grep -F msgbox "$LOG" | grep -q "does not look like an IP"' "a malformed address is refused before admin_cli is called (FEAT-2)"
+reset "A" "no"; step_lockout; rc=$?
+expect '[ $rc = 0 ] && ! seen "lockout clear --all"' "'release everything' does nothing unless it is confirmed (FEAT-2)"
+reset "A" "yes"; step_lockout
+expect 'seen "admin_cli lockout clear --all"' "confirmed: every lockout is released (FEAT-2)"
+expect 'declare -f menu_users | grep -q step_lockout' "the lockout entry is wired into the Users menu (FEAT-2)"
+
+echo "== FEAT-7: the whole request queue, paginated (no silent 200-row cap)"
+CLI_FAIL=1; reset "pending" ; step_requests; rc=$?; CLI_FAIL=0
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "cannot read the queue"' "an admin_cli failure is reported rather than shown as an empty queue (FEAT-7)"
+CLI_REQUESTS='{"ok": true, "total": 412, "rows": [{"rid": 7, "user": "alice", "title": "A Title", "status": "pending", "detail": "waiting", "created": 1}, {"rid": 8, "user": "bob", "title": "Another", "status": "pending", "detail": "", "created": 2}]}'
+reset "pending" "0"; step_requests; rc=$?
+expect '[ $rc = 0 ] && seen "admin_cli requests list --status pending --limit 20 --offset 0"' "the queue is read with an explicit status, limit and offset (FEAT-7)"
+expect 'grep -F "whiptail: " "$LOG" | grep -q "Rows 1-2 of 412"' "the row count comes from the full total, so nothing is capped at 200 (FEAT-7)"
+reset "pending" "N" "P" "0"; step_requests >/dev/null
+expect 'seen "requests list --status pending --limit 20 --offset 20" && seen "requests list --status pending --limit 20 --offset 0"' "next / previous page really move the offset (FEAT-7)"
+reset "all" "0"; step_requests >/dev/null
+expect 'grep -q "admin_cli requests list --limit 20 --offset 0" "$LOG"' "'everything' passes no --status filter at all (FEAT-7)"
+reset "error" "7" "R" "<cancel>"; step_requests >/dev/null
+expect 'seen "admin_cli requests retry 7"' "picking a row and choosing Retry calls the retry arm (FEAT-7)"
+reset "error" "7" "D" "no" "<cancel>"; step_requests >/dev/null
+expect '! seen "admin_cli requests dismiss"' "dismiss asks first, and a No dismisses nothing (FEAT-7)"
+reset "error" "7" "D" "yes" "<cancel>"; step_requests >/dev/null
+expect 'seen "admin_cli requests dismiss 7"' "confirmed: the row is dismissed (FEAT-7)"
+CLI_ACT_FAIL=1; reset "error" "7" "R" "<cancel>"; step_requests >/dev/null; CLI_ACT_FAIL=0
+expect 'grep -F msgbox "$LOG" | grep -q "no re-fetchable source"' "a retry the portal refuses explains why instead of claiming success (FEAT-7)"
+CLI_REQUESTS='{"ok": true, "total": 0, "rows": []}'
+reset "pending"; step_requests; rc=$?
+expect '[ $rc = 0 ] && grep -F msgbox "$LOG" | grep -q "No pending requests"' "an empty queue says so instead of drawing an empty menu (FEAT-7)"
+
+echo "== FEAT-8: parked files in dropbox/<user>/.failed"
+CLI_FAIL=1; reset; step_parked; rc=$?; CLI_FAIL=0
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "the dropbox is unreadable"' "a failing parked list is reported (FEAT-8)"
+reset; step_parked; rc=$?
+expect '[ $rc = 0 ] && grep -F msgbox "$LOG" | grep -q "Nothing is parked"' "nothing parked: a sentence, not an empty menu (FEAT-8)"
+CLI_PARKED='{"ok": true, "rows": [{"token": "dG9rZW4x", "user": "zoe", "name": "hobbit.zip", "bytes": 52428800, "mtime": 1, "reason": "mixed folder: neither ebooks nor audio"}]}'
+reset "0"; step_parked; rc=$?
+expect '[ $rc = 0 ] && grep -F "whiptail: " "$LOG" | grep -q "hobbit.zip" && grep -F "whiptail: " "$LOG" | grep -q "50.0 MB" && grep -F "whiptail: " "$LOG" | grep -q "mixed folder"' "each parked entry shows its owner, size in MB and the reason it was parked (FEAT-8)"
+reset "dG9rZW4x" "R" "<cancel>"; CLI_ACT='{"ok": true, "moved": "/srv/bookstack/library/dropbox/zoe/hobbit.zip"}' step_parked >/dev/null
+expect 'seen "admin_cli parked retry dG9rZW4x"' "Retry moves it back into the dropbox (FEAT-8)"
+reset "dG9rZW4x" "D" "no" "<cancel>"; step_parked >/dev/null
+expect '! seen "admin_cli parked delete"' "Delete asks first, and a No deletes nothing (FEAT-8)"
+reset "dG9rZW4x" "D" "yes" "<cancel>"; step_parked >/dev/null
+expect 'seen "admin_cli parked delete dG9rZW4x" && grep -F "yesno: " "$LOG" | grep -q "cannot be undone"' "confirmed deletion says out loud that it cannot be undone from here (FEAT-8)"
+CLI_ACT='{"ok": true}'
+
+echo "== FEAT-9: Audiobookshelf rescan"
+abak2=$(envget ABS_TOKEN); envset ABS_TOKEN ""
+reset; step_abs_scan; rc=$?
+expect '[ $rc = 1 ] && ! seen "python -m abs scan" && grep -F msgbox "$LOG" | grep -q "no API key"' "no ABS_TOKEN: the rescan refuses and points at Library -> Audiobookshelf (FEAT-9)"
+envset ABS_TOKEN abs-key-STUB
+reset "no"; step_abs_scan; rc=$?
+expect '[ $rc = 0 ] && ! seen "python -m abs scan"' "declining the confirmation starts no scan (FEAT-9)"
+reset "yes"; step_abs_scan; rc=$?
+expect '[ $rc = 0 ] && seen "docker: exec -i librarian python -m abs scan"' "confirmed: absctl scan is called, so the admin needs no invocation by heart (FEAT-9)"
+envset ABS_TOKEN "$abak2"
+expect 'declare -f menu_library | grep -q step_abs_scan && declare -f menu_library | grep -q step_requests && declare -f menu_library | grep -q step_parked' "the three Library entries are wired into the menu (FEAT-7, FEAT-8, FEAT-9)"
+unset -f portal_up; eval "portal_up() $(declare -f real_portal_up | sed '1d')"; unset -f real_portal_up
+
+echo "== FEAT-3: restart / stop / start one service"
+reset "librarian" "R" "yes"; step_service; rc=$?
+expect '[ $rc = 0 ] && seen "docker: compose ps --services" && grep -F "whiptail: " "$LOG" | grep -q "audiobookshelf"' "the service list comes from compose ps (FEAT-3)"
+expect 'seen "docker: compose up -d --force-recreate librarian"' "Restart RECREATES the container, so a setting this TUI wrote is actually picked up (FEAT-3)"
+reset "shelfmark" "U"; step_service; rc=$?
+expect '[ $rc = 0 ] && seen "docker: compose up -d shelfmark" && ! grep -qE "docker: compose( --profile torrents)? start shelfmark" "$LOG"' "Start uses 'up -d', never 'start': a removed container is recreated (FEAT-3)"
+reset "shelfmark" "S" "no"; step_service; rc=$?
+expect '[ $rc = 0 ] && ! seen "compose stop shelfmark"' "declining the stop confirmation changes nothing (FEAT-3)"
+reset "shelfmark" "S" "yes"; step_service
+expect 'seen "docker: compose stop shelfmark"' "confirmed: the service is stopped (FEAT-3)"
+reset "caddy" "S" "no"; step_service; rc=$?
+expect '[ $rc = 0 ] && ! seen "compose stop caddy" && grep -F "yesno: " "$LOG" | grep -q "ONLY process that answers from the internet"' "stopping caddy names what goes dark and is refused on No (FEAT-3)"
+reset "caddy" "S" "yes"; step_service
+expect 'seen "docker: compose stop caddy" && grep -F msgbox "$LOG" | grep -q "EVERY public site is down"' "and when it IS stopped the admin is told, not left to find out (FEAT-3)"
+abak3=$(envget AUTHELIA_ENABLED); envset AUTHELIA_ENABLED true
+PS_SERVICES="caddy librarian"; reset "authelia" "R" "yes"; step_service >/dev/null
+expect 'seen "docker: compose -f docker-compose.yml -f docker-compose.authelia.yml up -d --force-recreate authelia"' "Authelia is driven through its overlay compose file, which plain compose cannot see (FEAT-3)"
+envset AUTHELIA_ENABLED "$abak3"; unset PS_SERVICES
+eval "real_compose3() $(declare -f compose | sed '1d')"
+compose(){ case "$*" in *"up -d --force-recreate"*) echo "docker: compose $*" >> "$LOG"; return 1;; esac; real_compose3 "$@"; }
+reset "librarian" "R" "yes"; step_service; rc=$?
+unset -f compose; eval "compose() $(declare -f real_compose3 | sed '1d')"; unset -f real_compose3
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "could not do that"' "a compose failure is reported instead of a success screen (FEAT-3)"
+expect 'declare -f menu_ops | grep -q step_service' "the entry is wired into the Operations menu (FEAT-3)"
+
+echo "== FEAT-5: restore a SINGLE file beside the stack"
+export FAKESNAP="$T/fakesnap"
+rm -f "$renv"; reset; step_restore_file; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "No backup repository"' "without a repository the step refuses (FEAT-5)"
+printf 'RESTIC_REPOSITORY=/mnt/backup\nRESTIC_PASSWORD=resticpass-123\n' > "$renv"
+: > "$RLOG"; reset "abc12345" "library/books/big.epub" "no"; step_restore_file; rc=$?
+expect '[ $rc = 0 ] && ! grep -q "restore abc12345" "$RLOG" && ! seen "compose down"' "declining the confirmation restores nothing and stops nothing (FEAT-5)"
+: > "$RLOG"; reset "abc12345" "/etc/passwd" "yes"; step_restore_file; rc=$?
+expect '[ $rc = 1 ] && ! grep -q "restore abc12345" "$RLOG" && grep -F msgbox "$LOG" | grep -q "outside $STACK_DIR"' "a path outside \$STACK_DIR is refused: the snapshots contain nothing else (FEAT-5)"
+: > "$RLOG"; rm -rf "$T"/bookstack-restored-*
+reset "abc12345" "library/books/big.epub" "yes"; step_restore_file; rc=$?
+stg=$(ls -d "$T"/bookstack-restored-* 2>/dev/null | head -1)
+expect '[ $rc = 0 ] && [ -n "$stg" ] && [ -f "$stg$STACK_DIR/library/books/big.epub" ]' "the file lands in a staging directory BESIDE the stack, never in place (FEAT-5)"
+expect 'grep -qE "restic: (--retry-lock 30m )?restore abc12345 --target $T/bookstack-restored-[0-9-]+ --include $STACK_DIR/library/books/big.epub" "$RLOG"' "restic restores exactly that one path, not the whole snapshot (FEAT-5)"
+expect '! seen "docker: compose down" && grep -F msgbox "$LOG" | grep -q "$stg"' "nothing is stopped and the admin is told where it landed (FEAT-5)"
+: > "$RLOG"; rm -rf "$T"/bookstack-restored-*
+reset "abc12345" "library/books/never-existed.epub" "yes"; step_restore_file; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "contains nothing at" && [ -z "$(ls -d "$T"/bookstack-restored-* 2>/dev/null)" ]' "restic exits 0 when an --include matches nothing: the empty result is caught and the staging dir removed (FEAT-5)"
+expect 'declare -f menu_ops | grep -q step_restore_file' "the entry is wired into the Operations menu (FEAT-5)"
+
+echo "== FEAT-6: rotate the restic repository password safely"
+rm -f "$renv"; reset; step_restic_rotate; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "No backup repository"' "nothing configured: there is no password to rotate (FEAT-6)"
+mkrenv(){ printf 'RESTIC_REPOSITORY=/mnt/backup\nRESTIC_PASSWORD=oldpass-123\nAWS_ACCESS_KEY_ID=keyid\n' > "$renv"; chmod 600 "$renv"; }
+mkrenv; cp "$renv" "$T/renv.rot"
+export RESTIC_NOREPO=1; : > "$RLOG"; reset; step_restic_rotate; rc=$?; export RESTIC_NOREPO=0
+expect '[ $rc = 1 ] && cmp -s "$renv" "$T/renv.rot" && ! grep -q "key add" "$RLOG" && grep -F msgbox "$LOG" | grep -q "nothing safe to rotate FROM"' "a credential that does not open the repository is not a rotation starting point (FEAT-6)"
+: > "$RLOG"; RESTIC_KEYADD_RC=1 reset "yes" "newpass-4567" "newpass-4567"; RESTIC_KEYADD_RC=1 step_restic_rotate; rc=$?
+expect '[ $rc = 1 ] && cmp -s "$renv" "$T/renv.rot" && ! grep -q "key remove" "$RLOG" && [ ! -e "$renv.new" ] && grep -F msgbox "$LOG" | grep -q "NOTHING was changed"' "a refused 'key add' leaves the working credential file and every snapshot exactly as they were (FEAT-6)"
+: > "$RLOG"; reset "yes" "newpass-4567" "newpass-4567"; RESTIC_BAD_PW=newpass-4567 step_restic_rotate; rc=$?
+expect '[ $rc = 1 ] && cmp -s "$renv" "$T/renv.rot" && ! grep -q "key remove" "$RLOG" && [ ! -e "$renv.new" ] && grep -F msgbox "$LOG" | grep -q "does NOT open the repository"' "the new key is TESTED before anything is removed or replaced — the whole point of the step (FEAT-6)"
+: > "$RLOG"; reset "yes" "newpass-4567" "newpass-4567"; step_restic_rotate; rc=$?
+expect '[ $rc = 0 ] && grep -q "restic-key-add-pw: newpass-4567" "$RLOG" && grep -qE "${RX}key remove 0a1b2c3doldkey" "$RLOG"' "happy path: the new key is added, then the OLD key (the 'current' one) is removed (FEAT-6)"
+expect '[ "$(rl "key add")" -lt "$(rl "key remove")" ] && grep -q "restic-key-remove-pw: newpass-4567" "$RLOG"' "add comes first, and the removal runs with the NEW password (restic refuses to remove the key it is using) (FEAT-6)"
+expect 'grep -q "^RESTIC_PASSWORD=newpass-4567$" "$renv" && grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv" && grep -q "^AWS_ACCESS_KEY_ID=keyid$" "$renv" && [ ! -e "$renv.new" ] && [ "$(stat -c %a "$renv" 2>/dev/null || stat -f %Lp "$renv")" = 600 ]' "only now is restic.env rewritten: new password, repository and S3 keys kept, still 0600 (FEAT-6)"
+mkrenv; : > "$RLOG"; reset "yes" "newpass-4567" "newpass-4567"; RESTIC_KEYRM_RC=1 step_restic_rotate; rc=$?
+expect '[ $rc = 1 ] && grep -q "^RESTIC_PASSWORD=newpass-4567$" "$renv" && grep -F msgbox "$LOG" | grep -q "OLD key could NOT be removed"' "a failed 'key remove' still saves the working new password, and says the old one still opens the repository (FEAT-6)"
+mkrenv; reset "no"; step_restic_rotate; rc=$?
+expect '[ $rc = 0 ] && grep -q "^RESTIC_PASSWORD=oldpass-123$" "$renv"' "declining the confirmation rotates nothing (FEAT-6)"
+# the destructive Backups re-run and this safe rotation must point at each other
+expect 'declare -f step_backup | grep -q "Rotate the backup repository password" && declare -f menu_ops | grep -q step_restic_rotate' "Install -> Backups, which REFUSES a new password, names the step that does it safely (FEAT-6)"
+printf 'RESTIC_REPOSITORY=/mnt/backup\n' > "$renv"
+
+echo "== FEAT-10: advanced settings (the tunables that had no writer)"
+# the values this screen shows must be the ones the container really falls back to
+python3 - "$REPO" "$ADV_SETTINGS" <<'PY' && ok "every Advanced default matches docker-compose.yml's \${KEY:-default} and .env.example (FEAT-10)" || bad "Advanced settings default mismatch"
+import re, sys
+repo, spec = sys.argv[1], sys.argv[2]
+comp = dict(re.findall(r"\$\{(\w+):-([^}]*)\}", open(repo + "/docker-compose.yml").read()))
+env = dict(re.findall(r"^(\w+)=(\S*)", open(repo + "/.env.example").read(), re.M))
+bad = []
+for line in spec.strip().splitlines():
+    _g, key, default, _kind, _help = line.split("|", 4)
+    if key in comp and comp[key] != default:
+        bad.append("%s: compose says %s, the TUI shows %s" % (key, comp[key], default))
+    if key in env and env[key] != default:
+        bad.append("%s: .env.example says %s, the TUI shows %s" % (key, env[key], default))
+    if key not in comp and key not in env:
+        bad.append("%s: reaches the stack from nowhere (not in compose, not in .env.example)" % key)
+print("\n".join("     " + b for b in bad)); sys.exit(1 if bad else 0)
+PY
+envset LOCKOUT_FAILS ""; envset SESSION_HOURS ""
+reset "lockout" "0" "0"; step_advanced; rc=$?
+expect '[ $rc = 0 ] && grep -F "whiptail: " "$LOG" | grep -q "LOCKOUT_FAILS 5" && grep -F "whiptail: " "$LOG" | grep -q "SESSION_HOURS 12"' "an unset key shows the built-in default the container really uses, not a blank (FEAT-10)"
+reset "lockout" "LOCKOUT_FAILS" "9" "0" "0"; step_advanced
+expect '[ "$(envget LOCKOUT_FAILS)" = 9 ] && seen "compose up -d librarian" && grep -F msgbox "$LOG" | grep -q "is live"' "changing a lockout value writes it and recreates the portal so it is in force (FEAT-10)"
+reset "lockout" "LOCKOUT_FAILS" "lots" "0" "0"; step_advanced
+expect '[ "$(envget LOCKOUT_FAILS)" = 9 ] && grep -F msgbox "$LOG" | grep -q "must be a whole number"' "a non-numeric value is refused and the old one kept (FEAT-10)"
+reset "mail" "IMAP_SSL" "maybe" "0" "0"; step_advanced
+expect '[ -z "$(envget IMAP_SSL)" ] && grep -F msgbox "$LOG" | grep -q "must be exactly true or false"' "a boolean only takes true or false (FEAT-10)"
+reset "mail" "IMAP_SSL" "false" "0" "0"; step_advanced
+expect '[ "$(envget IMAP_SSL)" = false ] && seen "compose up -d librarian"' "and a valid boolean is stored and applied (FEAT-10)"
+reset "disk" "DISK_STOP_PCT" "150" "0" "0"; step_advanced
+expect '[ -z "$(envget DISK_STOP_PCT)" ] && grep -F msgbox "$LOG" | grep -q "between 1 and 99"' "a percentage outside 1-99 is refused (FEAT-10)"
+envset DISK_WARN_PCT ""; envset DISK_RESUME_PCT ""
+reset "disk" "DISK_STOP_PCT" "70" "0" "0"; step_advanced
+expect '[ "$(envget DISK_STOP_PCT)" = 70 ] && grep -F msgbox "$LOG" | grep -q "warn=85 stop=70 resume=80"' "thresholds that cannot work together are called out instead of silently accepted (FEAT-10)"
+envset DISK_STOP_PCT ""
+reset "backup" "RESTIC_KEEP_MONTHLY" "12" "0" "0"; step_advanced
+expect '[ "$(envget RESTIC_KEEP_MONTHLY)" = 12 ] && ! seen "compose up -d librarian" && grep -F msgbox "$LOG" | grep -q "nothing has to be restarted"' "retention is read by backup.sh at run time, so no container is restarted for it (FEAT-10)"
+reset "uploads" "MAX_PDF_MB" "400" "0" "0"; step_advanced
+expect '[ "$(envget MAX_PDF_MB)" = 400 ]' "the upload-cap group writes its keys too (FEAT-10)"
+eval "real_envset4() $(declare -f envset | sed '1d')"
+envset(){ [ "$1" = KINDLE_MAX_MB ] && return 1; real_envset4 "$@"; }
+reset "uploads" "KINDLE_MAX_MB" "25" "0" "0"; step_advanced
+unset -f envset; eval "envset() $(declare -f real_envset4 | sed '1d')"; unset -f real_envset4
+expect 'grep -F msgbox "$LOG" | grep -q "was NOT changed"' "a write that cannot happen is reported, never reported as applied (FEAT-10)"
+eval "real_restart_portal() $(declare -f restart_portal | sed '1d')"
+restart_portal(){ return 1; }
+reset "lockout" "SESSION_HOURS" "48" "0" "0"; step_advanced
+unset -f restart_portal; eval "restart_portal() $(declare -f real_restart_portal | sed '1d')"; unset -f real_restart_portal
+expect '[ "$(envget SESSION_HOURS)" = 48 ] && grep -F msgbox "$LOG" | grep -q "NOT in force yet"' "a portal that will not restart means the setting is NOT live, and it says so (FEAT-10)"
+expect 'declare -f menu_ops | grep -q step_advanced' "the entry is wired into the Operations menu (FEAT-10)"
+for k in LOCKOUT_FAILS SESSION_HOURS IMAP_SSL DISK_WARN_PCT DISK_STOP_PCT DISK_RESUME_PCT RESTIC_KEEP_MONTHLY MAX_PDF_MB; do envset "$k" ""; done
+
+echo "== the touched helpers behave under the script's own errexit"
+# the suite runs with `set +e`; these helpers really execute with -euo pipefail, where a final
+# `[ x = y ] && cmd` that is false aborts the caller
+out=$( (set -euo pipefail
+  render_caddyfile >/dev/null
+  restart_shelfmark >/dev/null || true
+  restart_shelfmark --end-sessions >/dev/null || true
+  RESTIC_NO_RETRY_LOCK=1 restic_run cat config >/dev/null
+  restic_run cat config >/dev/null
+  envset ERRX 1; envdefault ERRX 2; valid_admin_hash "$(envget ADMIN_HASH)"
+  torrents_on || true
+  # the new helpers: each ends in a test or an && list that is false on a normal, boring stack
+  stack_services >/dev/null
+  compose_for authelia >/dev/null; compose_for caddy >/dev/null
+  adv_rows lockout >/dev/null; adv_value LOCKOUT_FAILS 5 >/dev/null
+  valid_ip 203.0.113.9 || true; valid_ip nope || true; caller_ip >/dev/null
+  cli_err '{"ok": false, "error": "x"}' >/dev/null; cli_err 'not json at all' >/dev/null
+  echo "ERREXIT-OK") 2>&1 )
+expect 'printf "%s" "$out" | grep -q "ERREXIT-OK"' "render_caddyfile / restart_shelfmark / restic_run / envset and the new helpers all survive set -euo pipefail"
 
 echo; echo "TUI RESULT: $pass passed, $fails failed"; exit $fails

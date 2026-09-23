@@ -7,12 +7,13 @@ against loopback/LAN/tailnet/link-local ranges first (a logged-in user controls 
 request), catalog credentials only ever go to the configured catalog origin, and downloads
 are capped per kind (local files too: a huge PDF must not OOM-kill the portal). Each loop
 keeps a heartbeat in HEARTBEAT for /healthz."""
-import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata
+import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata, errno
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
 import config, db, notify, abs as absapi, kindle, cwa
-from tagger import add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError
+from tagger import (add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError,
+                    MAX_ZIP_MEMBERS as TAG_MAX_ZIP_MEMBERS)
 
 log = logging.getLogger("worker")
 UA = {"User-Agent": "bookstack-librarian/4.3"}
@@ -38,6 +39,15 @@ def _tmpdir():
         return tempfile.mkdtemp(dir=base)
     except OSError:
         return tempfile.mkdtemp()
+
+# scripts/disk-watch.sh touches this at DISK_STOP_PCT and removes it below DISK_RESUME_PCT.
+# Stopping Shelfmark and qBittorrent is not enough on its own: the queue, the dropbox watcher
+# and the mail intake each write multi-GB files too, and the admin has already been told
+# (alert, README, self-test, Advanced settings) that intake stops when the disk is full.
+DISK_PAUSE_FLAG = ".disk-paused"
+
+def _disk_paused():
+    return os.path.exists(os.path.join(config.STAGING_DIR, DISK_PAUSE_FLAG))
 
 # Linux NAME_MAX is 255 BYTES, not characters: 150 Cyrillic or Devanagari characters are 300+
 # bytes and every rename then fails with ENAMETOOLONG. Names are cut to this many UTF-8 bytes,
@@ -269,7 +279,7 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
         if ext in ("epub", "cbz"):
             # before anything opens it, and for admins too: an absurd archive OOM-kills the
             # container, and "tag skipped" would hand it to Calibre-Web to die on instead
-            _zip_ok(part, f"this {ext.upper()}")
+            _zip_ok(part, f"this {ext.upper()}", TAG_MAX_ZIP_MEMBERS)
         if ext in _TAGGERS:
             note = _tag_or_fail(part, owner, ext, title=title or final_base, author=author)
             if ext in ("epub", "pdf"):
@@ -382,12 +392,16 @@ def _refuse_links(path):
 # ---- audiobooks -------------------------------------------------------------------------------
 MAX_ZIP_MEMBERS, MAX_ZIP_UNPACKED = 2000, 8 * 1024 ** 3   # zip-bomb guard for audiobook archives
 
-def _zip_ok(path, what="this archive"):
+def _zip_ok(path, what="this archive", max_members=MAX_ZIP_MEMBERS):
     """Refuse an absurd archive BEFORE zipfile.ZipFile() parses (and materialises) the whole
     central directory — _safe_extract's member count runs far too late to save the container.
-    tagger owns the End-Of-Central-Directory reader; this is its ValueError face."""
+    tagger owns the End-Of-Central-Directory reader; this is its ValueError face.
+
+    Never pass a limit stricter than the guard this front-runs, or files that used to import
+    are refused with a reason that is not true: audiobook archives are held to the tighter
+    count here, EPUB and CBZ to tagger's, which is what actually gates their tagging."""
     try:
-        precheck_zip(path, what, MAX_ZIP_MEMBERS)
+        precheck_zip(path, what, max_members)
     except TagError as e:
         raise ValueError(str(e))
 
@@ -520,33 +534,72 @@ def _expand_audio_zips(d):
     """A dropped folder often carries the audiobook as one zip (LibriVox, a Shelfmark grab).
     Audiobookshelf cannot read a zip, so each audio archive is unpacked where it lies and the
     archive itself removed — otherwise the folder lands in the library holding nothing
-    playable, ABS indexes no item and the tag job waits 24 h for something that never appears."""
+    playable, ABS indexes no item and the tag job waits 24 h for something that never appears.
+
+    Only ever called on our own staging copy, and the archive is NOT deleted here: it may be
+    the reader's only copy, so it goes once the folder is safely in the library. Returns
+    [(archive, [files it produced])] so a failure in between can be undone exactly, leaving
+    the folder byte-identical to what was dropped."""
+    expanded = []
     zips = [os.path.join(r, n) for r, _dirs, names in os.walk(d) for n in names if _ext(n) == "zip"]
     for p in zips:
         if _zip_kind(p) != "audio-zip":
             continue
         _zip_ok(p)
+        here = os.path.dirname(p)
+        before = set(_files_under(here))
         with zipfile.ZipFile(p) as zf:
-            _safe_extract(zf, os.path.dirname(p))
-        os.remove(p)
+            _safe_extract(zf, here)
+        expanded.append((p, sorted(set(_files_under(here)) - before)))
         _beat("dropbox")
+    return expanded
+
+def _files_under(d):
+    return [os.path.join(r, n) for r, _dirs, names in os.walk(d) for n in names]
 
 def _place_audio_dir(src_dir, owner, base, rid=None):
-    """A folder of audio files dropped in a dropbox (Shelfmark, rsync) becomes one audiobook."""
-    _expand_audio_zips(src_dir)
-    if _audio_duplicate(owner, base, _tree_size(src_dir)):
-        raise ValueError("this audiobook is already in your audiobooks (same name and size)")
+    """A folder of audio files dropped in a dropbox (Shelfmark, rsync) becomes one audiobook.
+
+    The folder is taken out of the dropbox into our own staging name first, and everything
+    that can fail happens there. On any failure it goes back exactly as it was: nothing the
+    reader dropped is lost, and its fingerprint still matches, so _handle parks it with the
+    real reason instead of 'the file was still being written'."""
     final = _audio_final(owner, base)
+    inc = os.path.join(config.AUDIO_DIR, ".incoming-" + uuid4().hex)
+    moved = False
     try:
-        os.rename(src_dir, final)                # same filesystem: instant and atomic
+        os.rename(src_dir, inc)                  # same filesystem: instant and atomic
+        moved = True
     except OSError:
-        inc = os.path.join(config.AUDIO_DIR, ".incoming-" + uuid4().hex)
-        try:
-            shutil.copytree(src_dir, inc, copy_function=_copy_beating)
-            os.rename(inc, final)
-        except Exception:
+        shutil.copytree(src_dir, inc, copy_function=_copy_beating)
+    expanded = []
+    try:
+        expanded = _expand_audio_zips(inc)
+        if _audio_duplicate(owner, base, _tree_size(inc)):
+            raise ValueError("this audiobook is already in your audiobooks (same name and size)")
+        os.rename(inc, final)
+    except BaseException:
+        if moved:
+            for _archive, made in expanded:      # undo the unpacking, keep the archive
+                for f in made:
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+            try:
+                os.rename(inc, src_dir)          # the reader's folder, exactly as they made it
+            except OSError:
+                shutil.rmtree(inc, ignore_errors=True)
+        else:
             shutil.rmtree(inc, ignore_errors=True)
-            raise
+        raise
+    # in the library now, and Audiobookshelf cannot read a zip: the archive has done its job
+    for archive, _made in expanded:
+        try:
+            os.remove(os.path.join(final, os.path.relpath(archive, inc)))
+        except OSError:
+            pass
+    if not moved:
         shutil.rmtree(src_dir)
     return _finish_audio(final, owner, rid)
 
@@ -760,6 +813,8 @@ def scan_dropbox_once(now=None):
     base = config.DROPBOX_DIR
     if not os.path.isdir(base):
         return 0
+    if _disk_paused():        # leave what was dropped where it is; it is picked up on resume
+        return 0
     for dirname in sorted(os.listdir(base)):
         d = os.path.join(base, dirname)
         if not os.path.isdir(d) or dirname.startswith("."):
@@ -882,9 +937,14 @@ def _place_http(req):
                              f"({_SNIFF_NAMES.get(ext, 'an unrecognised file')}); kept at {kept}")
         _finish(req["id"], _status_for(note), note)
     except OSError as e:
-        # never surface a raw errno and an internal container path to a family member
-        raise ValueError(f"the file could not be saved ({e.strerror or e.__class__.__name__}); "
-                         f"the title or the author name may be too long for this filesystem")
+        # never surface a raw errno and an internal container path to a family member, and
+        # never blame the title for a disk that is simply full: the admin acts on this text
+        why = e.strerror or e.__class__.__name__
+        if e.errno == errno.ENAMETOOLONG:
+            why += "; the title or the author name may be too long for this filesystem"
+        elif e.errno in (errno.ENOSPC, errno.EDQUOT):
+            why = "the server is out of disk space"
+        raise ValueError(f"the file could not be saved ({why})")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1055,23 +1115,6 @@ def _ingest_marker(owner, rid):
     for finding that exact book again in /ingest, in metadata.db or in CWA's failed folder."""
     return f"[{_safe(owner)}-{rid}]"
 
-def _in_ingest(marker):
-    try:
-        return any(marker in n for n in os.listdir(config.INGEST_DIR))
-    except OSError:
-        return False
-
-def _cwa_failed(marker):
-    """CWA moves files its importer could not handle to processed_books/failed."""
-    d = os.path.join(config.CWA_PROCESSED_DIR, "failed")
-    try:
-        for _root, dirs, names in os.walk(d):
-            if any(marker in n for n in dirs + names):
-                return True
-    except OSError:
-        pass
-    return False
-
 def _in_calibre(marker):
     """metadata.db knows the book: CWA imported it. The suffix survives in the file name
     calibre stores (data.name) and, for files without metadata, in the title."""
@@ -1097,13 +1140,15 @@ RECONCILE_MAX_AGE = 24 * 3600
 STILL_WAITING = "still waiting for the library to import it"
 
 def _ingest_names():
+    """What is waiting in /ingest — read ONCE per pass, not once per row."""
     try:
         return os.listdir(config.INGEST_DIR)
     except OSError:
         return []
 
 def _cwa_failed_names():
-    """One walk of CWA's processed_books/failed per pass, not one per row."""
+    """CWA moves files its importer could not handle to processed_books/failed. One walk of
+    that tree per pass, not one per row."""
     out = []
     try:
         for _root, dirs, names in os.walk(os.path.join(config.CWA_PROCESSED_DIR, "failed")):
@@ -1237,6 +1282,18 @@ def housekeeping_once(now=None):
         _LAST_CHECKPOINT[0] = now
         cwa.checkpoint_passive()
         _guarded(check_password_drift)
+        _guarded(fail_orphaned_pending)
+
+def fail_orphaned_pending():
+    """A request awaiting approval is never claimed, so _owner_gone never sees it: removing the
+    user left it pending for ever, un-actionable (an admin could only 'deny' a person who no
+    longer exists). Fail it once, with a reason that says what happened."""
+    failed = 0
+    for r in db.rows_by_status(("pending",)):
+        if _owner_gone(r["owner"]):
+            _finish(r["id"], "error", f"the account '{r['owner']}' was removed while this was waiting for approval")
+            failed += 1
+    return failed
 
 def _loop(name, fn, every):
     _beat(name)
@@ -1278,6 +1335,8 @@ def sweep_orphans():
 
 def queue_once():
     """Claim and process one queued request. True if there was one."""
+    if _disk_paused():                           # nothing new on a disk that is already full
+        return False
     req = db.claim_one()
     if not req:
         return False

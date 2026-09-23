@@ -63,6 +63,28 @@ and are covered by `Operations → Self-test` after deploy.
       and off, with and without the Authelia gate; every compose combination renders.
 - [x] End-to-end run on real containers green after the fixes (see the commit message).
 
+## Verified locally in v4.4 (admin-coverage audit, fixes, post-fix review)
+- [x] A 38-agent audit built an independent list of every task this stack's admin faces over
+      its life (100 tasks) and classified each against both consoles. Verdict: the whiptail
+      TUI is the admin console; the web `/admin` page is a dashboard. The capability gaps it
+      found are now TUI entries: unban (fail2ban **and** the Cloudflare access rule), clear a
+      login lockout, restart/stop/start one service, reopen public SSH, restore a single file,
+      rotate the restic password safely, the full request queue, parked files, an ABS rescan,
+      and an editor for the 21 tunables that previously had no writer.
+- [x] **Debian 12 backups actually run.** apt ships restic 0.14, which has no `--retry-lock`:
+      every scheduled backup failed while setup reported success. Both scripts and the TUI now
+      probe for the flag; proven in a real `debian:12` container with restic 0.14.0 and again
+      against 0.18.
+- [x] An independent review of the combined diff found 16 issues, two of them regressions this
+      round introduced (the portal never read the disk-full pause flag it was documented to
+      honour; the audiobook placer deleted the reader's ZIP before the import could fail).
+      All 16 are fixed and covered by tests.
+- [x] Suites after the fixes: installer harness **440 passed**, portal suite **233 passed**,
+      end-to-end on real containers **163 checks / 0 failed** (no worker crash, no container
+      restart, peak 1325 MiB). ruff clean; `bash -n` clean on every script; all 5 compose
+      combinations render; **all 8 Caddyfile variants** (torrents x Ephemera x Authelia)
+      validate against the pinned Caddy build, with `auth.` rendered only when the gate is on.
+
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,

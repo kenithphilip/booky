@@ -359,7 +359,9 @@ def retry_all():
     flash(f"Requeued {n} failed request(s).")
     return redirect(url_for("status"))
 
-DISMISSABLE = ("error", worker.NEEDS_TAG)
+# 'pending' is admin-only (the check below keeps users to their own 'error' rows): a request
+# whose owner was removed cannot be approved or honestly denied, so it needs a way out.
+DISMISSABLE = ("error", worker.NEEDS_TAG, "pending")
 
 @app.route("/dismiss/<int:rid>", methods=["POST"])
 @login_required

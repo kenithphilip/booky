@@ -41,7 +41,7 @@ CWA_PROCESSED_DIR  = os.environ.get("CWA_PROCESSED_DIR", "") or os.path.join(os.
 DROPBOX_DIR   = os.environ.get("DROPBOX_DIR", "/dropbox")     # per-user subfolders, watched for files
 INTAKE_TOKEN  = os.environ.get("INTAKE_TOKEN", "")            # bearer token for POST /intake automation
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "95"))    # browser upload size cap (Cloudflare Free: 100 MB bodies)
-MAX_EBOOK_MB  = int(os.environ.get("MAX_EBOOK_MB", "500"))    # worker download caps, per kind ...
+MAX_EBOOK_MB  = int(os.environ.get("MAX_EBOOK_MB", "200"))    # worker download caps, per kind ...
 MAX_AUDIO_MB  = int(os.environ.get("MAX_AUDIO_MB", "2048"))   # ... (LibriVox zips of long books run past 1 GB)
 # pypdf holds a whole PDF (and its clone) in memory while it embeds the owner tag; a 262 MB
 # scan needed more than 384 MB. PDFs above this are parked instead of OOM-killing the portal.
@@ -113,10 +113,10 @@ ABS_TAG_ATTEMPTS = int(os.environ.get("ABS_TAG_ATTEMPTS", "24"))    # x5 s: `pyt
 ABS_TAG_GIVE_UP_HOURS = int(os.environ.get("ABS_TAG_GIVE_UP_HOURS", "24"))   # worker: persistent tag jobs retried this long
 
 # --- Abuse controls -----------------------------------------------------------------------
-LOCKOUT_FAILS   = int(os.environ.get("LOCKOUT_FAILS", "6"))        # failed logins per user+IP ...
+LOCKOUT_FAILS   = int(os.environ.get("LOCKOUT_FAILS", "5"))        # failed logins per user+IP ...
 LOCKOUT_WINDOW  = int(os.environ.get("LOCKOUT_WINDOW", "900"))     # ... within this many seconds ...
 LOCKOUT_SECONDS = int(os.environ.get("LOCKOUT_SECONDS", "900"))    # ... lock that pair for this long
-LOCKOUT_IP_FAILS = int(os.environ.get("LOCKOUT_IP_FAILS", "30"))   # any usernames from one IP
+LOCKOUT_IP_FAILS = int(os.environ.get("LOCKOUT_IP_FAILS", "20"))   # any usernames from one IP
 MAX_REQUESTS_PER_DAY = int(os.environ.get("MAX_REQUESTS_PER_DAY", "30"))  # non-admins; 0 = unlimited
 SESSION_HOURS   = int(os.environ.get("SESSION_HOURS", "12"))
 TRUST_PROXY     = _bool("TRUST_PROXY", True)      # Caddy is the only thing in front (127.0.0.1 bind)

@@ -219,6 +219,7 @@ services:
       - NOTIFY_WEBHOOK_FORMAT=${NOTIFY_WEBHOOK_FORMAT:-auto}   # auto = ntfy style when the URL host contains 'ntfy'
       - AUTHELIA_ENABLED=${AUTHELIA_ENABLED:-false}           # portal hides self-service user creation when the gate is on
       - TORRENTS_ENABLED=${TORRENTS_ENABLED:-false}           # shows the qBittorrent admin link
+      - EPHEMERA_ENABLED=${EPHEMERA_ENABLED:-false}          # shows the Ephemera admin link
       - DEDUPE_WARN=${DEDUPE_WARN:-true}
       - ENRICH_METADATA=${ENRICH_METADATA:-true}
       - CALIBRE_DB=/calibre-library/metadata.db
@@ -227,6 +228,9 @@ services:
       # Cloudflare Free/Pro reject request bodies over 100 MB at the edge; bigger files go
       # through the user's dropbox.
       - MAX_UPLOAD_MB=${MAX_UPLOAD_MB:-95}
+      # NOT MAX_UPLOAD_MB: a browser upload is streamed to disk, a mailed message is parsed in
+      # memory at roughly a dozen times the attachment, which OOM-killed the whole portal.
+      - MAX_MAIL_MB=${MAX_MAIL_MB:-40}
       - GUTENBERG_MIRROR=${GUTENBERG_MIRROR:-}
       - MAX_EBOOK_MB=${MAX_EBOOK_MB:-200}     # worker download caps per kind (SSRF/abuse fence)
       - MAX_AUDIO_MB=${MAX_AUDIO_MB:-2048}
