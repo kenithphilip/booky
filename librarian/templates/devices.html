@@ -16,6 +16,8 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 </ol>
 <form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_reset">
 <button type="submit" class="sec">Regenerate link</button> <span class="mut">(the old link stops working; update the device)</span></form>
+<p class="mut" style="margin-top:8px">This link is a key in its own right: anyone holding it reads your whole library, and
+<strong>changing your password does not change it</strong>. If the link leaked, or a device carrying it was lost, regenerate it here.</p>
 {% else %}
 <p class="mut">Generate a private link, then put it in the Kobo's config file (instructions appear after generating).</p>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="kobo"><button type="submit">Generate my Kobo link</button></form>
@@ -30,7 +32,7 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 {% if u.kindle_mail %}<span class="mut">Current: {{ u.kindle_mail }}</span>{% endif %}</div></form>
 <p class="mut" style="margin-top:8px">Find it under Amazon → Manage Your Content and Devices → Preferences → Personal Document Settings.
 There, also add <strong>{{ cfg.SMTP_FROM or 'the library sender address (ask the admin)' }}</strong> to <em>Approved Personal Document E-mail List</em>, or Amazon will drop the mail.
-Amazon takes EPUB and PDF by mail (not MOBI/AZW3), up to 50 MB per mail.</p>
+Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files up to {{ cfg.KINDLE_MAX_MB }} MB.</p>
 {% if kindle_enabled and u.kindle_mail %}
 <form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kindle_test">
 <button type="submit" class="sec">Send a test to my Kindle</button>
@@ -49,7 +51,7 @@ Automatically e-mail every new ebook to my Kindle{% if not kindle_enabled %} <sp
 <p><label><input type="checkbox" name="notify_email" value="1" {{ 'checked' if prefs.notify_email }} {{ '' if kindle_enabled else 'disabled' }}>
 E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or denied{% if not kindle_enabled %} <span class="mut">(needs outgoing mail)</span>{% endif %}</label></p>
 <button type="submit">Save preferences</button></form>
-<p class="mut" style="margin-top:8px">Formats: the library converts books to EPUB on arrival (PDF and comics stay as they are). Kobo receives KEPUB automatically on sync; Kindle accepts EPUB or PDF by e-mail, AZW3/MOBI only over USB.</p>
+<p class="mut" style="margin-top:8px">Formats: the library converts books to EPUB on arrival (PDF and comics stay as they are). Kobo receives EPUB over sync — it reads normally, but the Kobo only remembers your place at each chapter, not the exact page. Kindle accepts EPUB or PDF by e-mail, AZW3/MOBI only over USB.</p>
 </div>
 
 <div class="card">

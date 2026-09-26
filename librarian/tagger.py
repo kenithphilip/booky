@@ -113,6 +113,35 @@ def _foreign_owner(text, owner_tag):
     t = (text or "").strip()
     return t.startswith(config.OWNER_PREFIX) and t != owner_tag
 
+def _read_opf_meta(meta):
+    """What the OPF says about the book, from the <metadata> element already in memory.
+
+    dc:identifier is the valuable one: an EPUB from Calibre carries the library's own UUID,
+    and a retail or Standard Ebooks EPUB usually carries an ISBN. Identifiers are a
+    VERIFICATION and DEDUPE key here, never a query key — the release protocols have no ISBN
+    field, so searching still goes out as title+author.
+    Best effort throughout: a malformed value must never cost the import."""
+    def _txt(tag):
+        el = meta.find(f"{{{DC_NS}}}{tag}")
+        return (el.text or "").strip() if el is not None and el.text else ""
+    ids = []
+    for el in meta.findall(f"{{{DC_NS}}}identifier"):
+        v = (el.text or "").strip()
+        if not v:
+            continue
+        # the scheme lives in an attribute whose namespace varies by EPUB version
+        scheme = next((a for k, a in el.attrib.items() if k.lower().endswith("scheme")), "")
+        low = v.lower()
+        if not scheme:
+            if low.startswith("urn:isbn:") or low.startswith("isbn:"):
+                scheme = "isbn"
+            elif low.startswith("urn:uuid:") or low.startswith("uuid:"):
+                scheme = "uuid"
+        ids.append({"kind": (scheme or "unknown").lower(),
+                    "value": v.split(":")[-1] if low.startswith(("urn:", "isbn:", "uuid:")) else v})
+    return {"title": _txt("title"), "author": _txt("creator"),
+            "language": _txt("language"), "identifiers": ids}
+
 def add_owner_tag(epub_path, owner_tag):
     tmp = epub_path + ".tmp"
     precheck_zip(epub_path, "this EPUB")     # before ZipFile parses the central directory
@@ -130,6 +159,11 @@ def add_owner_tag(epub_path, owner_tag):
         meta = root.find(f"{{{OPF_NS}}}metadata")
         if meta is None:
             meta = etree.SubElement(root, f"{{{OPF_NS}}}metadata")
+        # Read BEFORE the edit and hand it back. This is the cheapest identification evidence
+        # in the whole stack and it was being thrown away: for a Shelfmark, qBittorrent,
+        # dropbox or mailed-in arrival the portal otherwise records title = the raw filename
+        # and author = "". Reading is not writing — nothing here changes the stored file.
+        found = _read_opf_meta(meta)
         subjects = meta.findall(f"{{{DC_NS}}}subject")
         for el in subjects:
             if _foreign_owner(el.text, owner_tag):
@@ -158,9 +192,19 @@ def add_owner_tag(epub_path, owner_tag):
                 os.remove(tmp)
             raise TagError(f"cannot rewrite EPUB ({e})")
     os.replace(tmp, epub_path)
+    return found
 
 def _split_keywords(s):
     return [k.strip() for k in re.split(r"[,;]", s or "") if k.strip()]
+
+def _read_pdf_meta(meta):
+    """What the PDF's Info dictionary says, from the object add_owner_tag_pdf already holds.
+    PDFs rarely carry an identifier, so this is mostly title/author — still far better than
+    the filename, which for a dropbox arrival is all the portal has today."""
+    def _s(k):
+        v = meta.get(k) if meta else None
+        return str(v).strip() if v else ""
+    return {"title": _s("/Title"), "author": _s("/Author"), "language": "", "identifiers": []}
 
 def add_owner_tag_pdf(pdf_path, owner_tag, title=None, author=None):
     """Merge the tag into the Info dictionary's /Keywords (comma-separated, other keywords
@@ -175,8 +219,9 @@ def add_owner_tag_pdf(pdf_path, owner_tag, title=None, author=None):
         meta = reader.metadata or {}
         keywords = _split_keywords(str(meta.get("/Keywords") or ""))
         kept = [k for k in keywords if not _foreign_owner(k, owner_tag)]
+        found = _read_pdf_meta(meta)
         if owner_tag in kept and kept == keywords:
-            return
+            return found                      # already tagged: still hand back what it says
         writer = PdfWriter(clone_from=reader)
         new = {"/Keywords": ", ".join([k for k in kept if k != owner_tag] + [owner_tag])}
         if title and not str(meta.get("/Title") or "").strip():
@@ -192,6 +237,7 @@ def add_owner_tag_pdf(pdf_path, owner_tag, title=None, author=None):
             os.remove(tmp)
         raise TagError(f"cannot rewrite PDF ({e.__class__.__name__}: {str(e)[:80]})")
     os.replace(tmp, pdf_path)
+    return found
 
 RDF_NS, DC_NS_XMP, X_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#", "http://purl.org/dc/elements/1.1/", "adobe:ns:meta/"
 

@@ -43,6 +43,69 @@ PY
 }
 trap cleanup EXIT
 
+# ---- static assertions -------------------------------------------------------------------
+# Config-file properties that no running container can demonstrate, checked before anything is
+# built so a broken one fails in seconds instead of ten minutes. Each is a property a previous
+# round got wrong; the reasoning lives next to the config itself.
+sfail=0
+sok(){ echo "   [ OK ] $1"; }
+sbad(){ echo "   [FAIL] $1"; sfail=$((sfail+1)); }
+echo "== static assertions (config files, no containers)"
+TPL="$REPO/caddy/Caddyfile.template"
+grep -q '/duplicates/invalidate-cache' "$TPL" \
+  && sok "Caddyfile: /duplicates/invalidate-cache is in @cwa_admin_jobs" \
+  || sbad "Caddyfile: /duplicates/invalidate-cache is NOT blocked (anonymous CSRF-exempt write into cwa.db)"
+grep -q 'duplicates/invalidate-cache).*;' "$TPL" \
+  && sok "Caddyfile: ...and in the ';'-parameter path_regexp companion" \
+  || sbad "Caddyfile: /duplicates/invalidate-cache missing from the path_regexp alternation"
+# /opds and /kosync must NOT share a rate-limit budget: OPDS needs hundreds a minute (one cover
+# per entry), KOReader needs single digits and is the password oracle.
+grep -q 'zone kosync_auth' "$TPL" \
+  && sok "Caddyfile: /kosync has its own rate-limit zone" \
+  || sbad "Caddyfile: /kosync has no zone of its own (it is back in the loose 300/min OPDS bucket)"
+grep -qE '^\s*path /opds\* /kosync\*' "$TPL" \
+  && sbad "Caddyfile: /opds and /kosync share one rate-limit matcher again" \
+  || sok "Caddyfile: /opds and /kosync no longer share a matcher"
+# The blanket no-store deletes every app's own cache directive; `private` must survive any relaxation.
+# Both spellings: the default inside (hardening)'s header block, and the per-site
+# `header @matcher >Cache-Control "..."` exceptions. Every one must contain `private`.
+cc=$(grep -oE '>Cache-Control "[^"]*"' "$TPL")
+if [ -n "$cc" ] && ! printf '%s\n' "$cc" | grep -qv private; then
+  sok "Caddyfile: all $(printf '%s\n' "$cc" | grep -c .) >Cache-Control values keep 'private' (no shared-cache leak)"
+else sbad "Caddyfile: a >Cache-Control value is missing 'private' — Cloudflare could cache one reader's response for everyone"; fi
+# ABS 2.36.1 has no route under /s; an unanchored bypass of the SSO gate must not outlive its route.
+grep -vE '^[[:space:]]*#' "$REPO/authelia/configuration.yml.template" | grep -q "'\^/s/" \
+  && sbad "Authelia: the unjustified '^/s/.*' bypass is back (no such route in ABS 2.36.1)" \
+  || sok "Authelia: no '/s/' bypass (ABS 2.36.1 has no route there)"
+grep -vE '^[[:space:]]*#' "$REPO/authelia/inject-gate.py" | grep -q '/s/\*' \
+  && sbad "inject-gate.py: the unjustified /s/* bypass is back" \
+  || sok "inject-gate.py: no /s/* bypass"
+# The snapshot must never carry the key that decrypts it or the credentials that can delete it.
+grep -qE '^for p in .*restic\.env' "$REPO/scripts/backup.sh" \
+  && sbad "backup.sh: /etc/bookstack/restic.env is staged verbatim again (RESTIC_PASSWORD and the S3 keys would be inside every snapshot)" \
+  || sok "backup.sh: restic.env is not copied verbatim into the snapshot"
+grep -q 'RESTIC_PASSWORD, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are deliberately absent' "$REPO/scripts/backup.sh" \
+  && sok "backup.sh: writes the redacted restic.env stub instead" \
+  || sbad "backup.sh: no redacted restic.env stub (a rebuild would not know which repository to open)"
+# The .part reaper must not be able to delete a file the portal is still holding: _atomic_ingest
+# copies up to 250 MB, tags it, and may run a synchronous 45 MB SMTP upload, all under the .part name.
+pm=$(grep -oE "name '\*\.part' -mmin \+[0-9]+" "$REPO/scripts/disk-watch.sh" | grep -oE '[0-9]+$')
+if [ -n "$pm" ] && [ "$pm" -ge 120 ]; then sok "disk-watch.sh: the .part reaper waits ${pm} min (past copy + tag + a slow Send-to-Kindle upload)"
+else sbad "disk-watch.sh: the .part reaper window is ${pm:-?} min — it can delete a file worker.py is still writing"; fi
+# The token table must not ask for a permission nothing uses.
+grep -q '| Config Rules | Edit |' "$REPO/README.md" \
+  && sbad "README: asks for Cloudflare 'Config Rules: Edit' again, but nothing creates a Configuration Rule" \
+  || sok "README: no Config Rules permission requested (nothing uses it)"
+grep -qE 'Size caps: 200 MB ebooks' "$REPO/README.md" \
+  && sok "README: the ebook size cap matches MAX_EBOOK_MB=200" \
+  || sbad "README: the ebook size cap disagrees with librarian/config.py's MAX_EBOOK_MB=200"
+# The Shelfmark healthcheck must assert app.db is readable NOW, not only that the process
+# started with it: the auth mode is resolved once at import and never re-checked.
+grep -q 'SQLite format 3' "$REPO/docker-compose.yml" \
+  && sok "compose: the shelfmark healthcheck re-checks app.db, not just the cached auth_mode" \
+  || sbad "compose: the shelfmark healthcheck only reads auth_mode, which stays 'cwa' after app.db vanishes"
+[ "$sfail" = 0 ] || { echo "== $sfail static assertion(s) FAILED"; exit 1; }
+
 echo "== stack dir: $STACK"
 mkdir -p "$STACK"; cd "$STACK"
 cp "$REPO/docker-compose.yml" "$REPO/tests/docker-compose.test.yml" .

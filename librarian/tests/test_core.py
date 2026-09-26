@@ -213,8 +213,11 @@ def test_library_is_tag_scoped_and_paths_are_confined():
     assert library.best_format({"formats": ["pdf"]}, "epub") == "pdf"
     assert library.best_format({"formats": []}, "epub") is None
 
-def test_kepub_made_by_kobo_sync_is_downloadable():
-    """F26/C12: CWA stores the KEPUB it makes on Kobo sync as a real format (file <name>.kepub)."""
+def test_existing_kepub_format_is_downloadable():
+    """F26/C12: a KEPUB already in the library is a real Calibre format (file <name>.kepub) and
+    is served as <name>.kepub.epub. The behaviour is right; only the old premise was wrong —
+    Kobo sync has never made one (CWA v4.0.6 cannot find its own kepubify binary), so the only
+    way a library holds one is an admin pre-generating it with Convert Library."""
     add_calibre_book(1, "Kobo Book", "Ann", tags=["owner:alice"], formats=("epub", "kepub"))
     f = library.file_for("alice", 1, "kepub")
     assert f and f["path"].endswith("Kobo Book - Ann.kepub") and f["filename"] == "Kobo Book - Ann.kepub.epub"
@@ -744,13 +747,18 @@ class FakeResp:
     def json(self): return self._d
     def raise_for_status(self): pass
 
-def test_gutenberg_adapter_prefers_epub_and_mirror(monkeypatch):
-    data = {"results": [{"id": 1342, "title": "Pride and Prejudice", "authors": [{"name": "Austen, Jane"}],
-                         "formats": {"application/epub+zip": "https://www.gutenberg.org/ebooks/1342.epub3.images", "text/plain": "x"}},
-                        {"id": 1, "title": "No epub", "authors": [], "formats": {"text/plain": "x"}}]}
-    monkeypatch.setattr(fetchers, "_get", lambda url, **kw: FakeResp(data))
+PG_SEARCH_FEED = b"""<feed xmlns="http://www.w3.org/2005/Atom">
+<entry><id>https://www.gutenberg.org/ebooks/subjects/search.opds/?query=pride</id><title>Subjects</title></entry>
+<entry><id>https://www.gutenberg.org/ebooks/1342.opds</id><title>Pride and Prejudice</title>
+ <content type="text">Jane Austen</content></entry></feed>"""
+
+def test_gutenberg_adapter_derives_the_epub_and_honours_a_mirror(monkeypatch):
+    """Gutenberg's own OPDS search replaced gutendex.com (see test_round4). It is a navigation
+    feed, so the EPUB address comes from the book id rather than a second request per hit."""
+    monkeypatch.setattr(fetchers, "_get", lambda url, **kw: FakeResp(content=PG_SEARCH_FEED))
     out = fetchers.gutenberg("pride")
     assert len(out) == 1 and out[0]["download_url"].endswith("1342.epub3.images") and out[0]["identifier"] == "gutenberg:1342"
+    assert out[0]["title"] == "Pride and Prejudice" and out[0]["author"] == "Jane Austen"
     assert fetchers.url_allowed("gutenberg", out[0]["download_url"])
     monkeypatch.setattr(config, "GUTENBERG_MIRROR", "https://mirror.local/")
     assert fetchers.gutenberg("pride")[0]["download_url"].startswith("https://mirror.local/ebooks/")

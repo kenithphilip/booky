@@ -25,7 +25,7 @@
 <div class="row" style="flex:none">
 <span class="badge">{{ source_label(r.source) }}</span>
 <span class="badge">{{ 'audiobook' if r.kind=='audio' else r.format }}</span>
-{% if r.dupe %}<span class="badge" title="Already in the library">in library</span>{% endif %}
+{% if r.dupe %}<span class="badge" title="{{ {'isbn': 'Same ISBN as a book you have', 'uuid': 'This exact file is already in your library', 'title+author': 'Same title and author as a book you have', 'title': 'Same title as a book you have (no author to compare)'}.get(r.dupe.how, 'Already in the library') }}">{{ 'maybe in library' if r.dupe.how == 'title' else 'in library' }}</span>{% endif %}
 <form method="post" action="{{url_for('make_request')}}">{{ csrf_field() }}
 {% for k in ['kind','source','identifier','title','author','download_url'] %}
 <input type="hidden" name="{{k}}" value="{{ r[k] }}">{% endfor %}

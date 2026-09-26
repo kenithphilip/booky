@@ -52,3 +52,5 @@ fi
 
 printf '%s\n' "$new" > "$STATE"
 echo "ufw: web ports limited to $(grep -c . "$STATE") Cloudflare ranges"
+# dead-man's switch (success only: a failure already alerted through fail() above)
+"${KUMA_PUSH:-$STACK_DIR/scripts/kuma-push.sh}" cfips up "$(grep -c . "$STATE") ranges" >/dev/null 2>&1 || true

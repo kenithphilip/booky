@@ -24,7 +24,10 @@ BYPASS = {
     # stop syncing hourly), OIDC if it is ever turned on, API, sockets, streams and public feeds.
     # "/socket.io /socket.io/*" (not just the prefix) so a client that asks for the bare
     # /socket.io?EIO=4 is bypassed here too — configuration.yml.template already allows it.
-    "audio": "/login /logout /init /auth/refresh /auth/openid /auth/openid/* /api/* /socket.io /socket.io/* /hls/* /s/* /ping /status /healthcheck /public/* /feed/*",
+    # No "/s/*": ghcr.io/advplyr/audiobookshelf:2.36.1 has no route under /s (verified
+    # against Server.js and the client bundle). The share path is the client route
+    # /share/:slug, whose data comes from /public/* — see configuration.yml.template.
+    "audio": "/login /logout /init /auth/refresh /auth/openid /auth/openid/* /api/* /socket.io /socket.io/* /hls/* /ping /status /healthcheck /public/* /feed/*",
     # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback
     "request": "/intake",
     # Shelfmark: nothing bypassed

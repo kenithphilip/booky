@@ -123,8 +123,8 @@ Measured with docker stats on OrbStack arm64, app mem_limit 768m (auto heap abou
 - **Disk:** about 1.9 GB of images (1.2 GB app plus 648 MB Postgres), plus DB and covers.
 
 **Budget:** roughly 300-450 MiB resident for app plus DB, with fences of 768m + 256m ≈ 1 GiB.
-- **X4 (2c/4 GB/80 GB):** the core stack is already 1.3-1.7 GB resident, plus CWA conversion spikes and ABS scans (README.md:387-395), and the compose fences already total about 4.9 GB (docker-compose.yml). Adding about 0.4 GB resident / 1 GB fence is possible but eats most of the remaining headroom and about 2 GB of the 80 GB disk. It is in the same class as the Ephemera overlay, which the checklist says to keep off on X4 (docs/DEPLOYMENT-CHECKLIST.md:79-81).
-- **X8 (4c/8 GB/160 GB):** comfortable.
+- **X4 (2c/4 GB/80 GB) — the deployed plan.** Corrected against the round-4 measurement on the real stack (README.md, "VPS sizing"): the core stack is **≈ 1.2 GB idle and ≈ 2.2 GB peak** on the 4 GB box, not the 1.3-1.7 GB resident *plus* unbounded spikes this paragraph used to assume. So the RAM objection is weaker than it was written: about 0.4 GB resident / 1 GB fence fits in the ~1.8 GB of headroom at peak. Two objections survive and they are the ones that matter on this plan: **about 2 GB of the 80 GB disk**, which is the binding constraint, and **CPU** — a 500-book scan already costs 34-45% of one core for 85 s, and there are only two cores, one of which a CWA library conversion can occupy on its own (107.8% measured). It remains in the same class as the Ephemera overlay, which the checklist keeps off.
+- **X8 (4c/8 GB/160 GB):** comfortable, but the reason to move is disk, not memory.
 
 ## Hands-on trial (2026-09-22)
 
@@ -251,7 +251,7 @@ Ranked by what would actually bite.
 7. **[duplicates] CWA's new_record policy.** Per-user copies (README.md:165) show up in BookOrbit's duplicate detector. Merges and deletes must not be attempted; they fail on :ro.
 8. **[backups] Raw PGDATA in the snapshot.** backup.sh only snapshots SQLite (lines 18-19) and backs up all of STACK_DIR (line 45), so Postgres files would be copied live and inconsistent. Restore has no pg step. Auto-migrations on start make image rollbacks one-way without a dump.
 9. **[ops] One-maintainer project.** Bus factor 1, 441 open issues, weekly minors, a v3 major one day old. Expect breaking changes over a year of unattended running. A pinned digest and manual updates are mandatory.
-10. **[resources] RAM and disk.** About 0.4 GB RAM / 1 GB fence and about 2 GB disk. Tight on X4 alongside CWA spikes and ABS scans.
+10. **[resources] Disk and CPU, not RAM.** About 0.4 GB RAM / 1 GB fence, which the measured ≈ 1.8 GB of peak headroom on the 4 GB box absorbs; about 2 GB of the 80 GB disk, which is the binding constraint; and a scan that takes a third to a half of one of only two cores while CWA conversions want more than one.
 11. **[friction] Two logins and another password.** With the Authelia gate on, users log in to Authelia then BookOrbit (no header auth). OPDS and KOReader need separate sub-account passwords on top of the CWA password: a fourth credential set for a family.
 12. **[minor]** Phones home to GitHub for update checks by default (can be disabled). An additional AGPL attribution term was added on 2026-09-10 (no effect on private unmodified use). Device paths through Cloudflare have the same Bot Fight Mode caveat as the existing books./audio. hosts.
 
@@ -280,7 +280,7 @@ Go public (phase 2, behind the Authelia gate with the bypass list above) only if
 - the scripted account and filter flow and the pg_dump backup are implemented,
 - the project has stabilised (no major bump for a couple of months, #1186 fixed).
 
-On X4, keep it off unless Ephemera is off and memory headroom has been confirmed in real use. On X8 the RAM cost is a non-issue.
+On the deployed X4, keep it off unless Ephemera is off and there is disk to spare for its ~2 GB of images plus the database and covers — the measurement says memory is not the reason to refuse it, disk and the two cores are. The recommendation itself does not change: admin-only trial first.
 
 If it isn't worth that effort, skipping it loses nothing the family needs today.
 

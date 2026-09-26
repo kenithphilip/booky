@@ -7,11 +7,11 @@ against loopback/LAN/tailnet/link-local ranges first (a logged-in user controls 
 request), catalog credentials only ever go to the configured catalog origin, and downloads
 are capped per kind (local files too: a huge PDF must not OOM-kill the portal). Each loop
 keeps a heartbeat in HEARTBEAT for /healthz."""
-import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata, errno
+import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata, errno, hashlib
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
-import config, db, notify, abs as absapi, kindle, cwa
+import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe
 from tagger import (add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError,
                     MAX_ZIP_MEMBERS as TAG_MAX_ZIP_MEMBERS)
 
@@ -196,6 +196,44 @@ def _friendly(e):
         return "the source could not be reached; try again later"
     return str(e)[:200]
 
+def verify_download(path, req):
+    """Check a downloaded file against what the SOURCE said it would be. Returns a list of
+    reasons it does NOT match; empty means it does (or that there was nothing to check).
+
+    This is the half Readarr got wrong and the half that matters. Its scorer treated a MISSING
+    identifier as weak evidence of a match (0.1) against a WRONG one (10.0), so absent evidence
+    read as confidence and a 40 KB sample could satisfy a request for a 452-page book.
+    Here, evidence that is absent produces no verdict at all — only evidence that is present
+    and DISAGREES produces a reject."""
+    reasons = []
+    if not req:
+        return reasons
+    try:
+        actual = os.path.getsize(path)
+    except OSError:
+        return ["the downloaded file could not be read"]
+    want = req.get("expect_size")
+    if want and actual != want:
+        # a hard mismatch: archive.org states the exact byte count of the file it serves
+        reasons.append(f"size is {actual} bytes, the source said {want}")
+    for algo in ("sha1", "md5"):
+        want_hash = req.get(f"expect_{algo}")
+        if not want_hash:
+            continue
+        h = hashlib.new(algo)
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+                    _beat("queue")           # a large file must not look like a dead loop
+        except OSError as e:
+            reasons.append(f"could not checksum the file ({e.strerror or e})")
+            break
+        if h.hexdigest().lower() != str(want_hash).lower():
+            reasons.append(f"{algo} does not match what the source published")
+        break                                 # one strong hash is enough; sha1 is preferred
+    return reasons
+
 def _download(url, dest, req=None, rid=None, attempts=3):
     """Download with retry + exponential backoff. Sets a 'downloading' state so the user sees
     what is happening, and a 'retrying' state between attempts so a transient network blip
@@ -223,21 +261,29 @@ def _download(url, dest, req=None, rid=None, attempts=3):
 # ---- ebooks: stage, tag, place --------------------------------------------------------------
 _TAGGERS = {"epub": add_owner_tag, "pdf": add_owner_tag_pdf, "cbz": add_owner_tag_cbz}
 
-def _tag_or_fail(part, owner, ext, title=None, author=None):
+def _tag_or_fail(part, owner, ext, title=None, author=None, seen=None):
     """Tag the staged copy. Admins import untagged when that fails (they see everything
     anyway); for an isolated user an untagged import would be invisible to them and owned by
-    nobody, so the request fails instead of silently importing."""
+    nobody, so the request fails instead of silently importing.
+
+    `seen` is an optional dict the taggers fill with what the file says about itself (title,
+    author, language, identifiers). The portal otherwise records the FILENAME as the title and
+    "" as the author for every dropbox, Shelfmark, qBittorrent and mailed-in arrival."""
+    seen = {} if seen is None else seen
     tag = _owner_tag(owner)
     try:
         if ext == "epub":
-            add_owner_tag(part, tag)
+            found = add_owner_tag(part, tag)
         elif ext == "pdf":
             if os.path.getsize(part) > config.MAX_PDF_MB * 1024 * 1024:
                 raise ValueError(f"PDF is {os.path.getsize(part) >> 20} MB: too large to tag safely "
                                  f"(MAX_PDF_MB={config.MAX_PDF_MB})")
-            add_owner_tag_pdf(part, tag, title=title, author=author)
+            found = add_owner_tag_pdf(part, tag, title=title, author=author)
         else:
-            _TAGGERS[ext](part, tag, title=title)
+            found = _TAGGERS[ext](part, tag, title=title)
+        # what the FILE says about itself, for the caller to record. Never fatal.
+        if isinstance(found, dict):
+            seen.update({k: v for k, v in found.items() if v})
         return f"tagged {tag}"
     except Exception as e:
         if _is_admin(owner):
@@ -281,7 +327,11 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
             # container, and "tag skipped" would hand it to Calibre-Web to die on instead
             _zip_ok(part, f"this {ext.upper()}", TAG_MAX_ZIP_MEMBERS)
         if ext in _TAGGERS:
-            note = _tag_or_fail(part, owner, ext, title=title or final_base, author=author)
+            seen = {}
+            note = _tag_or_fail(part, owner, ext, title=title or final_base, author=author, seen=seen)
+            # the file's own title/author/identifiers, recorded against the request. For a
+            # dropbox or Shelfmark arrival this replaces "the filename" as the only evidence.
+            db.set_file_meta(rid, seen)
             if ext in ("epub", "pdf"):
                 note += _drm_note(part, ext)
                 # before CWA consumes the file; Amazon takes EPUB and PDF by mail
@@ -315,7 +365,16 @@ def _auto_kindle(owner, path, filename, title=None):
         u = cwa.get_user(owner)
         if not u or not u.get("kindle_mail"):
             return "; auto-Kindle skipped (no address on Devices page)"
-        return "; auto-Kindle " + kindle.send(u["kindle_mail"], path, title or filename, filename)
+        # The same daily ceiling the manual button obeys, drawn from the same counter. It
+        # protects the SMTP account, not the reader — and a provider suspension would take out
+        # Send-to-Kindle, the notification mails AND alert.sh's fallback channel together. A
+        # bulk dropbox drop is exactly the way to hit it without anyone pressing a button.
+        limit = config.KINDLE_MAX_PER_DAY
+        if limit and db.audit_count("kindle_send", owner, time.time() - 86400) >= limit:
+            return f"; auto-Kindle skipped ({limit} sent today, the daily limit)"
+        note = kindle.send(u["kindle_mail"], path, title or filename, filename)
+        db.audit("kindle_send", owner, None, f"auto: {filename}")
+        return "; auto-Kindle " + note
     except Exception as e:
         return f"; auto-Kindle failed: {str(e)[:80]}"
 
@@ -917,6 +976,18 @@ def _place_http(req):
     try:
         raw = os.path.join(tmpdir, "download.bin")
         _download(req["download_url"], raw, req=req, rid=req["id"])
+        # Verify against what the SOURCE published, before the file is tagged or imported.
+        # A mismatch is NOT silently accepted and NOT silently discarded: the row goes to
+        # needs-review with the reason, because "we got something different from what was
+        # advertised" is a decision for a person, not a retry.
+        bad = verify_download(raw, req)
+        if bad:
+            db.set_status(req["id"], "needs-review",
+                          "the download does not match what the source published: "
+                          + "; ".join(bad) + ". Nothing was imported — retry it, or dismiss it.")
+            db.audit("download_mismatch", req["owner"], None,
+                     f"#{req['id']} {req.get('title','')[:60]}: {'; '.join(bad)[:150]}")
+            return
         # ONE byte budget for the whole name: two independent 180-byte truncations added up to
         # 363 bytes, and the ingest rename then failed with ENAMETOOLONG on every retry
         base = _safe(f"{_safe(req['author'])} - {_safe(req['title'])}")
@@ -1116,20 +1187,28 @@ def _ingest_marker(owner, rid):
     return f"[{_safe(owner)}-{rid}]"
 
 def _in_calibre(marker):
-    """metadata.db knows the book: CWA imported it. The suffix survives in the file name
-    calibre stores (data.name) and, for files without metadata, in the title."""
+    """The Calibre book id for an import, or None. The ' [owner-rid]' marker survives in the
+    file name calibre stores (data.name) and, for files without metadata, in the title.
+
+    Returns the ID rather than a bool on purpose: this is the ONE moment the portal knows with
+    certainty which Calibre row belongs to which request, so it is the only free and reliable
+    join we will ever get. Callers that only care whether it imported can still treat the
+    result as truthy — id 0 does not exist in Calibre."""
     import sqlite3
     try:
-        c = sqlite3.connect(f"file:{config.CALIBRE_DB}?mode=ro", uri=True, timeout=5)
+        c = library._conn()
         try:
             like = f"%{marker}%"
-            r = c.execute("SELECT 1 FROM data WHERE name LIKE ? LIMIT 1", (like,)).fetchone() or \
-                c.execute("SELECT 1 FROM books WHERE title LIKE ? OR path LIKE ? LIMIT 1", (like, like)).fetchone()
-            return bool(r)
+            r = c.execute("SELECT book FROM data WHERE name LIKE ? LIMIT 1", (like,)).fetchone() or \
+                c.execute("SELECT id FROM books WHERE title LIKE ? OR path LIKE ? LIMIT 1", (like, like)).fetchone()
+            return int(r[0]) if r else None
         finally:
             c.close()
-    except Exception:
-        return False
+    except sqlite3.Error as e:
+        # NOT a bare except returning False: "the catalogue is unreadable" and "this book did
+        # not import" are different answers and were indistinguishable here.
+        log.warning("could not read metadata.db while reconciling %s: %s", marker, e)
+        return None
 
 IMPORT_GRACE_SECONDS = 180     # CWA normally takes seconds; this is generous
 # A row nobody has touched for this long is settled: CWA either imported it or the ingest
@@ -1197,7 +1276,9 @@ def reconcile_imports(now=None):
                 changed += 1
             continue
         if interrupted:
-            if _in_calibre(marker):
+            cid = _in_calibre(marker)
+            if cid:
+                db.link_calibre(r["id"], cid, r["owner"])
                 _finish(r["id"], "done", "imported into your library (a restart interrupted the "
                                          "request, but the file had already been handed over)")
                 changed += 1
@@ -1205,7 +1286,11 @@ def reconcile_imports(now=None):
         # An 'importing' row is only closed here when we KNOW its file reached the ingest
         # folder: either metadata.db has it, or this loop is the one that re-opened it (a row
         # that is still downloading has neither and must be left alone).
-        if r["status"] == "importing" and (_in_calibre(marker) or STILL_WAITING in detail):
+        cid = _in_calibre(marker) if r["status"] == "importing" else None
+        if cid:
+            # the one moment the request-to-Calibre mapping is certain; every later join needs it
+            db.link_calibre(r["id"], cid, r["owner"])
+        if r["status"] == "importing" and (cid or STILL_WAITING in detail):
             clean = detail.replace(f"; {STILL_WAITING}", "") or "imported into your library"
             if STILL_WAITING in detail:
                 # this loop re-opened a row that had already been reported done (and notified):
@@ -1261,6 +1346,7 @@ CHECKPOINT_EVERY = 300
 RECONCILE_EVERY = 60
 _LAST_CHECKPOINT = [0.0]
 _LAST_RECONCILE = [0.0]
+_LAST_ENRICH = [0.0]
 
 def _guarded(fn, *a):
     try:
@@ -1278,11 +1364,136 @@ def housekeeping_once(now=None):
     if now - _LAST_RECONCILE[0] >= RECONCILE_EVERY:
         _LAST_RECONCILE[0] = now
         _guarded(reconcile_imports)
+    if now - _LAST_ENRICH[0] >= ENRICH_EVERY:
+        _LAST_ENRICH[0] = now
+        _guarded(enrich_once, now)
+        _guarded(queue_device_pushes)
     if now - _LAST_CHECKPOINT[0] >= CHECKPOINT_EVERY:
         _LAST_CHECKPOINT[0] = now
         cwa.checkpoint_passive()
         _guarded(check_password_drift)
         _guarded(fail_orphaned_pending)
+
+ENRICH_EVERY = 120          # seconds between enrichment passes
+ENRICH_BATCH = 3            # books per pass: 2 cores, beside Calibre conversions
+
+def enrich_once(now=None):
+    """Fill in descriptive metadata for recently imported books, from the provider chain.
+
+    BACKGROUND ONLY, and deliberately unhurried. The first provider's cold path measured 28.4 s
+    — more than twice the search page's entire deadline — so this never runs inside a request.
+    Nobody is waiting on it: a book is readable the moment it imports, and the metadata makes
+    the portal nicer and the matching possible.
+
+    The query is title+author (plus any identifier the FILE carried, which tagger.py now hands
+    back). Identifiers are a VERIFICATION and DEDUPE key, never a query key — the release
+    protocols have no ISBN field at all."""
+    if not config.METADATA_ENABLED:
+        return 0
+    now = now or time.time()
+    done = 0
+    for r in db.needs_enrichment(ENRICH_BATCH):
+        _beat("housekeeping")                    # a slow provider must not look like a dead loop
+        query = {"title": r["file_title"] or r["title"],
+                 "author": r["file_author"] or r["author"] or "",
+                 "identifiers": db.file_ids(r["id"])}
+        key = metadata.cache_key(query)
+        if metadata.negative_cached(key, now=now):
+            # the whole chain already drew a blank on this one; re-asking three providers about
+            # it on every pass for ever is how a background job becomes a self-inflicted load
+            continue
+        try:
+            merged, trace = metadata.fetch(query, now=now)
+        except Exception:
+            log.exception("enrichment failed for request %s", r["id"])
+            continue
+        if merged:
+            db.meta_store(merged, rid=r["id"], owner=r["owner"], now=now)
+            db.meta_miss_clear(key)
+            done += 1
+        else:
+            # NOT silent: the trace says whether we asked and nobody knew, or whether every
+            # provider was stood down. Those are different problems with different fixes.
+            metadata.remember_miss(key, now=now)
+            log.info("no metadata for request %s (%s): %s",
+                     r["id"], query["title"][:60], metadata.describe_trace(trace))
+    return done
+
+PLACEHOLDER_AUTHORS = {"", "unknown", "unknown author", "anonymous"}
+
+def _calibre_current(calibre_id):
+    """Calibre's present title, authors and series for one book (read-only)."""
+    import sqlite3
+    try:
+        c = library._conn()
+        try:
+            r = c.execute("SELECT title FROM books WHERE id=?", (calibre_id,)).fetchone()
+            if not r:
+                return None
+            authors = [a for (a,) in c.execute(
+                "SELECT a.name FROM books_authors_link l JOIN authors a ON a.id=l.author "
+                "WHERE l.book=?", (calibre_id,))]
+            series = c.execute("SELECT s.name FROM books_series_link l JOIN series s "
+                               "ON s.id=l.series WHERE l.book=?", (calibre_id,)).fetchone()
+            return {"title": r[0] or "", "authors": authors, "series": series[0] if series else None}
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+def _looks_like_placeholder(calibre_title, owner, rid, request_title):
+    """True when Calibre's title is a stand-in rather than a real one: it still carries our own
+    ' [owner-rid]' ingest marker, it is the raw filename the request recorded, or it is empty.
+    Only then is a provider title allowed to REPLACE it — a real title, possibly one a family
+    member corrected by hand, is never overwritten with provider data."""
+    t = (calibre_title or "").strip()
+    if not t:
+        return True
+    if _ingest_marker(owner, rid) in t:
+        return True
+    return bool(request_title) and dedupe.norm_title(t) == dedupe.norm_title(request_title) \
+        and any(ch in request_title for ch in "._") and " " not in request_title.strip()
+
+def _title_sort(title):
+    """Calibre's convention: a leading article moves to the end ('The Hobbit' -> 'Hobbit, The')."""
+    t = (title or "").strip()
+    for art in ("The ", "A ", "An "):
+        if t.startswith(art) and len(t) > len(art):
+            return f"{t[len(art):]}, {art.strip()}"
+    return t
+
+def queue_device_pushes(limit=20):
+    """Decide what Calibre should learn from the portal's metadata, and queue it for the host.
+
+    FILL GAPS, NEVER OVERWRITE: series goes in only when Calibre has none; authors only when
+    Calibre says 'Unknown'; the title only when Calibre's is a placeholder. The owner tag is not
+    in the vocabulary at all (db.PUSH_FIELDS), so it cannot be touched from here."""
+    queued = 0
+    for c in db.push_candidates(limit):
+        cur = _calibre_current(c["calibre_id"])
+        if cur is None:
+            continue                             # unreadable right now: try again next pass
+        fields = {}
+        if _looks_like_placeholder(cur["title"], c["owner"], c["rid"], c["req_title"]):
+            fields["title"] = c["full_title"] or c["title"]
+            # calibredb leaves 'Title sort' at the OLD value (measured), so without this the
+            # book keeps sorting under its release filename in Calibre-Web
+            fields["sort"] = _title_sort(fields["title"])
+        if not cur["authors"] or all(a.strip().lower() in PLACEHOLDER_AUTHORS for a in cur["authors"]):
+            names = db.work_authors(c["work_id"])
+            if names:
+                fields["authors"] = " & ".join(names[:3])   # calibredb's own separator
+        if not cur["series"]:
+            s = db.work_series(c["work_id"])
+            if s and s.get("name"):
+                fields["series"] = s["name"]
+                if s.get("sort_position") is not None:
+                    fields["series_index"] = s["sort_position"]
+        if fields and db.queue_push(c["calibre_id"], fields, rid=c["rid"], owner=c["owner"]):
+            queued += 1
+        elif not fields:
+            db.push_nothing_needed(c["calibre_id"], rid=c["rid"], owner=c["owner"])
+    return queued
 
 def fail_orphaned_pending():
     """A request awaiting approval is never claimed, so _owner_gone never sees it: removing the
@@ -1307,12 +1518,45 @@ def _loop(name, fn, every):
 
 _OWN_PART = re.compile(r"^[0-9a-f]{32}\.part(\.tmp)?$")
 _OWN_UPLOAD = re.compile(r"^\.[0-9a-f]{32}\.uploading$")
+_OWN_INCOMING = re.compile(r"^\.incoming-[0-9a-f]{32}$")
+
+def _sweep_audio_incoming():
+    """library/audiobooks/.incoming-<uuid32> — a half-placed audiobook.
+
+    _place_audio_dir and _place_audio_file rename the source INTO one of these and rename it
+    out again when the book is complete; the put-it-back cleanup lives in an `except
+    BaseException`, which a SIGKILL never runs. The OOM killer, an expiring stop_grace_period
+    and the 04:30 automatic reboot all kill this process that way, and nothing else on the box
+    knew the shape: sweep_orphans globbed only .part/.uploading/staging-tmp and
+    scripts/disk-watch.sh reaps downloads/incomplete, library/staging and library/ingest/*.part.
+    So each interrupted import leaked its own full size (a dropped folder is uncapped) as a
+    hidden directory that shows up in no Audiobookshelf scan, no request row, no /admin and no
+    self-test — but in every nightly restic snapshot. The reader, whose source folder is gone,
+    simply drops it again, and the next kill makes a second copy.
+
+    Swept here for the same reason as the rest: at worker start nothing of ours is in flight.
+    The size is logged because a leak nobody can see is the whole problem."""
+    removed = 0
+    for p in glob.glob(os.path.join(config.AUDIO_DIR, ".incoming-*")):
+        if not _OWN_INCOMING.match(os.path.basename(p)):
+            continue
+        if not os.path.isdir(p) or os.path.islink(p):
+            continue
+        mb = _tree_size(p) / 2**20
+        shutil.rmtree(p, ignore_errors=True)
+        if os.path.exists(p):
+            log.warning("could not remove orphaned audiobook import %s", p)
+            continue
+        log.warning("removed orphaned audiobook import %s (%.1f MB reclaimed)", p, mb)
+        removed += 1
+    return removed
 
 def sweep_orphans():
     """At worker start nothing of ours is in flight (one process), so every partial file we
-    own is an orphan of a crash or OOM kill: /ingest/<uuid>.part, dropbox .<uuid>.uploading and
-    the download temp dirs under /staging/tmp. They are deleted whatever their age (they are
-    copies; a quarantine would only fill the disk the way the crash loop did)."""
+    own is an orphan of a crash or OOM kill: /ingest/<uuid>.part, dropbox .<uuid>.uploading,
+    the download temp dirs under /staging/tmp and the half-placed audiobooks under
+    /audiobooks/.incoming-<uuid>. They are deleted whatever their age (they are copies; a
+    quarantine would only fill the disk the way the crash loop did)."""
     removed = 0
     for p in glob.glob(os.path.join(config.INGEST_DIR, "*.part*")) + \
             glob.glob(os.path.join(config.DROPBOX_DIR, "*", ".*.uploading")):
@@ -1331,7 +1575,7 @@ def sweep_orphans():
         for n in os.listdir(tmp):
             shutil.rmtree(os.path.join(tmp, n), ignore_errors=True)
             removed += 1
-    return removed
+    return removed + _sweep_audio_incoming()
 
 def queue_once():
     """Claim and process one queued request. True if there was one."""

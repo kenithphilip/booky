@@ -61,6 +61,23 @@ if [ -f "$r/.backup-snap/MANIFEST" ]; then
   done < "$r/.backup-snap/MANIFEST"
 fi
 
+# The host files backup.sh stages under .backup-snap/host/ are the ones NOTHING regenerates on a
+# rebuild: bookstack.sh's restore re-renders fail2ban, the systemd units and the cron files from
+# the checkout, but sshd_config.d, sysctl.d and /etc/docker/daemon.json come from this snapshot
+# or from nowhere. Assert they are in it, so the staging cannot rot unnoticed and hand the admin
+# a "restore succeeded" on a box with no SSH, kernel or dockerd hardening.
+for h in etc/ssh/sshd_config.d/01-bookstack.conf etc/docker/daemon.json etc/sysctl.d/90-bookstack.conf; do
+  [ -f "/${h}" ] || continue                      # only assert what this server actually has
+  [ -f "$r/.backup-snap/host/$h" ] && ok "host state in the snapshot: $h" \
+    || bad "/$h exists on this server but is NOT in the snapshot: a restore onto a replacement VPS would silently come up without it (scripts/backup.sh host-state loop)"
+done
+# The other half of the same loop: it must NOT carry the keys to the repository it lives in.
+if [ -f "$r/.backup-snap/host/etc/bookstack/restic.env" ]; then
+  if grep -qE '^(RESTIC_PASSWORD|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)=..' "$r/.backup-snap/host/etc/bookstack/restic.env"; then
+    bad "the snapshot's copy of restic.env still holds the repository password or the object-store keys: every snapshot contains the key that decrypts it and the credentials that can delete it"
+  else ok "the snapshot's restic.env is the redacted stub (no password, no object-store keys)"; fi
+fi
+
 # a full restore goes in place into the stack directory: it needs the snapshot's size in free space
 need=$(restic "${R[@]}" stats latest --mode restore-size --json 2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin)["total_size"])' 2>/dev/null)
 disk=$(df -Pk "$STACK_DIR" 2>/dev/null | awk 'NR==2{print $2}')

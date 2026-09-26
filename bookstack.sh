@@ -13,7 +13,7 @@ CF_API=https://api.cloudflare.com/client/v4
 BOOKSTACK_VERSION=4
 # Image pins (looked up 2026-09-22). Seeded into .env by Configure; changed by Operations -> Update.
 IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.6 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
-IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.3.7 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
+IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.3.15 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
 IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
 
@@ -101,7 +101,11 @@ cf()     { curl -fsS -m 30 --retry 2 --retry-connrefused -X "$1" "$CF_API$2" -H 
 # qBittorrent is opt-in (compose profile "torrents", Library -> Torrents): every compose call
 # that starts or stops the stack carries the profile while it is enabled.
 torrents_on(){ [ "$(envget TORRENTS_ENABLED)" = true ]; }
-compose_profiles(){ if torrents_on; then printf '%s\n' --profile torrents; fi; }
+# FlareSolverr (compose profile "solver") is shared: Shelfmark uses it when FLARESOLVERR_ENABLED,
+# Ephemera always needs it. It runs while either one wants it.
+solver_on(){ [ "$(envget FLARESOLVERR_ENABLED)" = true ] || [ "$(envget EPHEMERA_ENABLED)" = true ]; }
+compose_profiles(){ if torrents_on; then printf '%s\n' --profile torrents; fi
+  if solver_on; then printf '%s\n' --profile solver; fi; }
 compose(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose ${p[@]+"${p[@]}"} "$@"); }
 composeA(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.authelia.yml ${p[@]+"${p[@]}"} "$@"); }
 composeE(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.ephemera.yml ${p[@]+"${p[@]}"} "$@"); }
@@ -246,10 +250,11 @@ copy_code_trees(){ # repo -> $STACK_DIR: code, templates and scripts (never live
   cp -f "$SRC_DIR/caddy/Dockerfile" "$SRC_DIR/caddy/Caddyfile.template" "$STACK_DIR/caddy/"
   cp -f "$SRC_DIR/scripts/"*.sh "$SRC_DIR/authelia/inject-gate.py" "$SRC_DIR/authelia/caddy-gate.snippet" "$STACK_DIR/scripts/"
   rsync -a --delete --exclude state --exclude tests --exclude __pycache__ "$SRC_DIR/librarian/" "$STACK_DIR/librarian/"
+  rsync -a --delete --exclude __pycache__ "$SRC_DIR/monitoring/" "$STACK_DIR/monitoring/"   # kuma-bootstrap build context
   rm -rf "$STACK_DIR/configs"; cp -R "$SRC_DIR/configs" "$STACK_DIR/configs"
   # root-owned and not writable by uid 1000 (cron, systemd and this TUI run them as root)
   local d
-  for d in caddy/Dockerfile caddy/Caddyfile.template scripts configs docker-compose.yml docker-compose.authelia.yml docker-compose.ephemera.yml; do
+  for d in caddy/Dockerfile caddy/Caddyfile.template scripts configs monitoring docker-compose.yml docker-compose.authelia.yml docker-compose.ephemera.yml; do
     chown -R root:root "$STACK_DIR/$d"; chmod -R go-w "$STACK_DIR/$d"
   done
   chown -R root:root "$STACK_DIR/librarian"; chmod -R go-w "$STACK_DIR/librarian"
@@ -490,6 +495,32 @@ valid_email(){ [[ "$1" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; }
 # The domain is rendered into every Caddy site address and into the Cloudflare API URLs; a
 # character that does not belong in a hostname can only produce a config nobody can reach.
 valid_domain(){ [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]; }
+# `lib rename-user` moves the Calibre-Web account row; the portal's own owner-keyed rows
+# (requests, prefs, pw_sync, abs_tags, audit) are librarian/cwa.py's half of the same rename.
+# Four stores live OUTSIDE both databases and key on the NAME, and a rename that leaves them
+# behind is silent: the admin's dropbox becomes a folder the watcher no longer scans (so their own
+# uploads are never imported), an already-configured qBittorrent keeps saving into it, Authelia
+# still knows them under the old name (they pass the gate as one person and the apps as another),
+# and Ephemera's bind mount still points at the old dropbox. Every arm is best-effort and
+# independent: a rename must never be undone by one of them failing.
+rename_user_artifacts(){ # old new
+  local old="$1" new="$2" db="$STACK_DIR/library/dropbox"
+  [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ] || return 0
+  if [ -d "$db/$old" ]; then
+    if [ -d "$db/$new" ]; then      # both exist (a half-finished earlier rename): keep the new
+      find "$db/$old" -mindepth 1 -maxdepth 1 -exec mv -f {} "$db/$new/" \; >/dev/null 2>&1 || true
+      rmdir "$db/$old" >/dev/null 2>&1 || true
+    else
+      mv "$db/$old" "$db/$new" >/dev/null 2>&1 || true
+    fi
+  fi
+  install -d -o 1000 -g 1000 "$db/$new" >/dev/null 2>&1 || true
+  authelia_rename_user "$old" "$new" >/dev/null 2>&1 || true
+  if [ "$(envget EPHEMERA_OWNER)" = "$old" ]; then envset EPHEMERA_OWNER "$new" || true; fi
+  # the save path is the ADMIN's dropbox; reseed only when the admin is the one being renamed
+  if [ "$new" = "$(admin_user)" ] && torrents_on; then qbt_seed_config >/dev/null 2>&1 || true; fi
+  return 0
+}
 ensure_admin_name(){ # rename the CWA admin row to ADMIN_USER when it still has an older name (factory 'admin')
   # 0 = the admin is called ADMIN_USER now, 1 = could not tell (portal down), 2 = rename failed
   local want list src; want=$(admin_user)
@@ -498,7 +529,7 @@ ensure_admin_name(){ # rename the CWA admin row to ADMIN_USER when it still has 
   for src in "$(envget ADMIN_USER_PREV)" admin; do
     [ -n "$src" ] && [ "$src" != "$want" ] || continue
     if printf '%s' "$list" | python3 -c 'import sys,json; sys.exit(0 if any(x["name"]==sys.argv[1] and x["is_admin"] for x in json.load(sys.stdin)) else 1)' "$src" 2>/dev/null; then
-      lib rename-user "$src" "$want" >/dev/null 2>&1 && { envset ADMIN_USER_PREV ""; return 0; }
+      lib rename-user "$src" "$want" >/dev/null 2>&1 && { rename_user_artifacts "$src" "$want"; envset ADMIN_USER_PREV ""; return 0; }
       return 2                     # the old admin exists but the rename failed
     fi
   done
@@ -549,7 +580,8 @@ step_configure() {
   envdefault LIBRARIAN_SECRET "$(openssl rand -hex 32)"
   # INTAKE_TOKEN stays empty (webhook off) until Library -> Intake enables it
   for kv in SRC_GUTENBERG:true SRC_STANDARD:false SRC_ARCHIVE:true SRC_LIBRIVOX:true SRC_MYCATALOG:false TORRENTS_ENABLED:false \
-            APPROVALS_REQUIRED:false SHELFMARK_LANGUAGE:en SHELFMARK_CONCURRENCY:1 EPHEMERA_ENABLED:false AUTHELIA_ENABLED:false; do
+            APPROVALS_REQUIRED:false SHELFMARK_LANGUAGE:en SHELFMARK_CONCURRENCY:1 EPHEMERA_ENABLED:false AUTHELIA_ENABLED:false \
+            FLARESOLVERR_ENABLED:false; do
     envdefault "${kv%%:*}" "${kv##*:}"; done
   for kv in $IMG_DEFAULTS; do envdefault "${kv%%=*}" "${kv#*=}"; done
   envdefault IA_COLLECTIONS "gutenberg,opensource,americana,cdl"
@@ -722,7 +754,8 @@ The public sites will not work while SSL is not 'Full (strict)' or Authenticated
 apply_library_defaults() {
   # Secure + sane defaults inside the apps, so nothing has to be clicked in a GUI:
   # CWA: registration off, Kobo sync on, store proxy off; convert on ingest to EPUB, keep
-  # per-user copies separate (new_record), fix EPUBs for Kindle.
+  # per-user copies separate (new_record), and CWA's import-time Kindle EPUB fixer OFF (it
+  # rewrites every archive and strips the owner tag from CBZ) — see step_formats.
   local out
   out=$(lib harden 2>/dev/null) || return 1
   cwa_sql "UPDATE cwa_settings SET auto_convert=1, auto_convert_target_format='epub', auto_ingest_automerge='new_record', kindle_epub_fixer=0;" >/dev/null 2>&1 || true
@@ -750,6 +783,14 @@ apply_library_defaults() {
 install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 95 %, cleans growers (scripts/disk-watch.sh)
   mkdir -p "$ETC/bookstack"
   write_cron bookstack-disk "17 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/disk-watch.sh >/dev/null 2>&1"
+  install_metadata_push
+}
+install_metadata_push() { # every 15 min: the portal's queued metadata -> Calibre, so devices show it
+  # A host job because the portal cannot do it: it mounts the library read-only and has no Docker
+  # socket, both on purpose. Output goes to the journal (logger), not /dev/null: this is the job
+  # that alerts if a write ever changes a book's owner tag, and its routine output is how an admin
+  # confirms it is running at all.
+  write_cron bookstack-metapush "*/15 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/metadata-push.sh 2>&1 | logger -t bookstack-metapush"
 }
 # Loop until the factory admin/admin123 is gone. Cancel generates a random password (shown in
 # the summary): there is no path that leaves the default live behind a public hostname.
@@ -790,7 +831,7 @@ step_deploy() {
   clear; echo "Building images and starting containers (first run takes a few minutes)..."
   # BUILD_VERSION is baked into the images (compose build arg, default "dev"); the portal
   # reports it on /healthz and Self-test compares it with $STACK_DIR/.version (J03).
-  BUILD_VERSION="$(build_version)" compose build --pull caddy librarian || { msg "Image build failed (caddy/librarian). See the output above; nothing was started."; return 1; }
+  BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap || { msg "Image build failed (caddy/librarian/kuma-bootstrap). See the output above; nothing was started."; return 1; }
   compose pull --ignore-buildable || { msg "Image pull failed. Check the network / registry and run Deploy again."; return 1; }
   # Caddy (the only thing that listens publicly) starts LAST: after the admin password is
   # set and Audiobookshelf has its root user, never before.
@@ -803,7 +844,8 @@ step_deploy() {
   fi
   compose up -d librarian shelfmark || { msg "The portal or Shelfmark failed to start. Operations -> Logs shows why."; return 1; }
   [ "$(envget AUTHELIA_ENABLED)" = "true" ] && { composeA up -d authelia || { msg "Authelia failed to start."; return 1; }; }
-  [ "$(envget EPHEMERA_ENABLED)" = "true" ] && { composeE up -d ephemera flaresolverr || echo "(Ephemera did not start; see Operations -> Logs)"; }
+  solver_on && { compose up -d flaresolverr || echo "(FlareSolverr did not start; see Operations -> Logs)"; }
+  [ "$(envget EPHEMERA_ENABLED)" = "true" ] && { composeE up -d ephemera || echo "(Ephemera did not start; see Operations -> Logs)"; }
   echo "Waiting for the portal..."; wait_for http://127.0.0.1:8090/healthz 45 || true
   sleep 5
   prune_shelfmark_placeholder    # J35: drop Shelfmark's empty "{User}" template folder
@@ -817,6 +859,13 @@ step_deploy() {
   compose up -d caddy || { msg "Caddy failed to start. Operations -> Logs -> caddy."; return 1; }
   apply_caddy || true     # an already-running Caddy is not recreated by `up`: validate + reload the new file
   install_disk_watch
+  install_postboot_unit   # the unattended 04:30 reboot needs checking even without restic configured
+  install_selftest_timer  # ...and every hour after it, pushed to Kuma
+  # Monitoring is set up as the LAST step, once everything it watches is running: Kuma gets its
+  # admin account, notification channels and monitors without anyone opening its web UI.
+  # Never fatal: a stack that is up must not be reported as a failed Deploy because Kuma lagged.
+  echo "Configuring Uptime Kuma (monitors, alert channels, reboot window)..."
+  local monline; setup_monitoring || true; monline="$MON_NOTE"
   local privline="https://monitor.$d  (Uptime Kuma)" qline=""
   if torrents_on; then
     qpw=$(docker logs qbittorrent 2>&1 | grep -oE 'temporary password.*: *[A-Za-z0-9]+' | tail -1 | awk '{print $NF}')
@@ -838,10 +887,11 @@ Logins:
   $(admin_user) (portal / Calibre-Web / Shelfmark): $adminline
   $absnote
 $qline
+Monitoring: $monline
 
 Already applied for you: public registration OFF, Kobo sync ON, convert-to-EPUB on import,
 per-user copies kept separate, CWA's Kindle EPUB fixer OFF (the portal applies the Kindle fixes when it mails a book; on import the fixer would strip the owner tag from comics), CWA's duplicate file copies OFF,
-hourly disk watchdog (alerts at 85 %, stops downloaders at 95 %).
+hourly disk watchdog (alerts at 85 %, stops downloaders at 95 %), hourly self-test (pushed to Kuma).
 
 Next: Users & devices -> Add user (isolated account + Kobo link + ABS login in one go),
 Library -> Mail for Send-to-Kindle from the portal, Install -> Backups, Install -> Alerts, Operations -> Self-test."
@@ -878,8 +928,11 @@ write_restic_env() { # prompts for repository / password / S3 keys; writes resti
   local back; back=$(bash -c 'set -a; . "$1"; printf "%s" "$RESTIC_PASSWORD"' _ "$new")
   [ "$back" = "$rpw" ] || { rm -f "$new"; msg "Internal error: the backup password did not round-trip through restic.env. Nothing saved."; return 1; }
 }
-install_backup_units() { # backup nightly at 01:00 (before the 04:30 reboot window), restore test on the 1st at 13:00 (never
-  # overlapping the backup's repository lock), both alert on failure
+POSTBOOT_LOG_REL=.postboot-selftest.log   # written by the post-boot unit; read by postboot_last
+# The OnFailure= target of every bookstack unit. Written by each installer that references it:
+# it used to exist only once backups were configured, so on an install without restic the
+# post-boot unit's OnFailure= pointed at a unit that did not exist, and failed silently.
+write_alert_template() {
   local u="$ETC/systemd/system"; mkdir -p "$u"
   cat > "$u/bookstack-alert@.service" << UNIT
 [Unit]
@@ -888,6 +941,12 @@ Description=Bookstack alert for %i
 Type=oneshot
 ExecStart=$STACK_DIR/scripts/alert.sh 'Bookstack: %i FAILED' 'see: journalctl -u bookstack-%i' high
 UNIT
+}
+install_backup_units() { # backup nightly at 01:00 (before the 04:30 reboot window), restore test on the 1st at 13:00 (never
+  # overlapping the backup's repository lock), both alert on failure; plus the post-reboot
+  # self-test that proves the stack actually came back from the 04:30 unattended-upgrades reboot
+  local u="$ETC/systemd/system"; mkdir -p "$u"
+  write_alert_template
   cat > "$u/bookstack-backup.service" << UNIT
 [Unit]
 Description=Bookstack encrypted backup
@@ -924,7 +983,207 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
+  install_postboot_unit
   systemctl daemon-reload && systemctl enable --now bookstack-backup.timer bookstack-restore-test.timer
+}
+# step_system sets unattended-upgrades Automatic-Reboot at 04:30: the one scheduled event that
+# restarts every container while nobody is watching. scripts/selftest.sh otherwise runs only from
+# the TUI and at the end of an Update, so a stack that never came back stayed silent until
+# somebody tried to read a book.
+# Installed by install_backup_units AND by Deploy, next to install_disk_watch: an admin who never
+# configures restic still gets the one check that runs unattended.
+install_postboot_unit() {
+  local u="$ETC/systemd/system"; mkdir -p "$u"
+  write_alert_template
+  # The wrapper is generated here, beside restic.env and disk.state, rather than living in
+  # $STACK_DIR/scripts: it bakes in STACK_DIR the same way the unit files do, and
+  # copy_code_trees does not own it.
+  local pb="$ETC/bookstack/postboot.sh"; mkdir -p "$ETC/bookstack"
+  { printf '#!/usr/bin/env bash\nSTACK_DIR=%q\n' "$STACK_DIR"; cat << 'PB'
+# Generated by bookstack.sh (install_postboot_unit) — rewritten on every run, do not edit.
+# Runs once per boot from bookstack-postboot.service.
+set -uo pipefail
+PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+export STACK_DIR                    # selftest.sh and alert.sh both read it from the environment
+LOG="$STACK_DIR/.postboot-selftest.log"
+ALERT="$STACK_DIR/scripts/alert.sh"
+# CWA's healthcheck has a 120 s start period and ABS 60 s. selftest.sh deliberately only WARNS
+# for a container still inside its start period, so running too early turns a real failure into
+# a warning nobody reads. Wait for the containers to settle instead of sleeping a fixed time: a
+# healthy container reports healthy long before its start period is over. Nothing running at all
+# (Docker never came up) falls through the deadline and is reported by the self-test itself.
+# "something is running and nothing says 'starting'" is NOT enough: caddy and uptime-kuma carry no
+# healthcheck, so in the window after dockerd has restarted the first restart:unless-stopped
+# container but before calibre-web and audiobookshelf exist, that test is already true — and the
+# self-test then reports the containers that have not started yet as FAILED, which is an alert
+# after every healthy 04:30 reboot. Wait for the core set to be PRESENT as well. Optional
+# containers (qbittorrent, ephemera) are left out: they are not always deployed.
+WAIT=${POSTBOOT_WAIT:-900}; STEP=${POSTBOOT_SLEEP:-15}
+CORE=${POSTBOOT_CORE:-"caddy calibre-web audiobookshelf librarian shelfmark"}
+# disk-watch.sh stops shelfmark when the disk latches, and a container stopped that way does not
+# come back under restart:unless-stopped. Waiting for it would burn the whole deadline before the
+# self-test ran at all — 15 minutes late for an alert about a box that is already degraded. The
+# self-test still reports the stopped container, so dropping it here hides nothing.
+[ "$(grep -E '^paused=' /etc/bookstack/disk.state 2>/dev/null | tail -1 | cut -d= -f2)" = 1 ] \
+  && CORE=$(printf '%s\n' $CORE | grep -vx shelfmark | tr '\n' ' ')
+deadline=$(( $(date +%s) + WAIT ))
+while :; do
+  names=$(docker ps --format '{{.Names}}' 2>/dev/null)
+  missing=0
+  for c in $CORE; do printf '%s\n' "$names" | grep -qx -- "$c" || missing=1; done
+  st=$(for c in $(docker ps -q 2>/dev/null); do docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null; done | grep -c '^starting$')
+  [ "$missing" -eq 0 ] && [ "${st:-0}" -eq 0 ] && break
+  [ "$(date +%s)" -ge "$deadline" ] && break
+  sleep "$STEP"
+done
+rc=0
+# One self-test at a time: the hourly timer can fire while this one is still waiting for the
+# containers. This run waits for the lock (it must run); the hourly one skips instead.
+# (Best effort: without a writable lock file or flock(1) the run simply goes ahead.)
+if { exec 9>"${SELFTEST_LOCK:-/run/bookstack-selftest.lock}"; } 2>/dev/null && command -v flock >/dev/null; then flock -w 900 9 || true; fi
+# Publish 'killed' BEFORE the self-test runs. Without this, a run that systemd SIGTERMs at
+# TimeoutStartSec (a hung selftest.sh is one of the failure modes this unit exists for) never
+# reaches the mv below, so $LOG still holds the PREVIOUS boot's result and every menu reports
+# the last reboot as all-clear. A stale pass is worse than no result.
+printf 'finished=%s exit=killed\n' "$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)" > "$LOG" 2>/dev/null || true
+bash "$STACK_DIR/scripts/selftest.sh" > "$LOG.tmp" 2>&1 || rc=$?
+printf 'finished=%s exit=%s\n' "$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)" "$rc" >> "$LOG.tmp"
+mv -f "$LOG.tmp" "$LOG" 2>/dev/null || true
+cat "$LOG" 2>/dev/null || true      # also into journalctl -u bookstack-postboot
+# Kuma's "Self-test (hourly)" push monitor hears about this run too (best effort; the alert
+# below is this unit's own channel and does not depend on it)
+if [ "$rc" = 0 ]; then "$STACK_DIR/scripts/kuma-push.sh" selftest up "post-reboot: all checks passed" || true
+else "$STACK_DIR/scripts/kuma-push.sh" selftest down "post-reboot: $rc check(s) failed: $(grep -F '[FAIL]' "$LOG" 2>/dev/null | head -1 | sed 's/^ *\[FAIL\] //')" || true; fi
+# alert.sh directly, not OnFailure=: the generic bookstack-alert@ template can only say the unit
+# failed, and after an unattended reboot WHICH checks failed is the whole message.
+if [ "$rc" != 0 ]; then
+  "$ALERT" "Bookstack: post-reboot self-test FAILED" "$rc check(s) failed after the reboot:
+
+$(grep -F '[FAIL]' "$LOG" 2>/dev/null | head -12)
+
+Full result: $LOG (or journalctl -u bookstack-postboot)" high
+fi
+exit "$rc"
+PB
+  } > "$pb"
+  chmod 755 "$pb"; chown root:root "$pb" 2>/dev/null || true
+  cat > "$u/bookstack-postboot.service" << UNIT
+[Unit]
+Description=Bookstack post-reboot self-test
+# After, never Requires: if Docker itself fails to come up this unit must still RUN and FAIL
+# loudly. A unit that is skipped sends no alert, which is exactly the silence being fixed.
+After=docker.service network-online.target
+Wants=network-online.target
+# The wrapper alerts with the failing check names, which is the message that matters. This is
+# the backstop for what the wrapper CANNOT reach: a SIGTERM at TimeoutStartSec, a missing or
+# non-executable alert.sh, a log redirect that will not open. Without it those modes are silent.
+OnFailure=bookstack-alert@post-reboot-selftest.service
+[Service]
+Type=oneshot
+# the health wait plus the self-test's own edge probes can legitimately take minutes; the
+# default 90 s start timeout would kill the unit half-way through and call it a failure
+TimeoutStartSec=1800
+ExecStart=$pb
+[Install]
+WantedBy=multi-user.target
+UNIT
+  # enabled, not --now: this unit is for the NEXT boot. Starting it here would sit in the health
+  # wait and then re-run a self-test the admin can run from Operations in a second.
+  # Both commands are idempotent, so a second Deploy or Backups run rewrites rather than doubles.
+  systemctl daemon-reload
+  systemctl enable bookstack-postboot.service >/dev/null 2>&1 || true
+}
+# Hourly self-test. The post-boot unit covers one moment a day; this covers the other 23 hours:
+# a container that dies at 14:00, an owner tag that goes missing, a certificate, a full disk.
+# Notification is Kuma's job (its "Self-test (hourly)" push monitor alerts on the change and
+# repeats once a day while red), so a failure that persists is not an alert every hour. alert.sh
+# is the fallback for when Kuma could not be told at all — Kuma down, or monitoring not set up.
+# The scheduled run skips the two probes that cost something when repeated 24 times a day:
+# the factory-password login (it counts against Calibre-Web's 40-per-day limit for that
+# username) and the remote restic query (repository transactions; the backup reports itself).
+install_selftest_timer() {
+  local u="$ETC/systemd/system" w="$ETC/bookstack/selftest-hourly.sh"; mkdir -p "$u" "$ETC/bookstack"
+  write_alert_template
+  { printf '#!/usr/bin/env bash\nSTACK_DIR=%q\n' "$STACK_DIR"; cat << 'HW'
+# Generated by bookstack.sh (install_selftest_timer) — rewritten on every run, do not edit.
+set -uo pipefail
+PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+export STACK_DIR
+LOG="$STACK_DIR/.selftest-hourly.log"
+STATE="${SELFTEST_STATE:-/etc/bookstack/selftest.state}"
+# a run already going (the post-boot one, or an admin's) makes this hour's redundant
+if { exec 9>"${SELFTEST_LOCK:-/run/bookstack-selftest.lock}"; } 2>/dev/null && command -v flock >/dev/null; then flock -n 9 || exit 0; fi
+rc=0
+SELFTEST_SCHEDULED=1 bash "$STACK_DIR/scripts/selftest.sh" > "$LOG.tmp" 2>&1 || rc=$?
+printf 'finished=%s exit=%s\n' "$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)" "$rc" >> "$LOG.tmp"
+mv -f "$LOG.tmp" "$LOG" 2>/dev/null || true
+first=$(grep -F '[FAIL]' "$LOG" 2>/dev/null | head -1 | sed 's/^ *\[FAIL\] //')
+if [ "$rc" = 0 ]; then st=up; m="all checks passed"; now=pass; else st=down; m="$rc check(s) failed: $first"; now=fail; fi
+prev=$(cat "$STATE" 2>/dev/null || echo pass)
+printf '%s\n' "$now" > "$STATE" 2>/dev/null || true
+if ! "$STACK_DIR/scripts/kuma-push.sh" selftest "$st" "$m"; then
+  if [ "$now" != "$prev" ]; then
+    if [ "$now" = fail ]; then
+      "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test FAILED" "$rc check(s) failed:
+
+$(grep -F '[FAIL]' "$LOG" 2>/dev/null | head -12)
+
+(Uptime Kuma could not be told, so this came directly.) Full result: $LOG" high
+    else
+      "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test passes again" "All checks pass. Full result: $LOG"
+    fi
+  fi
+fi
+exit 0
+HW
+  } > "$w"
+  chmod 755 "$w"; chown root:root "$w" 2>/dev/null || true
+  cat > "$u/bookstack-selftest.service" << UNIT
+[Unit]
+Description=Bookstack hourly self-test
+After=docker.service
+# only a crash of the wrapper itself lands here: it exits 0 after reporting a failed self-test
+OnFailure=bookstack-alert@selftest.service
+[Service]
+Type=oneshot
+TimeoutStartSec=900
+ExecStart=$w
+UNIT
+  cat > "$u/bookstack-selftest.timer" << 'UNIT'
+[Unit]
+Description=Hourly bookstack self-test
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+# no catch-up burst after downtime: the post-boot unit runs the first test after a boot
+Persistent=false
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now bookstack-selftest.timer >/dev/null 2>&1 || true
+}
+# The result of the last automatic post-reboot self-test, one line, for the menus. Returns 1 when
+# it has never run — which is also the state of every install made before this unit existed.
+postboot_last() {
+  local log="$STACK_DIR/$POSTBOOT_LOG_REL" line rc when
+  [ -s "$log" ] || return 1
+  line=$(grep -E '^finished=' "$log" 2>/dev/null | tail -1); [ -n "$line" ] || return 1
+  when=${line#finished=}; when=${when%% exit=*}; rc=${line##* exit=}
+  # 'killed' is the stamp the wrapper writes BEFORE the self-test: seeing it here means the run
+  # was killed part-way (a hung self-test, an OOM, the 1800 s timeout). Reporting that as "never
+  # ran" would hide it behind the same silence as a fresh install, so it is a FAILURE.
+  case "$rc" in
+    killed) printf '%s — KILLED part-way (hung or timed out); see journalctl -u bookstack-postboot' "$when"; return 0;;
+    ''|*[!0-9]*) return 1;;
+  esac
+  [ "$rc" = 0 ] && printf '%s — all checks passed' "$when" || printf '%s — %s check(s) FAILED' "$when" "$rc"
+}
+# Only a FAILED post-reboot self-test earns space on the first screen; a pass is visible in
+# Operations -> Self-test and in journalctl -u bookstack-postboot.
+postboot_banner() {
+  local last; last=$(postboot_last) || return 0
+  case "$last" in *FAILED*|*KILLED*) printf '\\n\\nPost-reboot self-test: %s\\nSee Operations -> Self-test.' "$last";; esac
 }
 offsite_checklist() {
   big "Keep these OFF this server" "A backup only helps if you can open it from a fresh machine. Store, in a password
@@ -1069,6 +1328,47 @@ for x in s[:40]:
 # config + databases only: everything except the library/audiobook trees (a rollback after a bad
 # update, or when the books are fine and only settings/users broke)
 RESTORE_CONFIG_PATHS=".env .backup-snap authelia caddy/data cwa/config abs/config librarian/state kuma/data shelfmark/config qbt/config"
+restore_host_files() { # $1 = .backup-snap/host  -> sets HOST_RESTORED / HOST_MANUAL
+  # Files OUTSIDE $STACK_DIR that nothing else regenerates. backup.sh stages them; before this
+  # existed, step_restore restored them as inert data under .backup-snap/host/ and nothing ever
+  # read them — so a recovery onto a replacement VPS came up serving books with the SSH
+  # hardening, the kernel hardening and dockerd's pinned publish address all MISSING, while the
+  # restore, the restore test and the self-test all reported success.
+  #
+  # Only these three. fail2ban's jail and filters, the cron.d files and the systemd units are
+  # regenerated from the checkout later in step_restore, and copying the OLD server's versions
+  # over the fresh ones would be a downgrade. /etc/bookstack/restic.env is deliberately never
+  # auto-restored: the repository credentials come from the owner's password manager, by design.
+  local host="$1" src dst
+  HOST_RESTORED=""; HOST_MANUAL=""
+  [ -d "$host" ] || return 0
+  for rel in etc/ssh/sshd_config.d/01-bookstack.conf etc/sysctl.d/90-bookstack.conf etc/docker/daemon.json; do
+    src="$host/$rel"; dst="/$rel"
+    [ -f "$src" ] || continue
+    cmp -s "$src" "$dst" 2>/dev/null && continue          # already identical: nothing to do
+    mkdir -p "$(dirname "$dst")"
+    install -o root -g root -m 0644 "$src" "$dst" 2>/dev/null || { HOST_MANUAL="$HOST_MANUAL\n  - $dst (copy failed)"; continue; }
+    HOST_RESTORED="$HOST_RESTORED\n  - $dst"
+  done
+  # sysctl is safe to apply immediately and inert until it is.
+  case "$HOST_RESTORED" in *sysctl.d*) sysctl --system >/dev/null 2>&1 || true;; esac
+  # sshd: validate BEFORE reloading. A bad drop-in that gets reloaded can lock the owner out of
+  # a machine they are in the middle of recovering, which is the worst possible moment.
+  case "$HOST_RESTORED" in *sshd_config.d*)
+    if sshd -t 2>/dev/null; then systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    else rm -f /etc/ssh/sshd_config.d/01-bookstack.conf
+         HOST_MANUAL="$HOST_MANUAL\n  - /etc/ssh/sshd_config.d/01-bookstack.conf (restored copy failed sshd -t; REMOVED, re-run Install -> System)"
+         HOST_RESTORED=$(printf '%s' "$HOST_RESTORED" | grep -v sshd_config.d || true)
+    fi;;
+  esac
+  # daemon.json is NOT applied here: restarting dockerd would kill the stack in the middle of
+  # its own restore. It takes effect at the next Docker restart, and until then a published
+  # port can still bind 0.0.0.0 — which the self-test checks explicitly.
+  case "$HOST_RESTORED" in *daemon.json*)
+    HOST_MANUAL="$HOST_MANUAL\n  - /etc/docker/daemon.json was restored but Docker was NOT restarted (that would kill this restore). Run 'systemctl restart docker' at a quiet moment, or let the 04:30 reboot do it; until then Operations -> Self-test will flag any port published on a public address.";;
+  esac
+  return 0
+}
 restore_fits(){ # snapshot-id: in-place restore needs (restore size - what is already here) + 1 GB
   local need have cur
   need=$(restic_run stats "$1" --mode restore-size --json 2>/dev/null | json 'd["total_size"]') || need=""
@@ -1132,15 +1432,22 @@ step_restore() {
   # The snapshot carried the OLD server's copy of the code and templates; this checkout is the
   # version being deployed, so the code trees come from here (data and secrets stay restored).
   make_dirs; copy_code_trees; own_data_dirs
+  # host files first: sshd/sysctl/daemon.json are regenerated by NOTHING below this line
+  restore_host_files "$STACK_DIR/.backup-snap/host"
   render_caddy_all || { msg "Restored, but the Caddyfile could not be rendered; Caddy was NOT started. Fix it (Install -> Configure) then Install -> Deploy."; return 1; }
   [ "$(envget AUTHELIA_ENABLED)" = "true" ] && render_authelia_config
   if [ -n "$(envget CF_API_TOKEN)" ]; then echo "Pointing Cloudflare DNS at this server..."; step_cloudflare || echo "(Cloudflare step failed; run Install -> Cloudflare)"; fi
   install_backup_units
+  # the snapshot carried the OLD server's post-reboot result; keeping it would put a stale
+  # "N check(s) FAILED" banner on the main menu of a machine that has not rebooted yet
+  rm -f "$STACK_DIR/$POSTBOOT_LOG_REL"
   echo "Starting the stack..."; stack_up_all || { msg "Restore copied the files but the stack did not start: Operations -> Logs."; return 1; }
   # after the stack: fail2ban's Caddy jails need caddy/data/access.log (not in the backup)
   command -v fail2ban-client >/dev/null && { render_fail2ban || true; systemctl restart fail2ban || true; }
   install_disk_watch
-  msg "Restored $SNAP_DESC and started.\n\nRun Operations -> Self-test now. Users' Kobo links, Audiobookshelf accounts and Authelia logins came back with the databases; the Tailscale IP of this server is new (monitor./dl.)."
+  msg "Restored $SNAP_DESC and started.\n\nRun Operations -> Self-test now. Users' Kobo links, Audiobookshelf accounts and Authelia logins came back with the databases; the Tailscale IP of this server is new (monitor./dl.).\
+${HOST_RESTORED:+\n\nHost files restored from the snapshot (nothing else regenerates these):$HOST_RESTORED}\
+${HOST_MANUAL:+\n\nNEEDS YOU:$HOST_MANUAL}"
   offsite_checklist
 }
 # One file (or one folder) out of a snapshot, next to the stack instead of over it. Getting a
@@ -1331,7 +1638,18 @@ step_user_remove() {
   u=$(ask "Username to remove (their books and dropbox are kept):"); [ -n "$u" ] || return 1
   yesno "Remove login '$u' from the library, portal, Audiobookshelf and Authelia?\n\nTheir books stay in the library. Requests already being worked on are failed by the portal; requests still waiting for approval stay in the queue until you deny them there." || return 0
   out=$(lib remove-user "$u" 2>&1) || { msg "Failed:\n$out"; return 1; }
-  abs_ready && absctl remove-user "$u" >/dev/null 2>&1 || true
+  # The confirmation above promises Audiobookshelf too, and an audiobook account nothing reports
+  # on is an account that keeps working: `|| true` here used to swallow both a missing ABS_TOKEN
+  # and a failed API call, and selftest.sh cannot catch it either (a leftover account for a
+  # removed user is still tag-restricted, so its assertion passes). Say what really happened.
+  local absnote
+  if ! abs_ready; then
+    absnote="\nAudiobookshelf has no API key here (Library -> Audiobookshelf), so no audiobook account was touched: if $u has one, delete it there under Settings -> Users."
+  elif absctl remove-user "$u" >/dev/null 2>&1; then
+    absnote="\nTheir Audiobookshelf account was removed too."
+  else
+    absnote="\nWARNING: their Audiobookshelf account could NOT be removed, so $u can still sign in to the audiobook app and reach every audiobook tagged owner:$u. Delete it in Audiobookshelf -> Settings -> Users (Operations -> Logs -> audiobookshelf shows why)."
+  fi
   local anote=""
   if [ -f "$STACK_DIR/authelia/users_database.yml" ] && grep -q "^  $u:" "$STACK_DIR/authelia/users_database.yml"; then
     authelia_remove_user "$u" && anote="\nTheir Authelia login was removed too." || anote="\nCould NOT remove their Authelia login: delete '$u' from $STACK_DIR/authelia/users_database.yml."
@@ -1345,7 +1663,7 @@ step_user_remove() {
   else
     smnote="\n\nWARNING: Shelfmark could NOT be restarted, so it still holds its old session key and $u can keep searching and downloading there. Operations -> Logs -> shelfmark, then run this removal again."
   fi
-  msg "Removed $u. Books tagged owner:$u remain in the library (admin sees them).$anote$smnote\n\nA browser tab already signed in to Calibre-Web or Audiobookshelf may keep working until that session expires; Security -> 'Rotate the portal session secret' ends every portal session at once if you need that now."
+  msg "Removed $u. Books tagged owner:$u remain in the library (admin sees them).$absnote$anote$smnote\n\nA browser tab already signed in to Calibre-Web or Audiobookshelf may keep working until that session expires; Security -> 'Rotate the portal session secret' ends every portal session at once if you need that now."
 }
 step_user_repair() {
   portal_up || { msg "The portal is not running."; return 1; }
@@ -1434,10 +1752,18 @@ step_formats() {
   cur=$(cwa_sql "SELECT auto_convert||'|'||auto_convert_target_format||'|'||auto_ingest_automerge||'|'||kindle_epub_fixer||'|'||IFNULL(auto_convert_retained_formats,'')||'|'||IFNULL(koreader_sync_enabled,0) FROM cwa_settings;" 2>/dev/null) || { msg "Could not read CWA settings."; return 1; }
   IFS='|' read -r _ _ c_merge _ c_keep c_ko <<< "$cur"
   # The conversion target is always EPUB: the one format every reader handles. Kobo devices get
-  # KEPUB converted on the fly by Calibre-Web's Kobo sync and the portal's download; Kindles take
-  # EPUB by mail. Other targets would break Send-to-Kindle or the Kobo path.
+  # EPUB too, not KEPUB: CWA v4.0.6 autodetects kepubify only at /opt/kepubify/kepubify-linux-
+  # {64,32}bit (cps/config_sql.py) while the image installs it at /usr/bin/kepubify, so
+  # config_kepubifypath is permanently empty and the conversion in cps/kobo.py never fires.
+  # EPUB syncs to a Kobo and reads fine; the only loss is that the device records reading
+  # position at chapter boundaries instead of paragraph-exact. Do NOT "fix" this by pointing
+  # config_kepubifypath at the real binary: sync then converts inline, the writers collide with
+  # the sync's reader and the sync dies with HTTP 500 part-way through the library while every
+  # health check stays green. docs/DECISIONS-PENDING.md records the safe order (convert the
+  # library first, with nobody syncing). Kindles take EPUB by mail. Other targets would break
+  # Send-to-Kindle or the Kobo path.
   fmt=epub
-  msg "Imported books are converted to EPUB (fixed: Kobo gets KEPUB automatically, Kindle accepts EPUB by mail). Next: whether to convert at all, and which original formats to keep next to the EPUB."
+  msg "Imported books are converted to EPUB (fixed: Kobo syncs EPUB, Kindle accepts EPUB by mail). Next: whether to convert at all, and which original formats to keep next to the EPUB."
   on=0; yesno "Convert on import? (No = files are imported as-is)" && on=1
   fix=0; yesno "Run CWA's Kindle EPUB fixer on IMPORT?\n\nRecommended: NO. The portal already applies the Kindle fixes (language, encoding) when it mails a book to a Kindle. On import the CWA fixer rewrites every archive and strips the owner tag from comics (CBZ), which then need manual tagging in CWA." && fix=1
   keep=$(ask "Original formats to KEEP alongside the EPUB (comma list, e.g. pdf,azw3; blank = EPUB only):" "$c_keep")
@@ -1534,7 +1860,12 @@ Everything that adds a book applies the tag automatically:
   - portal requests and uploads, per-user dropboxes, e-mail intake, the intake webhook
   - Shelfmark downloads (routed to the user's dropbox)
   - Ephemera downloads (routed to the configured owner's dropbox)
-Non-EPUB files are converted to EPUB on import; the tag is added to the EPUB before import.
+EPUB, PDF and CBZ carry the tag INSIDE the file and it is written before import; PDFs and
+comics (CBZ/CBR/CB7) keep their own format, other ebooks are converted to EPUB afterwards.
+MOBI, AZW3, FB2 and TXT can carry no tag at all: they import UNTAGGED and are listed under
+'Imported without an owner tag' on the portal's /admin page until an admin adds owner:<user>
+in Calibre-Web. Check that list: until then the book is invisible to the person who asked
+for it.
 
 Users & devices -> Add user sets the restriction; -> Repair re-applies it to everyone.
 Keep the duplicate policy at new_record (Library -> Formats) so users' copies stay separate.
@@ -1688,15 +2019,129 @@ Releasing an address below clears it in every jail AND deletes its Cloudflare ru
 }
 
 # ---------- 15. monitoring (Uptime Kuma) ----------
+# Kuma used to be started and then handed to the admin as a to-do list of seven monitors to type
+# in by hand, so on a real install it watched nothing. Now monitoring/kuma_bootstrap.py configures
+# it: admin account, the alert channels scripts/alert.sh already uses, a monitor per service and
+# per enabled feature, push (dead-man's switch) monitors for the scheduled jobs, and a
+# maintenance window over the nightly reboot. Re-run after every Deploy and feature toggle.
+KUMA_JOBS="selftest disk metapush cfips backup"   # push monitors; each job has KUMA_PUSH_<JOB>
+ensure_kuma_secrets() {
+  envdefault KUMA_USER "$(admin_user)" || return 1
+  # alphanumeric: it goes through .env, JSON and a whiptail box, and 24 random characters from
+  # three classes is far past Kuma's own strength check
+  [ -n "$(envget KUMA_PASS)" ] || envset KUMA_PASS "$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-24)" || return 1
+  local j; for j in $KUMA_JOBS; do
+    envdefault "KUMA_PUSH_$(printf '%s' "$j" | tr '[:lower:]' '[:upper:]')" "$(openssl rand -hex 16)" || return 1
+  done
+}
+kuma_reboot_time() { # the unattended-upgrades reboot time step_system configured, else 04:30
+  local t; t=$(grep -hoE '^Unattended-Upgrade::Automatic-Reboot-Time +"[0-9]{1,2}:[0-9]{2}"' \
+    "$ETC/apt/apt.conf.d/50unattended-upgrades" 2>/dev/null | grep -oE '[0-9]{1,2}:[0-9]{2}' | tail -1) || t=""
+  printf '%s' "${t:-04:30}"      # (no match is grep exit 1: under pipefail + errexit that ended Deploy)
+}
+kuma_config() { # the bootstrap's JSON input on stdout — secrets included, so only ever piped
+  local bind; bind=$(envget BIND_IP); bind="${bind:-$(envget PUBLIC_IP)}"
+  # a push monitor only for a job that is actually scheduled here: an unscheduled job would
+  # read as "missed its heartbeat" forever
+  local ps="" pd="" pm="" pc="" pb=""
+  [ -f "$ETC/systemd/system/bookstack-selftest.timer" ] && ps=$(envget KUMA_PUSH_SELFTEST)
+  [ -f "$ETC/cron.d/bookstack-disk" ] && pd=$(envget KUMA_PUSH_DISK)
+  [ -f "$ETC/cron.d/bookstack-metapush" ] && pm=$(envget KUMA_PUSH_METAPUSH)
+  [ -f "$ETC/cron.d/bookstack-cfips" ] && pc=$(envget KUMA_PUSH_CFIPS)
+  [ -f "$(restic_env)" ] && pb=$(envget KUMA_PUSH_BACKUP)
+  KC_USER="$(envget KUMA_USER)" KC_PASS="$(envget KUMA_PASS)" KC_DOMAIN="$(envget DOMAIN)" KC_BIND="$bind" \
+  KC_TOR="$(envget TORRENTS_ENABLED)" KC_EPH="$(envget EPHEMERA_ENABLED)" KC_AUTH="$(envget AUTHELIA_ENABLED)" \
+  KC_FS="$(solver_on && echo true)" KC_REBOOT="$(kuma_reboot_time)" \
+  KC_PS="$ps" KC_PD="$pd" KC_PM="$pm" KC_PC="$pc" KC_PB="$pb" \
+  KC_HOOK="$(envget NOTIFY_WEBHOOK)" KC_FMT="$(envget NOTIFY_WEBHOOK_FORMAT)" KC_TO="$(envget ADMIN_EMAIL)" \
+  KC_SH="$(envget SMTP_HOST)" KC_SP="$(envget SMTP_PORT)" KC_SS="$(envget SMTP_SECURITY)" \
+  KC_SU="$(envget SMTP_USER)" KC_SW="$(envget SMTP_PASS)" KC_SF="$(envget SMTP_FROM)" \
+  python3 -c '
+import json, os
+e = lambda k: os.environ.get(k, "")
+on = lambda k: e(k) == "true"
+smtp = {"host": e("KC_SH"), "port": e("KC_SP") or "587", "security": e("KC_SS") or "starttls",
+        "user": e("KC_SU"), "password": e("KC_SW"), "from": e("KC_SF")} if e("KC_SH") else None
+print(json.dumps({"url": "http://127.0.0.1:3001", "user": e("KC_USER"), "password": e("KC_PASS"),
+  "domain": e("KC_DOMAIN"), "bind_ip": e("KC_BIND"), "reboot_time": e("KC_REBOOT"),
+  "features": {"torrents": on("KC_TOR"), "ephemera": on("KC_EPH"), "authelia": on("KC_AUTH"), "flaresolverr": on("KC_FS")},
+  "push": {k: e(v) for k, v in (("selftest", "KC_PS"), ("disk", "KC_PD"), ("metapush", "KC_PM"),
+                                ("cfips", "KC_PC"), ("backup", "KC_PB")) if e(v)},
+  "notify": {"webhook": e("KC_HOOK"), "format": e("KC_FMT") or "auto", "to": e("KC_TO"), "smtp": smtp}}))'
+}
+# setup_monitoring -> 0 configured | 1 failed | 2 Kuma has an account that is not ours.
+# Never prompts (Deploy calls it); sets MON_NOTE to one line saying what happened.
+setup_monitoring() {
+  MON_NOTE=""
+  local d out rc=0; d=$(envget DOMAIN)
+  ensure_kuma_secrets || { MON_NOTE="could not write the Kuma credentials to $ENV_FILE (disk full?)"; return 1; }
+  compose up -d uptime-kuma >/dev/null 2>&1 || { MON_NOTE="Uptime Kuma did not start (Operations -> Logs -> uptime-kuma)"; return 1; }
+  wait_for http://127.0.0.1:3001 90 || { MON_NOTE="Uptime Kuma is not answering on 127.0.0.1:3001 (Operations -> Logs -> uptime-kuma), so it was not configured; run Operations -> Monitoring once it is up"; return 1; }
+  docker image inspect bookstack/kuma-bootstrap:local >/dev/null 2>&1 || compose build kuma-bootstrap >/dev/null 2>&1 \
+    || { MON_NOTE="the kuma-bootstrap image could not be built (compose build kuma-bootstrap)"; return 1; }
+  out=$(kuma_config | compose run --rm -T kuma-bootstrap 2>/dev/null | tail -1) || rc=$?
+  local ok added upd del mons chans err code
+  ok=$(printf '%s' "$out" | json 'd.get("ok")') || ok=""
+  if [ "$ok" != True ]; then
+    err=$(printf '%s' "$out" | json 'd.get("error") or ""') || err=""
+    code=$(printf '%s' "$out" | json 'd.get("code") or ""') || code=""
+    MON_NOTE="Kuma was NOT configured: ${err:-no answer from the bootstrap (exit $rc)}"
+    [ "$code" = credentials ] && return 2
+    return 1
+  fi
+  mons=$(printf '%s' "$out" | json 'd.get("monitors")')
+  added=$(printf '%s' "$out" | json 'len(d.get("added") or [])')
+  upd=$(printf '%s' "$out" | json 'len(d.get("updated") or [])')
+  del=$(printf '%s' "$out" | json 'len(d.get("deleted") or [])')
+  chans=$(printf '%s' "$out" | json '", ".join(n.replace("bookstack: ", "") for n in d.get("notifications") or []) or "NONE"')
+  envset KUMA_BOOTSTRAP_AT "$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)" || true
+  MON_NOTE="$mons monitors at https://monitor.$d (+$added ~$upd -$del this run), alerts via: $chans; login '$(envget KUMA_USER)', password under Operations -> Monitoring"
+  [ "$chans" = NONE ] && MON_NOTE="$MON_NOTE. NO alert channel: Kuma can show problems but tell nobody (Install -> Alerts, then Operations -> Monitoring)"
+  return 0
+}
+# after a feature toggle: add/remove that feature's monitor. Only once monitoring was set up at
+# least once (otherwise Deploy / Operations -> Monitoring will do it), and never fatal.
+monitoring_refresh() {
+  [ -n "$(envget KUMA_BOOTSTRAP_AT)" ] || return 0
+  setup_monitoring >/dev/null 2>&1 || true
+}
 step_monitoring() {
-  local d; d=$(envget DOMAIN)
-  # Kuma is what tells the admin when something ELSE breaks: a page of setup instructions for a
-  # container that never started is a monitoring blind spot, not a cosmetic bug.
-  compose up -d uptime-kuma >/dev/null 2>&1 \
-    || { msg "Uptime Kuma did not start (Operations -> Logs -> uptime-kuma). Nothing was changed."; return 1; }
-  wait_for http://127.0.0.1:3001 20 \
-    || { msg "Uptime Kuma was started but is not answering on http://127.0.0.1:3001 yet, so https://monitor.$d will not load. Give it a minute and try again; if it stays down, Operations -> Logs -> uptime-kuma."; return 1; }
-  msg "Uptime Kuma runs at https://monitor.$d (Tailscale only). It uses the host network, so loopback monitors work.\n\nOpen it, create the admin account, then add HTTP(s) monitors for:\n  https://books.$d   https://audio.$d\n  https://request.$d https://shelf.$d\n  http://127.0.0.1:8090/healthz    http://127.0.0.1:8084/api/health\n  http://127.0.0.1:8084/api/auth/check  (keyword monitor: \"cwa\" = Shelfmark still uses library logins)\nAdd a notification (ntfy/email/Telegram) so a dead container or expired cert pings you.\n\nKuma runs ON this server, so it cannot tell you when the whole VPS is down: add a free external check too (healthchecks.io via Backups' ping URL, or UptimeRobot on https://request.$d)."
+  local d rc=0 u p; d=$(envget DOMAIN)
+  clear; echo "Configuring Uptime Kuma (monitors, alert channels, reboot window)..."
+  setup_monitoring || rc=$?
+  if [ "$rc" = 2 ]; then
+    yesno "Uptime Kuma already has an admin account, and the credentials bookstack holds are not it (it was set up by hand, or its password was changed).\n\nEnter that account now so bookstack can manage the monitors? Your own monitors are never touched; only the ones bookstack creates." || { msg "Monitoring left as it is. $MON_NOTE"; return 1; }
+    u=$(ask "Uptime Kuma username:" "$(envget KUMA_USER)") || return 1
+    p=$(askpw "Uptime Kuma password for '$u':") || return 1
+    [ -n "$u" ] && [ -n "$p" ] || { msg "Nothing entered; nothing changed."; return 1; }
+    envset KUMA_USER "$u"; envset KUMA_PASS "$p"
+    rc=0; setup_monitoring || rc=$?
+  fi
+  [ "$rc" = 0 ] || { msg "$MON_NOTE"; return 1; }
+  # The one check Kuma cannot make from ON this server. Every self-test (hourly, and after each
+  # reboot) GETs <url> when all checks pass and <url>/fail when not, so a healthchecks.io-style
+  # check with a ~2 h period goes red both for a failing stack and for a box that is gone.
+  local hp; hp=$(ask "Optional: external dead-man's-switch URL for the self-test (e.g. a free healthchecks.io check, period 1 hour, grace 1 hour). Every self-test pings it; silence means the whole server is down. Blank = none." "$(envget HEALTH_PING_URL)") || hp=$(envget HEALTH_PING_URL)
+  case "$hp" in ""|https://*) envset HEALTH_PING_URL "$hp";; *) msg "'$hp' is not an https:// URL; HEALTH_PING_URL left as it was."; hp=$(envget HEALTH_PING_URL);; esac
+  big "Monitoring" "Uptime Kuma: https://monitor.$d  (Tailscale only)
+  user:     $(envget KUMA_USER)
+  password: $(envget KUMA_PASS)
+  (kept in $ENV_FILE as KUMA_USER / KUMA_PASS; change it in Kuma and enter it here again)
+
+$MON_NOTE
+
+What it watches, every minute unless noted: the portal, Calibre-Web, Audiobookshelf (still
+initialised), Shelfmark (and that it still demands library logins), Caddy's public listener,
+the public path through Cloudflare (every 5 min), plus each optional service that is on.
+Dead-man's switches: the hourly self-test, the disk watchdog, the metadata push, the
+Cloudflare IP refresh and the nightly backup each report in; silence past their schedule
+is an alert. The nightly reboot is a maintenance window, not an alert.
+
+Monitors you add yourself in Kuma are left alone. Bookstack's own are put back to spec on
+every Deploy (and when a feature is switched on or off).
+
+Kuma runs ON this server, so it cannot tell you the whole VPS is down.
+External check (HEALTH_PING_URL, pinged by every self-test): ${hp:-NOT SET — run this entry again to add one}"
 }
 
 # ---------- 16. Cloudflare Access (guide) ----------
@@ -1803,6 +2248,7 @@ step_authelia() {
   restart_portal || pnote="\n\nNOTE: the portal could not be restarted, so its /admin page still offers 'Add a user'. A user added there would have NO Authelia login and could not sign in anywhere — add users from Users -> Add here until the portal is back (Operations -> Logs -> librarian)."
   local mailnote="Enrolment and reset codes are e-mailed through your SMTP server (Library -> Mail)."
   [ -n "$(envget SMTP_HOST)" ] || mailnote="No SMTP is configured, so enrolment/reset codes are NOT e-mailed: they are written to $STACK_DIR/authelia/notification.txt on this server (read it with: cat $STACK_DIR/authelia/notification.txt). Set up Library -> Mail to e-mail them instead."
+  monitoring_refresh
   msg "Authelia enabled and the gate is live.$pnote\n\nTEST NOW: open https://books.$(envget DOMAIN) — you should meet the Authelia login before the app.\n\nUsers log in at https://auth.$(envget DOMAIN) and enrol TOTP or a passkey on first login. $mailnote\n\nIf anything misbehaves, 'Authelia: disable' removes the gate immediately."
 }
 step_authelia_off() {
@@ -1813,6 +2259,7 @@ step_authelia_off() {
   # without this the portal keeps AUTHELIA_ENABLED=true and still shows a dead 'Authelia' link
   local pnote=""
   restart_portal || pnote="\nThe portal could not be restarted, so its /admin page still links to the (now stopped) Authelia — Operations -> Logs -> librarian."
+  monitoring_refresh
   msg "Gate removed — apps are back to their own logins. Authelia container stopped.$pnote\nRe-enable any time (your users and secrets are kept)."
 }
 authelia_add_user() { # name displayname email password (blank displayname/email = keep the stored ones; a NEW user needs an e-mail)
@@ -1855,6 +2302,32 @@ s = s.rstrip("\n") + "\n  %s:\n    displayname: %s\n    password: %s\n    email:
 with open(f, "w") as out:
     out.write(s)
 PYU
+  chown 1000:1000 "$f"
+  composeA restart authelia >/dev/null 2>&1 || true
+}
+# Renaming the key is the only way to carry an Authelia login across a rename: the argon2 hash
+# cannot be recomputed without the password, so authelia_add_user could not be used here.
+authelia_rename_user() { # old new (keeps the stored hash, e-mail, groups; 1 = nothing renamed)
+  local f="$STACK_DIR/authelia/users_database.yml"
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$2" =~ ^[A-Za-z0-9._-]+$ ]] && [ -f "$f" ] || return 1
+  python3 - "$f" "$1" "$2" <<'PYM' || return 1
+import sys, re, json
+f, old, new = sys.argv[1:4]
+s = open(f).read()
+if not re.search(r"^  " + re.escape(old) + r":\s*$", s, re.M):
+    sys.exit(1)                      # no login under the old name: nothing to do
+if re.search(r"^  " + re.escape(new) + r":\s*$", s, re.M):
+    sys.exit(1)                      # the new name already has its own login: never merge two
+def fix(m):
+    body = m.group(1)
+    # the display name is a human label ("Kim"), so it is only touched when it WAS the username
+    body = re.sub(r"^    displayname: (\"?)" + re.escape(old) + r"\1[ \t]*$",
+                  "    displayname: " + json.dumps(new), body, count=1, flags=re.M)
+    return "\n  " + new + ":\n" + body
+s = re.sub(r"\n  " + re.escape(old) + r":\n((?:    .*\n?)*)", fix, s, count=1)
+with open(f, "w") as out:
+    out.write(s)
+PYM
   chown 1000:1000 "$f"
   composeA restart authelia >/dev/null 2>&1 || true
 }
@@ -2071,6 +2544,7 @@ step_torrents() { # C5: qBittorrent runs only while enabled (compose profile), 6
     { render_caddy_all && apply_caddy; } || cnote="\n\nCaddy did not pick the change up, so https://dl.$d may still be configured there (Operations -> Logs -> caddy)."
     # the portal reads TORRENTS_ENABLED at start-up to decide whether /admin shows the link
     restart_portal || pnote="\nThe portal could not be restarted, so its /admin page still links to qBittorrent."
+    monitoring_refresh
     msg "qBittorrent disabled and removed; port 6881 closed.$pnote$cnote"; return 0
   fi
   yesno "Enable qBittorrent (admin-only torrent client at https://dl.$d, Tailscale only)?\n\nIt opens peer port 6881 to the internet, which also shows this server's IP to every swarm it joins. Download only what you are allowed to.\n\nEnable?" || return 0
@@ -2090,6 +2564,7 @@ step_torrents() { # C5: qBittorrent runs only while enabled (compose profile), 6
 
 "
   sleep 5
+  monitoring_refresh
   local qpw; qpw=$(docker logs qbittorrent 2>&1 | grep -oE 'temporary password.*: *[A-Za-z0-9]+' | tail -1 | awk '{print $NF}')
   big "qBittorrent enabled" "${cnote}Open https://dl.$d (Tailscale on; admin-gate password first).
 Web UI login: admin / ${qpw:-<see: docker logs qbittorrent>}  -> change it under Tools -> Options -> Web UI.
@@ -2143,8 +2618,10 @@ Updates with Operations -> Update. Logs: Operations -> Logs -> shelfmark."
 step_ephemera() {
   need DOMAIN TAILSCALE_IP || return 1
   whiptail --title "Ephemera — read before enabling" --scrolltext --yesno \
-"Ephemera = search + a request queue that auto-downloads a title once it appears,
-with FlareSolverr (headless Chromium, ~0.5-1 GB RAM) as its helper.
+"Ephemera = search + a request queue that auto-downloads a title once it appears.
+It uses the shared FlareSolverr (headless Chromium) for protection challenges,
+which is started with it. Measured: Ephemera ~60 MiB, FlareSolverr ~50 MiB idle
+and ~500 MiB per open browser (fenced at 1 GiB) — it fits the 4 GB plan.
 
 STATUS: the upstream project and its container image were REMOVED from GitHub in
 early 2026. This builds the last release (v1.3.1, Nov 2025) from a community
@@ -2174,24 +2651,82 @@ Build takes several minutes (Node toolchain). Proceed?" 24 84 || return 1
     # the ephemera. vhost exists only while it is enabled; without it the URL below answers nothing
     local cnote=""
     { render_caddy_all && apply_caddy; } || cnote="\n\nWARNING: Caddy did NOT pick up the ephemera. site, so that URL will not answer yet (Operations -> Logs -> caddy)."
-    msg "Ephemera is up at https://ephemera.$(envget DOMAIN) (Tailscale only; admin gate password).\n\nDownloads are filed to '$own' (owner:$own) via library/dropbox/$own.\nDisable any time under Operations.$cnote"
+    # Ephemera only reaches FlareSolverr over the compose network; prove it from inside
+    local fnote=""
+    wait_for http://127.0.0.1:8191/health 60 >/dev/null 2>&1 || true
+    docker exec ephemera wget -qO- -T 5 http://flaresolverr:8191/health >/dev/null 2>&1 \
+      || fnote="\n\nWARNING: Ephemera cannot reach FlareSolverr (http://flaresolverr:8191): protected sources will fail. Operations -> Logs -> flaresolverr."
+    monitoring_refresh
+    msg "Ephemera is up at https://ephemera.$(envget DOMAIN) (Tailscale only; admin gate password).\n\nDownloads are filed to '$own' (owner:$own) via library/dropbox/$own.\nFlareSolverr is running for it (Operations -> FlareSolverr shares it with Shelfmark).\nDisable any time under Operations.$cnote$fnote"
   else
     envset EPHEMERA_ENABLED false
     msg "Ephemera build or start failed — left disabled. Check the output above (the pinned source must still be reachable on GitHub)."
   fi
 }
 step_ephemera_off() {
-  composeE stop ephemera flaresolverr >/dev/null 2>&1 || true
-  composeE rm -f ephemera flaresolverr >/dev/null 2>&1 || true
+  composeE stop ephemera >/dev/null 2>&1 || true
+  composeE rm -f ephemera >/dev/null 2>&1 || true
   envset EPHEMERA_ENABLED false
+  # FlareSolverr is shared: it stays up while Shelfmark is set to use it
+  local fsnote="FlareSolverr is kept running: Shelfmark uses it (Operations -> FlareSolverr)."
+  if ! solver_on; then
+    compose stop flaresolverr >/dev/null 2>&1 || true
+    compose rm -f flaresolverr >/dev/null 2>&1 || true
+    fsnote="FlareSolverr stopped too (nothing else uses it)."
+  fi
   local cnote=""
   { render_caddy_all && apply_caddy; } || cnote="\n\nCaddy did not pick the change up, so https://ephemera.$(envget DOMAIN) may still be configured there (Operations -> Logs -> caddy)."
-  msg "Ephemera and FlareSolverr stopped and removed. Its data (ephemera/) and settings are kept; re-enable any time.$cnote"
+  monitoring_refresh
+  msg "Ephemera stopped and removed. Its data (ephemera/) and settings are kept; re-enable any time.\n$fsnote$cnote"
+}
+
+# ---------- FlareSolverr (shared protection-challenge solver) ----------
+# Shelfmark: its "external bypasser" (USING_EXTERNAL_BYPASSER, set from FLARESOLVERR_ENABLED in
+# docker-compose.yml) sends challenge pages here instead of starting its own Chromium inside its
+# 768 MiB fence. Ephemera: always uses it. The container runs while either one wants it.
+step_flaresolverr() {
+  local cur; cur=$(envget FLARESOLVERR_ENABLED)
+  if [ "$cur" = true ]; then
+    yesno "FlareSolverr is ON for Shelfmark.\n\nTurn it off? Shelfmark goes back to its built-in challenge solver (a Chromium inside its own container).$([ "$(envget EPHEMERA_ENABLED)" = true ] && printf '\n\nFlareSolverr itself keeps running: Ephemera needs it.')" || return 0
+    envset FLARESOLVERR_ENABLED false
+    # `up -d` (not restart): the container must be RECREATED to see the changed environment
+    compose up -d shelfmark >/dev/null 2>&1 || { msg "Shelfmark could NOT be recreated, so it still points at FlareSolverr (Operations -> Logs -> shelfmark)."; return 1; }
+    prune_shelfmark_placeholder
+    if ! solver_on; then compose stop flaresolverr >/dev/null 2>&1 || true; compose rm -f flaresolverr >/dev/null 2>&1 || true; fi
+    monitoring_refresh
+    msg "Shelfmark uses its built-in solver again.$(solver_on && printf ' FlareSolverr keeps running for Ephemera.' || printf ' FlareSolverr stopped.')"
+    return 0
+  fi
+  yesno "FlareSolverr solves the browser challenges some download sites put in front of their pages (a headless Chromium), for Shelfmark — and for Ephemera, which always uses it.\n\nMeasured on the pinned v3.5.2: ~50 MiB idle, ~450-500 MiB per page being solved, back down afterwards; fenced at 1 GiB, room for two at once. Loopback only; no web page of its own.\n\nWith it on, Shelfmark sends challenges here instead of running its own Chromium inside its 768 MiB container.\n\nTurn it on?" || return 0
+  envset FLARESOLVERR_ENABLED true
+  clear; echo "Starting FlareSolverr and pointing Shelfmark at it..."
+  if ! compose up -d flaresolverr || ! wait_for http://127.0.0.1:8191/health 90; then
+    envset FLARESOLVERR_ENABLED false
+    compose up -d shelfmark >/dev/null 2>&1 || true
+    msg "FlareSolverr did not come up on 127.0.0.1:8191, so Shelfmark was left on its built-in solver (Operations -> Logs -> flaresolverr)."
+    return 1
+  fi
+  compose up -d shelfmark >/dev/null 2>&1 || { msg "FlareSolverr is up, but Shelfmark could NOT be recreated to use it (Operations -> Logs -> shelfmark)."; return 1; }
+  prune_shelfmark_placeholder
+  # what matters is Shelfmark reaching it by name over the compose network, not the loopback port
+  local reach=""
+  for _ in $(seq 1 20); do
+    docker exec shelfmark curl -fs -m 5 http://flaresolverr:8191/health >/dev/null 2>&1 && { reach=ok; break; }
+    sleep 3
+  done
+  monitoring_refresh
+  [ "$reach" = ok ] || { msg "FlareSolverr is running, but Shelfmark cannot reach http://flaresolverr:8191 from inside its container, so protected sources will fail. Operations -> Logs -> shelfmark / flaresolverr."; return 1; }
+  msg "FlareSolverr is on. Shelfmark now sends protection challenges to it (confirmed from inside the Shelfmark container). Its Settings page shows the external bypasser as set by the deployment; turn it off here, not there."
 }
 
 # ---------- operations ----------
 step_selftest() { # a failing check must never drop the admin out of the TUI (selftest exits with the fail count)
-  clear; STACK_DIR="$STACK_DIR" bash "$STACK_DIR/scripts/selftest.sh" 2>&1 | tee "${TMPDIR:-/tmp}/bookstack-selftest.log" || true
+  clear
+  # what the unattended 04:30 reboot left behind, before this run overwrites the screen with a
+  # fresh result: the automatic test is the only one that ever runs while nobody is watching
+  local last; last=$(postboot_last) \
+    && printf 'Last automatic post-reboot self-test: %s\n  (full result: %s, or journalctl -u bookstack-postboot)\n\n' "$last" "$STACK_DIR/$POSTBOOT_LOG_REL"
+  STACK_DIR="$STACK_DIR" bash "$STACK_DIR/scripts/selftest.sh" 2>&1 | tee "${TMPDIR:-/tmp}/bookstack-selftest.log" || true
   echo; read -rp "Press Enter to continue..." _ || true
 }
 step_status() { docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' 2>&1 | whiptail --title "Containers" --textbox /dev/stdin 24 110 || true; }
@@ -2208,7 +2743,7 @@ BUILT_IMAGES="bookstack/caddy bookstack/librarian"   # built locally: kept as :p
 stack_up_all() { # (re)start every enabled service with the tags in .env
   compose up -d || return 1
   [ "$(envget AUTHELIA_ENABLED)" = "true" ] && { composeA up -d authelia || return 1; }
-  [ "$(envget EPHEMERA_ENABLED)" = "true" ] && { composeE up -d flaresolverr ephemera || return 1; }
+  [ "$(envget EPHEMERA_ENABLED)" = "true" ] && { composeE up -d ephemera || return 1; }
   prune_shelfmark_placeholder    # J35
   return 0
 }
@@ -2263,6 +2798,7 @@ Operations -> Update lets you type the new tags; it backs up first and can roll 
 local_checks() { # the update gate: what an update can break. Not disk, NTP, Tailscale or edge probes
   local c fails="" want="caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma"
   torrents_on && want="$want qbittorrent"
+  solver_on && want="$want flaresolverr"
   for c in $want; do running "$c" || fails="$fails $c:not-running"; done
   curl -fs -m 5 -o /dev/null http://127.0.0.1:8090/healthz || fails="$fails portal:/healthz"
   curl -fs -m 5 -o /dev/null http://127.0.0.1:8084/api/health || fails="$fails shelfmark:/api/health"
@@ -2308,9 +2844,12 @@ step_update() {
   [ -s "$cf" ] && cat "$cf" > "$cf.pre-update"
   [ "$keep" = 0 ] && tag_images latest prev
   copy_code_trees; own_data_dirs
+  # host-side units the update may be introducing: an existing install that only ever runs
+  # Operations -> Update would otherwise never pick up a new one (idempotent, so it is free)
+  install_postboot_unit
   render_caddy_all || { update_failed "the new Caddyfile could not be rendered"; return 1; }
   # the rebuilt images carry this checkout's version (J03); Self-test compares it with .version
-  if ! { compose pull --ignore-buildable && BUILD_VERSION="$(build_version)" compose build --pull caddy librarian && stack_up_all; }; then
+  if ! { compose pull --ignore-buildable && BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap && stack_up_all; }; then
     update_failed "pull/build/start failed"; return 1
   fi
   apply_caddy >/dev/null 2>&1 || true
@@ -2324,6 +2863,8 @@ step_update() {
   # (g) only now free old layers; the update landed, so the frozen rollback point is released
   rm -f "$mark"
   docker system prune -f --filter until=72h >/dev/null 2>&1 || true
+  # new code may carry new monitors or scheduled jobs (the timer wrapper is regenerated too)
+  install_selftest_timer; setup_monitoring >/dev/null 2>&1 || true
   msg "Updated and healthy (deployed $(deployed_version)).$([ -n "$changed" ] && printf '\n\nNew tags:%b' "$changed")$([ "$st" != 0 ] && printf '\n\nThe full self-test reports %s failure(s) unrelated to the update gate: Operations -> Self-test.' "$st")"
 }
 rollback_images() { # restore the IMG_* values saved by step_update
@@ -2351,13 +2892,15 @@ update_failed() { # (f) offer the rollback: previous tags, previous caddy/librar
 # ---------- operations: one service, and the tunables ----------
 # Authelia and Ephemera exist only in their overlay compose files: plain `compose` can neither
 # see nor start them, so every action has to go through the wrapper that owns the service.
-compose_for(){ case "$1" in authelia) printf 'composeA';; ephemera|flaresolverr) printf 'composeE';; *) printf 'compose';; esac; }
+# FlareSolverr lives in docker-compose.yml (profile "solver"), so plain compose owns it.
+compose_for(){ case "$1" in authelia) printf 'composeA';; ephemera) printf 'composeE';; *) printf 'compose';; esac; }
 stack_services(){ # what compose knows about, with the optional services appended when enabled
   local s; s=$(compose ps --services 2>/dev/null | tr -d '\r' | grep -v '^$' || true)
   # a stack that has never been started lists nothing; the admin still needs the menu
   [ -n "$s" ] || s="caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma"
   [ "$(envget AUTHELIA_ENABLED)" = true ] && s="$s authelia"
-  [ "$(envget EPHEMERA_ENABLED)" = true ] && s="$s ephemera flaresolverr"
+  [ "$(envget EPHEMERA_ENABLED)" = true ] && s="$s ephemera"
+  solver_on && s="$s flaresolverr"
   printf '%s\n' $s | awk '!seen[$0]++'
 }
 # "Restart audiobookshelf, it's wedged" is the commonest thing an admin does to a stack like this
@@ -2557,7 +3100,7 @@ step_rotate_secret() {
 }
 menu_ops() {
   while true; do
-    ch=$(whiptail --title "Operations" --menu "Ephemera: $([ "$(envget EPHEMERA_ENABLED)" = true ] && echo ON || echo off)   (the list scrolls)" 24 88 15 \
+    ch=$(whiptail --title "Operations" --menu "Ephemera: $([ "$(envget EPHEMERA_ENABLED)" = true ] && echo ON || echo off)   FlareSolverr: $(solver_on && echo running || echo off)   (the list scrolls)" 24 88 15 \
       T "Self-test: containers, endpoints, configs, firewall, TLS, isolation, backups" \
       S "Status: all containers" \
       V "Restart / stop / start ONE service" \
@@ -2571,7 +3114,8 @@ menu_ops() {
       R "Backup restore test" \
       W "Restore from backup: pick a snapshot, everything or config + databases" \
       F "Restore a SINGLE file from a snapshot (beside the stack, nothing stops)" \
-      M "Monitoring: Uptime Kuma + external check" \
+      M "Monitoring: Uptime Kuma (set up / repair monitors) + external check" \
+      G "FlareSolverr: $([ "$(envget FLARESOLVERR_ENABLED)" = true ] && echo "ON for Shelfmark — turn off" || echo "off for Shelfmark — turn on") (challenge solver)" \
       E "Ephemera: enable (Tailscale-only, unmaintained upstream — read notice)" \
       X "Ephemera: disable" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
@@ -2579,12 +3123,16 @@ menu_ops() {
       D) step_advanced || true;; C) step_check_updates || true;; U) step_update || true;;
       B) step_backup || true;; K) step_restic_rotate || true;; A) step_alerts || true;; R) step_restore_test || true;;
       W) step_restore || true;; F) step_restore_file || true;; M) step_monitoring || true;;
-      E) step_ephemera || true;; X) step_ephemera_off || true;; 0) return 0;; esac
+      G) step_flaresolverr || true;; E) step_ephemera || true;; X) step_ephemera_off || true;; 0) return 0;; esac
   done
 }
 main_menu() {
+  local banner h
   while true; do
-    choice=$(whiptail --title "Bookstack v$BOOKSTACK_VERSION — $(envget DOMAIN)" --menu "Private, per-user book library. Everything is configured from here." 18 84 6 \
+    # a failed post-reboot self-test belongs on the FIRST screen, not three menus down; the box
+    # grows so the extra lines cannot push the menu out of an 80x24 terminal
+    banner=$(postboot_banner); h=18; [ -n "$banner" ] && h=21
+    choice=$(whiptail --title "Bookstack v$BOOKSTACK_VERSION — $(envget DOMAIN)" --menu "Private, per-user book library. Everything is configured from here.$banner" "$h" 84 6 \
       I "Install & deploy   (Quick install, system, Tailscale, Cloudflare, deploy, backups, alerts)" \
       U "Users & devices    (add users, Kindle address, Kobo link, passwords, isolation)" \
       L "Library            (formats & conversion, mail, sources, Shelfmark, intake, torrents)" \

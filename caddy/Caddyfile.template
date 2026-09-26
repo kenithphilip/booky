@@ -39,6 +39,11 @@
 		X-Robots-Tag "noindex, nofollow"
 		# Deferred (>) so it replaces whatever the app sent: Cloudflare must never cache a
 		# book/audio response from one user's session and serve it to the next.
+		# This is the DEFAULT and stays the default. Three sites below add ONE narrow, deferred
+		# exception each (books. /static/*, audio. /_nuxt/*, request. /cover) that relaxes
+		# `no-store` on paths carrying no per-user content. `private` is never relaxed anywhere:
+		# an app that says `public` on an authenticated route would otherwise have that response
+		# cached by Cloudflare and handed to the next reader.
 		>Cache-Control "private, no-store"
 		-Server
 		-X-Powered-By
@@ -78,7 +83,7 @@
 			roll_keep 5
 		}
 		# JSON, minus secrets: the per-user Kobo token in the URI, Audiobookshelf's ?token=
-		# query (its apps put the user's JWT on /hls, /s, cover and download URLs), the intake
+		# query (its apps put the user's JWT on /hls, cover and download URLs), the intake
 		# bearer, KOReader's X-Auth-Key, credentials and cookies.
 		# fail2ban (configs/fail2ban/*.conf) only needs client_ip, method, uri (path), status;
 		# client_ip is the real visitor (CF-Connecting-IP), not the Cloudflare edge.
@@ -163,16 +168,59 @@ books.@@DOMAIN@@ {
 	import public_tls
 	import hardening
 	import login_ratelimit books
+	# The deferred Cache-Control in (hardening) REPLACES whatever the app sent (proven: two Caddy
+	# 2.11.4 instances, upstream `private, max-age=86400`, client received `private, no-store`).
+	# That is right for per-user HTML and for book bytes, and wrong for Calibre-Web's static
+	# assets: the pinned v4.0.6 serves /static/* with `Cache-Control: no-cache` AND an ETag, i.e.
+	# store-then-revalidate. `no-store` forbids storing, so the browser can never send
+	# If-None-Match and the 304 path is dead code - cps/templates/layout.html references 24
+	# assets totalling 1,424,404 bytes, re-sent in full on EVERY page view, for every reader,
+	# at 1.5-2.2 ms of CWA Python each. On 2 cores that is the tight resource, not bandwidth.
+	# So relax `no-store` to `no-cache` HERE ONLY: revalidation stays mandatory (nothing can go
+	# stale after a CWA upgrade, the filenames are not content-hashed) and the 304 costs
+	# 0.001 s and 0 bytes. `private` is KEPT - never drop the deferred header and let the app's
+	# own value through, or an app that says `public` on an authenticated route would have that
+	# response cached by Cloudflare for everyone. Written after `import hardening` on purpose:
+	# same directive, later instance wins for the matched paths (verified on 2.11.4).
+	@cwa_static path /static/* /favicon.ico
+	header @cwa_static >Cache-Control "private, no-cache"
 	# Device paths use HTTP Basic against CWA (no lockout of its own) and bypass the Authelia
 	# gate, so cap them per client: a password oracle at Cloudflare speed is not acceptable.
-	# OPDS apps fetch one cover per entry, so the ceiling is loose for a real reader.
+	#
+	# /opds and /kosync CANNOT share a budget, and used to. An OPDS reader fetches one cover
+	# per entry, so browsing a shelf is legitimately hundreds of requests a minute and the OPDS
+	# ceiling has to stay loose. KOReader syncs a position when a book is opened or closed and
+	# every few pages - single digits per minute per device - so it needs nothing like that, and
+	# it is the far more dangerous oracle of the two. Measured against the pinned
+	# crocodilestick/calibre-web-automated:v4.0.6 with koreader_sync_enabled=1:
+	#   GET /kosync/users/auth          no creds -> 401 ; wrong pw -> 401 ; right pw -> 200
+	#   GET /kosync/syncs/progress/<id> no creds -> 400 ; wrong pw -> 400 ; right pw -> 200
+	# The 400 is not an accident: cps/progress_syncing/protocols/kosync.py:532 raises
+	# KOSyncError(ERROR_UNAUTHORIZED_USER) and handle_sync_error() returns it as 400. So the
+	# progress endpoints were a clean password oracle answering with a status the 401-based
+	# fail2ban filter never counted (configs/fail2ban/caddy-device-auth.conf now counts those
+	# 400s too, so the jail can finally fire). CWA's authenticate_user() carries no limiter of
+	# its own - flask-limiter is only on web.login_post - and a hit yields that reader's
+	# Calibre-Web password, which is also their Shelfmark and Audiobookshelf password. PUT
+	# /kosync/syncs/progress behaves identically and is a WRITE. Upstream's own docstring on
+	# auth_user() says "Rate limiting should be applied at reverse proxy level ... suggested:
+	# 10 requests per minute per IP"; 60 is six times that and far above anything a household
+	# of four readers produces, while 300 was 30 guesses a second per source address.
 	rate_limit {
 		zone device_auth {
 			match {
-				path /opds* /kosync*
+				path /opds*
 			}
 			key {client_ip}
 			events 300
+			window 1m
+		}
+		zone kosync_auth {
+			match {
+				path /kosync*
+			}
+			key {client_ip}
+			events 60
 			window 1m
 		}
 	}
@@ -192,15 +240,54 @@ books.@@DOMAIN@@ {
 	# remote_ip is always a Cloudflare edge address, and {client_ip} (CF-Connecting-IP) is
 	# the visitor's public address - never a tailnet 100.64.0.0/10 one, even for the admin.
 	# An allowlist would therefore either match nobody or pin a home IP that changes.
+	# /api/v3/* and /api/UserStorage/* are an UNAUTHENTICATED OPEN RELAY to Kobo and are
+	# blocked here for the same reason. Verified in the pinned image
+	# (cps/readingservices.py:35-36 registers both blueprints; :117-142
+	# requires_reading_services_auth_and_config PROXIES to
+	# https://readingservices.kobo.com whenever annotation sync is off, Kobo sync is off, or
+	# the caller is anonymous - all three are the default here - and :596/:609 are
+	# <path:subpath> catch-alls). proxy_to_kobo_reading_services forwards the caller's
+	# method, headers and body and returns the response verbatim, so books.<domain> would
+	# lend its IP and its Cloudflare reputation to anyone who asks.
+	# Nothing else in CWA v4.0.6 mounts under /api (only /gdrive, /kobo/<auth_token>,
+	# /kobo_auth and /login have url_prefixes; the web UI's own calls go to /ajax/*), so the
+	# 403 cannot break the pages, OPDS, KOReader or /kobo/<token>/ sync.
+	# No real Kobo sends these here today: cps/kobo.py:1370/1389 only advertises
+	# "reading_services_host" as THIS server when config_hardcover_annotations_sync is on and
+	# the hardcover module loaded; otherwise the device keeps the built-in
+	# https://readingservices.kobo.com (kobo.py:1543) and never touches our origin. So the 403
+	# costs a device nothing, and every request it does answer was somebody else's.
+	# IF Hardcover annotation sync is ever enabled (config_hardcover_annotations_sync +
+	# config_kobo_sync), these two prefixes must MOVE OUT of the block below and INTO:
+	#   * the Authelia bypass list for books (authelia/inject-gate.py BYPASS["books"] and the
+	#     matching resources in authelia/configuration.yml.template), and
+	#   * the Cloudflare Browser-Integrity-Check exception,
+	# because they are the one Kobo path NOT under /kobo/<token>/ - the device sends them
+	# with its own Authorization header and no session cookie.
+	# /duplicates/invalidate-cache is a THIRD route of the same class and is blocked here too.
+	# Verified in the pinned image: cps/duplicates.py:1196 declares
+	# @duplicates.route("/duplicates/invalidate-cache", methods=['POST']) with @csrf.exempt and
+	# NO auth decorator, while every sibling in the same file (/duplicates, /duplicates/status,
+	# /duplicates/dismiss/*, /duplicates/undismiss/*, /duplicates/trigger-scan) carries
+	# @login_required_if_no_ano + @admin_or_edit_required. The blueprint is registered
+	# unconditionally and CWA has no global auth before_request, so anonymous POSTs commit
+	# `UPDATE cwa_duplicate_cache SET scan_pending=1` into cwa.db - unbounded writes on a 2-core
+	# box, and a permanent scan_pending that makes every visit to the duplicates page re-run a
+	# full-library duplicate scan. Only the ONE path, not the /duplicates* prefix: the other
+	# routes are the admin's own UI and are already gated. Same argument as the four above -
+	# the sole in-tree caller is CWA's own scripts/ingest_processor.py via
+	# get_internal_api_url() -> http://127.0.0.1:8083 INSIDE the container, which never passes
+	# through Caddy - so nothing a reader, the portal, Shelfmark, OPDS, Kobo or KOReader does
+	# can break.
 	# route{} so the 403 is decided ahead of the Authelia gate route below.
 	route {
-		@cwa_admin_jobs path /cwa-convert-library-overview /cwa-convert-library-start /cwa-convert-library /cwa-convert-library/* /convert-library-status /convert-library-cancel /cwa-epub-fixer-overview /cwa-epub-fixer-start /cwa-epub-fixer /cwa-epub-fixer/* /epub-fixer-status /epub-fixer-cancel /cwa-logs /cwa-logs/* /cwa-internal /cwa-internal/* /reconnect
+		@cwa_admin_jobs path /cwa-convert-library-overview /cwa-convert-library-start /cwa-convert-library /cwa-convert-library/* /convert-library-status /convert-library-cancel /cwa-epub-fixer-overview /cwa-epub-fixer-start /cwa-epub-fixer /cwa-epub-fixer/* /epub-fixer-status /epub-fixer-cancel /cwa-logs /cwa-logs/* /cwa-internal /cwa-internal/* /reconnect /api/v3 /api/v3/* /api/UserStorage /api/UserStorage/* /duplicates/invalidate-cache
 		respond @cwa_admin_jobs "Not available" 403
 		# The one shape the exact list above cannot express: an old-style ';' path parameter.
 		# /cwa-convert-library-start;x is a different string to `path` but the same endpoint to
 		# some routers. Werkzeug 404s it today, so this is defence in depth, not a live hole.
 		# `path` is case-insensitive; path_regexp is not, hence (?i).
-		@cwa_admin_jobs_params path_regexp cwa_admin_jobs_params (?i)^/(?:cwa-convert-library|convert-library-status|convert-library-cancel|cwa-epub-fixer|epub-fixer-status|epub-fixer-cancel|cwa-logs|cwa-internal|reconnect).*;
+		@cwa_admin_jobs_params path_regexp cwa_admin_jobs_params (?i)^/(?:cwa-convert-library|convert-library-status|convert-library-cancel|cwa-epub-fixer|epub-fixer-status|epub-fixer-cancel|cwa-logs|cwa-internal|reconnect|api/v3|api/UserStorage|duplicates/invalidate-cache).*;
 		respond @cwa_admin_jobs_params "Not available" 403
 	}
 	# @AUTHELIA_GATE:books@
@@ -214,6 +301,12 @@ audio.@@DOMAIN@@ {
 	bind @@BIND_IP@@
 	import public_tls
 	import hardening
+	# Same reasoning as books./static: Audiobookshelf's web bundle is served by express.static,
+	# which sends ETag + Last-Modified, and `no-store` from (hardening) kills the 304. Relaxed
+	# to `no-cache` (revalidate every time) rather than a max-age, so nothing can be stale after
+	# an ABS upgrade. `private` kept, as everywhere.
+	@abs_static path /_nuxt/* /favicon.ico
+	header @abs_static >Cache-Control "private, no-cache"
 	# Audiobookshelf 2.36.1 has no account lockout; its only defence is an express
 	# rate-limiter of 40 requests / 10 min per client IP (server/utils/rateLimiterFactory.js)
 	# SHARED by POST /login, POST /auth/refresh and PATCH /api/me/password. Password guessing
@@ -259,6 +352,15 @@ request.@@DOMAIN@@ {
 	import public_tls
 	import hardening
 	import login_ratelimit request
+	# /cover proxies covers.openlibrary.org so the reader's browser never talks to a third party
+	# (librarian/enrich.py's docstring). The portal already answers it with
+	# `private, max-age=604800` and (hardening) was overwriting that with `no-store`, so every
+	# search page re-fetched all eight covers through the portal's gunicorn threads. Restated
+	# here, deferred, so the edge and the app agree; `private` is explicit rather than inherited,
+	# because /cover is a @login_required route and Cloudflare must never share one reader's
+	# response with another.
+	@portal_cover path /cover
+	header @portal_cover >Cache-Control "private, max-age=604800"
 	# Bulk-download and automation abuse limits (per real client IP)
 	rate_limit {
 		zone portal_downloads {

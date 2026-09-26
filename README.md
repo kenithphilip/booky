@@ -19,10 +19,16 @@ Everything an admin previously had to click through in three different web UIs (
 creation, Allowed Tags, Kobo sync toggle, registration off, conversion settings, Kindle
 addresses) is now done by the menu or by users themselves in the portal.
 
-## What changed in v4.3 (fan-out audit + synthetic user journeys)
+## What changed in v4.3 (fan-out audit + simulated user journeys)
 Five auditors, each checked by a skeptic, went through the installer, the service wiring, the
 portal, every family journey and operations; every verified finding (8 high, 24 medium, 37
-low, 8 simplifications) is fixed and covered by tests. Highlights:
+low, 8 simplifications) is fixed and covered by tests.
+
+To be exact about the journeys, because the wording used to invite the wrong conclusion: they
+were run once, locally, during development, against a throwaway stack. They are **not** a
+scheduled canary on your server — nothing replays a user journey there. What DOES run on the
+server unattended is the post-reboot self-test (below). A recurring canary is a deliberate
+deferral, recorded in `docs/RESEARCH-GAPS.md`. Highlights:
 - **Alerts reach you.** A required Alerts step (ntfy or webhook, with a test); the scripts
   fall back to a direct post when the portal is down; the self-test fails with no channel.
 - **Nothing on the admin side can take the public sites down.** Admin sites no longer bind the
@@ -207,7 +213,6 @@ Create Custom Token** and add these permissions, all with type **Zone**:
 | Zone | Read | find your domain's zone |
 | DNS | Edit | create the `books`, `audio`, `request`, `shelf`, `auth`, `monitor` (and `dl` with torrents) records |
 | Zone Settings | Edit | SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls, e-reader-breaking features off |
-| Config Rules | Edit | per-host exceptions for the device paths |
 | Cache Rules | Edit | never cache a user's book or audio response |
 | Firewall Services | Edit | fail2ban bans abusive visitors at Cloudflare |
 
@@ -226,6 +231,15 @@ re-run **Install & deploy → Configure** and paste the new one.
 In the Cloudflare dashboard, turn **Security → WAF → Managed rules ON**. Leave **Bot Fight
 Mode OFF**: it challenges Kobo, OPDS, KOReader and the Audiobookshelf apps, cannot be
 exempted on the Free plan, and the devices fail silently.
+
+**Browser Integrity Check is turned off for the whole zone, not per path.** The device paths
+(`/opds`, `/kosync`, `/kobo/<token>`, the Audiobookshelf apps) are not browsers and fail the
+check silently, and the Free plan has no per-path exception that works for them — so the
+installer sets `browser_check: off` zone-wide and the HTML apps lose that layer too. The
+accepted trade: the WAF managed rules, Caddy's per-path rate-limit zones and the fail2ban
+jails (which ban at Cloudflare) are the defence for the HTML apps instead. No Configuration
+Rule is created, which is why the token above needs no Config Rules permission — an earlier
+version of this table asked for one for a feature that was never built.
 
 **2. Tailscale.** Create an account and install the app on the devices *you* administer
 from. The free Personal plan is enough: only you and the server join the tailnet. End users
@@ -270,6 +284,43 @@ accounts it asks for are described in the section above. Afterwards: **Library �
 so users can Send-to-Kindle from the portal), **Security → Authelia** if you want SSO + 2FA,
 **Operations → Self-test**. Every step is re-runnable from its submenu.
 
+## Book information (metadata)
+
+Every book gets a page — cover, author, series and position, publication details and a
+description — and **My books** links to it. Authors and series have pages too; a series page
+tells a reader which numbers they are missing and which comes next. What it is, plainly:
+
+- **Where it comes from.** A chain of providers, asked in the background a few minutes after a
+  book imports, never while someone is waiting on a page: bookinfo.pro (the Goodreads mirror
+  that replaced Readarr's metadata service), then its Hardcover twin, then Open Library, which
+  needs no key and is the floor. A provider that fails three times in a row is stood down for
+  15 minutes; a provider that simply has no answer about one book is NOT counted as failing.
+  A book the whole chain has never heard of is not re-asked for a week.
+- **Where it lives.** In the portal's own database. Your stored book files are never modified
+  for it. The one thing written into a file remains the `owner:` tag, and that is access
+  control, not description.
+- **How the devices get it.** Kobo shows what Calibre's database says, so every 15 minutes a
+  host job (`scripts/metadata-push.sh`) writes title, title sort, authors and series into
+  Calibre — but only to FILL GAPS: a title a family member corrected by hand, or a series they
+  set themselves, is never overwritten. It reads each book's owner tag before and after the
+  write and raises a high-priority alert if it ever changed. Kindle reads the title from the
+  file, so the copy mailed to a Kindle carries the library's title and author; the stored file
+  is not touched.
+- **What it is for besides looks.** Identification. A download from Shelfmark, the dropbox or
+  e-mail is identified by what the FILE says (its title, author and ISBN) instead of its
+  filename; the "in library" badge on search matches ISBN, then title with author, so a
+  subtitle no longer hides a book you have and a same-titled book by someone else no longer
+  claims you have it; and a download from the Internet Archive is checked against the size and
+  SHA-1 the Archive publishes before it is imported — a mismatch waits for you in
+  **needs-review** rather than being imported or silently thrown away.
+- **Privacy between readers.** Author and series pages are only reachable from a book you own
+  and only list your own books. Gaps in a series are worked out from YOUR copies, never from
+  what a sibling has — the metadata store is shared across the household, and it would
+  otherwise say what everyone else is reading.
+- **What it does not do.** It does not find or download books. The portal's own search still
+  covers the free, redistributable catalogues (Gutenberg, Internet Archive, LibriVox, Standard
+  Ebooks); anything else comes through Shelfmark, configured by the admin.
+
 ## The request flow
 Users sign in at `https://request.<domain>` with their library credentials → search →
 **Request**. Approvals are **off** by default for a family (`APPROVALS_REQUIRED=false`; they
@@ -304,11 +355,18 @@ On the portal's **Devices** page:
 
 ## Formats & conversion (Library → Formats)
 Drives CWA's own settings in `cwa.db`, applied on the next import:
-the target format is always EPUB (Kobo receives KEPUB automatically on sync and users can
-download it as `.kepub.epub`; Kindle accepts EPUB by mail), convert on import on/off, CWA's
-import-time Kindle fixer (keep off), originals to keep alongside, and
+the target format is always EPUB (Kindle accepts EPUB by mail), convert on import on/off,
+CWA's import-time Kindle fixer (keep off), originals to keep alongside, and
 the duplicate policy (`new_record` required for isolation). Deploy applies the secure
 defaults; users choose their own *download* format on Devices.
+
+**Kobo receives EPUB, not KEPUB.** CWA v4.0.6 looks for `kepubify` only under
+`/opt/kepubify/` while its image installs it at `/usr/bin/kepubify`, so KEPUB conversion is
+never enabled and never has been here. EPUB syncs and reads fine on a Kobo; the one
+difference is that reading position is recorded at chapter boundaries rather than
+continuously. Turning KEPUB on is not a one-line change — doing it the obvious way makes Kobo
+sync fail with a permanent HTTP 500 while every health check stays green. The measurement and
+the safe three-step path are in `docs/DECISIONS-PENDING.md`.
 
 ## Shelfmark — the CWA companion (Library → Shelfmark)
 `https://shelf.<domain>` runs Shelfmark (`ghcr.io/calibrain/shelfmark`), the maintained
@@ -318,26 +376,43 @@ successor of *calibre-web-automated-book-downloader*:
   log, so the portal checkpoints the WAL after every user/device write — new accounts are
   visible to Shelfmark immediately. Shelfmark also only starts once CWA is healthy: with no
   `app.db` present it would run with *no* authentication.
-- **Per-user destination**: `INGEST_DIR=/dropbox/{User}` → every ebook lands in
+- **Per-user destination**: `INGEST_DIR=/dropbox` with `FILE_ORGANIZATION=organize` and
+  `TEMPLATE_ORGANIZE={User}/...` — the per-user level is in the naming TEMPLATE, not in the
+  destination path, because Shelfmark's entrypoint `mkdir -p`s the raw destination and a
+  literal `{User}` folder would appear in the dropbox root. Every ebook lands in
   `library/dropbox/<username>/`, is tagged `owner:<username>` and atomically ingested within
   ~15 s. Limit its formats to epub, pdf and cbz.
 - **Audiobooks** land in the same dropbox; an audio-only folder becomes one audiobook, tagged
   to its owner in Audiobookshelf automatically. A folder of ebooks is imported book by book;
   mixed or empty folders are parked in `.failed` with a reason.
 - **Sources are opt-in** in Shelfmark → Settings.
+- **Protection challenges** (the browser check some download sites put in front of a page):
+  with **Operations → FlareSolverr** on, Shelfmark sends them to the shared FlareSolverr
+  container instead of starting its own Chromium inside its 768 MiB fence. The switch is an
+  environment value (`USING_EXTERNAL_BYPASSER`, from `FLARESOLVERR_ENABLED`), which in the pinned
+  Shelfmark always wins over its Settings page — so turn it on and off in the menu, not there.
 - Shelfmark refuses to start without CWA's `app.db` and reports unhealthy if its auth mode is
   ever anything but `cwa`.
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
 
 ## Ephemera — optional, Tailscale-only (Operations → Ephemera)
-Adds a "request it and auto-download when it appears" queue and a newznab indexer mode.
+Adds a "request it and auto-download when it appears" queue and a newznab indexer mode —
+the one thing neither the portal nor Shelfmark does (they search when asked, once).
 **Status (Sept 2026):** the upstream repo `OrwellianEpilogue/ephemera` and its image were
 removed from GitHub. The overlay *builds* the last release (v1.3.1, Nov 2025) from a
 community re-upload pinned to commit `e98e9944…`; treat it as unmaintained. It is reachable
-only at `https://ephemera.<domain>` over Tailscale behind the admin password, files
-everything to one CWA user's dropbox (`EPHEMERA_OWNER`), and needs FlareSolverr (~0.5–1 GB
-RAM). If you only need multi-user search + download, skip it; Shelfmark does that.
+only at `https://ephemera.<domain>` over Tailscale behind the admin password and files
+everything to one CWA user's dropbox (`EPHEMERA_OWNER`), because it has no accounts of its own.
+
+## FlareSolverr — the shared challenge solver (Operations → FlareSolverr)
+One headless-Chromium container (`ghcr.io/flaresolverr/flaresolverr`, compose profile
+`solver`) that both Shelfmark (when switched on) and Ephemera (always) use. It runs while
+either one wants it, listens on `127.0.0.1:8191` only, and has no site in Caddy. Measured on
+the pinned v3.5.2: ~50 MiB idle, ~450–500 MiB for each page being solved, back to ~125 MiB
+after 20 page loads (no leak); two at once ~910 MiB inside its 1 GiB fence. Enabling it proves
+Shelfmark reaches it *by name from inside the Shelfmark container*, which is the path that
+matters, and the self-test repeats that check.
 
 ## Automated acquisition & distributed ingest (Library → Intake)
 Four more ways files enter, all owner-mapped and run through the same state machine
@@ -352,8 +427,9 @@ Four more ways files enter, all owner-mapped and run through the same state mach
   when the receiving server's `Authentication-Results` shows DMARC, DKIM or SPF passing for the
   sender (`IMAP_REQUIRE_AUTH=false` for a local relay).
 A re-dropped file with the name of an earlier failure is imported; a second upload with the
-same name becomes `name (2).ext` instead of overwriting. Size caps: 500 MB ebooks, 2 GB audio,
-PDFs over 250 MB are not tagged (parked for users).
+same name becomes `name (2).ext` instead of overwriting. Size caps: 200 MB ebooks (`MAX_EBOOK_MB`), 2 GB audio
+(`MAX_AUDIO_MB`), PDFs over 250 MB are not tagged (`MAX_PDF_MB`, parked for users) — all
+three in `.env`.
 Gutenberg can pull from a local mirror; the OPDS source pulls from any catalog you host.
 
 ## Application hardening
@@ -367,10 +443,37 @@ creates `dl.<domain>` and seeds its default save path to your dropbox; point eve
 removed.
 
 Still yours to do once: a real qBittorrent Web UI password (if you enable torrents), CWA SMTP
-(Admin → Edit e-mail server) if you also want CWA's own Send-to-Kindle button, and Uptime Kuma
-monitors (loopback checks such as `http://127.0.0.1:8084/api/auth/check`, keyword `cwa`, now
-work) plus one free external monitor for "the whole VPS is down". Operations → Self-test
-checks the posture.
+(Admin → Edit e-mail server) if you also want CWA's own Send-to-Kindle button, and one free
+external monitor for "the whole VPS is down" (Operations → Monitoring asks for its URL).
+Operations → Self-test checks the posture.
+
+## Monitoring (Uptime Kuma, configured for you)
+Deploy ends by configuring Uptime Kuma at `https://monitor.<domain>` (Tailscale only) — nobody
+has to open its web UI and type monitors in. `monitoring/kuma_bootstrap.py` runs as a one-shot
+container, reads its settings (passwords included) on stdin, and:
+- creates Kuma's admin account on first run (`KUMA_USER` = your admin name, `KUMA_PASS`
+  generated; both shown under **Operations → Monitoring**);
+- adds the **same alert channels `scripts/alert.sh` uses** — your `NOTIFY_WEBHOOK` (ntfy-style
+  plain text, like every other alert) and, when SMTP is set, e-mail to `ADMIN_EMAIL` — directly,
+  not through the portal, so "the portal is down" can still be reported;
+- watches, every minute: the portal, Calibre-Web, Audiobookshelf (still initialised — the state
+  in which a stranger could become its root), Shelfmark and that it still demands library
+  logins, Caddy's public listener; every 5 minutes, the full public path through Cloudflare;
+  and each optional service that is on (qBittorrent, Authelia, Ephemera, FlareSolverr);
+- adds **dead-man's switches** for the scheduled jobs — hourly self-test, disk watchdog, metadata
+  push, Cloudflare IP refresh, nightly backup. Each job reports in when it succeeds
+  (`scripts/kuma-push.sh`); silence past its schedule is an alert;
+- puts the nightly unattended reboot in a maintenance window, keeps 30 days of history (not
+  Kuma's 180 — that is millions of rows in a database the backup snapshots every night), and
+  never touches a monitor you added yourself. Its own monitors are put back to spec on every
+  Deploy, Update and feature switch.
+
+The **self-test now also runs every hour** (`bookstack-selftest.timer`) and reports to Kuma,
+which alerts on the change and repeats once a day while it stays red; if Kuma cannot be told,
+the hourly run falls back to `alert.sh`. The hourly run skips two probes that cost something
+24 times a day (the factory-password login, which counts against Calibre-Web's per-name login
+limit, and the remote restic listing). Every self-test pings `HEALTH_PING_URL`, the one check
+that works when the whole server is gone.
 
 ## Security & ops menu (what's where)
 - **Install & deploy**: Quick install, System, Tailscale, Configure, Cloudflare, Deploy, Backups, Alerts.
@@ -384,11 +487,12 @@ checks the posture.
   session secret.
 - **Operations**: Self-test, Status, Restart / stop / start one service, Logs, Advanced settings,
   Check for updates, Update, Backups, Rotate the backup repository password, Alerts,
-  Restore test, Restore from backup, Restore a single file, Monitoring,
-  Ephemera enable / disable.
+  Restore test, Restore from backup, Restore a single file, Monitoring (set up / repair Kuma,
+  external check URL), FlareSolverr on / off, Ephemera enable / disable.
 
 Backups are encrypted restic (7 daily / 4 weekly / 6 monthly by default — `RESTIC_KEEP_DAILY`
-/ `_WEEKLY` / `_MONTHLY` in `.env`; `pre-update` snapshots kept 90 days; `restic check` weekly;
+/ `_WEEKLY` / `_MONTHLY` in `.env`; `pre-update` snapshots kept 90 days; `restic check` weekly,
+re-reading a different 1/52 of the repository each week so every byte is verified once a year;
 a monthly restore test on the 1st) — keep the repo password safe. **Restore** lets you pick a snapshot and restore everything or only config +
 databases; it checks free space first and restores in place. **Update** deploys the code from
 the checkout it runs from, gates on container health, and can roll back to the previous
@@ -398,6 +502,15 @@ images and Caddyfile. Watch `df -h /srv`; audiobooks fill the disk fastest.
 Everything here is a menu entry in `bookstack.sh` over Tailscale SSH. That is the admin
 console; the web `/admin` page is a read-mostly dashboard and says so. Start with
 **Operations → Self-test**: it names the menu entry for almost every failure it reports.
+
+**"Nothing works this morning."** The server takes an unattended security reboot at 04:30, and
+that is the one scheduled event that restarts everything while nobody is watching. It is now
+checked automatically: a oneshot systemd unit waits for the containers to settle, runs the
+self-test, and if anything fails it alerts through your Alerts channel and puts a line on the
+first screen of the TUI. So the usual answer is that you already know. To look yourself:
+`systemctl status bookstack-postboot`, `journalctl -u bookstack-postboot` for the full output,
+or `$STACK_DIR/.postboot-selftest.log`. A result reading `KILLED part-way` means the check
+itself hung or timed out — treat that as a failure, not as "no news".
 
 **"Convert library" / "EPUB fixer" / "Show logs" in Calibre-Web's own admin page do nothing
 (403).** That is deliberate and it also hits *you*. Calibre-Web Automated v4.0.6 registers
@@ -473,6 +586,7 @@ edges (`/opdsfoo` is *not* bypassed, bare `/socket.io` *is*).
 bash tests/run-unit.sh      # portal unit/integration tests inside the shipping image (~1 min)
 bash tests/tui-test.sh      # installer logic: .env quoting, configure, gate, users, ABS, formats, mail
 bash tests/stack-test.sh    # end-to-end with the REAL containers (~8-10 min); KEEP=1 to inspect
+bash tests/monitoring-test.sh  # the Kuma bootstrap against the REAL pinned Uptime Kuma (~2 min)
 ```
 `run-unit.sh` needs Docker; it also runs `pip-audit` against the locked requirements, which
 needs network (`SKIP_AUDIT=1` for an offline run). Lint the Python with an isolated ruff:
@@ -505,28 +619,52 @@ prints peak memory per container (see the VPS section) and fails on any worker c
 - `docs/` — deployment checklist, research sweep (`RESEARCH-GAPS.md`), pending decisions
 
 ## VPS sizing (measured)
-Peak resident memory per container during the full end-to-end run (laptop, arm64, five runs):
+**The deployed and supported plan is 2 vCPU / 4 GB RAM / 80 GB NVMe / 10 TB (X4).** It is not
+a compromise: the numbers below were measured on the real stack with a 5,015-book library,
+and they replace the desk estimates this section used to carry.
 
-| Container | Peak |
+| Measured on the real stack (5,015 books) | |
 |---|---|
-| calibre-web (CWA, incl. an import + Kindle fixer) | 450–575 MiB |
-| authelia | ~240 MiB |
-| audiobookshelf | 150–200 MiB |
-| shelfmark | 140–195 MiB |
-| portal (librarian) | ~70 MiB |
-| caddy | ~55 MiB |
-| qbittorrent (opt-in) / Uptime Kuma (not in the run) | ~150 / 150 MiB typical |
+| Containers idle | **563 MiB** |
+| Containers at peak, full end-to-end run driving every journey | **1,587 MiB** |
+| Largest single container (calibre-web, against its 1600m fence) | 562 MiB |
+| Plus Debian + systemd + sshd + tailscaled + fail2ban + dockerd | ~400–500 MB |
+| Plus Uptime Kuma and the real xcaddy Caddy | ~150 / ~55 MB |
+| **On the 4 GB box: idle / peak** | **≈ 1.2 GB / ≈ 2.2 GB** |
+| Optional, measured 2026-09-25: Ephemera idle / FlareSolverr idle / per page solved | 58 / ~50 / ~450–500 MiB |
+| **With Ephemera + FlareSolverr on, worst case (two solves at once)** | **≈ 3.3 GB** |
 
-Core stack ≈ 1.3–1.7 GB resident, plus calibre conversion spikes (a few hundred MB per
-`ebook-convert`), Audiobookshelf's first scan (up to 1–1.5 GB on a big library) and the OS.
+So RAM has about 1.8 GB of headroom at peak, with the swap the installer creates untouched.
+The `mem_limit` fences in `docker-compose.yml` are what keeps one runaway container from
+taking the box down; they are sized for this plan and are not to be retuned without a new
+measurement showing real failure on 4 GB.
 
-**Recommendation: the 4-core / 8 GB / 160 GB plan (X8).** Disk is the binding constraint:
-on 80 GB, after OS, images, swap and ebooks, roughly 50 GB remains for audiobooks (100–150
-titles). The 2-core / 4 GB / 80 GB plan (X4) is defensible for ≤ ~10 users if audiobooks stay
-under ~40 GB, Ephemera stays off and Shelfmark's browser-backed sources stay off; the memory
-fences in `docker-compose.yml` keep one runaway container from taking the box down, and the
-installer adds swap. Upgrade signals and the full working are in `docs/RESEARCH-GAPS.md`
-section 2. The 1-core / 2 GB plan is not viable. Bandwidth (10 TB) is a non-issue.
+**Disk is the binding constraint, not memory.** On 80 GB, after the OS, images, swap and
+ebooks, roughly 50 GB remains for audiobooks — 100–150 titles. Keep audiobooks under ~40 GB.
+(Ephemera and FlareSolverr fit in RAM — see the table — and their images take ~1 GB of disk.) Watch `df -h /srv`, and watch inodes
+as well: one directory per book plus covers, formats and multi-part audiobooks exhausts an
+inode table long before it fills the disk, and the symptoms are identical.
+`scripts/disk-watch.sh` and **Operations → Self-test** now check both and say which tripped.
+
+**CPU, not RAM, is the tight resource on 2 cores.** A CWA library-wide KEPUB conversion
+sustains 107.8 % CPU — more than one of the two cores — for as long as it runs. Batch work
+(Convert Library, a first Audiobookshelf scan) belongs overnight, not beside someone reading.
+Backups run at 01:00 and the unattended-upgrades reboot at 04:30; they are already staggered.
+One CPU worry that is *not* real, measured so it stops being re-raised: Caddy's
+`encode zstd gzip` compresses text only. Against caddy 2.11.4 with `Accept-Encoding: zstd,
+gzip`, HTML and JavaScript came back zstd-compressed (100,000 bytes → 27) while `book.epub`,
+`audio.mp3` and a plain `application/octet-stream` came back with no `Content-Encoding` and
+byte-for-byte identical. EPUB, KEPUB, PDF, CBZ, MP3 and M4B are never compressed on the way
+out, so there is no CPU to reclaim there and no `encode` allowlist to add.
+
+**Bandwidth (10 TB/month) rules out any egress worry.** A household streaming audiobooks,
+syncing Kobo and Kindle, and pushing an incremental restic off-site uses a few hundred GB a
+month — under 5 % of the allowance. Nothing here needs rationing or a local-only fallback.
+
+The 4-core / 8 GB / 160 GB plan (X8) is worth its extra EUR 50/year only when the library
+outgrows 80 GB, or when the overnight batch jobs stop fitting in the night — not for RAM.
+The 1-core / 2 GB plan is not viable. Upgrade signals and the full working are in
+`docs/RESEARCH-GAPS.md` section 2.
 
 ## Known limits
 - Isolation is visibility, not separate storage — admin sees all files.

@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('my_library') }}">← {{ 'All books' if admin else 'My books' }}</a></p>
+<div class="card"><div class="row" style="align-items:flex-start;gap:16px">
+{% if b.has_cover %}<img src="{{ url_for('book_cover', book_id=b.id) }}" alt="" style="width:120px;height:auto;border-radius:4px">{% endif %}
+<div style="flex:1">
+<h2 style="margin-top:0">{{ b.title }}</h2>
+<p>{% for name in b.authors %}{% set m = (authors | selectattr('name', 'equalto', name) | list) %}{% if m %}<a href="{{ url_for('author_page', author_id=m[0].id) }}">{{ name }}</a>{% else %}{{ name }}{% endif %}{% if not loop.last %} &amp; {% endif %}{% else %}<span class="mut">Unknown author</span>{% endfor %}</p>
+{% if b.series %}<p class="mut">{% if series %}<a href="{{ url_for('series_page', series_id=series.id) }}">{{ b.series }}</a>{% else %}{{ b.series }}{% endif %}{% if b.series_index %} · #{{ '%g' % b.series_index }}{% endif %}</p>{% endif %}
+<p class="mut">
+{% if first_year %}First published {{ first_year }}{% endif %}{% if first_year and b.published %} · {% endif %}{% if b.published %}this edition {{ b.published }}{% endif %}
+{% if b.publisher %} · {{ b.publisher }}{% endif %}{% if b.languages %} · {{ b.languages | join(', ') }}{% endif %}
+</p>
+{% if admin and b.owners %}<p class="mut">On the shelf of: {{ b.owners | join(', ') }}</p>{% endif %}
+<div class="row">
+{% if b.best %}<a class="btn" href="{{ url_for('download', book_id=b.id, fmt=b.best) }}">Download {{ b.best }}</a>{% endif %}
+{% for f in b.formats if f != b.best %}<a class="btn sec" href="{{ url_for('download', book_id=b.id, fmt=f) }}">{{ f }}</a>{% endfor %}
+{% if kindle_enabled and kindle_mail and b.kindle_ok %}
+<form method="post" action="{{ url_for('send_kindle', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Send to Kindle</button></form>{% endif %}
+</div>
+</div></div></div>
+{% if description %}<div class="card"><h3 style="margin-top:0">About this book</h3><p style="white-space:pre-line">{{ description }}</p></div>{% endif %}
+{% endblock %}

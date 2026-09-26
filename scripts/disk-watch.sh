@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Hourly disk watchdog (installed by bookstack.sh Deploy as /etc/cron.d/bookstack-disk).
+# "used" below is the WORSE of blocks-used and inodes-used (see the pctread block): an
+# exhausted inode table wedges the stack exactly like a full disk, and `df` alone never shows it.
 #   >= DISK_WARN_PCT (85) used : alert once per 24 h
 #   >= DISK_STOP_PCT (95) used : also stop the downloaders (shelfmark; qBittorrent when it runs)
 #                                AND raise the pause flag the portal's own worker honours, alert high
@@ -33,9 +35,36 @@ torrents_on(){ [ "$(envget TORRENTS_ENABLED)" = true ]; }
 compose(){ if torrents_on; then (cd "$STACK_DIR" && docker compose --profile torrents "$@"); else (cd "$STACK_DIR" && docker compose "$@"); fi; }
 running(){ docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true; }
 
-pct=$(df --output=pcent "$STACK_DIR" 2>/dev/null | tail -1 | tr -dc 0-9); pct="${pct:-0}"
+# Blocks AND inodes. A filesystem can sit at 60 % blocks and 100 % inodes; the symptoms are
+# identical to a full disk (SQLite ENOSPC, ingest failures, Caddy unable to log) while every
+# block threshold reads normal and nothing is ever paused. One directory per book, plus its
+# covers and formats, plus multi-part audiobooks, is the classic inode-hungry workload.
+# $pct is the WORSE of the two, so the thresholds, the 24 h latch and the pause flag below are
+# untouched; $trip names the one that tripped, because the remedies have nothing in common
+# (delete big files vs. delete many small ones, and only a mkfs adds inodes to ext4).
+# Anything that is not a 0..100 number is a df that did not answer what we asked — busybox
+# (no --output), a filesystem with no fixed inode table printing "-", a test stub falling
+# through to the human table. pctread prints nothing then, and an unknown reading must never
+# be treated as "full": that would stop the downloaders on a perfectly healthy box. The bound
+# is that test, not a clamp.
+pctread(){ local v; v=$(df "$@" "$STACK_DIR" 2>/dev/null | tail -1 | tr -dc 0-9)
+  case "$v" in ''|*[!0-9]*) return 0;; esac; [ "$v" -le 100 ] || return 0; printf '%s' "$v"; }
+bpct=$(pctread --output=pcent); bpct="${bpct:-0}"
+ipct=$(pctread -i --output=ipcent)                       # "" where inodes are not counted
+if [ "${ipct:-0}" -gt "$bpct" ]; then pct="$ipct"; else pct="$bpct"; fi
+# "blocks 96%", "inodes 97%" or "blocks 96% and inodes 97%" — whichever is at or over $1.
+trip(){ local w=""
+  [ "$bpct" -ge "$1" ] && w="blocks ${bpct}%"
+  [ -n "$ipct" ] && [ "$ipct" -ge "$1" ] && w="${w:+$w and }inodes ${ipct}%"
+  printf '%s' "${w:-blocks ${bpct}%${ipct:+, inodes ${ipct}%}}"; }
+# Freeing gigabytes does nothing for an inode shortage, and `df -h` will keep saying there is
+# room, so say so in the alert itself rather than leaving the admin to delete large files.
+inode_hint(){ [ -n "$ipct" ] && [ "$ipct" -ge "$1" ] || return 0
+  printf ' INODES, not bytes: `df -h` still shows free space and deleting one big file will not help. Delete MANY small files (cwa/config/processed_books, abs/metadata/cache, old thumbnails) or move the library to a filesystem with more inodes — ext4 fixes its inode count at mkfs time.'; }
 now=$(date +%s); last=$(state_get last_alert); last="${last:-0}"
 free_h=$(df -h "$STACK_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+ifree=""; [ -n "$ipct" ] && ifree=$(df -i --output=iavail "$STACK_DIR" 2>/dev/null | tail -1 | tr -dc 0-9)
+free_txt="$free_h free${ifree:+ and $ifree free inodes}"
 
 if [ "$pct" -ge "$STOP_PCT" ]; then
   if [ "$(state_get paused)" != 1 ]; then
@@ -45,12 +74,12 @@ if [ "$pct" -ge "$STOP_PCT" ]; then
       if compose stop qbittorrent >/dev/null 2>&1; then stopped="${stopped:+$stopped, }qbittorrent"; else nostop="${nostop:+$nostop, }qbittorrent"; fi
     fi
     state_set paused 1
-    "$ALERT" "Disk ${pct}% full on $(hostname)" "Only $free_h free under $STACK_DIR. Downloaders stopped (${stopped:-none})${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too. Free space, then they restart automatically below ${RESUME_PCT}%." high
+    "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$STOP_PCT") under $STACK_DIR; only $free_txt. Downloaders stopped (${stopped:-none})${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too.$(inode_hint "$STOP_PCT") Free space, then they restart automatically below ${RESUME_PCT}%." high
     state_set last_alert "$now"
   fi
 elif [ "$pct" -ge "$WARN_PCT" ]; then
   if [ $((now - last)) -ge 86400 ]; then
-    "$ALERT" "Disk ${pct}% full on $(hostname)" "$free_h free under $STACK_DIR. At ${STOP_PCT}% the downloaders are stopped. Check Operations -> Self-test and library/audiobooks."
+    "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$WARN_PCT") under $STACK_DIR; $free_txt. At ${STOP_PCT}% the downloaders are stopped.$(inode_hint "$WARN_PCT") Check Operations -> Self-test and library/audiobooks."
     state_set last_alert "$now"
   fi
 elif [ "$pct" -lt "$RESUME_PCT" ] && [ "$(state_get paused)" = 1 ]; then
@@ -64,7 +93,7 @@ elif [ "$pct" -lt "$RESUME_PCT" ] && [ "$(state_get paused)" = 1 ]; then
   fi
   if [ -z "$nostart" ]; then
     state_set paused 0; state_set resume_failed 0
-    "$ALERT" "Disk back to ${pct}% on $(hostname)" "Downloaders started again ($started)."
+    "$ALERT" "Disk back to ${pct}% on $(hostname)" "Now at blocks ${bpct}%${ipct:+, inodes ${ipct}%}; $free_txt. Downloaders started again ($started)."
   else
     # paused stays 1: the next hourly run tries again instead of leaving a dead container behind.
     if [ "$(state_get resume_failed)" != 1 ] || [ $((now - last)) -ge 86400 ]; then
@@ -78,17 +107,42 @@ fi
 # sweep below (-mtime +14 under library/staging) can never quietly un-pause the portal.
 if [ "$(state_get paused)" = 1 ]; then
   mkdir -p "$(dirname "$PAUSE_FLAG")" 2>/dev/null
-  printf 'disk %s%% >= %s%%; set by scripts/disk-watch.sh at %s\n' "$pct" "$STOP_PCT" "$(date -Is 2>/dev/null)" > "$PAUSE_FLAG" 2>/dev/null || true
+  printf 'disk %s%% >= %s%% (%s); set by scripts/disk-watch.sh at %s\n' "$pct" "$STOP_PCT" "$(trip "$STOP_PCT")" "$(date -Is 2>/dev/null)" > "$PAUSE_FLAG" 2>/dev/null || true
 else
   rm -f "$PAUSE_FLAG" 2>/dev/null || true
 fi
 
 # growers
 find "$STACK_DIR/downloads/incomplete" "$STACK_DIR/library/staging" -type f -mtime +14 -delete 2>/dev/null
-# A .part is renamed to its real extension immediately after tagging, so none survives 15
-# minutes legitimately; a day-wide backstop leaves the last free bytes of a full disk pinned.
-find "$STACK_DIR/library/ingest" -name '*.part' -mmin +15 -delete 2>/dev/null
+# Stale .part files from an ingest that died. 6 HOURS, not the 15 minutes this used to be:
+# tagging is NOT the only work the portal does under the .part name. librarian/worker.py's
+# _atomic_ingest runs, all inside one try and all BEFORE `os.rename(part, ...)`: a
+# shutil.copyfile of up to MAX_EBOOK_MB=200 MB (MAX_PDF_MB=250 for PDFs), _zip_ok, the tagger
+# (pypdf clones a 250 MB PDF in memory), _drm_note and - for epub and pdf - _auto_kindle,
+# which is a SYNCHRONOUS SMTP session uploading up to KINDLE_MAX_MB=45 MB to Amazon.
+# librarian/kindle.py's timeout=30 is per socket operation, not a total, so a 45 MB body at
+# 20 KB/s takes ~37 minutes without one send() ever timing out. -mmin is mtime and the last
+# thing to refresh it is the tagger's os.replace, so that whole upload ran inside the old
+# 15-minute window. When the reaper won, os.rename raised FileNotFoundError, _atomic_ingest's
+# `except BaseException` re-raised and the request was closed as an error - AFTER the book had
+# already been mailed to the reader's Kindle. It fired only under disk pressure and a slow
+# uplink, i.e. exactly when the admin is already chasing other symptoms.
+# 6 h is ~10x the worst case above and still reclaims within a quarter of a day; the real
+# owner of this cleanup is librarian/worker.py's sweep_orphans, which matches the exact
+# ^[0-9a-f]{32}\.part(\.tmp)?$ shape and runs at worker start, when nothing of the worker's is
+# in flight by construction. This line is only the backstop for a worker that is not restarting.
+find "$STACK_DIR/library/ingest" -name '*.part' -mmin +360 -delete 2>/dev/null
 journalctl --vacuum-size=200M >/dev/null 2>&1
+# NOTE, deliberately left as-is: caddy/Dockerfile builds Caddy from source with xcaddy and
+# three pinned plugins, and both Deploy and Update run `compose build --pull caddy librarian`,
+# so this weekly eviction guarantees every Update compiles Caddy cold on two shared vCPUs.
+# That is real but bounded, and disk - not CPU - is the binding constraint at 80 GB, so the
+# cache is not worth one to two GB of it by default. If cold Update builds ever actually hurt,
+# the cheap fix is local and one line: raise `until=168h`, and accept that disk. Do NOT stand
+# up a registry and a cross-arch publish pipeline for an event that happens a few times a year.
 docker builder prune -f --filter until=168h >/dev/null 2>&1
 if [ -f /etc/bookstack/restic.env ]; then ( set -a; . /etc/bookstack/restic.env; set +a; restic cache --cleanup >/dev/null 2>&1 ); fi
+# dead-man's switch: Kuma's "Disk watchdog" monitor goes red if this hourly run stops happening.
+# Always "up": the disk level itself is alerted above, through alert.sh, with its own latch.
+"${KUMA_PUSH:-$STACK_DIR/scripts/kuma-push.sh}" disk up "ran: blocks ${bpct}%${ipct:+, inodes ${ipct}%}$([ -e "$PAUSE_FLAG" ] && printf ', downloaders PAUSED')" >/dev/null 2>&1 || true
 exit 0

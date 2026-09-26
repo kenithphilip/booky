@@ -50,10 +50,13 @@ Twenty items are recommended before the first deploy; all are small or medium. T
 notices, an alert channel, a canary user journey, taking the portal off the host network)
 are scheduled for later and do not block go-live.
 
-**VPS**: buy the X8 (4 cores / 8 GB / 160 GB, EUR 9.99). The X4 runs the core stack, but
-its 80 GB disk caps the audiobook library at roughly 40–50 GB and leaves no headroom for
-Shelfmark's browser-backed sources, Ephemera, or a large first Audiobookshelf scan. Details
-in section 2.
+**VPS**: the stack is deployed on the **X4 (2 cores / 4 GB / 80 GB NVMe / 10 TB, EUR 5.79)**,
+and that is the supported plan. The memory estimate this section was originally written
+around has since been replaced by measurement on the real stack with a 5,015-book library
+(see section 2): the box is comfortable on RAM. What the X4 really costs is disk — 80 GB caps
+the audiobook library at roughly 40–50 GB — and CPU, because a library-wide KEPUB conversion
+already uses more than one of the two cores. Shelfmark's browser-backed sources and Ephemera
+stay off. Details in section 2.
 
 ---
 
@@ -78,14 +81,23 @@ plus published figures for the services the run does not exercise:
 | uptime-kuma | ~150 MB | 300 MB (slow growth over weeks reported) | 384 MB |
 | authelia (optional) | ~30 MB | ~240 MB measured during argon2 hashing | 384 MB |
 | aria2 + AriaNg | ~40 MB | ~120 MB | 128 + 64 MB |
-| ephemera + flaresolverr (optional) | 450 MB | 1.5 GB+ (Chromium per solve; on-box pnpm/tsc/vite build needs 1–2 GB) | 1024 MB, X8 only |
+| ephemera + flaresolverr (optional) | **measured** 58 + ~50 MiB | ~450–500 MiB per page solved, ~910 MiB for two at once (on-box pnpm/tsc/vite build: not measured) | 512 + 1024 MB; fits X4 |
 | restic backup/prune (host, nightly) | 0 | 200–500 MB | — |
 
-Core stack idle ≈ 1.8–2.3 GB including the OS. Worst realistic coincidence on X4 (one
-conversion + an ABS scan + a Shelfmark browser solve) ≈ 4.5 GB, i.e. into the 2 GB swap the
-installer creates. Not fatal, but slow, and today nothing stops the kernel from OOM-killing
-CWA or ABS mid-import because no service has a memory limit (docker-compose.yml x-common
-sets only `no-new-privileges` and log rotation).
+**Measured, not estimated (2026-09-23, real stack, 5,015-book library).** The 1.8–2.3 GB idle
+figure this section used to carry was a desk estimate; it was too pessimistic. Containers
+only: **563 MiB idle**, **1,587 MiB peak** across a full end-to-end run driving every user
+journey, the largest single container being calibre-web at 562 MiB against its 1600m fence.
+Adding what the real VPS carries and the laptop run does not — Debian + systemd + sshd +
+tailscaled + fail2ban + dockerd (~400–500 MB), Uptime Kuma (~150 MB) and the real xcaddy
+Caddy (~55 MB) — gives **≈ 1.2 GB idle and ≈ 2.2 GB peak on the 4 GB box**. That is roughly
+half the machine at peak, with the 2 GB swap the installer creates untouched.
+
+The pathological coincidence the estimate was built around (one conversion + an ABS scan + a
+Shelfmark browser solve, ≈ 4.5 GB) does not occur here: the browser-backed sources are off,
+and the per-service fences in `docker-compose.yml` bound each of the others. The fences are
+what keeps a runaway container from taking the box down, and they are not to be retuned on
+the strength of an estimate — only on a new measurement showing real failure on 4 GB.
 
 ### Disk (the real constraint)
 
@@ -95,25 +107,35 @@ xcaddy builder, transient doubling during `Update`) − ebooks 10–20 GB − AB
 100–150 titles at 300–500 MB each. README already says "audiobooks fill 60 GB fastest".
 X8: ~130 GB free ≈ 300+ titles. X16 only if the library really heads past ~150 GB.
 
-### CPU
+### CPU — the tight resource, not RAM
 
-2 shared vCPUs are fine for a small group: `ebook-convert` is mostly single-threaded
-(30–120 s per book), ABS scans are ffprobe-bound, Chromium solves peg a core for 10–60 s. The
-pain on X4 is contention when a scan overlaps a conversion; 4 cores remove it.
+On 2 shared vCPUs, CPU is what runs out first. `ebook-convert` is mostly single-threaded
+(30–120 s per book), ABS scans are ffprobe-bound, Chromium solves peg a core for 10–60 s —
+and **a CWA library-wide KEPUB conversion sustains 107.8 % CPU measured**, i.e. more than one
+of the two cores, for as long as it runs. For a family of 3–4 readers this is fine because
+those jobs are rare and serial; it is the reason batch work (a Convert Library run, a first
+Audiobookshelf scan) belongs overnight and not next to someone reading. Backups run at 01:00
+and the unattended-upgrades reboot at 04:30: already staggered, and they stay that way.
 
 ### Bandwidth
 
-Irrelevant at this scale: 20 users streaming 64–128 kbps audio plus Kobo/Kindle syncs plus
-incremental restic is a few hundred GB/month. 10 TB vs 15 TB does not matter.
+**10 TB/month**, which at this scale rules out any egress worry. Three or four readers
+streaming 64–128 kbps audio, plus Kobo/Kindle syncs and an incremental off-site restic, is a
+few hundred GB/month — under 5 % of the allowance. Audiobook streaming and off-site backup
+can both be taken for granted; neither needs rationing, scheduling or a local-only fallback.
 
 ### Recommendation
 
-- **X8 (EUR 9.99)**. The extra EUR 4.20/month (EUR 50/year) buys 2× disk (the binding
-  constraint for audiobooks), 2× RAM (no swap during conversion + scan + browser), and 2×
-  cores. It is the plan on which the stack is "excellent to manage" without tuning.
-- **X4 is defensible** if all of these hold: audiobooks stay under ~40 GB on local disk,
-  Ephemera stays off, Shelfmark Direct-Download (browser) sources stay off, ≤ ~10 users, and
-  N11 (memory fences, 4 GB swap, `SHELFMARK_CONCURRENCY=1`) is applied. Watch `df` at 70 %.
+- **X4 (2c / 4 GB / 80 GB NVMe / 10 TB, EUR 5.79) — the deployed and supported plan.**
+  Measured idle ≈ 1.2 GB and peak ≈ 2.2 GB of 4 GB with the fences in place, so RAM is not
+  the constraint the estimate above expected. The conditions it is supported under: audiobooks
+  stay under ~40 GB on local disk, Ephemera stays off, Shelfmark Direct-Download (browser)
+  sources stay off, a household of 3–4 readers, and N11 (memory fences, swap,
+  `SHELFMARK_CONCURRENCY=1`) applied. Watch `df` at 70 % — and watch inodes too, which
+  `scripts/disk-watch.sh` and `scripts/selftest.sh` now do.
+- **X8 (EUR 9.99)** buys 2× disk — the binding constraint — plus 2× RAM and 2× cores. Worth
+  EUR 50/year only when the library really outgrows 80 GB, or when batch jobs (a Convert
+  Library run, a big first ABS scan) stop fitting in the night. RAM alone is not a reason.
 - **X2 is not viable** (CWA + Docker alone would live in swap). **X16** only for disk.
 - Do not offload audiobooks to an rclone/object-storage mount to stay on X4: ABS keys items
   by inode and re-probes everything when they change, qBittorrent must not write to FUSE,
@@ -204,6 +226,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: high.
 
 ### L04 — Use CWA's native per-user auto-send instead of mailing the raw EPUB pre-import
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `_auto_kindle` runs on the `.part` file before CWA imports it (`worker.py:62`), so
   the mailed copy never gets the Kindle EPUB fixer or fetched metadata, and non-EPUB uploads
   are never auto-sent. CWA v4 has per-user `auto_send_enabled` with a delay
@@ -218,6 +241,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L05 — One login when Authelia is on: header SSO into CWA/portal/Shelfmark + password sync + e-mail reset
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: README accepts double login and a separate Authelia password store;
   `authelia_add_user` keeps its own argon2 hash, and the self-service password change does
   not update it.
@@ -232,6 +256,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L10 — Post-import owner reconciliation for formats that cannot carry a tag
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: after N06, mobi/azw3/fb2/txt/djvu still import untagged.
 - **How**: on placement record `(rid, owner, basename, placed_at)`; a 30 s loop opens
   `metadata.db` read-only, finds `data.name` matching the placed basename with `timestamp ≥
@@ -242,6 +267,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L11 — Real KEPUB downloads with kepubify (or drop the option)
+- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `config.FORMATS` offers `kepub` and Devices labels it "(Kobo)", but CWA converts
   to EPUB and only kepubifies transiently on Kobo sync, so `library.best_format` silently
   falls back to EPUB. N07 relabels it now; this makes it real.
@@ -251,6 +277,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: low (later).
 
 ### L12 — Kobo card: prerequisites, pitfalls, last-sync indicator; Magic Shelves / shelves-only sync / Hardcover token
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: Devices Kobo card gets a "before you start" list (store/Libby stop working while
   linked because `config_kobo_proxy=0`; sign-in/factory reset rewrites `api_endpoint`; only
   EPUB/KEPUB sync; first sync takes minutes) and "Last sync: <time>, <n> books" from
@@ -261,6 +288,17 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: low (later).
 
 ### L13 — CWA auto-metadata fetch on ingest (with tag rewriting disabled)
+- **Status**: dropped   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Why dropped, and what replaced it (2026-09-25)**: what this entry prescribed is UNSAFE and
+  must not be done. Verified in the pinned image: CWA v4.0.6 resolves "the book just imported"
+  with `SELECT id FROM books ORDER BY last_modified DESC LIMIT 1`, so turning
+  `auto_metadata_fetch_enabled` on writes one reader's fetched metadata onto whichever book was
+  edited last — possibly another family member's — and the same fallback drives CWA's auto-send.
+  Metadata is now the PORTAL's job: `librarian/metadata.py` (a provider chain with circuit
+  breaker and negative cache, background only), the `meta_*` tables in `librarian/db.py`, and
+  `scripts/metadata-push.sh`, which writes title/sort/authors/series into Calibre for the devices
+  and checks the owner tag before and after every write. The sentinel still asserts that
+  `auto_metadata_fetch_enabled` appears nowhere in `bookstack.sh`.
 - **How**: `auto_metadata_fetch_enabled=1, auto_metadata_smart_application=1,
   auto_metadata_update_tags=0, auto_metadata_enforcement=1` in `apply_library_defaults`
   plus a `Library → Metadata` provider menu. `auto_metadata_update_tags` must stay 0 (it
@@ -268,6 +306,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L16 — Shelfmark request policies and a unified approval queue
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: the portal enforces `APPROVALS_REQUIRED`; Shelfmark downloads straight into the
   dropbox with no approval. Upstream ships per-source request policies (download directly /
   must request / blocked) and an admin approve/decline flow with a static API key.
@@ -278,6 +317,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small (docs) / medium (API). **Priority**: medium (later).
 
 ### L18 — Large uploads over the tailnet
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: N10 caps browser uploads at 95 MB because of Cloudflare; audiobook zips are bigger.
 - **How**: `upload.<domain> { bind @@TAILSCALE_IP@@; import private_tls; import hardening;
   request_body { max_size 2GB }; reverse_proxy 127.0.0.1:8090 }`, grey-cloud DNS record in
@@ -415,6 +455,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium.
 
 ### L01 — Container isolation: portal off the host network, per-service networks, `cap_drop`, `read_only`, Shelfmark sees only `app.db`
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: librarian is on the host network only to reach qBittorrent/aria2 on 127.0.0.1;
   everything else shares one bridge, so Shelfmark (third-party, internet-facing) can talk to
   qbittorrent:8080, authelia:9091, etc.; no `cap_drop`/`read_only`; caddy/kuma run as root;
@@ -432,6 +473,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: large. **Priority**: medium (later).
 
 ### L14 — The origin lock trusts Cloudflare's *shared* origin-pull CA
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: the CA in `cf-origin-pull-ca.pem` signs the same client cert for every Cloudflare
   tenant, so mTLS proves "some Cloudflare edge", not "my zone". Caddy's per-hostname certs
   blunt the classic bypass (the attacker needs an Enterprise Host/SNI override), but the
@@ -442,6 +484,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L15 — Backups deletable from the host they protect
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `backup.sh:13` runs `restic forget --prune` nightly with the same key as the
   backup, so root on the VPS (or the leaked B2 key) can wipe every snapshot.
 - **How**: an append-only B2 application key (no `deleteFiles`) or `rest-server
@@ -450,12 +493,14 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L17 — Bot friction on the portal login and a default nudge towards 2FA
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: Cloudflare Turnstile (free) on `login.html` with server-side siteverify; Quick
   install asks "Enable SSO + 2FA now? (recommended)"; `selftest.sh` warns when
   `forward_auth` is absent.
 - **Effort**: small. **Priority**: low (later).
 
 ### L19 — Host hardening extras
+- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: sshd drop-in adds `AllowUsers root books`, `LoginGraceTime 20`,
   `ClientAliveInterval 300`, `AllowTcpForwarding no`, `AllowAgentForwarding no`,
   `PermitEmptyPasswords no`, `sshd -t` before reload; sysctl adds `kernel.kptr_restrict=2`,
@@ -557,7 +602,11 @@ Checked against the files; no action needed beyond the residuals named.
   `*.db-wal`, `*.db-shm`, `*.sqlite-wal`, `cwa/config/processed_books`, `library/staging`,
   `downloads`; keep `caddy/data/access.log` excluded (it is now redacted, N04, but still
   noise). After backup: `restic check` (structure) daily, `restic check
-  --read-data-subset=5%` on Sundays; log `restic stats latest --json`. Set `auto_backup_
+  --read-data-subset=5%` on Sundays; log `restic stats latest --json`. *(Superseded 2026-09-23:
+  `5%` re-picks its 5 % at random every week, so no pack is ever guaranteed to have been read.
+  Shipped instead as `--read-data-subset=n/52` with the counter rotating in
+  `/etc/bookstack/backup.state` — every byte read exactly once a year, and weekly transfer
+  drops from 5 % to ~1.9 %.)* Set `auto_backup_
   imports=0, auto_backup_conversions=0, auto_backup_epub_fixes=0` in
   `apply_library_defaults` (toggle in `step_formats` for admins who want the copies).
   `restore-test.sh`: restore latest, `PRAGMA integrity_check == ok` on every snapshot DB,
@@ -634,11 +683,24 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: high.
 
 ### L06 — Update notices (Diun) and in-app CWA update banner
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: `crazymax/diun` service (docker socket read-only, watch-by-default, notify via
   the alert channel from L07 or e-mail), `cwa_update_notifications=1` in defaults.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L07 — Alert channel and Uptime Kuma bootstrap
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Resolution (2026-09-25, v4.6)**: `monitoring/kuma_bootstrap.py` (uptime-kuma-api 1.2.1,
+  hash-pinned) runs after every Deploy/Update/feature switch and from Operations → Monitoring:
+  admin account, notifications, one monitor per service and enabled feature, push monitors for
+  the hourly self-test, disk watchdog, metadata push, cf-ips and backup (`scripts/kuma-push.sh`),
+  a maintenance window over the 04:30 reboot, 30-day history. Proven against the real Kuma
+  1.23.17 by `tests/monitoring-test.sh`. Deviations from the plan below, on purpose: no separate
+  self-hosted ntfy — Kuma posts to the SAME `NOTIFY_WEBHOOK` (ntfy-shaped) and SMTP that
+  `alert.sh` uses, so there is one channel to configure; no Docker-container monitors — they
+  need `/var/run/docker.sock` in Kuma, which is root on the host, and the self-test's container
+  checks cover it hourly; Kuma stays on `:1` (the API library targets 1.23, and 2.x migrates the
+  database). The synthetic journey's push waits for L08.
 - **What**: `step_monitoring` only prints instructions; no monitors, no notification
   provider, no push (dead-man) monitors for the backup timer or cf-ips cron.
 - **How**: self-hosted `ntfy` on the tailnet (`auth-default-access: deny-all`, token in
@@ -650,6 +712,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L08 — Scheduled synthetic user journey on the VPS (canary user)
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: `scripts/synthetic.py` reusing `tests/e2e_driver.py` helpers, as user `_canary`
   (hidden from user lists): login → upload a generated EPUB through Cloudflare → wait for
   import with the owner tag → download → second canary gets 404 → OPDS + Kobo init through
@@ -660,6 +723,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L09 — Certificate and token expiry watch
+- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: daily `cert-watch.sh`: `openssl x509 -checkend` on every origin cert under
   `caddy/data/caddy/certificates` (alert < 14 days = renewal is failing), on
   `cf-origin-pull-ca.pem` (< 60 days), grep Caddy logs for `could not get certificate`;
@@ -668,6 +732,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L20 — Restart unhealthy containers (autoheal)
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `restart: unless-stopped` only reacts to PID 1 exiting; Docker never acts on a
   failing healthcheck, so a wedged CWA stays "unhealthy" forever.
 - **How**: `willfarrell/autoheal` with the docker socket read-only and the `autoheal` label
@@ -678,6 +743,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L02 — Make the P2P path actually work (qBittorrent auth, temp path, ingest mounts)
+- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `config.py:114-118` assumes "bypass auth for localhost"; the librarian's
   connection to the published port arrives from the Docker bridge gateway, not 127.0.0.1, so
   even that setting would not match and `Qbit().add()` gets 403. The LSIO image prints a new
@@ -695,6 +761,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L03 — Torrent watcher: match by hash, not by substring or "oldest pending"
+- **Status**: obsolete   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `worker.py:237-261` globs every `*.epub` under staging every 20 s, matches a
   request by identifier substring **or falls back to `pending[0]`** (any user's oldest
   torrent), ingests partial files, deletes qBittorrent's live file, and never times out.
@@ -706,12 +773,14 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L21 — Asynchronous Send-to-Kindle
+- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `send_kindle` is synchronous; a slow relay with a 45 MB attachment can hit
   Cloudflare's 100 s proxy timeout (524) even though the mail is sent.
 - **How**: enqueue a `kindle` job row processed by the worker; flash "Sending… see Status".
 - **Effort**: small. **Priority**: low (later).
 
 ### L22 — aria2 downloads should enter through a dropbox
+- **Status**: obsolete   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: mount `./library/dropbox/admin` as aria2's `/downloads` (or `downloads/incomplete`
   + an `--on-download-complete` move) so admin downloads go through the atomic, tagged path
   instead of landing raw in CWA's watched folder. Folded into L02 if done together.
@@ -778,12 +847,21 @@ Checked against the files; no action needed beyond the residuals named.
 - **How**: (1) remove the Bot Fight Mode advice from README:150, `DEPLOYMENT-CHECKLIST.md:53`
   and `bookstack.sh:250`; say plainly that it breaks Kobo/OPDS/KOReader/ABS apps and cannot
   be exempted on Free (Super Bot Fight Mode with a skip rule needs Pro). (2) In
-  `step_cloudflare`, create a Configuration Rule via the rulesets API (`http_config_settings`
-  phase, action `set_config` with `bic: false`) for `books.<d>` paths `/kobo/`, `/opds`,
-  `/kosync` and `audio.<d>` paths `/api/`, `/socket.io`, `/hls/`; the token needs the
-  Config Rules edit permission (add it to the permission list shown in `step_configure` and
-  README); fall back to printing the dashboard steps if the API refuses. Keep
-  `browser_check on` for the HTML apps. (3) `MAX_UPLOAD_MB` default 95 in `config.py`,
+  `step_cloudflare`, **NOT DONE — and the half that was done has now been undone.** The
+  proposal was to create a Configuration Rule via the rulesets API (`http_config_settings`
+  phase, action `set_config` with `bic: false`) for the device paths and keep
+  `browser_check on` for the HTML apps. Only the paperwork half shipped: the "Config
+  Rules:Edit" permission was added to `README.md`, `step_configure`, `step_cloudflare` and
+  `step_quick`, while `cf_ruleset_rule()` is still called from exactly one place
+  (`cf_cache_rule`, phase `http_request_cache_settings`) and nothing anywhere uses
+  `http_config_settings`. What `step_cloudflare` actually does is `cf_setting browser_check
+  off` — zone-wide, not per host or per path. So the admin was being asked to grant a
+  zone-wide rules-editing permission on the most powerful credential in the deployment for a
+  feature that does not exist, and whose absence nothing would ever have noticed.
+  **Resolved the honest way (2026-09-23):** the Config Rules row is gone from README's token
+  table, replaced by a plain statement that Browser Integrity Check is off zone-wide and why
+  that is the accepted trade on the Free plan. If the per-path rule is ever actually built,
+  the permission goes back in all four places at the same time, not before. (3) `MAX_UPLOAD_MB` default 95 in `config.py`,
   compose and `.env.example`; show the limit on `upload.html`; add a 413 handler with a
   friendly message and pointer to the dropbox/Tailscale path (L18 later). (4)
   `selftest.sh`: `curl -A 'Mozilla/5.0 (Linux; U; Android 2.0; en-us;) AppleWebKit/533.1
@@ -866,10 +944,49 @@ Checked against the files; no action needed beyond the residuals named.
   writer against Calibre's database for every book; kept only as the narrow fallback in L10.
 - **Cloudflare Access instead of Authelia.** Already documented as the alternative; run one.
 - **Bot Fight Mode.** Breaks non-browser clients and cannot be exempted on the Free plan.
-- **Running Ephemera on X4.** Unmaintained upstream plus ~1 GB for FlareSolverr and an on-box
-  Node build; X8 only, and only if its request-and-wait queue is really wanted.
+- **Running Ephemera on X4** — *withdrawn 2026-09-25.* Measured, not estimated: Ephemera idles at
+  58 MiB and FlareSolverr at ~50 MiB, ~450–500 MiB per page being solved (1 GiB fence), so the
+  worst case is ≈ 3.3 GB on the 4 GB box. The owner kept it (for its request-and-wait queue);
+  FlareSolverr is now one shared service that Shelfmark uses too. Still unmaintained upstream.
 - **X2 plan.** Not viable; **X16** only for disk.
 - **Kobo store proxy on.** Privacy; users are told the store/Libby stop working while linked.
+- **`X-Accel-Redirect` byte-serving (2026-09-23).** Audiobookshelf ships full support and it is
+  unused here: `server/Server.js:70` reads `global.XAccel = process.env.USE_X_ACCEL`, honoured
+  in `SessionController.js:318` (audio streaming), `LibraryItemController.js:988/1080/1137`
+  (file and ebook download), `:415` (cover), `CacheManager.js:50/76` and
+  `ShareController.js:162/203`; the portal is the same shape (`librarian/app.py` serves books
+  with Flask `send_file` on one of gunicorn's 8 threads). Finding it unused is NOT a defect,
+  and a future round should not treat it as one. Rejected for three reasons in order of
+  weight: **(a) the byte rate does not justify it** — four readers at 64–128 kbps is ~64 KB/s
+  aggregate, where Node's `fs.createReadStream` → `res` costs a few percent of a core, and the
+  measured pressure on this box is `ebook-convert`/KEPUB (107.8 % CPU), not streaming; **(b)**
+  Caddy has no native `X-Accel-Redirect` handler (it is an nginx feature), so it would have to
+  be built from `reverse_proxy { handle_response }` + `rewrite {rp.header.X-Accel-Redirect}` +
+  `file_server` and kept correct across all Caddyfile variants; **(c)** it requires
+  bind-mounting `library/audiobooks` and `library/books` into the EDGE proxy, which today
+  mounts only its own config — turning an upstream-supplied header into a filesystem path the
+  internet-facing process reads is a new path-traversal surface protecting nothing that is
+  currently sore. Revisit only if the access log ever shows sustained multi-stream bulk
+  downloading, and only then.
+- **Adding anything at all (2026-09-23).** A round that went looking specifically for a
+  *new* component to wire into the stack, on the confirmed 2 vCPU / 4 GB / 80 GB / 10 TB,
+  found none that clears the bar. The 18 candidates already rejected above and the 14 deferred
+  ones (L01–L22) all keep their verdicts on this hardware; none was rejected on bandwidth
+  grounds, so 10 TB changes nothing either. Every job a newcomer would be proposed for is
+  already covered in-repo: alerting (`scripts/alert.sh`, webhook + SMTP + journal fallback),
+  health checking (`scripts/selftest.sh`), disk watch with an automatic downloader pause
+  (`scripts/disk-watch.sh`), backup with a monthly restore test (`scripts/backup.sh`,
+  `scripts/restore-test.sh`), edge banning (fail2ban → Cloudflare IP Access Rules),
+  search-and-download with per-user accounts (Shelfmark), and the OPDS/Kobo/KOReader/Kindle
+  device paths. The only thing another container could add is another thing to update, back up
+  and restore — and this stack's own history (the CWA EPUB fixer corrupting CBZ metadata,
+  restic 0.14 silently failing every nightly backup, Ephemera's upstream vanishing) is a
+  record of moving parts going wrong quietly. **The one genuine gap is not an addition:**
+  nothing here survives the box itself dying. `BACKUP_PING_URL` in `scripts/backup.sh` is
+  already a healthchecks.io-style dead-man's switch but fires only once a night from the
+  backup. Pinging it — or a sibling `HEALTH_PING_URL` — from the unattended self-test timer
+  closes it with one `curl` line, no new container, no new datastore and no weekly chore.
+  That is the whole recommendation.
 
 ---
 

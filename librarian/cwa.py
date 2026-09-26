@@ -13,7 +13,7 @@ live immediately. Also usable as a CLI (bookstack.sh menu "Users" calls it):
     python -m cwa remove-user alice | enable-kobo-sync | rename-user admin kenith-admin
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 """
-import sqlite3, os, sys, json, argparse, re
+import sqlite3, os, sys, json, argparse, re, functools
 from binascii import hexlify
 from werkzeug.security import generate_password_hash
 import config
@@ -31,6 +31,37 @@ ADMIN_SIDEBAR = 524287   # constants.ADMIN_USER_SIDEBAR (all sidebar items)
 
 class CwaError(Exception):
     pass
+
+class CwaUnavailable(CwaError):
+    """app.db exists but could not be read or written right now — SQLITE_BUSY after the 30 s
+    timeout, 'unable to open database file' when the WAL sidecars cannot be created, 'file is
+    not a database' mid-checkpoint.
+
+    A SUBCLASS of CwaError on purpose: _conn() only ever raised for a missing file, so every
+    guard in the portal is `except cwa.CwaError` and every other sqlite3 error escaped this
+    module raw. worker._owner_gone then read a transient lock as 'that account is gone' and
+    _process wrote a permanent `error` row plus a 'could not be added' mail for a request that
+    only needed retrying, while app._cwa_user turned it into a bare 500 on /library, /upload,
+    /devices and /admin — with /login still working, because auth._row is the one place that
+    catches bare Exception. Being a CwaError means those guards now fail open, as their own
+    docstrings already promised; the distinct class is there for a caller that wants to tell
+    'no such user' from 'ask again in a moment'.
+
+    The portal manufactures this contention itself: _checkpoint() runs a TRUNCATE checkpoint
+    after every user/kindle/kobo write and checkpoint_passive() every 300 s."""
+
+def _guard(fn):
+    """Translate sqlite3 errors into CwaUnavailable. On every public entry point that touches
+    app.db, so no caller has to know this module uses sqlite. sqlite3.IntegrityError is caught
+    closer to the statement where it means something specific (a duplicate e-mail)."""
+    @functools.wraps(fn)
+    def wrapped(*a, **kw):
+        try:
+            return fn(*a, **kw)
+        except sqlite3.Error as e:
+            raise CwaUnavailable(f"the library database is busy or unreadable ({e}); "
+                                 f"try again in a moment") from e
+    return wrapped
 
 def kindle_fixer_on():
     """CWA's own settings DB (cwa.db) sits beside app.db. True when its Kindle EPUB fixer runs
@@ -109,12 +140,14 @@ def owner_tag(name):
     return f"{config.OWNER_PREFIX}{name}"
 
 # ---- users -----------------------------------------------------------------------
+@_guard
 def get_user(name):
     with _conn() as c:
         r = c.execute("SELECT id,name,email,role,kindle_mail,allowed_tags FROM user "
                       "WHERE name=? COLLATE NOCASE", (name,)).fetchone()
     return dict(r) if r else None
 
+@_guard
 def list_users():
     """Real accounts only: CWA's built-in anonymous 'Guest' row (ROLE_ANONYMOUS) is not a
     login and anonymous browsing is switched off by harden(), so it is left out."""
@@ -143,6 +176,7 @@ def _setting(c, name, default):
         pass
     return default
 
+@_guard
 def add_user(name, password, email="", admin=False):
     """Create a CWA user. Non-admins get Allowed Tags = owner:<name> (the isolation model).
     Column set adapts to the CWA version at hand: every known column gets the same value
@@ -178,6 +212,7 @@ def add_user(name, password, email="", admin=False):
     _checkpoint()
     return get_user(name)
 
+@_guard
 def set_password(name, password):
     if len(password or "") < 8:
         raise CwaError("password must be at least 8 characters")
@@ -187,6 +222,7 @@ def set_password(name, password):
         raise CwaError(f"no such user '{name}'")
     _checkpoint()
 
+@_guard
 def rename_user(old, new):
     """Rename an ADMIN account (the installer lets the admin choose a name other than 'admin').
     An isolated user is refused: their books carry owner:<old>, so a rename would hide them."""
@@ -203,9 +239,19 @@ def rename_user(old, new):
                        f"books (tagged {owner_tag(u['name'])}); create a new user instead")
     with _conn() as c:
         c.execute("UPDATE user SET name=? WHERE id=?", (new, u["id"]))
+    # The portal's own rows are keyed on the NAME, not on CWA's user id: without this the
+    # renamed admin loses their request history, preferences and audit trail. Imported late so
+    # the CLI keeps working against a machine where only app.db is reachable.
+    moved = {}
+    try:
+        import db as _db
+        moved = _db.rename_owner(u["name"], new)
+    except Exception as e:                       # never leave the CWA account half-renamed
+        moved = {"error": str(e)}
     _checkpoint()
-    return {"old": u["name"], "new": new, "id": u["id"]}
+    return {"old": u["name"], "new": new, "id": u["id"], "portal_rows": moved}
 
+@_guard
 def set_email(name, address):
     """The user's own e-mail (notifications, and the sender allowed for mail-to-library).
     CWA keeps it UNIQUE, so an address another account uses is refused."""
@@ -223,6 +269,7 @@ def set_email(name, address):
     _checkpoint()
     return address
 
+@_guard
 def remove_user(name):
     u = get_user(name)
     if not u:
@@ -237,6 +284,7 @@ def remove_user(name):
         c.execute("DELETE FROM user WHERE id=?", (u["id"],))
     _checkpoint()
 
+@_guard
 def ensure_isolation(name):
     """Re-apply Allowed Tags = owner:<name> for a non-admin (idempotent)."""
     u = get_user(name)
@@ -250,6 +298,7 @@ def ensure_isolation(name):
     return True
 
 # ---- devices ---------------------------------------------------------------------
+@_guard
 def set_kindle_mail(name, address):
     address = (address or "").strip()
     if address and ("@" not in address or " " in address):
@@ -261,6 +310,7 @@ def set_kindle_mail(name, address):
     _checkpoint()
     return address
 
+@_guard
 def kobo_token(name, create=True):
     """Return the user's Kobo sync token (create one like CWA's own button if missing)."""
     u = get_user(name)
@@ -279,10 +329,12 @@ def kobo_token(name, create=True):
     _checkpoint()
     return tok
 
+@_guard
 def kobo_url(name, create=True):
     tok = kobo_token(name, create)
     return f"{config.BOOKS_URL}/kobo/{tok}" if tok and config.BOOKS_URL else None
 
+@_guard
 def reset_kobo_token(name):
     u = get_user(name)
     if not u:
@@ -291,11 +343,13 @@ def reset_kobo_token(name):
         c.execute("DELETE FROM remote_auth_token WHERE user_id=? AND token_type=?", (u["id"], KOBO_TOKEN_TYPE))
     return kobo_token(name, True)
 
+@_guard
 def kobo_sync_enabled():
     with _conn() as c:
         r = c.execute("SELECT config_kobo_sync FROM settings LIMIT 1").fetchone()
     return bool(r and r["config_kobo_sync"])
 
+@_guard
 def _apply_settings(wanted):
     """UPDATE settings SET k=v for the columns that exist. Returns True if anything changed.
     NOTE: CWA loads `settings` into memory at start-up, so a change here takes effect after
@@ -317,7 +371,21 @@ def enable_kobo_sync():
     return _apply_settings({"config_kobo_sync": 1, "config_kobo_proxy": 0})
 
 def disable_public_registration():
-    return _apply_settings({"config_public_reg": 0, "config_anonbrowse": 0, "config_remote_login": 0})
+    """Pin every way into CWA that does not go through a password prompt.
+
+    config_allow_reverse_proxy_header_login is off in the shipped image, so this is a pin and
+    not a repair — but it is the one flag here whose ON state is a full authentication bypass
+    on books.<domain>, and it is one admin click (or one Authelia integration attempt) away.
+    With it on, cps/__init__.py:_cwa_ensure_db_session calls load_user_from_reverse_proxy_header
+    before ANY blueprint runs and kosync's authenticate_user() short-circuits on it before it
+    looks at the Authorization header, so an anonymous request carrying the header is logged in
+    as whoever it names, including admin. The header NAME is itself an admin-chosen setting
+    (config_reverse_proxy_login_header_name) while caddy/Caddyfile.template strips a FIXED list,
+    so Caddy cannot catch a name nobody anticipated. Every other hardening step in this stack is
+    pinned rather than assumed; this one now is too."""
+    return _apply_settings({"config_public_reg": 0, "config_anonbrowse": 0,
+                            "config_remote_login": 0,
+                            "config_allow_reverse_proxy_header_login": 0})
 
 # ---- CLI (used by bookstack.sh) ---------------------------------------------------
 def _password_args(sub):

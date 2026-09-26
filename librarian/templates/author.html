@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('my_library') }}">← My books</a></p>
+<h2>{{ a.name }}</h2>
+{% if a.birth_year or a.death_year %}<p class="mut">{{ a.birth_year or '?' }}–{{ a.death_year or '' }}</p>{% endif %}
+{% if a.bio %}<div class="card"><p style="white-space:pre-line">{{ a.bio }}</p></div>{% endif %}
+<h3>In your library</h3>
+{% for w in yours %}<div class="card"><a href="{{ url_for('book_page', book_id=w.book_id) }}"><strong>{{ w.title }}</strong></a>{% if w.first_publish_year %} <span class="mut">({{ w.first_publish_year }})</span>{% endif %}</div>{% endfor %}
+{% for x in extra %}<div class="card"><a href="{{ url_for('book_page', book_id=x.id) }}"><strong>{{ x.title }}</strong></a>{% if x.series %} <span class="mut">· {{ x.series }}{% if x.series_index %} #{{ '%g' % x.series_index }}{% endif %}</span>{% endif %}</div>{% endfor %}
+{% if not yours and not extra %}<p class="mut">None yet.</p>{% endif %}
+{% if others %}<h3>Known, not in any library here <span class="mut">(admin view)</span></h3>
+{% for w in others %}<div class="card mut">{{ w.title }}{% if w.first_publish_year %} ({{ w.first_publish_year }}){% endif %}
+· <a href="{{ url_for('index', q=w.title ~ ' ' ~ a.name) }}">search for it</a></div>{% endfor %}{% endif %}
+{% endblock %}

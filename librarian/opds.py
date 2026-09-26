@@ -10,13 +10,18 @@ ATOM = "http://www.w3.org/2005/Atom"
 ACQ_RELS = ("http://opds-spec.org/acquisition",
             "http://opds-spec.org/acquisition/open-access")
 PREF_TYPES = ("epub", "kepub", "mobi", "azw3", "pdf")
+# Your own catalog is usually on the tailnet and fast, but it is still one source on a page
+# that gives up after fetchers.SEARCH_DEADLINE (12 s). The old 25 s left a thread fetching from
+# a wedged catalog long after the reader had been shown the page. (Not imported from fetchers:
+# fetchers imports this module.)
+TIMEOUT = 10
 
 def _auth():
     if config.MYCATALOG_USER:
         return (config.MYCATALOG_USER, config.MYCATALOG_PASS)
     return None
 
-def search(q, limit=12):
+def search(q, limit=12, budget=None):
     url = config.MYCATALOG_URL
     if not url:
         return []
@@ -24,7 +29,15 @@ def search(q, limit=12):
         url = url.replace("{q}", urllib.parse.quote(q))
     out = []
     try:
-        r = requests.get(url, headers=UA, auth=_auth(), timeout=25)
+        # Build one when the caller did not, exactly as the other four adapters do. Without it
+        # the fallback (3, TIMEOUT) is a per-connection timeout, not a wall-clock bound: a
+        # catalog that accepts the connection and then stalls could outlive both SOURCE_BUDGET
+        # and the page's own SEARCH_DEADLINE, which is what the budget exists to prevent.
+        # imported here, not at module scope: fetchers imports this module, so a top-level
+        # import would be circular
+        import fetchers
+        budget = budget or fetchers._Budget()
+        r = requests.get(url, headers=UA, auth=_auth(), timeout=budget.pair(read=TIMEOUT))
         r.raise_for_status()
         root = etree.fromstring(r.content)
         ql = q.lower().strip()

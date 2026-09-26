@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('my_library') }}">← My books</a></p>
+<h2>{{ s.name }}</h2>
+{% if missing %}<div class="card">You are missing {% for n in missing %}#{{ n }}{% if not loop.last %}, {% endif %}{% endfor %} from this series.</div>{% endif %}
+{% if nxt %}<p class="mut">Next after yours: #{{ nxt }} · <a href="{{ url_for('index', q=s.name) }}">search for it</a></p>{% endif %}
+{% for r in rows %}
+<div class="card{% if not r.book_id %} mut{% endif %}">
+<span class="mut">{{ '#' ~ r.position if r.position else '—' }}</span>
+{% if r.book_id %}<a href="{{ url_for('book_page', book_id=r.book_id) }}"><strong>{{ r.title }}</strong></a>
+{% else %}{{ r.title }} <span class="mut">· not in your library{% if admin %} (admin view){% endif %}</span>{% endif %}
+{% if r.authors %}<span class="mut"> · {{ r.authors }}</span>{% endif %}
+</div>
+{% endfor %}
+{% endblock %}

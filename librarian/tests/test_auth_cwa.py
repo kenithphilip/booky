@@ -195,7 +195,8 @@ def test_cli_rename_user_for_a_chosen_admin_name(capsys):
     cwa.add_user("admin", "adminpass1", admin=True); cwa.add_user("alice", "alicepass1")
     assert cwa._cli(["rename-user", "admin", "kenith-admin"]) == 0
     out = json.loads(capsys.readouterr().out)
-    assert out == {"ok": True, "old": "admin", "new": "kenith-admin", "id": out["id"]}
+    assert out == {"ok": True, "old": "admin", "new": "kenith-admin", "id": out["id"],
+                   "portal_rows": out["portal_rows"]}
     assert cwa.get_user("admin") is None and auth.verify("kenith-admin", "adminpass1")["is_admin"]
     assert _immutable_reader_sees("kenith-admin") is not None                        # WAL checkpointed for Shelfmark
     assert cwa._cli(["rename-user", "kenith-admin", "alice"]) == 2 and "already exists" in capsys.readouterr().err

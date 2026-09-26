@@ -272,7 +272,28 @@ services:
     # owner:<user> and ingests it atomically (ebooks -> Calibre-Web, audiobooks -> Audiobookshelf
     # with the owner tag), so per-user isolation is preserved end to end.
     # Which release sources are enabled is chosen by the admin in Shelfmark's Settings.
-    image: ${IMG_SHELFMARK:-ghcr.io/calibrain/shelfmark:v1.3.7}
+    #
+    # OUTBOUND SSRF SURFACE — the tailnet ACL is load-bearing, not optional.
+    # GET /api/covers/<id>?url=<base64url> is @login_required only: on a cache miss
+    # main.py:api_cover base64-decodes the CALLER'S url and fetches it
+    # (core/image_cache.py ImageCacheService._prepare_safe_url). That guard rejects only
+    # `ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved`. Measured inside
+    # the pinned v1.3.15 image (Python 3.14.7): 169.254.169.254 and 172.17.0.1 are BLOCKED,
+    # but 100.64.1.5 is private=False loopback=False link_local=False reserved=False, i.e.
+    # ALLOWED — the whole Tailscale CGNAT range 100.64.0.0/10 is not fenced. Redirects ARE
+    # re-checked, so the hole is the range, not the redirect handling. v1.3.15 did not fix it
+    # (re-verified this round); re-check whenever IMG_SHELFMARK is bumped.
+    # The portal's own fence does block it — see librarian/worker.py::_check_target,
+    # `CGNAT = ipaddress.ip_network("100.64.0.0/10")  # Tailscale addresses live here` — so
+    # this stack has already decided that range is in scope and Shelfmark simply does not
+    # implement it. Caddy cannot help: this is outbound.
+    # What contains it: the tailnet ACL from the Tailscale step must give this machine
+    # (tag:bookstack) NO outbound access to other tailnet nodes. scripts/selftest.sh now
+    # probes that from inside this container instead of assuming it (see "tailnet ACL").
+    # The alternative, if the ACL cannot be relied on, is to turn the cover cache off
+    # entirely (COVERS_CACHE_ENABLED in Shelfmark's Settings) at the cost of cover latency —
+    # recorded in docs/DECISIONS-PENDING.md.
+    image: ${IMG_SHELFMARK:-ghcr.io/calibrain/shelfmark:v1.3.15}
     container_name: shelfmark
     # Fail closed: Shelfmark silently falls back to auth mode "none" (no login at all, everyone
     # admin) when CWA's app.db is missing or unreadable at start. Refuse to start unless the
@@ -300,17 +321,21 @@ services:
       - AUTH_METHOD=cwa
       - CWA_DB_PATH=/auth/app.db
       # Where downloads land. The per-user level is written into the NAMING TEMPLATES, not
-      # into the destination path, for two reasons (both verified in
-      # ghcr.io/calibrain/shelfmark:v1.3.7):
+      # into the destination path, for two reasons (both re-verified on the pinned
+      # ghcr.io/calibrain/shelfmark:v1.3.15, and on v1.3.7 side by side: identical output):
       #  * the image's entrypoint runs `make_writable "${INGEST_DIR:-/books}"` -> `mkdir -p`
       #    on the RAW value (/app/entrypoint.sh:481), so a destination of "/dropbox/{User}"
       #    created a literal folder named "{User}" in the dropbox root at every start, which
       #    the librarian then logged as "not an existing user's folder; ignored". With
       #    INGEST_DIR=/dropbox it only touches the real mount.
-      #  * only "organize" mode may contain path separators, and only it keeps a multi-file
-      #    audiobook together: "rename" renames single-file downloads and drops multi-file
-      #    downloads flat under their original names (download/postprocess/transfer.py), so
-      #    a 3-part audiobook became 3 separate Audiobookshelf items.
+      #  * only "organize" mode may contain path separators, and only it can put the {User}
+      #    level in the template at all: "rename" renames single-file downloads and drops
+      #    multi-file downloads flat under their original names
+      #    (download/postprocess/transfer.py), so a 3-part audiobook became 3 separate
+      #    Audiobookshelf items. v1.3.12 added a third mode, "rename_and_group", which keeps
+      #    a multi-file audiobook in its SOURCE folder name; it is not what this stack wants,
+      #    because that name comes from the release, not from the template, and it still
+      #    forbids path separators, so there would be no per-user level.
       # INGEST_DIR is the ONLY env name for the books destination: the setting is called
       # DESTINATION but declares env_var="INGEST_DIR" (config/settings.py), so an env var
       # named DESTINATION is ignored. DESTINATION_AUDIOBOOK is its own key and is read as-is.
@@ -332,8 +357,27 @@ services:
       - BOOK_LANGUAGE=${SHELFMARK_LANGUAGE:-en}
       - SEARCH_PAGE_TITLE=${SHELFMARK_TITLE:-Library search}
       - MAX_CONCURRENT_DOWNLOADS=${SHELFMARK_CONCURRENCY:-1}
+      # New in v1.3.13 and 300 s by default, which is longer than this stack can deliver:
+      # shelf.<domain> is served through Cloudflare, and the Free plan gives up on an origin
+      # that has not answered in 100 s with its own error 524 page. Shelfmark's own note says
+      # the proxy's read timeout must be at least this value or the search is cut off first.
+      # At 300 s a slow search returns a Cloudflare 524 and the user learns nothing; at 90 s
+      # Shelfmark answers first and names the real cause (usually a protection challenge
+      # nobody could solve). Raise it only together with a Cloudflare plan that allows it.
+      - RELEASE_SEARCH_TIMEOUT=${SHELFMARK_SEARCH_TIMEOUT:-90}
       - CALIBRE_WEB_URL=https://books.${DOMAIN}
       - AUDIOBOOK_LIBRARY_URL=https://audio.${DOMAIN}
+      # Protection challenges on download sites. With FlareSolverr on (Operations -> FlareSolverr,
+      # FLARESOLVERR_ENABLED) they are solved by the shared flaresolverr service below, whose
+      # Chromium lives in ITS 1 GiB fence, instead of Shelfmark's built-in bypasser, which starts
+      # a Chromium inside this 768 MiB one. Set from the environment on purpose: in the pinned
+      # v1.3.15 an env value always wins over the Settings page (core/config.py get(): "Deployment-
+      # level ENV values always win"), so the admin UI cannot point Shelfmark at a solver that is
+      # not running. EXT_BYPASSER_TIMEOUT stays under RELEASE_SEARCH_TIMEOUT (Cloudflare's 100 s).
+      - USING_EXTERNAL_BYPASSER=${FLARESOLVERR_ENABLED:-false}
+      - EXT_BYPASSER_URL=http://flaresolverr:8191
+      - EXT_BYPASSER_PATH=/v1
+      - EXT_BYPASSER_TIMEOUT=${FLARESOLVERR_TIMEOUT_MS:-60000}
     ports:
       - "127.0.0.1:8084:8084"
     depends_on:
@@ -346,9 +390,29 @@ services:
       - ./library/audiobooks:/audiobooks:ro
       - ./cwa/config:/auth:ro
     healthcheck:
-      # Unhealthy unless Shelfmark reports Calibre-Web authentication (it re-resolves the mode
-      # per request, so a vanished app.db later would flip it to "none"); selftest checks too.
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8084/api/auth/check | grep -q '\"auth_mode\": *\"cwa\"'"]
+      # TWO assertions, because the first one alone is blind in the direction that matters.
+      # (a) /api/auth/check reports auth_mode "cwa". This proves Shelfmark STARTED with a
+      #     readable app.db and NOTHING MORE: the mode is fixed at process start. Measured on
+      #     the pinned ghcr.io/calibrain/shelfmark:v1.3.15:
+      #     shelfmark/config/env.py:166 evaluates `CWA_DB_PATH = _resolve_cwa_db_path()` ONCE at
+      #     module import, and core/auth_modes.py:80 `if auth_mode == AUTH_SOURCE_CWA and
+      #     cwa_db_path:` tests the TRUTHINESS of that cached Path, never its existence. Proven
+      #     live: with app.db present /api/auth/check said "cwa" and POST /api/auth/login
+      #     answered 401; after `mv app.db app.db.gone` /api/auth/check STILL said "cwa" (this
+      #     command still printed healthy) while every login answered 500 "Database
+      #     configuration error". So the one regression this check exists to catch — the
+      #     ./cwa/config bind-mount lost, app.db renamed by a restore, CWA's config dir wiped —
+      #     was exactly the one it could not see.
+      # (b) app.db is STILL a readable SQLite file right now. Same test the entrypoint above
+      #     makes at start, re-made every interval, as the run-as user (a root-readable file
+      #     the app cannot open fails a login just as hard as a missing one). This is the half
+      #     that catches the after-start case, and it has no side effects.
+      # NOT a login probe: Shelfmark locks an account after 10 failed attempts for 30 minutes
+      # and then answers 429 (measured), so a per-minute healthcheck would lock its own probe
+      # account and go blind again. scripts/selftest.sh makes that probe instead — once, on
+      # demand — where a single attempt can never reach the lockout.
+      # $$ so compose leaves the expansion to the container's shell (as in the entrypoint above).
+      test: ["CMD-SHELL", "gosu \"$${PUID:-1000}:$${PGID:-1000}\" head -c 16 /auth/app.db 2>/dev/null | grep -q '^SQLite format 3' && curl -sf http://127.0.0.1:8084/api/auth/check | grep -q '\"auth_mode\": *\"cwa\"'"]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -371,4 +435,52 @@ services:
       - TZ=${TZ}
     volumes:
       - ./kuma/data:/app/data
-    # Reached only over Tailscale at monitor.<domain>
+    # Reached only over Tailscale at monitor.<domain>. Its monitors, notification channels and
+    # the nightly-reboot maintenance window are created by kuma-bootstrap below, not by hand.
+
+  kuma-bootstrap:
+    # One-shot, never a running service (profile "tools": `up` never starts it). bookstack.sh
+    # runs it after every Deploy and from Operations -> Monitoring:
+    #   docker compose run --rm -T kuma-bootstrap < config.json
+    # It creates Kuma's admin account on first run and reconciles the monitors it owns with the
+    # features that are switched on (monitoring/kuma_bootstrap.py). Config, including every
+    # password, arrives on stdin, never in the environment.
+    build: ./monitoring
+    image: bookstack/kuma-bootstrap:local
+    profiles: ["tools"]
+    restart: "no"
+    network_mode: host             # Kuma listens on 127.0.0.1:3001 only
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    pids_limit: 64
+
+  flaresolverr:
+    <<: *common
+    # Shared protection-challenge solver (headless Chromium): Shelfmark's external bypasser and
+    # Ephemera both use it. Profile "solver", which bookstack.sh adds while FLARESOLVERR_ENABLED
+    # or EPHEMERA_ENABLED is true (Operations -> FlareSolverr / Ephemera).
+    # Measured on the pinned v3.5.2 (2026-09-25): ~50 MiB idle; each open browser 450-500 MiB,
+    # returned when the request or session ends (back to ~125 MiB after 20 sequential page
+    # loads: no leak); two browsers at once ~910 MiB. The 1 GiB fence therefore allows two
+    # simultaneous solves, which is Shelfmark (SHELFMARK_CONCURRENCY=1) plus Ephemera; a third
+    # would have its Chromium killed inside this container, never anything else on the box.
+    image: ${IMG_FLARESOLVERR:-ghcr.io/flaresolverr/flaresolverr:v3.5.2}
+    container_name: flaresolverr
+    profiles: ["solver"]
+    mem_limit: 1024m
+    environment:
+      - TZ=${TZ}
+      - LOG_LEVEL=info
+    # Loopback only, for Kuma's health monitor (host network). No authentication of its own:
+    # nothing on the internet can reach it, and Caddy has no site for it.
+    ports:
+      - "127.0.0.1:8191:8191"
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:8191/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

@@ -3,6 +3,30 @@
 Status as of 2026-09-22 (v4.3). Items marked **on the VPS** cannot be exercised on a laptop
 and are covered by `Operations → Self-test` after deploy.
 
+## The plan, and what it commits you to (read before ordering)
+
+**Deployed and supported: X4 — 2 vCPU / 4 GB RAM / 80 GB NVMe / 10 TB, for a household of
+3–4 readers.** This is a measured choice, not a budget compromise: the stack idles at ≈ 1.2 GB
+and peaks at ≈ 2.2 GB of the 4 GB (measured on a 5,015-book library; see `README.md` → VPS
+sizing). RAM is not the constraint. These three conditions are what the plan buys, and they
+are operative guidance, not a footnote:
+
+- [ ] **Audiobooks stay under ~40 GB.** 80 GB is the binding constraint — after OS, images,
+      swap and ebooks, ~50 GB remains. Check `df -h /srv` *and* `df -i /srv`: an exhausted
+      inode table looks exactly like a full disk while `df -h` still shows free space.
+- [ ] **Browser-based challenge solving goes through ONE FlareSolverr.** Ephemera and
+      Shelfmark's protected sources both use it (Operations → FlareSolverr). Measured
+      2026-09-25: ~50 MiB idle, ~450–500 MiB per page being solved, fenced at 1 GiB — with
+      Ephemera on, ≈ 3.3 GB worst case on the 4 GB box. It fits; it is the largest optional
+      cost. (This line used to say "Ephemera stays off, X8 only" — a desk estimate.)
+- [ ] **Batch work runs overnight.** CPU, not RAM, is what 2 cores run short of: a CWA
+      library-wide conversion sustains 107.8 % CPU. Convert Library and a first Audiobookshelf
+      scan belong at night. Backups (01:00) and the auto-reboot (04:30) are already staggered.
+
+Bandwidth is a non-issue at 10 TB/month: audiobook streaming plus off-site restic is a few
+hundred GB. Move to X8 (4c/8 GB/160 GB) when the library outgrows 80 GB or the overnight jobs
+stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has the upgrade signals.
+
 ## Verified locally (this machine, Docker/OrbStack running)
 - [x] Repo layout matches what `bookstack.sh` copies; tests are excluded from the copy.
 - [x] `bash tests/run-unit.sh` — portal suite inside the shipping image, against schemas
@@ -85,6 +109,66 @@ and are covered by `Operations → Self-test` after deploy.
       combinations render; **all 8 Caddyfile variants** (torrents x Ephemera x Authelia)
       validate against the pinned Caddy build, with `auth.` rendered only when the gate is on.
 
+## Verified locally in round 4 (stack, Caddy and backups)
+- [x] **Closed an unauthenticated open relay.** `books.<domain>/api/v3/*` and
+      `/api/UserStorage/*` were proxied verbatim to `https://readingservices.kobo.com` for
+      anyone, with the caller's method, headers and body and the upstream's response returned
+      unchanged — reproduced against the pinned CWA image (the reply carried kobo.com's own
+      `Set-Cookie` and `CF-RAY`). Both prefixes now 403 in `caddy/Caddyfile.template`, in the
+      same matcher as CWA's unauthenticated admin jobs and its `;`-parameter companion.
+      Proven behind a real Caddy with the pinned CWA image: all relay paths (including
+      `/api/V3/…` and `/api/v3/x;y`) 403 with and without the Authelia gate, while `/login`,
+      `/opds`, `/kosync`, `/kobo/<token>/v1/initialization` and the web UI are unchanged.
+      No device is affected: CWA only advertises itself as the Kobo reading-services host when
+      Hardcover annotation sync is on, which it is not.
+- [x] **Shelfmark bumped v1.3.7 → v1.3.15** after running both side by side against the same
+      CWA `app.db`: healthcheck still matches `auth_mode: cwa`, login with a Calibre-Web
+      account still works (admin flag carried, wrong password 401), and `organize` mode with
+      the `{User}` templates produces byte-identical output — one folder per audiobook,
+      ebooks flat in the user's dropbox. v1.3.12's "preserve multi-file audiobook folders" is
+      a *new* mode (`rename_and_group`) this stack does not use; `organize` was already right.
+      Its new 300 s release-search timeout is pinned to 90 s, under Cloudflare's 100 s origin
+      limit, so a slow search reports its real cause instead of a Cloudflare 524.
+- [x] **Inodes are monitored, not just blocks.** `scripts/disk-watch.sh` and
+      `scripts/selftest.sh` take the worse of blocks-used and inodes-used, and the alert names
+      which tripped — the remedies have nothing in common. A reading that is not a 0–100 number
+      (no fixed inode table, busybox `df`) is treated as unknown, never as full.
+- [x] **Backup verification now covers the whole repository.** `--read-data-subset=5%` re-picked
+      its 5 % at random weekly, so no pack was ever guaranteed to have been read. Now
+      `n/52` with the counter rotating in `/etc/bookstack/backup.state`: every byte read once a
+      year, weekly transfer down from 5 % to ~1.9 %. The counter advances only after a check
+      that passed, is backed up with the rest of the host state, and Self-test reports it.
+- [x] **The Kobo/KEPUB claim was false and is corrected** in `README.md`; the real enablement
+      path and the HTTP-500 trap are recorded in `docs/DECISIONS-PENDING.md`.
+- [x] Verification: `bash -n` clean on every script; **all 5 compose combinations** render;
+      **all 8 Caddyfile variants** (torrents × Ephemera × Authelia) validate against a fresh
+      build of `caddy/Dockerfile`; ruff clean on the Python in `authelia/` and `tests/`.
+
+## Verified locally in v4.5 (metadata, identification, restore)
+- [x] Restore now brings back the three host files nothing else regenerates (sshd drop-in,
+      sysctl, daemon.json); sshd is validated before any reload and a failing drop-in is removed.
+- [x] Book, author and series pages; the provider chain with its failure matrix (dead, soft
+      miss, rate limit, bad request, slow, unexpected exception) each covered by a test.
+- [x] Arrivals identified by the file's own OPF (title, author, ISBN / Calibre UUID).
+- [x] `calibredb set_metadata` proven in the pinned CWA image to update title, title sort,
+      authors, series and series index while leaving `owner:` untouched.
+- [x] Internet Archive downloads verified against the published size and SHA-1.
+- [x] Suites: installer 510, portal 332, end-to-end 181 checks / 0 failed on real containers.
+
+## Verified locally in v4.6 (monitoring, FlareSolverr)
+- [x] `monitoring/kuma_bootstrap.py` against the real pinned Uptime Kuma 1.23.17 (41 checks,
+      `tests/monitoring-test.sh`): first-run account, idempotent re-run, feature monitors added and
+      removed, a hand-made monitor untouched, drift put back, 30-day history, reboot window, live
+      push tokens, a DOWN push delivered ntfy-style to a webhook AND as e-mail through GreenMail,
+      `/metrics` readable with the admin login, wrong credentials exit 2.
+- [x] Shelfmark v1.3.15 with `USING_EXTERNAL_BYPASSER=true` fetches through a FlareSolverr
+      container (seen in FlareSolverr's log) and runs no Chromium of its own.
+- [x] FlareSolverr and Ephemera memory measured (README → VPS sizing).
+- [x] Found and fixed on the way: the post-boot unit's `OnFailure=` target was only written by
+      the Backups step; a missing reboot-time line aborted Deploy under `pipefail`; the Shelfmark
+      login probe's fixed name would have hit its 10-failure lockout every 10 hours once hourly.
+- [x] Installer suite 564 / 0.
+
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,
@@ -102,15 +186,26 @@ and are covered by `Operations → Self-test` after deploy.
 - [ ] Cloudflare API token has **Firewall Services: Edit** (fail2ban bans at Cloudflare); after
       Security → fail2ban, `fail2ban-client status caddy-auth` shows the jail active.
 - [ ] Library → Mail: test mail arrives; a request left pending mails the admin.
+- [ ] Metadata: an hour after the first import, open a book's page (My books → the title);
+      `journalctl -t bookstack-metapush` shows 'applied' lines, and a Kobo sync shows the title.
 - [ ] Alerts: the test notification from Quick install → Alerts arrived on your phone.
+- [ ] Monitoring: Deploy's summary says "N monitors at https://monitor.<domain>" with your alert
+      channel named. Open it over Tailscale with the login under Operations → Monitoring; all
+      green after a few minutes. `systemctl list-timers bookstack-selftest.timer` shows the next
+      hourly run, and after an hour Self-test says "hourly self-test last finished N min ago".
+- [ ] External check: a free healthchecks.io check (period 1 h, grace 1 h) entered under
+      Operations → Monitoring; it turns green within the hour.
 - [ ] Tailscale: key expiry disabled for this machine (the Tailscale step checks it).
 - [ ] Cloudflare dashboard: WAF Managed rules ON; Bot Fight Mode **OFF** (it silently breaks
       Kobo, OPDS, KOReader and the Audiobookshelf apps and cannot be exempted on the Free plan).
-- [ ] (Only if enabling Ephemera) `Operations → Ephemera` builds on the VPS and RAM suffices.
-- [ ] Plan: X8 (4c/8 GB/160 GB) recommended; on X4 keep audiobooks < 40 GB, Ephemera and
-      Shelfmark browser sources off (`docs/RESEARCH-GAPS.md` §2 has the upgrade signals).
-- [ ] After the first week: `Operations → Backup restore test` green; `df /srv` < 70 %;
-      no `OOMKilled` in `docker ps -a` / `dmesg`.
+- [ ] (Only if enabling Ephemera) `Operations → Ephemera` builds on the VPS; its success
+      screen reports that Ephemera reaches FlareSolverr.
+- [ ] (Only if Shelfmark's protected sources are used) `Operations → FlareSolverr` on; its
+      success screen confirms Shelfmark reaches `flaresolverr:8191`.
+- [ ] Plan conditions still hold (see "The plan" at the top): audiobooks < 40 GB, one shared
+      FlareSolverr, batch jobs overnight.
+- [ ] After the first week: `Operations → Backup restore test` green; `df /srv` < 70 % **and**
+      `df -i /srv` < 70 %; no `OOMKilled` in `docker ps -a` / `dmesg`.
 
 ## Housekeeping
 - The repo is under git (branch `main`, initial commit 2026-09-22). Tag the commit you deploy

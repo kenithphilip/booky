@@ -71,6 +71,18 @@ IMAP_REQUIRE_AUTH = _bool("IMAP_REQUIRE_AUTH", True)
 
 # Curated catalogs offered to users. The set is fixed to sources that are free to
 # redistribute — this is not a general indexer and cannot be pointed at a private tracker.
+# Descriptive-metadata providers, in chain order. Separate from SOURCES above: those are
+# CONTENT sources (where a book comes from); these only describe one. Keyless first, because a
+# key the admin must create, store and rotate is a provider that fails on a date nobody wrote
+# down. The chain runs in the BACKGROUND only — the first provider's cold path measured 28.4 s,
+# which is more than twice the search page's whole deadline.
+METADATA_PROVIDERS = {
+    "bookinfo":    _bool("META_BOOKINFO",   True),   # rreading-glasses; ISBN identity + series
+    "hardcover":   _bool("META_HARDCOVER",  True),   # same software, community-curated data
+    "openlibrary": _bool("META_OPENLIBRARY", True),  # keyless floor, no token to expire
+}
+METADATA_ENABLED = _bool("METADATA_ENABLED", True)
+
 SOURCES = {
     "gutenberg":       _bool("SRC_GUTENBERG", True),
     "standard_ebooks": _bool("SRC_STANDARD",  False),  # its OPDS feed now answers 401 without a Patrons Circle login
@@ -149,8 +161,14 @@ def admin_links():
 
 # --- Calibre library files (read-only) for direct download / Send-to-Kindle ----------
 LIBRARY_DIR = os.environ.get("LIBRARY_DIR", os.path.dirname(CALIBRE_DB))
-FORMATS     = ("epub", "azw3", "mobi", "pdf")   # preferred-format choices (kepub is made by CWA on Kobo sync, not chosen)
-DOWNLOAD_FORMATS = FORMATS + ("kepub", "txt", "cbz", "cbr", "fb2", "djvu")   # what /download serves if present
+FORMATS     = ("epub", "azw3", "mobi", "pdf")   # preferred-format choices (kepub is never chosen; see below)
+# What /download serves if the file is there. 'kepub' stays in this list on purpose even
+# though nothing in this stack produces one today: CWA v4.0.6 only autodetects kepubify at
+# /opt/kepubify/kepubify-linux-{64,32}bit and its image installs it at /usr/bin/kepubify, so
+# config_kepubifypath is permanently empty and Kobo sync ships plain EPUB. If an admin ever
+# pre-generates KEPUBs (Convert Library, with nothing syncing — see docs/DECISIONS-PENDING.md),
+# the serving half here and in library.py already works.
+DOWNLOAD_FORMATS = FORMATS + ("kepub", "txt", "cbz", "cbr", "fb2", "djvu")
 DEFAULT_FORMAT = "epub"
 KINDLE_FORMATS = ("epub", "pdf", "txt")         # what Amazon's Send-to-Kindle mail accepts (MOBI/AZW3 are bounced)
 
@@ -163,3 +181,12 @@ SMTP_FROM = os.environ.get("SMTP_FROM", "") or SMTP_USER
 SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "starttls").lower()   # starttls | ssl | none
 KINDLE_MAX_MB = int(os.environ.get("KINDLE_MAX_MB", "45"))
 KINDLE_DEFAULT_LANG = os.environ.get("KINDLE_DEFAULT_LANG", "en")   # dc:language added when an EPUB has none (Amazon bounces those)
+# Ceiling on Send-to-Kindle per non-admin per 24 h, in the spirit of MAX_REQUESTS_PER_DAY.
+# Nothing else limited outbound mail: neither route is matched by a Caddy rate_limit zone, and
+# kindle.send only checks the attachment size, so one session cookie could drive unlimited
+# 45 MB messages through the configured SMTP account. The realistic outcome is not a breach but
+# the provider suspending the account or Amazon dropping the approved sender — which kills
+# Send-to-Kindle, mail notifications AND scripts/alert.sh's fallback channel at the same time.
+# 20 is far above a reader's real use (a family of four sends a handful a week). 0 = unlimited.
+KINDLE_MAX_PER_DAY = int(os.environ.get("KINDLE_MAX_PER_DAY", "20"))
+KINDLE_TEST_COOLDOWN = 300   # seconds between "send a test to my Kindle" clicks, per user

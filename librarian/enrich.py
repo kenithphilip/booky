@@ -5,6 +5,13 @@ import requests
 import config
 
 UA = {"User-Agent": "bookstack-librarian/4.0"}
+# (connect, read), not a scalar: requests applies a scalar `timeout` to the connect AND to
+# every read, so the old `timeout=8` was really up to 16 s against a host that accepts the
+# connection and then stalls — more than twice app.ENRICH_DEADLINE (6 s), the deadline this
+# call is supposed to respect. It matters more now that these run on fetchers' shared, bounded
+# detail pool: a stalled enrichment holds one of a fixed number of threads, not a thread of its
+# own. Same reasoning, and the same numbers, as fetchers._Budget.pair.
+TIMEOUT = (3, 5)
 _cache = {}
 
 def for_book(title, author=""):
@@ -20,7 +27,7 @@ def for_book(title, author=""):
         if author:
             params["author"] = author
         docs = requests.get("https://openlibrary.org/search.json",
-                            params=params, headers=UA, timeout=8).json().get("docs") or []
+                            params=params, headers=UA, timeout=TIMEOUT).json().get("docs") or []
         if docs:
             d = docs[0]
             if d.get("cover_i"):

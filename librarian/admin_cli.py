@@ -155,6 +155,15 @@ def _parked(args):
     db.audit("parked_delete", None, "tui", args.token[:80])
     return {"ok": True}
 
+def _pushes(args):
+    """The host side of the Calibre metadata push (scripts/metadata-push.sh). The portal cannot
+    write metadata.db itself — it mounts the library read-only and has no Docker socket, both
+    on purpose — so it hands the host a list and hears back what happened."""
+    if args.what == "pending":
+        return {"ok": True, "rows": db.pending_pushes(args.limit)}
+    st = db.push_result(args.push_id, args.outcome == "ok", error=args.reason)
+    return {"ok": True, "status": st}
+
 def _parser():
     p = argparse.ArgumentParser(prog="admin_cli", description="Admin actions for bookstack.sh")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -176,9 +185,16 @@ def _parser():
     pk.add_parser("list")
     pk.add_parser("retry").add_argument("token")
     pk.add_parser("delete").add_argument("token")
+
+    pu = sp.add_parser("pushes").add_subparsers(dest="what", required=True)
+    pu.add_parser("pending").add_argument("--limit", type=int, default=50)
+    rs = pu.add_parser("result")
+    rs.add_argument("push_id", type=int)
+    rs.add_argument("outcome", choices=("ok", "fail"))
+    rs.add_argument("--reason", default="")
     return p
 
-ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked}
+ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes}
 
 def main(argv=None):
     args = _parser().parse_args(argv)

@@ -70,6 +70,7 @@ docker() {
     *"python -m cwa "*) echo '{"ok": true}';;
     *"python -m abs init"*) echo '{"ok": true, "created_root": true, "api_key": "abs-key-STUB", "library_id": "lib1", "created_library": true}';;
     *"python -m abs ensure-user"*) echo '{"ok": true, "user": "alice", "result": "created"}';;
+    *"python -m abs remove-user"*) [ "${FAIL_ABS_REMOVE:-0}" = 1 ] && { echo '{"ok": false, "error": "401 Unauthorized"}'; return 1; }; echo '{"ok": true}';;
     *"python -m abs status"*) echo "{\"isInit\": ${ABS_INIT:-true}, \"app\": \"audiobookshelf\"}";;
     *"python -m abs "*) echo '{"ok": true}';;
     # admin_cli = the portal's admin back end (librarian/admin_cli.py). Its answers are variables
@@ -360,6 +361,17 @@ cp "$T/tmpl.keep" "$STACK_DIR/caddy/Caddyfile.template"; render_caddyfile
 # reads the SHIPPED template on purpose — an earlier version injected the markers into a copy,
 # which passed happily while the real template carried no markers at all and nothing was dropped.
 expect 'grep -q "^# @AUTHELIA_BEGIN@" "$STACK_DIR/caddy/Caddyfile.template" && grep -q "^# @AUTHELIA_END@" "$STACK_DIR/caddy/Caddyfile.template"' "the shipped template really wraps the auth. vhost in @AUTHELIA_BEGIN@/@AUTHELIA_END@ (A34)"
+# F.2: CWA v4.0.6 proxies /api/v3/* and /api/UserStorage/* verbatim to
+# https://readingservices.kobo.com - caller's method, headers and body - whenever annotation sync
+# is off or the caller is anonymous, and books.<domain> is public. They belong in the same 403
+# route that already covers convert-library / epub-fixer / cwa-logs / cwa-internal / reconnect.
+# Asserted on the RENDERED Caddyfile: a pattern that only exists in the template protects nobody.
+cwaj=$(grep -F '@cwa_admin_jobs path ' "$STACK_DIR/caddy/Caddyfile" | head -1)
+cwajp=$(grep -F '@cwa_admin_jobs_params path_regexp' "$STACK_DIR/caddy/Caddyfile" | head -1)
+expect '[ -n "$cwaj" ] && [ -n "$cwajp" ] && grep -q "respond @cwa_admin_jobs " "$STACK_DIR/caddy/Caddyfile" && grep -q "respond @cwa_admin_jobs_params " "$STACK_DIR/caddy/Caddyfile"' "the rendered Caddyfile still carries the CWA admin-jobs 403 route and its ;-parameter companion"
+expect 'printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/v3([[:space:]]|$)" && printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/v3/\*([[:space:]]|$)"' "the unauthenticated Kobo relay /api/v3 and /api/v3/* are 403 at the edge (F.2)"
+expect 'printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/UserStorage([[:space:]]|$)" && printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/UserStorage/\*([[:space:]]|$)"' "...and /api/UserStorage and /api/UserStorage/* with it (F.2)"
+expect 'printf "%s\n" "$cwajp" | grep -q "api/v3" && printf "%s\n" "$cwajp" | grep -qi "api/UserStorage"' "the ;-smuggling path_regexp covers both relay prefixes too, so /api/v3/x;y is blocked as well (F.2)"
 abak=$(envget AUTHELIA_ENABLED); envset AUTHELIA_ENABLED false; render_caddyfile
 expect '! grep -q "^auth\.example\.test {" "$STACK_DIR/caddy/Caddyfile"' "auth. is not rendered while the gate is off (A34)"
 envset AUTHELIA_ENABLED true; render_caddyfile
@@ -384,6 +396,43 @@ expect '[ "$(envget ADMIN_USER_PREV)" = libadmin ] && [ "$(envget ADMIN_USER)" =
 reset "example.test" "admin@example.test" "UTC" "" "yes" "second-admin"; step_configure >/dev/null
 expect '[ "$(envget ADMIN_USER_PREV)" = libadmin ] && [ "$(envget ADMIN_USER)" = second-admin ]' "a SECOND rename does not clobber it, so the real old name is not lost (A10)"
 envset ADMIN_USER libadmin; envset ADMIN_USER_PREV ""
+# R4-A6: `lib rename-user` moves the Calibre-Web row and the portal's own owner-keyed rows and
+# nothing else, but four stores OUTSIDE both databases key on the name. The rename is not asked
+# for — it happens as a side effect of changing ADMIN_USER in Configure — so leaving them behind
+# is silent: the admin's uploads land in a dropbox the watcher no longer scans, an already
+# configured qBittorrent keeps saving into it, Authelia still knows them under the old name (they
+# pass the gate as one person and the apps as another) and Ephemera's bind mount is stale.
+envset TORRENTS_ENABLED true; envset EPHEMERA_OWNER oldadmin; envset ADMIN_USER newadmin
+mkdir -p "$STACK_DIR/library/dropbox/oldadmin"; : > "$STACK_DIR/library/dropbox/oldadmin/book.epub"
+AUY="$STACK_DIR/authelia/users_database.yml"; cp "$AUY" "$T/auy.bak"
+cat > "$AUY" <<'YML'
+users:
+  oldadmin:
+    displayname: "oldadmin"
+    password: "$argon2id$v=19$KEEPTHISHASH"
+    email: "old@example.test"
+    groups:
+      - users
+  bob:
+    displayname: "Bob"
+    password: "$argon2id$v=19$BOBHASH"
+    email: "bob@example.test"
+    groups:
+      - users
+YML
+reset; rename_user_artifacts oldadmin newadmin
+expect '[ -f "$STACK_DIR/library/dropbox/newadmin/book.epub" ] && [ ! -d "$STACK_DIR/library/dropbox/oldadmin" ]' "a rename carries the dropbox and its contents over, so the admin's own uploads are still scanned (R4-A6)"
+expect 'grep -q "^  newadmin:" "$AUY" && ! grep -q "^  oldadmin:" "$AUY" && grep -q "KEEPTHISHASH" "$AUY" && grep -q "old@example.test" "$AUY"' "the Authelia login is renamed in place, keeping the argon2 hash and e-mail that cannot be recomputed (R4-A6)"
+expect 'grep -q "^  bob:" "$AUY" && grep -q "BOBHASH" "$AUY" && grep -q "displayname: \"Bob\"" "$AUY"' "and no other login is touched (R4-A6)"
+expect 'grep -q "displayname: \"newadmin\"" "$AUY"' "a display name that WAS the username follows the rename (R4-A6)"
+expect '[ "$(envget EPHEMERA_OWNER)" = newadmin ]' "EPHEMERA_OWNER follows the rename, so its bind mount points at the dropbox that exists (R4-A6)"
+expect 'grep -qF "DefaultSavePath=/dropbox/newadmin" "$STACK_DIR/qbt/config/qBittorrent/qBittorrent.conf"' "an already-configured qBittorrent is reseeded with the new save path (R4-A6)"
+# it must not merge two people: a name that already has its own login is left alone
+reset; rename_user_artifacts bob newadmin
+expect 'grep -q "^  bob:" "$AUY" && grep -q "BOBHASH" "$AUY" && grep -q "KEEPTHISHASH" "$AUY"' "renaming onto a name that already has an Authelia login is refused instead of merging the two (R4-A6)"
+cp "$T/auy.bak" "$AUY"; rm -rf "$STACK_DIR/library/dropbox/newadmin"
+envset TORRENTS_ENABLED false; envset EPHEMERA_OWNER ""; envset ADMIN_USER libadmin
+expect 'declare -f ensure_admin_name | grep -q rename_user_artifacts && [ "$(declare -f ensure_admin_name | grep -c "rename-user")" -ge 1 ]' "ensure_admin_name runs it right after the rename it triggers automatically (R4-A6)"
 # A06: .env only reaches a container when it is recreated; a reload of Caddy is not enough
 envset TZ UTC; reset "example.test" "admin@example.test" "Europe/Oslo" "" "yes"; step_configure >/dev/null
 expect 'seen "docker: compose up -d" && grep -F msgbox "$LOG" | grep -q "containers were recreated"' "a changed timezone/domain/token recreates the containers, not just reloads Caddy (A06)"
@@ -528,12 +577,31 @@ compose(){ case "$*" in *"restart shelfmark"*) echo "docker: compose $*" >> "$LO
 reset "bob" "yes"; step_user_remove
 expect 'grep -F msgbox "$LOG" | grep -q "still holds its old session key"' "a failed Shelfmark restart is reported instead of claiming the session is dead (V02)"
 unset -f compose; eval "compose() $(declare -f real_compose | sed '1d')"; unset -f real_compose
+# R4-A1: the confirmation promises Audiobookshelf, so the summary has to say what happened there.
+# `abs_ready && absctl remove-user ... || true` swallowed both a missing API key and an API error,
+# and selftest.sh cannot catch a leftover account either (it is still tag-restricted, so the
+# assertion passes) — the admin was told the login was gone while the audiobook app still let
+# the removed reader in.
+reset "alice" "yes"; step_user_remove
+expect 'grep -F msgbox "$LOG" | grep -q "Audiobookshelf account was removed too"' "a successful ABS removal is reported alongside the Authelia and Shelfmark halves (R4-A1)"
+FAIL_ABS_REMOVE=1; reset "alice" "yes"; step_user_remove; FAIL_ABS_REMOVE=0
+expect 'grep -F msgbox "$LOG" | grep -q "Audiobookshelf account could NOT be removed" && grep -F msgbox "$LOG" | grep -q "can still sign in to the audiobook app"' "a failing absctl remove-user makes the removal summary name Audiobookshelf instead of reporting success (R4-A1)"
+abs_tok_keep=$(envget ABS_TOKEN); envset ABS_TOKEN ""
+reset "alice" "yes"; step_user_remove
+expect '! seen "python -m abs remove-user alice" && grep -F msgbox "$LOG" | grep -q "no audiobook account was touched"' "with no ABS API key the removal says so and points at Settings -> Users, rather than staying silent (R4-A1)"
+envset ABS_TOKEN "$abs_tok_keep"
 reset; step_user_repair; expect 'seen "cwa isolate bob" && seen "cwa isolate alice" && ! seen "cwa isolate admin" && seen "cwa harden"' "repair re-isolates every non-admin (never admins) + hardens"
 
 echo "== formats, mail, defaults"
 reset "yes" "no" "pdf,azw3" "new_record" "yes" "no"; step_formats && ok "step_formats" || bad "step_formats"
 expect "seen \"UPDATE cwa_settings SET auto_convert=1, auto_convert_target_format='epub', kindle_epub_fixer=0, auto_convert_retained_formats='pdf,azw3', auto_ingest_automerge='new_record';\"" "formats written to CWA settings; target always epub"
 expect '! grep -q "Target format" "$LOG" && ! grep -qE "azw3 \"AZW3|mobi \"MOBI|kepub \"KEPUB" "$LOG"' "no target-format picker: azw3/mobi/pdf/kepub are not offered as the conversion target (C12)"
+# F.1: CWA v4.0.6 autodetects kepubify only at /opt/kepubify/kepubify-linux-{64,32}bit while its
+# image installs it at /usr/bin/kepubify, so config_kepubifypath is never set and cps/kobo.py
+# never converts. Kobo receives EPUB. Neither the screen nor the comment may claim otherwise.
+expect '! grep -qi "Kobo gets KEPUB\|KEPUB converted on the fly\|Kobo gets KEPUB automatically" "$REPO/bookstack.sh"' "no claim anywhere in bookstack.sh that Kobo receives KEPUB (F.1)"
+expect 'grep -q "config_kepubifypath" "$REPO/bookstack.sh" && grep -q "chapter boundaries" "$REPO/bookstack.sh" && grep -q "DECISIONS-PENDING" "$REPO/bookstack.sh"' "step_formats records WHY Kobo gets EPUB, what it costs, and where the safe enablement order is written down (F.1)"
+expect 'grep -F msgbox "$LOG" | grep -q "Kobo syncs EPUB" && ! grep -F msgbox "$LOG" | grep -qi "Kobo gets KEPUB"' "and the Formats screen tells the admin EPUB, not KEPUB (F.1)"
 expect "seen \"koreader_sync_enabled=1\" && [ \"\$(envget KOSYNC_ENABLED)\" = true ]" "KOReader sync toggled on in CWA and advertised to the portal"
 expect 'seen "auto_backup_imports=0, auto_backup_conversions=0, auto_backup_epub_fixes=0"' "CWA file copies off by default"
 reset "no" "yes" "x; DROP TABLE--" "overwrite" "no" "yes"; step_formats
@@ -554,6 +622,32 @@ expect 'seen "duplicate_auto_resolve_enabled=0" && seen "UPDATE cwa_settings SET
 expect '[ "$(grep -c "sqlite3 /config/cwa.db UPDATE cwa_settings SET duplicate_notifications_enabled=0;" "$LOG")" = 1 ]' "duplicate_notifications_enabled is its own statement (an older schema cannot take the other defaults down with it)"
 expect 'grep -q "duplicate_notifications_enabled" "$REPO/scripts/selftest.sh"' "Self-test checks duplicate_notifications_enabled too (J31)"
 reset; step_user_repair >/dev/null; expect 'seen "duplicate_notifications_enabled=0"' "Users -> Repair re-applies it as well (J31)"
+# R4-A2: apply_library_defaults is where the isolation invariants are established, so its comment
+# is what an auditor reads instead of the SQL. It used to say the Kindle EPUB fixer is turned ON
+# while the very next statement sets kindle_epub_fixer=0 — the one setting the repo warns hardest
+# about, because on import it rewrites every archive and drops the zip comment the CBZ tag lives in.
+# bash drops comments from a function body, so this reads the source, not `declare -f`
+ald=$(awk '/^apply_library_defaults\(\) \{/,/^\}/' "$REPO/bookstack.sh")
+expect 'printf "%s" "$ald" | grep -qi "kindle epub fixer OFF" && ! printf "%s" "$ald" | grep -qi "fix EPUBs for Kindle"' "apply_library_defaults' comment agrees with its own SQL: the Kindle EPUB fixer is OFF (R4-A2)"
+expect 'printf "%s" "$ald" | grep -q "kindle_epub_fixer=0"' "and the SQL it describes is still the one that turns it off (R4-A2)"
+
+echo "== the isolation guide describes what the code actually does"
+# R4-A3/A5: this screen is the admin's reference for the isolation model. It claimed every
+# non-EPUB file is converted to EPUB with the tag added first. Neither half held: PDF/CBZ/CBR/CB7
+# are in auto_convert_ignored_formats and are tagged in their own format, and worker._TAGGERS is
+# {epub, pdf, cbz} only — MOBI/AZW3/FB2/TXT import untagged and land on the portal's needs-tag
+# list. An admin who believes the old text never looks at that list, and those books stay
+# invisible to their owner for good.
+reset; step_isolation
+iso=$(grep -F "whiptail: " "$LOG" | grep -c "msgbox")
+expect '[ "$iso" -ge 1 ]' "step_isolation draws its guide"
+expect '! declare -f step_isolation | grep -q "Non-EPUB files are converted to EPUB on import"' "the blanket 'every non-EPUB file is converted, tag added first' claim is gone (R4-A3/A5)"
+expect 'declare -f step_isolation | grep -q "MOBI, AZW3, FB2 and TXT" && declare -f step_isolation | grep -qi "untagged" && declare -f step_isolation | grep -q "Imported without an owner tag"' "it names the formats that cannot carry a tag and the /admin list they wait on, by the name the page uses (R4-A5)"
+expect 'declare -f step_isolation | grep -q "CBZ/CBR/CB7" && declare -f step_isolation | grep -qi "keep their own format"' "and says PDFs and comics keep their format rather than being converted (R4-A3)"
+# the formats named as tag-carrying are exactly worker._TAGGERS, and the exempt list is exactly
+# apply_library_defaults' auto_convert_ignored_formats: a drift in either makes the guide wrong again
+expect 'python3 -c "import re,sys; m=re.search(r\"^_TAGGERS = \{(.*)\}\", open(sys.argv[1]).read(), re.M); sys.exit(0 if m and sorted(re.findall(chr(34)+r\"(\w+)\"+chr(34), m.group(1)))==[\"cbz\",\"epub\",\"pdf\"] else 1)" "$REPO/librarian/worker.py"' "worker._TAGGERS still carries exactly epub, pdf and cbz, which is what the guide now claims (R4-A5)"
+expect 'declare -f apply_library_defaults | grep -q "auto_convert_ignored_formats='"'"'pdf,cbz,cbr,cb7'"'"'"' "the conversion-exempt list is still pdf,cbz,cbr,cb7, which is what the guide now claims (R4-A3)"
 
 echo "== sources"
 reset '"GUTENBERG" "LIBRIVOX"' "gutenberg,cdl" "yes" "25x" "no"; step_sources
@@ -679,6 +773,9 @@ expect 'seen "cwa passwd libadmin --password-stdin" && seen "docker-stdin: admin
 expect 'seen "cwa rename-user admin libadmin" && [ "$(line_of "cwa rename-user admin libadmin")" -lt "$(line_of "cwa passwd libadmin")" ]' "factory 'admin' renamed to ADMIN_USER before its password is set (C10/F19)"
 expect 'seen "compose up -d caddy" && [ "$(line_of "cwa passwd libadmin")" -lt "$(line_of "compose up -d caddy")" ]' "caddy started only AFTER the admin password"
 expect '[ -f "$T/etc/cron.d/bookstack-disk" ] && grep -q "disk-watch.sh" "$T/etc/cron.d/bookstack-disk" && grep -q "^PATH=/usr/local/sbin" "$T/etc/cron.d/bookstack-disk"' "hourly disk watchdog cron installed with a full PATH"
+# F.6: the 04:30 reboot happens whether or not restic was ever configured, so the unit that
+# checks the stack came back cannot depend on the admin having run Install -> Backups.
+expect '[ -s "$T/etc/systemd/system/bookstack-postboot.service" ] && [ -x "$T/etc/bookstack/postboot.sh" ] && seen "systemctl: enable bookstack-postboot.service"' "Deploy installs the post-reboot self-test too, not only the Backups step (F.6)"
 expect '! grep -E "compose .*up -d .*(qbittorrent|aria2|ariang)" "$LOG" && ! seen "profile torrents"' "torrents off: qBittorrent not started, no aria2/AriaNg (C4/C5)"
 expect '[ "$(line_of "compose up -d caddy")" -lt "$(line_of "caddy validate")" ] && seen "caddy reload"' "an already-running Caddy gets the new Caddyfile validated + reloaded (F11)"
 expect '! seen "python -m abs init"' "ABS setup not re-run when already initialised"
@@ -779,6 +876,18 @@ expect 'grep -q "^OnCalendar=\*-\*-\* 01:00:00" "$u/bookstack-backup.timer" && g
 expect 'grep -q "^OnCalendar=\*-\*-01 13:00:00" "$u/bookstack-restore-test.timer" && grep -q "restore-test.sh" "$u/bookstack-restore-test.service" && grep -q "^OnFailure=bookstack-alert@restore-test.service" "$u/bookstack-restore-test.service"' "restore test on the 1st at 13:00 (never overlaps the 01:00 backup, F40) with OnFailure alert"
 expect 'grep -q "scripts/alert.sh" "$u/bookstack-alert@.service" && grep -q "%i" "$u/bookstack-alert@.service"' "templated bookstack-alert@.service"
 expect 'seen "systemctl: enable --now bookstack-backup.timer bookstack-restore-test.timer" && grep -F "msgbox" "$LOG" | grep -q "Keep these OFF this server" && grep -F msgbox "$LOG" | grep -q "NO alert channel"' "timers enabled; offsite-secrets checklist shown; missing alert channel called out"
+# F.6: step_system sets unattended-upgrades Automatic-Reboot at 04:30 - the one scheduled event
+# that restarts every container while nobody is watching - and selftest.sh otherwise runs only
+# from the TUI and at the end of an Update, so a stack that never came back stayed silent.
+pbu="$u/bookstack-postboot.service"; pbs="$T/etc/bookstack/postboot.sh"
+expect '[ -s "$pbu" ] && [ -x "$pbs" ]' "Backups installs the post-reboot self-test unit and its wrapper beside the backup units (F.6)"
+expect 'grep -q "^After=docker.service" "$pbu" && ! grep -q "^Requires=" "$pbu" && grep -q "^Type=oneshot" "$pbu" && grep -q "^WantedBy=multi-user.target" "$pbu"' "ordered After docker.service but NOT Requires: a unit that is skipped when Docker dies sends no alert (F.6)"
+expect 'grep -qF "ExecStart=$pbs" "$pbu" && grep -qE "^TimeoutStartSec=(1800|infinity)$" "$pbu"' "the unit runs the wrapper and gets more than systemd's 90 s default to finish the wait plus the self-test (F.6)"
+expect 'seen "systemctl: enable bookstack-postboot.service" && ! seen "systemctl: enable --now bookstack-postboot.service"' "enabled for the NEXT boot, not started now (F.6)"
+expect 'bash -n "$pbs" && [ "$(head -1 "$pbs")" = "#!/usr/bin/env bash" ]' "the generated wrapper is valid bash"
+expect 'grep -q "scripts/selftest.sh" "$pbs" && grep -q "scripts/alert.sh" "$pbs" && grep -q "starting" "$pbs" && grep -qF "STACK_DIR=$STACK_DIR" "$pbs"' "the wrapper waits out the healthcheck start periods, runs selftest.sh and alerts through alert.sh, with STACK_DIR baked in (F.6)"
+cp "$pbu" "$T/pbu.1"; cp "$pbs" "$T/pbs.1"; install_backup_units
+expect 'cmp -s "$pbu" "$T/pbu.1" && cmp -s "$pbs" "$T/pbs.1" && [ "$(grep -c "env bash" "$pbs")" = 1 ] && [ "$(ls "$u" | grep -c postboot)" = 1 ]' "a second install_backup_units rewrites the unit and wrapper in place instead of duplicating either (F.6)"
 \# A01: a password that does not open the repository must NOT replace /etc/bookstack/restic.env
 cp "$renv" "$T/renv.good"; : > "$RLOG"; export RESTIC_NOREPO=1
 reset "/mnt/backup" "typo-password-9" "typo-password-9" "no"; step_backup; rc=$?; export RESTIC_NOREPO=0
@@ -826,7 +935,9 @@ rsync(){ command rsync "$@"; }
 fail2ban-client(){ :; }       # "installed": restore must restart fail2ban AFTER the stack is up
 envset PUBLIC_IP 203.0.113.5; envset TAILSCALE_IP 100.64.0.1; envset TZ UTC; envset ABS_TOKEN old-token
 echo "live" > "$STACK_DIR/cwa/config/app.db-wal"; echo "book" > "$T/fakesnap$STACK_DIR/library/books/big.epub"
+printf 'finished=2020-01-01T00:00:00+00:00 exit=9\n' > "$STACK_DIR/.postboot-selftest.log"   # the OLD server's result, inside the snapshot
 : > "$RLOG"; reset "abc12345" "full" "yes" "yes"; step_restore && ok "step_restore ran" || bad "step_restore failed"
+expect '[ ! -e "$STACK_DIR/.postboot-selftest.log" ] && [ -z "$(postboot_banner)" ]' "a restore drops the snapshot's post-reboot result: no stale 'checks FAILED' banner on a machine that has not rebooted (F.6)"
 expect 'grep -qE "${RX}snapshots --json" "$RLOG" && grep -F "whiptail: " "$LOG" | grep -q "Restore: pick a snapshot" && grep -qE "${RX}stats abc12345 --mode restore-size --json" "$RLOG"' "snapshot picker (restic snapshots --json) and a restore-size check before anything stops (F01/F16)"
 expect 'grep -qxE "${RX}restore abc12345 --target / --include $STACK_DIR" "$RLOG" && seen "docker: compose down" && [ -f "$STACK_DIR/library/books/big.epub" ] && ! ls -d "$(dirname "$STACK_DIR")"/.bs-restore.* >/dev/null 2>&1' "restores the picked snapshot IN PLACE (target /), no temporary copy of the library (F01)"
 expect '[ "$(envget ABS_TOKEN)" = from-snapshot ] && [ "$(envget PUBLIC_IP)" = 203.0.113.5 ] && [ "$(envget TAILSCALE_IP)" = 100.64.0.1 ] && [ "$(envget TZ)" = UTC ]' "snapshot .env restored, but this server's PUBLIC_IP / TAILSCALE_IP / TZ kept"
@@ -848,6 +959,44 @@ mkdir -p "$STACK_DIR/library/books"; printf 'LIVE-CATALOG' > "$STACK_DIR/library
 expect '[ "$(cat "$STACK_DIR/library/books/metadata.db")" = LIVE-CATALOG ]' "'config + databases only' keeps the live Calibre catalog, so books imported since the snapshot do not vanish (A16)"
 : > "$RLOG"; reset "abc12345" "full" "yes" "yes"; step_restore >/dev/null
 expect '[ "$(cat "$STACK_DIR/library/books/metadata.db")" = SNAPSHOT-CATALOG ]' "a FULL restore does bring the catalog back with the library"
+# The restore's silent gap: backup.sh stages sshd/sysctl/daemon.json under .backup-snap/host/
+# and, before restore_host_files existed, step_restore read NONE of them — the box came back
+# serving books with its SSH and kernel hardening missing while every check reported success.
+hostdir="$T/fakesnap$STACK_DIR/.backup-snap/host"
+mkdir -p "$hostdir/etc/ssh/sshd_config.d" "$hostdir/etc/sysctl.d" "$hostdir/etc/docker" "$hostdir/etc/fail2ban"
+printf 'PasswordAuthentication no\n' > "$hostdir/etc/ssh/sshd_config.d/01-bookstack.conf"
+printf 'net.ipv4.ip_nonlocal_bind=1\n'  > "$hostdir/etc/sysctl.d/90-bookstack.conf"
+printf '{"ip":"127.0.0.1"}\n'           > "$hostdir/etc/docker/daemon.json"
+printf 'OLD-JAIL\n'                     > "$hostdir/etc/fail2ban/jail.local"
+HOST_RESTORED=""; HOST_MANUAL=""
+FAKEROOT="$T/hostroot"; mkdir -p "$FAKEROOT"
+# stubs so the test never touches the real machine. The harness has its OWN systemctl/sshd
+# stubs that later assertions depend on, so save them and put them back rather than unsetting.
+_saved_stubs=$(declare -f systemctl sshd sysctl install cmp 2>/dev/null || true)
+install(){ local a=(); for x in "$@"; do case "$x" in -*) ;; *) a+=("$x");; esac; done
+  local dst="${a[-1]}" srcf="${a[-2]}"; mkdir -p "$FAKEROOT$(dirname "$dst")"; command cp "$srcf" "$FAKEROOT$dst"; }
+sysctl(){ echo "sysctl: $*" >> "$RLOG"; }
+sshd(){ echo "sshd: $*" >> "$RLOG"; [ "${SSHD_OK:-1}" = 1 ]; }
+systemctl(){ echo "systemctl: $*" >> "$RLOG"; }
+cmp(){ return 1; }                                   # nothing matches the live file
+: > "$RLOG"; restore_host_files "$hostdir"
+expect '[ -f "$FAKEROOT/etc/ssh/sshd_config.d/01-bookstack.conf" ] && [ -f "$FAKEROOT/etc/sysctl.d/90-bookstack.conf" ] && [ -f "$FAKEROOT/etc/docker/daemon.json" ]' \
+  "restore brings back the three host files nothing else regenerates (R5-restore)"
+expect '[ ! -f "$FAKEROOT/etc/fail2ban/jail.local" ]' \
+  "and NOT the ones the restore regenerates from the checkout, which would be a downgrade"
+expect 'grep -q "sysctl: --system" "$RLOG" && grep -q "sshd: -t" "$RLOG"' \
+  "sysctl is applied and sshd is VALIDATED before any reload"
+expect 'printf %s "$HOST_RESTORED" | grep -q sshd_config.d && printf %s "$HOST_MANUAL" | grep -q "systemctl restart docker"' \
+  "the admin is told what was restored, and that Docker still needs restarting for daemon.json"
+# a drop-in that fails validation must be REMOVED, not reloaded: locking the owner out of a
+# machine they are recovering is the worst possible moment for it
+rm -f "$FAKEROOT/etc/ssh/sshd_config.d/01-bookstack.conf"
+: > "$RLOG"; SSHD_OK=0 restore_host_files "$hostdir"
+expect 'printf %s "$HOST_MANUAL" | grep -q "failed sshd -t" && ! grep -q "systemctl: reload" "$RLOG"' \
+  "an sshd drop-in that fails validation is removed and reported, never reloaded"
+unset -f install sysctl sshd systemctl cmp; unset SSHD_OK
+eval "$_saved_stubs"; unset _saved_stubs        # restore the harness's own stubs
+
 # V05: restic restore never deletes files the snapshot lacks, so what is already here beyond the
 # snapshot's own size is not reclaimed and must not be credited against the space needed
 df(){ printf 'Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/x 100 100 %s 50%% /\n' "${DF_AVAIL_K:-0}"; }
@@ -877,6 +1026,8 @@ expect 'seen "copy_code_trees" && [ "$(line_of "copy_code_trees")" -lt "$(line_o
 expect 'seen "build-version: " && ! seen "build-version: <unset>" && [ "$(grep -m1 "^build-version: " "$LOG" | cut -d" " -f2)" = "$(cut -d" " -f1 "$STACK_DIR/.version")" ]' "Update rebuilds with BUILD_VERSION and re-records .version (J03)"
 expect 'seen "docker: image tag bookstack/caddy:latest bookstack/caddy:prev" && seen "docker: image tag bookstack/librarian:latest bookstack/librarian:prev" && [ "$(line_of "image tag bookstack/caddy:latest")" -lt "$(line_of "compose build")" ]' "locally built caddy/librarian images kept as :prev before the rebuild (F17)"
 expect 'seen "curl: -fs -m 5 -o /dev/null http://127.0.0.1:8090/healthz" && seen "curl: -fs -m 5 -o /dev/null http://127.0.0.1:13378/healthcheck"' "gate = health checks + local endpoints"
+rm -f "$T/etc/systemd/system/bookstack-postboot.service"; reset "no" "yes"; step_update >/dev/null
+expect '[ -s "$T/etc/systemd/system/bookstack-postboot.service" ] && seen "systemctl: enable bookstack-postboot.service"' "Update installs the host-side units this version introduces, so an install that only ever Updates still gets them (F.6)"
 export SELFTEST_RC=3; reset "no" "yes"; step_update; rc=$?; export SELFTEST_RC=0
 expect '[ $rc = 0 ] && ! seen "yesno: Update problem" && seen "system prune" && grep -q "3 failure(s) unrelated" "$LOG"' "a failing full self-test (disk, NTP, Tailscale...) is reported but is NOT a rollback reason (F17)"
 FAIL_HEALTHZ=1; reset "no" "yes" "no"; step_update; rc=$?; FAIL_HEALTHZ=0
@@ -907,13 +1058,14 @@ expect '[ $rc = 0 ] && seen "compose up -d librarian" && grep -F msgbox "$LOG" |
 sbak=$(envget LIBRARIAN_SECRET)
 FAIL_HEALTHZ=1; reset "yes"; step_rotate_secret; rc=$?; FAIL_HEALTHZ=0
 expect '[ $rc = 1 ] && [ "$(envget LIBRARIAN_SECRET)" != "$sbak" ] && grep -F msgbox "$LOG" | grep -q "NOBODY has been logged out"' "when the portal does not come back it says the OLD secret is still accepting cookies (A09)"
-# A18: Monitoring hands out a page of instructions for a container that must actually be up
-reset; step_monitoring; expect '[ $? = 0 ] && grep -F msgbox "$LOG" | grep -q "Uptime Kuma runs at"' "Monitoring prints its instructions once Kuma answers"
+# A18: Monitoring used to hand out a page of instructions; it now configures Kuma, and a
+# bootstrap that answers nothing (the stub docker prints nothing) must not read as success
+reset; step_monitoring; expect '[ $? = 1 ] && grep -F msgbox "$LOG" | grep -q "Kuma was NOT configured"' "Monitoring never claims success when the Kuma bootstrap gave no answer"
 eval "real_compose2() $(declare -f compose | sed '1d')"
 compose(){ case "$*" in *"up -d uptime-kuma"*) echo "docker: compose $*" >> "$LOG"; return 1;; esac; real_compose2 "$@"; }
 reset; step_monitoring; rc=$?
 unset -f compose; eval "compose() $(declare -f real_compose2 | sed '1d')"; unset -f real_compose2
-expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "did not start" && ! grep -F msgbox "$LOG" | grep -q "Uptime Kuma runs at"' "a Kuma that never started is reported instead of a page of instructions for nothing (A18)"
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "did not start" && ! seen "kuma-bootstrap"' "a Kuma that never started is reported, and nothing tries to configure it (A18)"
 unset -f copy_code_trees; source <(sed -n '/^copy_code_trees(){/,/^}/p' "$REPO/bookstack.sh")
 
 echo "== menus survive failures (F34)"
@@ -951,8 +1103,15 @@ expect '[ -f "$fs/.backup-snap/cwa_config_app.db" ] && [ -f "$fs/.backup-snap/li
 expect '[ "$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"select count(*) from user\").fetchone()[0])" "$fs/.backup-snap/cwa_config_app.db")" = 1 ]' "snapshot copy contains the committed row (WAL-safe backup API)"
 expect 'grep -q "restic: --retry-lock 30m backup $fs --exclude $fs/downloads .*--exclude $fs/cwa/config/processed_books --exclude $fs/library/staging --exclude $fs/ephemera/downloads --exclude $fs/abs/metadata/cache --exclude $fs/abs/metadata/logs --exclude \*.db-wal --exclude \*.db-shm --exclude \*.sqlite-wal --exclude \*.sqlite-shm --tag bookstack --tag pre-update" "$RLOG"' "restic backup with the excludes (incl. re-downloadable caches, F77), --retry-lock and the extra tag"
 rl(){ grep -nF -- "$1" "$RLOG" | head -1 | cut -d: -f1; }
-expect '[ "$(rl "restic: --retry-lock 30m check --read-data-subset=5%")" -lt "$(rl "restic: --retry-lock 30m forget")" ] && grep -q "restic: --retry-lock 30m forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-tag pre-update --prune" "$RLOG" && grep -q "restic: --retry-lock 30m stats latest --json" "$RLOG"' "weekly restic check runs BEFORE forget --prune; stats logged"
+expect '[ "$(rl "restic: --retry-lock 30m check --read-data-subset=1/52")" -lt "$(rl "restic: --retry-lock 30m forget")" ] && grep -q "restic: --retry-lock 30m forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-tag pre-update --prune" "$RLOG" && grep -q "restic: --retry-lock 30m stats latest --json" "$RLOG"' "weekly restic check runs BEFORE forget --prune; stats logged"
 expect '! grep -q "restic: .*init" "$RLOG" && ! grep -q "tag --remove" "$RLOG" && grep -q "curl: -fsS -m 10 --retry 3 https://hc-ping.example/uuid$" "$DLOG"' "backup.sh never inits; recent pre-update snapshots kept; success ping sent (C1)"
+# F.7: --read-data-subset=5% re-picked its 5 % AT RANDOM every week, so no particular pack was
+# ever guaranteed to have been read and bit rot in a cold one could survive indefinitely. The
+# n/52 form with a counter beside restic.env reads every byte exactly once a year - and only
+# advances after a check that passed, so a failed week re-reads the same group.
+expect 'grep -q "^check_group=2$" "$T/backup.state"' "the weekly verification counter advanced past the group it just read (F.7)"
+: > "$RLOG"; BACKUP_CHECK_DOW=$(date +%u) STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >/dev/null 2>&1
+expect 'grep -q "restic: --retry-lock 30m check --read-data-subset=2/52" "$RLOG" && grep -q "^check_group=3$" "$T/backup.state"' "the next weekly run reads the NEXT 52nd, never a random 5% again (F.7)"
 : > "$RLOG"; BACKUP_CHECK_DOW=8 STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >/dev/null 2>&1
 expect '! grep -q "restic: .* check" "$RLOG"' "no check on the other days of the week (F77)"
 : > "$RLOG"; RESTIC_SNAP_TIME=2020-01-01T00:00:00Z STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >/dev/null 2>&1
@@ -973,12 +1132,22 @@ STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/restore-test.sh" 
 # disk watchdog
 cat > "$bin/df" <<'EOS'
 #!/usr/bin/env bash
-case "$*" in *--output=pcent*) printf 'Use%%\n %s%%\n' "$DF_PCT";; *--output=avail*) printf 'Avail\n1000000\n';; *) printf 'Filesystem Size Used Avail Use%% Mounted\n/dev/x 80G 70G 10G %s%% /\n' "$DF_PCT";; esac
+# The -i arms come FIRST: `df -i --output=ipcent` also matches *--output=pcent*... no, it does
+# not, but it DOES fall through to the human table without them, which the >100 guard then
+# rejects as "unknown" — so every inode assertion silently tested nothing.
+# DF_IPCT=NONE simulates a filesystem that does not count inodes (df exits non-zero).
+case "$*" in
+  *-i*--output=ipcent*) [ "${DF_IPCT:-NONE}" = NONE ] && exit 1; printf 'IUse%%\n %s%%\n' "$DF_IPCT";;
+  *-i*--output=iavail*) printf 'IFree\n4200000\n';;
+  *--output=pcent*) printf 'Use%%\n %s%%\n' "$DF_PCT";;
+  *--output=avail*) printf 'Avail\n1000000\n';;
+  *) printf 'Filesystem Size Used Avail Use%% Mounted\n/dev/x 80G 70G 10G %s%% /\n' "$DF_PCT";;
+esac
 EOS
 chmod +x "$bin/df"
 touch -t 202001010000 "$fs/downloads/incomplete/old.part" "$fs/library/staging/old.bin" "$fs/library/ingest/old.part"; touch "$fs/downloads/incomplete/new.part"
 printf "TORRENTS_ENABLED='false'\n" > "$fs/.env"
-dw(){ DF_PCT=$1 STACK_DIR="$fs" DISK_STATE="$T/disk.state" bash "$REPO/scripts/disk-watch.sh"; }
+dw(){ DF_PCT=$1 DF_IPCT="${2-NONE}" STACK_DIR="$fs" DISK_STATE="$T/disk.state" bash "$REPO/scripts/disk-watch.sh"; }
 : > "$DLOG"; dw 96 && ok "disk-watch.sh runs" || bad "disk-watch.sh failed"
 expect 'grep -q "docker: compose stop shelfmark" "$DLOG" && ! grep -q "aria2" "$DLOG" && ! grep -q "stop qbittorrent" "$DLOG" && grep -q "^paused=1" "$T/disk.state" && grep -q "python -m notify alert Disk 96% full" "$DLOG" && grep -q " high$" "$DLOG"' "96 %: shelfmark stopped (no aria2; qBittorrent not running), high-priority alert, state recorded"
 expect '[ ! -f "$fs/downloads/incomplete/old.part" ] && [ ! -f "$fs/library/staging/old.bin" ] && [ ! -f "$fs/library/ingest/old.part" ] && [ -f "$fs/downloads/incomplete/new.part" ] && [ -f "$fs/library/ingest/stuck.epub" ]' "stale partials/staging deleted; fresh files and real ingest files kept"
@@ -991,6 +1160,25 @@ printf "TORRENTS_ENABLED='true'\n" > "$fs/.env"
 grep -v '^last_alert=' "$T/disk.state" > "$T/disk.state.n"; mv "$T/disk.state.n" "$T/disk.state"   # pretend the last alert was long ago
 : > "$DLOG"; dw 88; expect '! grep -q "compose stop" "$DLOG" && grep -q "notify alert Disk 88% full" "$DLOG"' "88 %: alert only (once per 24 h)"
 : > "$DLOG"; dw 88; expect '! grep -q "notify alert" "$DLOG"' "88 % again within 24 h: silent"
+# Inodes. The whole point of the inode watch is that blocks look fine while the filesystem is
+# wedged, so the test that matters is blocks LOW and inodes HIGH — which the old df stub could
+# never produce, leaving every inode branch unexecuted by the suite.
+# Each case resets the latch explicitly: depending on what a previous assertion left behind is
+# how the first draft of these tests silently tested nothing.
+dwfresh(){ : > "$T/disk.state"; : > "$DLOG"; dw "$@"; }
+dwfresh 40 97
+# the profile flag is present or not depending on TORRENTS_ENABLED at this point in the suite
+expect 'grep -q "notify alert Disk 97% full" "$DLOG" && grep -q "inodes 97%" "$DLOG" && grep -q "INODES, not bytes" "$DLOG" && grep -qE "docker: compose (--profile torrents )?stop shelfmark" "$DLOG"' \
+  "blocks 40 % but inodes 97 %: the worse figure drives the stop, the alert names inodes and says bytes will not help"
+dwfresh 40 88
+expect 'grep -q "notify alert Disk 88% full" "$DLOG" && grep -q "inodes 88%" "$DLOG" && ! grep -q "compose stop" "$DLOG"' \
+  "inodes 88 %: warn only, nothing stopped"
+dwfresh 96 NONE
+expect 'grep -q "notify alert Disk 96% full" "$DLOG" && ! grep -q "inodes" "$DLOG"' \
+  "a filesystem that does not count inodes falls back to blocks alone, with no inode wording"
+dwfresh 97 40
+expect 'grep -q "notify alert Disk 97% full" "$DLOG" && grep -q "blocks 97%" "$DLOG" && ! grep -q "INODES, not bytes" "$DLOG"' \
+  "blocks 97 % with inodes fine: no misleading inode advice"
 # alert.sh (C1)
 printf "NOTIFY_WEBHOOK='https://ntfy.example/secret-topic'\n" > "$fs/.env"
 : > "$DLOG"; STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "T" "body" high; expect 'grep -q "docker: exec -i librarian python -m notify alert T body high" "$DLOG" && ! grep -q "^curl:" "$DLOG" && ! grep -q "^logger:" "$DLOG"' "alert.sh hands off to the portal's notify CLI (delivered -> nothing else)"
@@ -1018,9 +1206,11 @@ cp "$T/v4.good" "$CF_V4_FILE"
 echo "== ephemera enable/disable"
 envset TAILSCALE_IP 100.64.0.1; envset CF_API_TOKEN ""
 reset "yes" "https://archive.example" "" "" "alice"; step_ephemera
-expect '[ "$(envget EPHEMERA_ENABLED)" = true ] && [ "$(envget EPHEMERA_OWNER)" = alice ] && [ -d "$STACK_DIR/library/dropbox/alice" ] && seen "compose -f docker-compose.yml -f docker-compose.ephemera.yml build ephemera"' "ephemera enabled, owner dropbox, pinned build"
+expect '[ "$(envget EPHEMERA_ENABLED)" = true ] && [ "$(envget EPHEMERA_OWNER)" = alice ] && [ -d "$STACK_DIR/library/dropbox/alice" ] && seen "compose -f docker-compose.yml -f docker-compose.ephemera.yml --profile solver build ephemera"' "ephemera enabled, owner dropbox, pinned build (with the solver profile on, since Ephemera needs FlareSolverr)"
 expect 'grep -q "^ephemera.example.test {" "$STACK_DIR/caddy/Caddyfile" && seen "caddy reload"' "enabling Ephemera renders its vhost and reloads Caddy (C6)"
-reset; step_ephemera_off; expect '[ "$(envget EPHEMERA_ENABLED)" = false ] && seen "stop ephemera flaresolverr" && ! grep -q "^ephemera.example.test {" "$STACK_DIR/caddy/Caddyfile" && seen "caddy reload"' "ephemera disabled; vhost removed and Caddy reloaded"
+expect 'seen "compose -f docker-compose.yml -f docker-compose.ephemera.yml --profile solver up -d flaresolverr ephemera"' "enabling Ephemera starts the shared FlareSolverr with it (compose profile solver)"
+envset FLARESOLVERR_ENABLED false
+reset; step_ephemera_off; expect '[ "$(envget EPHEMERA_ENABLED)" = false ] && seen "stop ephemera" && seen "compose stop flaresolverr" && ! grep -q "^ephemera.example.test {" "$STACK_DIR/caddy/Caddyfile" && seen "caddy reload"' "ephemera disabled; FlareSolverr stopped too (nothing else uses it); vhost removed and Caddy reloaded"
 hbak3=$(envget ADMIN_HASH); envset ADMIN_HASH ""
 reset "yes" "https://archive.example" "" "" "alice"; step_ephemera >/dev/null
 expect 'grep -q "Caddy did NOT pick up the ephemera. site" "$LOG"' "Ephemera enabled but its vhost was not rendered: the success message says so (A18/V10)"
@@ -1304,6 +1494,50 @@ expect '[ "$(envget SESSION_HOURS)" = 48 ] && grep -F msgbox "$LOG" | grep -q "N
 expect 'declare -f menu_ops | grep -q step_advanced' "the entry is wired into the Operations menu (FEAT-10)"
 for k in LOCKOUT_FAILS SESSION_HOURS IMAP_SSL DISK_WARN_PCT DISK_STOP_PCT DISK_RESUME_PCT RESTIC_KEEP_MONTHLY MAX_PDF_MB; do envset "$k" ""; done
 
+echo "== F.6: the post-reboot self-test runs, records its result and alerts"
+# The generated wrapper is run as a REAL process, the way systemd runs it: stub selftest.sh,
+# stub alert.sh, stub docker on PATH. POSTBOOT_WAIT/POSTBOOT_SLEEP are the only knobs the
+# wrapper exposes, so the health wait can be exercised in seconds instead of 15 minutes.
+pblog="$STACK_DIR/.postboot-selftest.log"; cp "$bin/docker" "$T/docker.stub.bak"
+printf '#!/usr/bin/env bash\necho "== Containers"\necho "  [FAIL] calibre-web: exited"\necho "  [FAIL] portal /healthz"\necho "RESULT: 7 passed, 2 failed"\nexit 2\n' > "$STACK_DIR/scripts/selftest.sh"
+printf '#!/usr/bin/env bash\n{ echo "alert.sh: $1"; echo "$2"; } >> "%s"\n' "$T/pb-alert.log" > "$STACK_DIR/scripts/alert.sh"
+chmod +x "$STACK_DIR/scripts/selftest.sh" "$STACK_DIR/scripts/alert.sh"; : > "$T/pb-alert.log"; rm -f "$pblog"
+POSTBOOT_WAIT=0 bash "$pbs" > "$T/pb.out" 2>&1; rc=$?
+expect '[ $rc = 2 ] && grep -q "RESULT: 7 passed, 2 failed" "$pblog" && grep -qE "^finished=.* exit=2$" "$pblog" && [ ! -e "$pblog.tmp" ]' "the wrapper exits with the self-test's failure count and records the result atomically (F.6)"
+expect 'grep -q "RESULT: 7 passed, 2 failed" "$T/pb.out"' "and repeats it on stdout, so journalctl -u bookstack-postboot holds the full result as well (F.6)"
+expect 'grep -q "post-reboot self-test FAILED" "$T/pb-alert.log" && grep -q "calibre-web: exited" "$T/pb-alert.log" && grep -q "portal /healthz" "$T/pb-alert.log"' "a non-zero exit reaches scripts/alert.sh naming WHICH checks failed, not just that something did (F.6)"
+expect 'postboot_last | grep -q "2 check(s) FAILED" && postboot_banner | grep -q "Post-reboot self-test"' "the TUI reads that result back, and a failure is worth the first screen (F.6)"
+expect 'declare -f step_selftest | grep -q postboot_last && declare -f main_menu | grep -q postboot_banner' "Operations -> Self-test shows the last automatic run and the main menu flags a failed one (F.6)"
+printf '#!/usr/bin/env bash\necho "RESULT: 9 passed, 0 failed"\nexit 0\n' > "$STACK_DIR/scripts/selftest.sh"; chmod +x "$STACK_DIR/scripts/selftest.sh"
+: > "$T/pb-alert.log"; POSTBOOT_WAIT=0 bash "$pbs" >/dev/null 2>&1; rc=$?
+expect '[ $rc = 0 ] && [ ! -s "$T/pb-alert.log" ] && postboot_last | grep -q "all checks passed" && [ -z "$(postboot_banner)" ]' "a clean post-reboot self-test alerts nobody and leaves the first screen alone (F.6)"
+cat > "$bin/docker" <<'EOS'
+#!/usr/bin/env bash
+case "$*" in
+  "ps -q") echo c1;;
+  "ps --format "*) printf '%s\n' ${PB_NAMES-caddy calibre-web audiobookshelf librarian shelfmark uptime-kuma};;
+  *inspect*) echo "${PB_HEALTH:-healthy}";;
+esac
+exit 0
+EOS
+chmod +x "$bin/docker"
+t0=$(date +%s); POSTBOOT_WAIT=60 POSTBOOT_SLEEP=5 bash "$pbs" >/dev/null 2>&1; t1=$(date +%s)
+expect '[ $((t1-t0)) -lt 5 ]' "an already-healthy stack is tested at once instead of after a fixed sleep (F.6)"
+t0=$(date +%s); PB_HEALTH=starting POSTBOOT_WAIT=3 POSTBOOT_SLEEP=1 bash "$pbs" >/dev/null 2>&1; t1=$(date +%s)
+expect '[ $((t1-t0)) -ge 3 ] && grep -q "RESULT: 9 passed" "$pblog"' "a container still inside its healthcheck start period (CWA 120 s, ABS 60 s) is waited out, then tested anyway (F.6)"
+# R4-A4: dockerd restarts the restart:unless-stopped containers one after another, and caddy and
+# uptime-kuma carry no healthcheck at all. "something is running and nothing says 'starting'" is
+# therefore already true in the window before calibre-web and audiobookshelf exist — the
+# self-test then calls the containers that have not started yet FAILED, and the admin gets an
+# alert after every healthy 04:30 reboot, which is the fastest way to teach them to ignore it.
+expect 'grep -q "ps --format" "$pbs" && for c in caddy calibre-web audiobookshelf librarian shelfmark; do grep -q "$c" "$pbs" || exit 1; done' "the generated wrapper waits for the core containers BY NAME, not just for a non-empty docker ps (R4-A4)"
+expect '! grep -E "^CORE=" "$pbs" | grep -qE "qbittorrent|ephemera|flaresolverr"' "and not for the optional ones, which are not always deployed (R4-A4)"
+t0=$(date +%s); PB_NAMES="caddy uptime-kuma" POSTBOOT_WAIT=3 POSTBOOT_SLEEP=1 bash "$pbs" >/dev/null 2>&1; t1=$(date +%s)
+expect '[ $((t1-t0)) -ge 3 ]' "a part-started stack (caddy up, calibre-web not yet) is waited out instead of being reported as a failed boot (R4-A4)"
+t0=$(date +%s); PB_NAMES="" POSTBOOT_WAIT=2 POSTBOOT_SLEEP=1 bash "$pbs" >/dev/null 2>&1; t1=$(date +%s)
+expect '[ $((t1-t0)) -ge 2 ] && grep -q "RESULT: 9 passed" "$pblog"' "and a Docker that never came up still falls through the deadline and is reported by the self-test itself (R4-A4)"
+cp "$T/docker.stub.bak" "$bin/docker"; rm -f "$pblog"
+
 echo "== the touched helpers behave under the script's own errexit"
 # the suite runs with `set +e`; these helpers really execute with -euo pipefail, where a final
 # `[ x = y ] && cmd` that is false aborts the caller
@@ -1321,7 +1555,238 @@ out=$( (set -euo pipefail
   adv_rows lockout >/dev/null; adv_value LOCKOUT_FAILS 5 >/dev/null
   valid_ip 203.0.113.9 || true; valid_ip nope || true; caller_ip >/dev/null
   cli_err '{"ok": false, "error": "x"}' >/dev/null; cli_err 'not json at all' >/dev/null
+  postboot_last >/dev/null || true; postboot_banner >/dev/null
+  # every arm of these two is a test or an && list that is false on a boring stack (no dropbox
+  # for the old name, no Authelia file, torrents off) — and a rename must survive all of it
+  rename_user_artifacts nosuch-old nosuch-new
+  authelia_rename_user nosuch-old nosuch-new || true
+  # monitoring + FlareSolverr helpers: false-y on a stack with nothing enabled and Kuma never set up
+  solver_on || true; compose_profiles >/dev/null; compose_for flaresolverr >/dev/null
+  ensure_kuma_secrets; kuma_reboot_time >/dev/null; kuma_config >/dev/null
+  envset KUMA_BOOTSTRAP_AT ""; monitoring_refresh
   echo "ERREXIT-OK") 2>&1 )
 expect 'printf "%s" "$out" | grep -q "ERREXIT-OK"' "render_caddyfile / restart_shelfmark / restic_run / envset and the new helpers all survive set -euo pipefail"
 
+
+# ---------------------------------------------------------------------------------------------
+echo "== Metadata push: the host side (scripts/metadata-push.sh)"
+# The one path that WRITES into the family's shared Calibre database. What reaches calibredb is
+# checked here as argv, because that is the only thing that matters.
+MP="$T/mp"; mkdir -p "$MP/bin" "$MP/stack/scripts"
+printf "PUID='1000'\nPGID='1000'\n" > "$MP/stack/.env"
+printf '#!/usr/bin/env bash\necho "ALERT $*" >> "%s/log"\n' "$MP" > "$MP/stack/scripts/alert.sh"
+chmod +x "$MP/stack/scripts/alert.sh"
+cat > "$MP/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MP/log"
+case "$*" in
+  *"admin_cli pushes pending"*)
+    # a row carrying a forbidden field, as if written by hand: the script must still drop it
+    echo '{"ok":true,"rows":[{"id":5,"calibre_id":42,"fields":{"title":"Moby-Dick","tags":"owner:mallory","series":"S"}}]}';;
+  *"admin_cli pushes result"*) echo '{"ok":true,"status":"done"}';;
+  *"calibredb list"*)
+    n=$(cat "$MP/listcount" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/listcount"
+    if [ "$n" -ge 2 ] && [ -n "${MP_TAG_CHANGES:-}" ]; then echo '[{"id":42,"tags":["owner:bob"]}]'
+    else echo '[{"id":42,"tags":["owner:alice"]}]'; fi;;
+  *"calibredb set_metadata"*) : ;;
+esac
+EOS
+chmod +x "$MP/bin/docker"
+mprun(){ : > "$MP/log"; rm -f "$MP/listcount"; MP="$MP" PATH="$MP/bin:$PATH" STACK_DIR="$MP/stack" bash "$REPO/scripts/metadata-push.sh" >/dev/null 2>&1; }
+mprun; rc=$?
+expect 'grep "calibredb set_metadata" "$MP/log" | grep -q -- "-u 1000:1000"' \
+  "calibredb runs as PUID:PGID, never root (a root-owned -wal would lock Calibre-Web out of its own database)"
+expect 'grep "calibredb set_metadata" "$MP/log" | grep -q "title:Moby-Dick" && grep "calibredb set_metadata" "$MP/log" | grep -q "series:S"' \
+  "the allowed fields reach calibredb"
+expect '! grep "calibredb set_metadata" "$MP/log" | grep -qi "tags"' \
+  "a tags field in the queue NEVER reaches calibredb, even when the row carries one"
+expect '[ "$(grep -c "calibredb list" "$MP/log")" = 2 ] && grep -q "pushes result 5 ok" "$MP/log" && [ "$rc" = 0 ]' \
+  "the owner tag is read before AND after the write, and an unchanged tag reports success"
+MP_TAG_CHANGES=1 mprun; rc=$?
+expect 'grep -q "ALERT Bookstack: a metadata update CHANGED a book" "$MP/log" && grep -q "pushes result 5 fail" "$MP/log" && [ "$rc" != 0 ]' \
+  "a write that CHANGED the owner tag raises a high alert and fails the push, it is never just logged"
+expect 'grep -q "bookstack-metapush" "$REPO/bookstack.sh" && grep -q "logger -t bookstack-metapush" "$REPO/bookstack.sh"' \
+  "the push job is installed as a cron entry whose output reaches the journal, not /dev/null"
+
+# ---------------------------------------------------------------------------------------------
+echo "== FlareSolverr: one shared solver for Shelfmark and Ephemera"
+envset FLARESOLVERR_ENABLED false; envset EPHEMERA_ENABLED false; envset TORRENTS_ENABLED false
+expect '! compose_profiles | grep -q solver' "neither Shelfmark nor Ephemera wants it: no solver profile, FlareSolverr does not run"
+envset FLARESOLVERR_ENABLED true
+expect 'compose_profiles | grep -qx solver && stack_services | grep -qx flaresolverr' "FLARESOLVERR_ENABLED alone turns the solver profile on and lists the service"
+envset FLARESOLVERR_ENABLED false; envset EPHEMERA_ENABLED true
+expect 'compose_profiles | grep -qx solver' "Ephemera alone turns it on too (it always needs FlareSolverr)"
+envset EPHEMERA_ENABLED false
+expect '[ "$(compose_for flaresolverr)" = compose ] && [ "$(compose_for ephemera)" = composeE ]' "FlareSolverr lives in docker-compose.yml now, so plain compose owns it"
+reset "yes"; step_flaresolverr >/dev/null; rc=$?
+expect '[ $rc = 0 ] && [ "$(envget FLARESOLVERR_ENABLED)" = true ] && seen "compose --profile solver up -d flaresolverr" && seen "up -d shelfmark" && seen "exec shelfmark curl -fs -m 5 http://flaresolverr:8191/health"' "turning it on starts it, RECREATES Shelfmark (restart would keep the old env) and proves Shelfmark reaches it by name"
+expect '! seen "compose restart shelfmark"' "and never uses 'restart', which would leave Shelfmark on the old environment"
+envset FLARESOLVERR_ENABLED false
+( curl(){ case "$*" in *8191*) return 7;; esac; return 0; }
+  reset "yes"; step_flaresolverr >/dev/null; echo "rc=$? env=$(envget FLARESOLVERR_ENABLED)" > "$T/fs.out" )
+expect 'grep -q "rc=1 env=false" "$T/fs.out" && grep -F msgbox "$LOG" | grep -q "left on its built-in solver"' "a FlareSolverr that never answers is rolled back: Shelfmark stays on its own solver, and it says so"
+( docker(){ echo "docker: $*" >> "$LOG"; case "$*" in *"exec shelfmark curl"*) return 1;; esac; return 0; }
+  reset "yes"; step_flaresolverr >/dev/null; echo "rc=$?" > "$T/fs.out" )
+expect 'grep -q "rc=1" "$T/fs.out" && grep -F msgbox "$LOG" | grep -q "Shelfmark cannot reach http://flaresolverr:8191"' "running but unreachable from inside Shelfmark is a failure, not a success message"
+envset FLARESOLVERR_ENABLED true; envset EPHEMERA_ENABLED true
+reset "yes"; step_flaresolverr >/dev/null
+expect '[ "$(envget FLARESOLVERR_ENABLED)" = false ] && seen "up -d shelfmark" && ! seen "stop flaresolverr"' "turning it off for Shelfmark keeps it running while Ephemera needs it"
+envset FLARESOLVERR_ENABLED true; envset EPHEMERA_ENABLED false
+reset "yes"; step_flaresolverr >/dev/null
+expect '[ "$(envget FLARESOLVERR_ENABLED)" = false ] && seen "compose stop flaresolverr"' "and stops it when nothing else uses it"
+envset FLARESOLVERR_ENABLED true; envset EPHEMERA_ENABLED true
+reset; step_ephemera_off >/dev/null
+expect 'seen "stop ephemera" && ! seen "stop flaresolverr" && grep -F msgbox "$LOG" | grep -q "kept running: Shelfmark uses it"' "disabling Ephemera leaves FlareSolverr up while Shelfmark uses it"
+envset FLARESOLVERR_ENABLED false; envset EPHEMERA_ENABLED false
+expect 'declare -f menu_ops | grep -q step_flaresolverr' "the toggle is in the Operations menu"
+for f in docker-compose.yml docker-compose.ephemera.yml; do :; done
+expect 'grep -q "USING_EXTERNAL_BYPASSER=\${FLARESOLVERR_ENABLED:-false}" "$REPO/docker-compose.yml" && grep -q "EXT_BYPASSER_URL=http://flaresolverr:8191" "$REPO/docker-compose.yml"' "Shelfmark's external bypasser follows FLARESOLVERR_ENABLED (env wins over its Settings page)"
+expect '! grep -q "^  flaresolverr:" "$REPO/docker-compose.ephemera.yml" && grep -A6 "depends_on:" "$REPO/docker-compose.ephemera.yml" | grep -q "flaresolverr:" && grep -q "required: false" "$REPO/docker-compose.ephemera.yml"' "the Ephemera overlay no longer defines its own FlareSolverr, and depends on the shared one without requiring it"
+expect '! grep -rq "only enable Ephemera on >= 8 GB\|Needs >= 8 GB\|enabled on < 8 GB" "$REPO/docker-compose.ephemera.yml" "$REPO/scripts/selftest.sh" "$REPO/bookstack.sh"' "the unmeasured '8 GB' claim is gone from the overlay, the self-test and the installer"
+
+echo "== Monitoring: Uptime Kuma is configured by bookstack, not by hand"
+envset KUMA_USER ""; envset KUMA_PASS ""; for j in SELFTEST DISK METAPUSH CFIPS BACKUP; do envset "KUMA_PUSH_$j" ""; done
+envset ADMIN_USER famadmin
+ensure_kuma_secrets
+kp1=$(envget KUMA_PASS); kt1=$(envget KUMA_PUSH_DISK)
+expect '[ "$(envget KUMA_USER)" = famadmin ] && [[ "$kp1" =~ ^[A-Za-z0-9]{24}$ ]]' "Kuma's admin is the stack admin, with a generated 24-character password"
+expect 'for j in SELFTEST DISK METAPUSH CFIPS BACKUP; do [[ "$(envget KUMA_PUSH_$j)" =~ ^[0-9a-f]{32}$ ]] || exit 1; done' "one 32-hex push token per scheduled job"
+ensure_kuma_secrets
+expect '[ "$(envget KUMA_PASS)" = "$kp1" ] && [ "$(envget KUMA_PUSH_DISK)" = "$kt1" ]' "a second run keeps them (the jobs and Kuma already hold these)"
+# which push monitors exist follows what is SCHEDULED on this host
+mkdir -p "$ETC/cron.d" "$ETC/systemd/system" "$ETC/apt/apt.conf.d"
+rm -f "$ETC/cron.d/bookstack-disk" "$ETC/cron.d/bookstack-metapush" "$ETC/cron.d/bookstack-cfips" "$ETC/systemd/system/bookstack-selftest.timer"
+touch "$ETC/cron.d/bookstack-disk" "$ETC/systemd/system/bookstack-selftest.timer"
+printf 'Unattended-Upgrade::Automatic-Reboot "true";\nUnattended-Upgrade::Automatic-Reboot-Time "03:10";\n' > "$ETC/apt/apt.conf.d/50unattended-upgrades"
+envset TORRENTS_ENABLED true; envset AUTHELIA_ENABLED false; envset EPHEMERA_ENABLED true; envset FLARESOLVERR_ENABLED false
+envset NOTIFY_WEBHOOK "https://ntfy.sh/bookstack-x"; envset SMTP_HOST ""; envset DOMAIN example.test
+kc=$(RESTIC_ENV_PATH="$T/no-restic.env" kuma_config)
+kq(){ printf '%s' "$kc" | python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
+expect '[ "$(kq "sorted(d[\"push\"])")" = "['"'"'disk'"'"', '"'"'selftest'"'"']" ]' "push monitors only for jobs scheduled here (selftest timer + disk cron; no cfips/metapush cron yet)"
+expect '[ "$(kq "d[\"features\"]")" = "{'"'"'torrents'"'"': True, '"'"'ephemera'"'"': True, '"'"'authelia'"'"': False, '"'"'flaresolverr'"'"': True}" ]' "features follow .env; Ephemera implies the FlareSolverr monitor"
+expect '[ "$(kq "d[\"reboot_time\"]")" = 03:10 ] && [ "$(kq "d[\"password\"]")" = "$kp1" ] && [ "$(kq "d[\"notify\"][\"smtp\"]")" = None ]' "the reboot window follows unattended-upgrades' own time; no SMTP -> no e-mail channel"
+envset SMTP_HOST smtp.example.test; envset SMTP_FROM lib@example.test; envset ADMIN_EMAIL me@example.test
+kc=$(kuma_config)
+expect '[ "$(kq "d[\"notify\"][\"smtp\"][\"host\"]")" = smtp.example.test ] && [ "$(kq "d[\"notify\"][\"to\"]")" = me@example.test ]' "SMTP configured -> Kuma mails the same admin address alert.sh uses"
+envset SMTP_HOST ""; envset TORRENTS_ENABLED false; envset EPHEMERA_ENABLED false
+# setup_monitoring against a stub compose: the bootstrap's answer drives the result
+KB_OUT='{"ok": true, "setup": "created", "added": ["a","b"], "updated": [], "deleted": [], "notifications": ["bookstack: webhook"], "maintenance": "5 3 * * *", "monitors": 9}'
+kbdocker(){ echo "docker: $*" >> "$LOG"
+  case "$*" in *"run --rm -T kuma-bootstrap"*) cat > "$T/kb.stdin"; echo "Creating ..." >&2; echo "$KB_OUT"; return 0;; esac; return 0; }
+( docker(){ kbdocker "$@"; }; reset; envset KUMA_BOOTSTRAP_AT ""; setup_monitoring; echo "rc=$? note=$MON_NOTE" > "$T/sm.out" )
+expect 'grep -q "^rc=0 note=9 monitors at https://monitor.example.test (+2 ~0 -0 this run), alerts via: webhook" "$T/sm.out" && [ -n "$(envget KUMA_BOOTSTRAP_AT)" ]' "a good bootstrap is summarised in one line and stamped in .env"
+expect 'grep -q "$kp1" "$T/kb.stdin" && ! grep -F "docker: " "$LOG" | grep -qF "$kp1"' "the Kuma password travels on stdin, never on a command line"
+expect 'seen "compose up -d uptime-kuma"' "Kuma is started first (the bootstrap needs it answering)"
+KB_OUT='{"ok": true, "added": [], "updated": [], "deleted": [], "notifications": [], "monitors": 9}'
+( docker(){ kbdocker "$@"; }; reset; setup_monitoring; echo "rc=$? note=$MON_NOTE" > "$T/sm.out" )
+expect 'grep -q "NO alert channel" "$T/sm.out"' "no webhook and no SMTP: it says Kuma can show problems but tell nobody"
+KB_OUT='{"ok": false, "code": "credentials", "error": "Uptime Kuma refused the login"}'
+( docker(){ kbdocker "$@"; }; reset; setup_monitoring; echo "rc=$? note=$MON_NOTE" > "$T/sm.out" )
+expect 'grep -q "^rc=2 note=Kuma was NOT configured: Uptime Kuma refused the login" "$T/sm.out"' "an account that is not ours is exit 2, so the menu can ask for it"
+KB_OUT='not json at all'
+( docker(){ kbdocker "$@"; }; reset; setup_monitoring; echo "rc=$?" > "$T/sm.out" )
+expect 'grep -q "^rc=1" "$T/sm.out"' "a bootstrap that answers garbage is a failure, never a success"
+# the menu entry: credentials refused -> ask for the real account -> retry
+printf '0' > "$T/kbn"
+kbdocker2(){ echo "docker: $*" >> "$LOG"
+  case "$*" in *"run --rm -T kuma-bootstrap"*) cat > /dev/null; n=$(cat "$T/kbn"); echo $((n+1)) > "$T/kbn"
+    if [ "$n" = 0 ]; then echo '{"ok": false, "code": "credentials", "error": "refused"}'; else echo '{"ok": true, "added": [], "updated": [], "deleted": [], "notifications": ["bookstack: webhook"], "monitors": 9}'; fi;; esac; return 0; }
+( docker(){ kbdocker2 "$@"; }; reset "yes" "kuma-owner" "their-own-pass" "http://not-https.example/x"; step_monitoring >/dev/null; echo "rc=$?" > "$T/sm.out" )
+expect 'grep -q "^rc=0" "$T/sm.out" && [ "$(envget KUMA_USER)" = kuma-owner ] && [ "$(envget KUMA_PASS)" = their-own-pass ] && [ "$(cat "$T/kbn")" = 2 ]' "Operations -> Monitoring adopts an existing Kuma account and retries"
+expect '[ -z "$(envget HEALTH_PING_URL)" ] && grep -F msgbox "$LOG" | grep -q "is not an https:// URL"' "a non-https external check URL is refused"
+expect 'grep -q "password: their-own-pass" "$LOG" && grep -q "cannot tell you the whole VPS is down" "$LOG"' "the result screen shows the login and says what Kuma cannot see"
+envset KUMA_USER famadmin; envset KUMA_PASS "$kp1"
+( docker(){ kbdocker2 "$@"; }; echo 1 > "$T/kbn"; reset "https://hc-ping.example/abc"; step_monitoring >/dev/null )
+expect '[ "$(envget HEALTH_PING_URL)" = https://hc-ping.example/abc ]' "and stores an https:// one (HEALTH_PING_URL had no prompt anywhere before)"
+envset HEALTH_PING_URL ""
+expect 'declare -f step_deploy | grep -q "setup_monitoring || true" && declare -f step_deploy | grep -q install_selftest_timer' "Deploy sets monitoring up as its last step, and a Kuma problem cannot fail the Deploy"
+expect 'declare -f step_update | grep -q setup_monitoring && declare -f step_torrents | grep -q monitoring_refresh && declare -f step_authelia | grep -q monitoring_refresh && declare -f step_ephemera | grep -q monitoring_refresh' "Update and every feature toggle reconcile the monitors"
+envset KUMA_BOOTSTRAP_AT ""; reset; monitoring_refresh
+expect '! seen "kuma-bootstrap"' "a refresh does nothing before monitoring was ever set up"
+
+echo "== Monitoring: the hourly self-test and its alert path"
+u="$ETC/systemd/system"; rm -f "$u/bookstack-alert@.service"
+install_postboot_unit
+expect '[ -s "$u/bookstack-alert@.service" ]' "the OnFailure= target exists without backups configured (it used to be written only by the Backups step)"
+reset; install_selftest_timer
+hw="$ETC/bookstack/selftest-hourly.sh"
+expect 'grep -q "^OnCalendar=hourly" "$u/bookstack-selftest.timer" && grep -q "^OnFailure=bookstack-alert@selftest.service" "$u/bookstack-selftest.service" && grep -qF "ExecStart=$hw" "$u/bookstack-selftest.service"' "an hourly timer with the wrapper and an OnFailure backstop"
+expect 'seen "systemctl: enable --now bookstack-selftest.timer" && bash -n "$hw"' "enabled now (unlike the post-boot unit), and the wrapper is valid bash"
+HW="$T/hw"; mkdir -p "$HW/stack/scripts"
+sed "s#^STACK_DIR=.*#STACK_DIR=$HW/stack#" "$hw" > "$HW/w.sh"
+printf '#!/usr/bin/env bash\necho "scheduled=$SELFTEST_SCHEDULED"\nif [ "${ST_RC:-0}" != 0 ]; then echo "  [FAIL] calibre-web: exited"; echo "  [FAIL] portal /healthz"; fi\nexit ${ST_RC:-0}\n' > "$HW/stack/scripts/selftest.sh"
+printf '#!/usr/bin/env bash\necho "push $*" >> "%s/log"\nexit ${KP_RC:-0}\n' "$HW" > "$HW/stack/scripts/kuma-push.sh"
+printf '#!/usr/bin/env bash\necho "alert $1" >> "%s/log"\n' "$HW" > "$HW/stack/scripts/alert.sh"
+chmod +x "$HW/stack/scripts/"*.sh
+hwrun(){ : > "$HW/log"; SELFTEST_STATE="$HW/state" SELFTEST_LOCK="$HW/lock" ST_RC="$1" KP_RC="$2" bash "$HW/w.sh" >/dev/null 2>&1; }
+rm -f "$HW/state"; hwrun 2 0; rc=$?
+expect '[ $rc = 0 ] && grep -q "^push selftest down 2 check(s) failed: calibre-web: exited" "$HW/log" && ! grep -q "^alert" "$HW/log"' "a failure goes to Kuma (which alerts on the change) and NOT also to alert.sh: one message, not two"
+expect 'grep -q "scheduled=1" "$HW/stack/.selftest-hourly.log" && grep -qE "^finished=.* exit=2$" "$HW/stack/.selftest-hourly.log"' "it runs the self-test in scheduled mode and records the result"
+rm -f "$HW/state"; hwrun 2 1
+expect 'grep -q "^alert Bookstack: hourly self-test FAILED" "$HW/log"' "Kuma unreachable: the failure comes through alert.sh instead"
+hwrun 2 1
+expect '! grep -q "^alert" "$HW/log"' "and a failure that persists is not re-sent every hour"
+hwrun 0 1
+expect 'grep -q "^alert Bookstack: hourly self-test passes again" "$HW/log"' "recovery is announced on the same fallback path"
+hwrun 0 0
+expect 'grep -q "^push selftest up all checks passed" "$HW/log" && ! grep -q "^alert" "$HW/log"' "a pass is a quiet heartbeat"
+expect 'grep -q "kuma-push.sh\" selftest" "$pbs"' "the post-reboot run reports to the same Kuma monitor"
+
+echo "== Monitoring: scripts/kuma-push.sh"
+KP="$T/kp"; mkdir -p "$KP/bin" "$KP/stack"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$@" > "%s/args"\necho "${KP_ANS}"\n' "$KP" > "$KP/bin/curl"; chmod +x "$KP/bin/curl"
+kprun(){ rm -f "$KP/args"; PATH="$KP/bin:$PATH" STACK_DIR="$KP/stack" KP_ANS="$2" bash "$REPO/scripts/kuma-push.sh" $1; }
+printf "KUMA_PUSH_DISK='abc123'\n" > "$KP/stack/.env"
+kprun "backup up" '{"ok":true}'; rc=$?
+expect '[ $rc = 0 ] && [ ! -e "$KP/args" ]' "a job with no token (monitoring not set up) is a silent no-op"
+kprun "disk down" '{"ok":true}'; rc=$?
+expect '[ $rc = 0 ] && grep -qx "http://127.0.0.1:3001/api/push/abc123" "$KP/args" && grep -qx "status=down" "$KP/args" && grep -qx -- "--data-urlencode" "$KP/args"' "a token pushes to its monitor, message url-encoded"
+kprun "disk up" '{"ok":false,"msg":"Monitor not found or not active."}'; rc=$?
+expect '[ $rc = 1 ]' "Kuma refusing the beat is exit 1 (the hourly wrapper then falls back to alert.sh)"
+kprun "nosuchjob up" ''; rc=$?
+expect '[ $rc = 2 ]' "an unknown job name is refused"
+expect 'grep -q "kuma-push.sh}\" disk up" "$REPO/scripts/disk-watch.sh" && grep -q "kuma-push.sh}\" cfips up" "$REPO/scripts/cf-ips.sh" && grep -q "kuma-push.sh}\" backup up" "$REPO/scripts/backup.sh" && grep -q "\"metapush\"" "$REPO/scripts/metadata-push.sh"' "disk watchdog, Cloudflare refresh, backup and metadata push each report in"
+
+echo "== Monitoring: the self-test's scheduled mode"
+st="$REPO/scripts/selftest.sh"
+expect 'awk "/factory admin\/admin123 must be dead/{f=1} f&&/SCHEDULED\" != 1/{print; exit}" "$st" | grep -q SCHEDULED' "the hourly run skips the factory-password login (Calibre-Web's 40-per-day limit counts it against the admin's name)"
+expect 'grep -q "restic --no-lock snapshots" "$st" && grep -q "if \[ \"\$SCHEDULED\" = 1 \]; then :" "$st"' "the restic listing takes no lock, and the hourly run skips it"
+expect 'grep -q "probe_user=\"__bookstack_selftest_\$(date +%s)_\$\$__\"" "$st"' "the Shelfmark probe name changes every run, so 24 runs a day never reach its 10-failure lockout"
+expect 'grep -q "u \"\$ku:\$kp\" http://127.0.0.1:3001/metrics" "$st"' "the self-test reads Kuma's own view (/metrics) instead of trusting that a setup once ran"
+
+# ---------------------------------------------------------------------------------------------
+echo "== Backlog truth (docs/RESEARCH-GAPS.md vs the code)"
+# Step 0. The backlog and the code drifted apart silently for three audit rounds: L13 shipped its
+# guard rail (auto_metadata_update_tags=0) and never shipped the feature, so the repo looked as
+# though metadata fetching existed. Prose cannot enforce itself — these probes can.
+#
+# Each probe answers ONE question: is the code for this item present? A probe that disagrees with
+# the declared Status fails the suite, in either direction: claiming 'done' for absent code is a
+# lie to the owner, and leaving 'not_done' on something that shipped is how the remaining half of
+# a partial item becomes invisible. Items with no probe still must carry an explicit Status.
+GAPS="$REPO/docs/RESEARCH-GAPS.md"
+declared(){ sed -n "/^### $1 — /,/^### /p" "$GAPS" | sed -n 's/^- \*\*Status\*\*: \([a-z_]*\).*/\1/p' | head -1; }
+# id | "present" probe (exit 0 = the code IS there) | what it looks for
+probe(){ case "$1" in
+  L06) grep -qi 'diun' "$REPO/docker-compose.yml";;                       # update notices
+  L07) [ -f "$REPO/monitoring/kuma_bootstrap.py" ] && grep -q setup_monitoring "$REPO/bookstack.sh";;  # Kuma configured
+  L08) grep -rqi 'canary' "$REPO/bookstack.sh" "$REPO/scripts";;          # scheduled journey
+  L13) grep -q 'auto_metadata_fetch_enabled' "$REPO/bookstack.sh";;       # CWA metadata fetch
+  L15) grep -rq 'append-only\|append_only' "$REPO/scripts" "$REPO/bookstack.sh";;
+  L20) grep -qi 'autoheal' "$REPO/docker-compose.yml";;                   # restart unhealthy
+  *) return 2;; esac; }
+for id in L01 L02 L03 L04 L05 L06 L07 L08 L09 L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22; do
+  d=$(declared "$id")
+  case "$d" in done|partial|not_done|obsolete|dropped) ;; *)
+    bad "$id has no valid **Status** line in RESEARCH-GAPS.md (got '${d:-none}')"; continue;; esac
+  probe "$id"; rc=$?
+  [ "$rc" = 2 ] && continue                       # no probe for this one; the Status line is the contract
+  if [ "$rc" = 0 ] && [ "$d" = not_done ]; then
+    bad "$id is marked not_done but its code IS present — update the Status line"
+  elif [ "$rc" != 0 ] && [ "$d" = done ]; then
+    bad "$id is marked done but its code is ABSENT (this is exactly how L13 hid)"
+  else
+    ok "$id status '$d' agrees with the code"
+  fi
+done
 echo; echo "TUI RESULT: $pass passed, $fails failed"; exit $fails

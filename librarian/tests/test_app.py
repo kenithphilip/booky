@@ -182,7 +182,13 @@ def test_upload_keeps_unicode_names_lands_in_own_dropbox_and_filters_types(clien
 def test_devices_page_manages_kindle_kobo_prefs_and_test_mail(client, users, monkeypatch):
     login(client, "alice", users["alice"])
     r = client.get("/devices"); assert r.status_code == 200 and b"Generate my Kobo link" in r.data
-    assert b"/opds/</span>" in r.data and b"USB only" in r.data and b"kepub" not in r.data.lower().replace(b"kepub automatically", b"")
+    # No carve-out. This used to read `.replace(b"kepub automatically", b"")` first, which
+    # deleted precisely the one false sentence the rule exists to keep off the page ("Kobo
+    # receives KEPUB automatically on sync") — a guard pre-drilled with a hole for the thing it
+    # guards against, reading as coverage while proving nothing. CWA v4.0.6 autodetects
+    # kepubify only at /opt/kepubify/kepubify-linux-{64,32}bit and its image installs it at
+    # /usr/bin/kepubify, so no KEPUB promise belongs anywhere on this page.
+    assert b"/opds/</span>" in r.data and b"USB only" in r.data and b"kepub" not in r.data.lower()
     r = post(client, "/devices", action="kindle", kindle_mail="alice_9@kindle.com")
     assert b"Kindle address saved" in r.data and cwa.get_user("alice")["kindle_mail"] == "alice_9@kindle.com"
     r = post(client, "/devices", action="kindle", kindle_mail="nope"); assert b"does not look like" in r.data
@@ -264,7 +270,7 @@ def test_send_to_kindle_only_mails_formats_amazon_accepts(client, users, monkeyp
     add_calibre_book(3, "Kindle Only", "Ann Author", tags=["owner:alice"], formats=("azw3",))
     monkeypatch.setattr(config, "SMTP_HOST", "smtp.example.test"); monkeypatch.setattr(config, "SMTP_FROM", "lib@example.test")
     sent = []
-    monkeypatch.setattr(kindle, "send", lambda to, path, title=None, filename=None: (sent.append((to, filename)), f"sent to {to}")[1])
+    monkeypatch.setattr(kindle, "send", lambda to, path, title=None, filename=None, **kw: (sent.append((to, filename)), f"sent to {to}")[1])
     login(client, "alice", users["alice"])
     r = post(client, "/kindle/1"); assert b"Devices page first" in r.data and sent == []
     cwa.set_kindle_mail("alice", "alice@kindle.com")
@@ -376,12 +382,14 @@ def test_cover_proxy_caps_size_type_and_redirects(client, users, monkeypatch):
     hops["https://archive.org/download/m/9-M.jpg"].headers["Location"] = "https://ia800.us.archive.org/9-M.jpg"
     monkeypatch.setattr(requests, "get", lambda u, **kw: hops[u])
     assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 200
+    # a different cover id per case: id 9 is now on disk (see test_round4) and would be served
+    # from there before any of these redirect chains was followed
     evil = R(302); evil.headers["Location"] = "https://evil.test/x.jpg"
     monkeypatch.setattr(requests, "get", lambda u, **kw: evil)
-    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 404
+    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/10-M.jpg").status_code == 404
     loop = R(302); loop.headers["Location"] = "https://archive.org/again"
     monkeypatch.setattr(requests, "get", lambda u, **kw: loop)
-    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/9-M.jpg").status_code == 404
+    assert client.get("/cover?u=https://covers.openlibrary.org/b/id/11-M.jpg").status_code == 404
     fake_get.resp = R(data=b"x" * (2 * 1024 * 1024 + 1)); assert client.get("/cover?u=https://covers.openlibrary.org/x").status_code == 404
     assert client.get("/cover?u=https://evil.test/x.jpg").status_code == 404
 

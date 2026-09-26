@@ -11,7 +11,7 @@ Kobo owners: just tap Sync on the device.{% if cfg.AUDIO_URL %} Audiobooks are i
 {% if cfg.AUDIO_URL %}<br>Audiobooks are not listed here: they live in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a> (same username and password).{% endif %}</div>{% endif %}
 {% for b in books %}
 <div class="card"><div class="row" style="justify-content:space-between">
-<div><strong>{{ b.title }}</strong><br><span class="mut">{{ b.author }} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>
+<div><a href="{{ url_for('book_page', book_id=b.id) }}"><strong>{{ b.title }}</strong></a><br><span class="mut">{{ b.author }} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>
 <div class="row">
 {% if b.best %}<a class="btn" href="{{ url_for('download', book_id=b.id, fmt=b.best) }}">Download {{ b.best }}</a>{% endif %}
 {% for f in b.formats if f != b.best %}<a class="btn sec" href="{{ url_for('download', book_id=b.id, fmt=f) }}">{{ f }}</a>{% endfor %}

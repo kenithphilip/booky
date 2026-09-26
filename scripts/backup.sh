@@ -39,6 +39,9 @@ finish(){
     if [ "$rc" = 0 ]; then curl -fsS -m 10 --retry 3 "$PING_URL" >/dev/null 2>&1 || true
     else curl -fsS -m 10 --retry 3 "${PING_URL%/}/fail" >/dev/null 2>&1 || true; fi
   fi
+  # Kuma's "Backup (nightly)" push monitor: success only. A failed run is already an alert
+  # (the unit's OnFailure=); silence past 26 h is Kuma's to report.
+  [ "$rc" = 0 ] && { "${KUMA_PUSH:-$STACK_DIR/scripts/kuma-push.sh}" backup up "snapshot saved" >/dev/null 2>&1 || true; }
   exit "$rc"
 }
 trap finish EXIT
@@ -64,7 +67,29 @@ PY
   done
 done
 # host state (small, root-only): needed to rebuild the server, not just the stack
-for p in /etc/bookstack/restic.env /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-auth.conf \
+# backup.state carries the weekly-verification counter: without it a rebuilt server restarts at
+# group 1 and re-reads what the old one already verified while the rest waits another year.
+#
+# /etc/bookstack/restic.env is DELIBERATELY NOT in this list. $SNAP lives under $STACK_DIR and
+# $STACK_DIR is the backup root with no --exclude for it, so copying restic.env here put
+# RESTIC_PASSWORD - and, for an s3:/B2 repository, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+# - INSIDE every snapshot: the key that decrypts the repository, and the bucket credentials
+# that can prune and delete it, stored in the thing they protect. That is the one secret
+# bookstack.sh tells the admin to keep off this server ("Keep these OFF this server"), and
+# rotating RESTIC_PASSWORD would not have revoked it, because the bucket key is unchanged and
+# the old snapshots stay readable with the old password. A redacted stub goes in instead, so a
+# rebuilt server still knows WHICH repository to open; the password and the object-store keys
+# come from the password manager. scripts/restore-test.sh asserts both halves of this.
+mkdir -p "$SNAP/host/etc/bookstack"
+{ echo "# REDACTED COPY - written by scripts/backup.sh, NOT the live file."
+  echo "# RESTIC_PASSWORD, AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are deliberately absent:"
+  echo "# a snapshot must never carry the key that decrypts it or the credentials that can"
+  echo "# delete it. Take them from your password manager and add them back by hand, then"
+  echo "# bookstack.sh -> Install -> Backups to re-write the real /etc/bookstack/restic.env."
+  echo "RESTIC_REPOSITORY=${RESTIC_REPOSITORY:-}"
+  echo "STACK_DIR=$STACK_DIR"
+} > "$SNAP/host/etc/bookstack/restic.env"
+for p in /etc/bookstack/backup.state /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-auth.conf \
          /etc/fail2ban/filter.d/caddy-device-auth.conf /etc/fail2ban/filter.d/caddy-abs-login.conf \
          /etc/ssh/sshd_config.d/01-bookstack.conf \
          /etc/sysctl.d/90-bookstack.conf /etc/docker/daemon.json /etc/cron.d/bookstack-cfips /etc/cron.d/bookstack-disk; do
@@ -91,9 +116,34 @@ restic "${R[@]}" backup "$STACK_DIR" \
   --exclude '*.db-wal' --exclude '*.db-shm' --exclude '*.sqlite-wal' --exclude '*.sqlite-shm' \
   --tag bookstack ${extra_tag:+--tag "$extra_tag"}
 
-# Verify before pruning: a structural check once a week, with 5 % of the data re-read.
+# Verify before pruning: a structural check once a week, plus one 52nd of the pack data.
+# --read-data-subset=5% picked its 5 % AT RANDOM every week. After a year ~92 % of packs have
+# been read *in expectation* and no particular pack is guaranteed ever to have been, so silent
+# bit rot in a cold pack can survive indefinitely. This repository holds the only copy of the
+# family's uploaded books and of the owner:<user> tags the whole isolation model rests on.
+# The n/t form reads the n-th of t equal groups, so a counter rotating 1..52 reads every byte
+# exactly once a year — and weekly transfer DROPS from 5 % to ~1.9 %. (n/t is also the oldest
+# spelling of the flag: restic 0.14 on Debian 12 accepts it, unlike --read-data-subset=<size>.)
+# The counter advances only after a check that PASSED: a failure stops this script (set -e)
+# before the prune, and next week re-reads the same group instead of moving past it. A week the
+# box is off is a delay, not a gap, for the same reason.
+# Same key=value state file idiom as /etc/bookstack/disk.state, kept beside restic.env so it
+# survives a redeploy (copy_code_trees overwrites everything under $STACK_DIR/scripts).
+BSTATE="${BACKUP_STATE:-$(dirname "${RESTIC_ENV:-/etc/bookstack/restic.env}")/backup.state}"
+# The `|| true` is not decoration: with `set -e -o pipefail` a grep that finds nothing (1) or
+# cannot open the file yet (2) becomes the pipeline's status and ends the whole backup.
+bstate_get(){ { grep -E "^$1=" "$BSTATE" 2>/dev/null || true; } | head -1 | cut -d= -f2-; }
+bstate_set(){ # a counter we cannot persist would restart at 1 every week: say so, loudly
+  if ! { mkdir -p "$(dirname "$BSTATE")" && { grep -vE "^$1=" "$BSTATE" 2>/dev/null || true; echo "$1=$2"; } > "$BSTATE.tmp" && mv "$BSTATE.tmp" "$BSTATE"; } 2>/dev/null; then
+    echo "WARNING: could not write $BSTATE; the weekly verification will keep re-reading group 1 instead of rotating through the repository." >&2
+  fi
+}
+CHECK_GROUPS=$(num RESTIC_CHECK_GROUPS 52); [ "$CHECK_GROUPS" -ge 1 ] || CHECK_GROUPS=52
 if [ "$(date +%u)" = "${BACKUP_CHECK_DOW:-7}" ]; then
-  restic "${R[@]}" check --read-data-subset=5%
+  n=$(bstate_get check_group); case "$n" in ''|*[!0-9]*) n=1;; esac
+  { [ "$n" -ge 1 ] && [ "$n" -le "$CHECK_GROUPS" ]; } || n=1
+  restic "${R[@]}" check --read-data-subset="$n/$CHECK_GROUPS"
+  bstate_set check_group "$(( n % CHECK_GROUPS + 1 ))"
 fi
 restic "${R[@]}" stats latest --json || true
 # pre-update snapshots (Operations -> Update) are kept 90 days, then the normal policy applies

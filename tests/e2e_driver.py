@@ -387,6 +387,16 @@ st, h, b = g.get(GATE + "/kosync/users/auth", headers={"Host": "books.example.te
 check(st == 200 and b'"authorized"' in b, "/kosync (KOReader) bypasses the gate and authenticates with the library password", f"{st} {b[:120]}")
 st, h, b = g.get(GATE + "/kosync/users/auth", headers={"Host": "books.example.test", **basic("alice", "wrong-pw")})
 check(st == 401, "/kosync refuses a wrong password (no gate, so CWA must do it)", str(st))
+# The endpoint that actually had the problem. /kosync/users/auth is the ONE kosync route that
+# answers 401; the progress routes raise KOSyncError(ERROR_UNAUTHORIZED_USER) and
+# handle_sync_error() returns it as 400 (cps/progress_syncing/protocols/kosync.py:532,223), so
+# the 401-only fail2ban filter counted none of them and the jail could never fire. Assert the
+# status this stack now bans on, so a CWA change that turned it into something else would show
+# up here instead of silently un-banning the oracle.
+st, h, b = g.get(f"{GATE}/kosync/syncs/progress/{'a'*32}", headers={"Host": "books.example.test", **basic("alice", "wrong-pw")})
+check(st == 400, "/kosync/syncs/progress refuses a wrong password with 400 (the status configs/fail2ban/caddy-device-auth.conf now counts)", str(st))
+st, h, b = g.get(f"{GATE}/kosync/syncs/progress/{'a'*32}", headers={"Host": "books.example.test"})
+check(st in (400, 401), "/kosync/syncs/progress refuses an anonymous caller", str(st))
 # a full KOReader round trip: PUT progress as alice, read it back, and make sure bob cannot
 doc = "e2e" + "0" * 29
 prog = {"document": doc, "progress": "/body/DocFragment[3]", "percentage": 0.42, "device": "KOReader", "device_id": "e2e-dev"}
@@ -410,6 +420,21 @@ codes = {u: g.get(GATE + u, headers=BOOKS)[0] for u in blocked}
 check(all(c == 403 for c in codes.values()), "CWA's unauthenticated admin-job endpoints are 403 at the edge (anonymous, no gate needed)", str(codes))
 st, h, b = g.post(GATE + "/cwa-internal/reconnect-db", json_body={}, headers=BOOKS)
 check(st == 403, "POST /cwa-internal/* is 403 too", str(st))
+# /duplicates/invalidate-cache is the same class: cps/duplicates.py:1196 declares it with
+# @csrf.exempt and NO auth decorator, while every sibling in that file carries
+# @login_required_if_no_ano + @admin_or_edit_required. Verified anonymously against the pinned
+# image: POST http://127.0.0.1:8083/duplicates/invalidate-cache -> 200 {"success":true}, which
+# commits `UPDATE cwa_duplicate_cache SET scan_pending=1` into cwa.db. Its only in-tree caller
+# is CWA's own scripts/ingest_processor.py over container loopback, which never passes through
+# Caddy, so the 403 costs nothing.
+st, h, b = g.post(GATE + "/duplicates/invalidate-cache", json_body={}, headers=BOOKS)
+check(st == 403, "POST /duplicates/invalidate-cache is 403 at the edge (anonymous CSRF-exempt write into cwa.db)", str(st))
+st, h, b = g.post(GATE + "/duplicates/invalidate-cache;x", json_body={}, headers=BOOKS)
+check(st == 403, "...and its ';'-parameter shape is caught by the path_regexp companion", str(st))
+# ONLY that one path: /duplicates and /duplicates/status are the admin's own UI and are
+# properly gated by CWA. Blocking the whole /duplicates* prefix would break them for no reason.
+st, h, b = g.get(GATE + "/duplicates/status", headers=BOOKS)
+check(st != 403, "...while /duplicates/status is NOT blocked (CWA gates it itself)", str(st))
 st, h, b = g.get(GATE + "/login", headers=BOOKS)
 check(st != 403, "...while Calibre-Web's own login page is not caught by the block (the Authelia gate still applies)", str(st))
 st, h, b = g.get(GATE + "/opds", headers={**BOOKS, **basic("alice", ALICE_PW)})

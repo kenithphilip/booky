@@ -9,14 +9,20 @@ import config, tagger
 
 log = logging.getLogger("kindle")
 
-def kindle_ready(path):
+def kindle_ready(path, title=None, author=None):
     """Return (file_to_send, note). For an EPUB, apply on a temporary copy the two repairs
     Amazon's Send-to-Kindle most often bounces a file for: no dc:language in the OPF (defaults
     to KINDLE_DEFAULT_LANG) and XHTML files without an XML encoding declaration. Everything
     else is copied byte-for-byte with its own compression (mimetype first and stored). This is
     what CWA's "Kindle EPUB fixer" does on import; it is applied here instead because on import
     that fixer rewrites every archive and strips the owner tag from comics. On any problem the
-    original file is sent unchanged: a fix must never block delivery."""
+    original file is sent unchanged: a fix must never block delivery.
+
+    `title`/`author` are what the LIBRARY says (Calibre's current record — fixed by the metadata
+    push, or corrected by hand). Amazon reads the title from the file, and calibredb updates the
+    database but never the OPF inside the EPUB, so without this a book whose file still carries
+    its release name arrives on the Kindle as 'Melville.Moby.Dick.RETAIL'. Applied to the temp
+    copy only; the stored file is never touched."""
     if not path.lower().endswith(".epub"):
         return path, ""
     tmp = None
@@ -31,8 +37,19 @@ def kindle_ready(path):
             if not any((el.text or "").strip() for el in meta.findall(f"{{{tagger.DC_NS}}}language")):
                 lang = etree.SubElement(meta, f"{{{tagger.DC_NS}}}language")
                 lang.text = config.KINDLE_DEFAULT_LANG
-                changes[opf] = etree.tostring(root, xml_declaration=True, encoding="utf-8", standalone=False)
                 kinds.add("language")
+            for tag, want in (("title", title), ("creator", author)):
+                want = (want or "").strip()
+                if not want:
+                    continue
+                els = meta.findall(f"{{{tagger.DC_NS}}}{tag}")
+                if els and (els[0].text or "").strip() == want:
+                    continue
+                el = els[0] if els else etree.SubElement(meta, f"{{{tagger.DC_NS}}}{tag}")
+                el.text = want
+                kinds.add(tag)
+            if kinds & {"language", "title", "creator"}:
+                changes[opf] = etree.tostring(root, xml_declaration=True, encoding="utf-8", standalone=False)
             for info in zin.infolist():
                 if info.filename == opf or not info.filename.lower().endswith((".xhtml", ".html", ".htm")):
                     continue
@@ -72,7 +89,11 @@ class MailNotConfigured(Exception):
 def configured():
     return bool(config.SMTP_HOST and config.SMTP_FROM)
 
-def send(to_addr, path, title=None, filename=None):
+def send(to_addr, path, title=None, filename=None, author=None, book_title=None):
+    """`title` is the MAIL SUBJECT. `book_title`/`author` are what the LIBRARY says the book is,
+    and only they rewrite the Kindle copy's metadata. Kept apart on purpose: the auto-Kindle path
+    passes a subject that can be a bare filename before import, and stamping that into the book's
+    dc:title would make the Kindle copy worse than the file it came from."""
     if not configured():
         raise MailNotConfigured("outgoing mail is not configured (SMTP_HOST/SMTP_FROM)")
     if not to_addr or "@" not in to_addr:
@@ -92,7 +113,7 @@ def send(to_addr, path, title=None, filename=None):
     msg["To"] = to_addr
     msg["Subject"] = title or filename
     msg.set_content("Sent from your library.")
-    send_path, note = kindle_ready(path)
+    send_path, note = kindle_ready(path, title=book_title, author=author)
     try:
         with open(send_path, "rb") as f:
             msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=filename)

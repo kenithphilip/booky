@@ -45,7 +45,15 @@ access_control:
         - '^/api/.*$'
         - '^/socket\.io([/?].*)?$'
         - '^/hls/.*$'
-        - '^/s/.*$'
+        # NO '^/s/.*$' here. It was a guess and there is no route behind it: grepping the
+        # pinned ghcr.io/advplyr/audiobookshelf:2.36.1 finds no /s mount in server/Server.js
+        # (the mounts are /api, /hls, /public, express.static and the dynamicRoutes list) and
+        # no "/s/" URL anywhere in the server or the client bundle. The item-share path is
+        # /share/:slug, a CLIENT route served by express.static whose data comes from
+        # /public/* (already bypassed above), so /share itself must stay gated. An unanchored
+        # bypass of the SSO gate for a prefix nobody can justify against the running image is
+        # exactly what this file's own header rule forbids; if a future ABS release mounts
+        # something at /s/, add it back WITH the route and version that needs it.
         - '^/ping(\?.*)?$'
         - '^/status(\?.*)?$'
         - '^/healthcheck(\?.*)?$'

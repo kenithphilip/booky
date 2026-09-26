@@ -1,10 +1,10 @@
-import threading, os, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress
+import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress
 from functools import wraps
 from urllib.parse import urlsplit
 from uuid import uuid4
 from flask import (Flask, request, session, redirect, url_for, render_template, flash,
                    Response, jsonify, send_file, abort)
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle
@@ -209,22 +209,29 @@ def logout_get():
 def index():
     q = request.args.get("q", "").strip()
     results = fetchers.search(q) if q else []
-    for r in results:                      # advisory duplicate flag, only for books this user can see
-        r["dupe"] = dedupe.exists(r.get("title"), session["user"], session.get("admin", False))
+    if results:
+        # ONE scoped read of the library for the whole page (it was one query per result), and
+        # a match that uses the author too — a same-title book by someone else is not this one.
+        seen = dedupe.Index(session["user"], session.get("admin", False))
+        for r in results:                  # advisory, only for books this user can see
+            r["dupe"] = seen.match(r.get("title"), r.get("author"),
+                                   [{"kind": k, "value": v} for k, v in r.get("src_ids") or ()])
     if results and config.ENRICH_METADATA:
         # covers/blurbs in parallel and best-effort, but never at the cost of the page: what
-        # Open Library has not answered within ENRICH_DEADLINE is simply left out
-        until = time.time() + ENRICH_DEADLINE
-        ex = ThreadPoolExecutor(max_workers=6)
-        try:
-            futures = [ex.submit(enrich.for_book, r["title"], r.get("author", "")) for r in results]
-            for r, f in zip(results, futures):
-                try:
-                    r.update(f.result(timeout=max(0.1, until - time.time())))
-                except Exception:
-                    pass
-        finally:
-            ex.shutdown(wait=False, cancel_futures=True)
+        # Open Library has not answered within ENRICH_DEADLINE is simply left out.
+        # fetchers' shared detail pool, not a pool of this request's own: GET / has no rate
+        # limit in front of it, and a pool per request meant a reader on refresh multiplied
+        # threads instead of sharing a fixed budget with everyone else's search.
+        until = time.monotonic() + ENRICH_DEADLINE
+        futures = [fetchers.submit_detail(enrich.for_book, r["title"], r.get("author", ""))
+                   for r in results]
+        for r, f in zip(results, futures):
+            try:
+                r.update(f.result(timeout=max(0.1, until - time.monotonic())))
+            except FutureTimeout:
+                f.cancel()      # queued work never starts; a running one holds its own timeout
+            except Exception:
+                pass
     return render_template("index.html", q=q, results=results,
                            sources=[s for s, on in config.SOURCES.items() if on])
 
@@ -296,6 +303,23 @@ def deny(rid):
 
 COVER_MAX = 2 * 1024 * 1024
 COVER_REDIRECTS = 2
+# Measured: 3.14 s per cover, the SAME 3.14 s on every repeat, for a 5,596-byte image fetched
+# over three serial server-side hops. Eight covers on one search page therefore held all eight
+# gunicorn threads for over three seconds and /library's p50 went 11.8 ms -> 32.9 ms (max
+# 1,135 ms). The proxy itself stays (enrich.py explains why the reader's browser must not talk
+# to covers.openlibrary.org), so the fix is to fetch each cover once.
+COVER_CACHE_DIR = os.path.join(config.STAGING_DIR, "covers")
+# ~28 MB holds the covers of a 5,000-book library; the cap is what keeps a portal that is
+# handed thousands of distinct ids from eating the 80 GB disk the library itself needs.
+# A constant, not an env read: the librarian container's environment is an explicit allowlist in
+# docker-compose.yml, so an os.environ tunable that is not in that list can never be set on the
+# deployed stack — it only looks configurable. 64 MB holds ~11k covers at the measured 5.6 KB
+# each, which is more than this library will ever show.
+COVER_CACHE_MB = 64
+# One id can legitimately be asked for at three sizes, so the size is part of the key.
+_COVER_KEY = re.compile(r"^https://covers\.openlibrary\.org/b/id/(\d{1,12})-([SML])\.jpg$")
+_COVER_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp"}
+_cover_lock = threading.Lock()
 
 def _cover_host_ok(url):
     """Open Library serves many covers by redirecting to archive.org; nothing else is fetched."""
@@ -304,12 +328,85 @@ def _cover_host_ok(url):
     return p.scheme == "https" and p.username is None and (
         h == "covers.openlibrary.org" or h == "archive.org" or h.endswith(".archive.org"))
 
+def _cover_key(url):
+    """The Open Library cover id + size, or None for a URL we will not put on disk. Only the
+    canonical /b/id/<n>-<S>.jpg form is cached: the key has to be a safe file name and it has
+    to identify the image, and no other shape of URL does both."""
+    m = _COVER_KEY.match(url or "")
+    return f"{m.group(1)}-{m.group(2)}" if m else None
+
+def _cover_cached(key):
+    for ctype, ext in _COVER_TYPES.items():
+        path = os.path.join(COVER_CACHE_DIR, f"{key}.{ext}")
+        try:
+            with open(path, "rb") as f:
+                body = f.read(COVER_MAX + 1)
+            if len(body) > COVER_MAX:         # not something we wrote; do not serve it
+                continue
+        except OSError:
+            continue
+        try:
+            os.utime(path, None)              # mtime is the eviction order, so a hit is "recent"
+        except OSError:
+            pass                              # a cover we cannot touch is still a cover we have
+        return body, ctype
+    return None, None
+
+def _cover_store(key, body, ctype):
+    """Write the image, then bring the directory back under COVER_CACHE_MB by deleting the
+    least recently used files. Best effort: a cache that cannot be written must not turn a
+    cover that was fetched successfully into a 404."""
+    ext = _COVER_TYPES.get(ctype)
+    if not ext:
+        return
+    try:
+        os.makedirs(COVER_CACHE_DIR, exist_ok=True)
+        tmp = os.path.join(COVER_CACHE_DIR, f".{uuid4().hex}")
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, os.path.join(COVER_CACHE_DIR, f"{key}.{ext}"))
+    except OSError:
+        return
+    _cover_prune()
+
+def _cover_prune():
+    """Evict oldest-first until the directory fits. Under one lock: two threads pruning at
+    once would each see the other's files and delete far past the cap."""
+    cap = COVER_CACHE_MB * 1024 * 1024
+    with _cover_lock:
+        try:
+            files = []
+            with os.scandir(COVER_CACHE_DIR) as it:
+                for e in it:
+                    try:
+                        st = e.stat()
+                    except OSError:
+                        continue
+                    if e.is_file():
+                        files.append((st.st_mtime, st.st_size, e.path))
+            total = sum(f[1] for f in files)
+            for mtime, size, path in sorted(files):
+                if total <= cap:
+                    break
+                try:
+                    os.unlink(path)
+                    total -= size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
 @app.route("/cover")
 @login_required
 def cover():
     u = request.args.get("u", "")
     if not u.startswith("https://covers.openlibrary.org/"):
         return "", 404
+    key = _cover_key(u)
+    if key:
+        body, ctype = _cover_cached(key)
+        if body is not None:
+            return _cover_response(body, ctype)
     try:
         import requests as _r
         from urllib.parse import urljoin
@@ -326,10 +423,19 @@ def cover():
                 body = resp.raw.read(COVER_MAX + 1, decode_content=True)
             if len(body) > COVER_MAX:
                 return "", 404
-            return Response(body, mimetype=ctype.split(";")[0], headers={"Cache-Control": "public, max-age=604800"})
+            ctype = ctype.split(";")[0].strip()
+            if key:
+                _cover_store(key, body, ctype)
+            return _cover_response(body, ctype)
         return "", 404
     except Exception:
         return "", 404
+
+def _cover_response(body, ctype):
+    # 'private', not 'public': /cover is behind @login_required and Cloudflare sits in front of
+    # this origin. A shared cache must not be able to hand an authenticated response to anyone
+    # else; the reader's own browser still caches it for a week.
+    return Response(body, mimetype=ctype, headers={"Cache-Control": "private, max-age=604800"})
 
 def _retryable(rec):
     return bool(rec and rec["status"] == "error" and rec.get("download_url")
@@ -485,6 +591,95 @@ def my_library():
                            first=page * library.PAGE + 1, last=page * library.PAGE + len(books),
                            more=(page + 1) * library.PAGE < total)
 
+# ---- book / author / series pages ----------------------------------------------------------
+# Isolation rules, the same as everywhere else in this portal, applied to a SHARED metadata store:
+#   * a book page is a 404 for any book the reader cannot already see;
+#   * an author or series page is reachable by a non-admin only through a book they OWN, and it
+#     lists only their own books. The metadata store is household-wide, so listing 'book 4
+#     exists' could only be known because a sibling imported book 4 — that would leak their
+#     reading. Gaps are therefore computed from the reader's OWN positions. Admins see all.
+def _ids(csv):
+    return [int(x) for x in (csv or "").split(",") if x.strip().isdigit()]
+
+@app.route("/book/<int:book_id>")
+@login_required
+def book_page(book_id):
+    user, is_admin = session["user"], session.get("admin", False)
+    b = library.book_detail(user, book_id, is_admin)
+    if not b:
+        abort(404)
+    meta = db.meta_for_calibre(book_id) or {}
+    work = meta.get("work") or {}
+    prefs = db.get_prefs(user)
+    b["best"] = library.best_format(b, prefs["preferred_format"])
+    b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
+    return render_template(
+        "book.html", b=b, admin=is_admin,
+        # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
+        description=b["description"] or work.get("description") or "",
+        first_year=work.get("first_publish_year"),
+        authors=meta.get("authors") or [], series=meta.get("series"),
+        kindle_mail=_cwa_user(user).get("kindle_mail") or "")
+
+@app.route("/book/<int:book_id>/cover")
+@login_required
+def book_cover(book_id):
+    p = library.cover_path(session["user"], book_id, session.get("admin", False))
+    if not p:
+        abort(404)
+    resp = send_file(p, mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=86400"   # a cover does not change hourly
+    return resp
+
+@app.route("/author/<int:author_id>")
+@login_required
+def author_page(author_id):
+    user, is_admin = session["user"], session.get("admin", False)
+    rec = db.author_record(author_id)
+    if not rec:
+        abort(404)
+    linked = [i for w in rec["works"] for i in _ids(w["calibre_ids"])]
+    mine = library.visible_ids(user, linked, is_admin)
+    yours, others = [], []
+    for w in rec["works"]:
+        own = [i for i in _ids(w["calibre_ids"]) if i in mine]
+        if own:
+            yours.append({**w, "book_id": own[0]})
+        elif is_admin:
+            others.append(w)
+    shown = {w["book_id"] for w in yours}
+    # Calibre books by that name the portal never enriched still belong on the page
+    extra = [x for x in library.books_by_author(user, rec["author"]["name"], is_admin)
+             if x["id"] not in shown]
+    if not yours and not extra and not is_admin:
+        abort(404)                 # not reachable except through a book this reader owns
+    return render_template("author.html", a=rec["author"], yours=yours, extra=extra, others=others)
+
+@app.route("/series/<int:series_id>")
+@login_required
+def series_page(series_id):
+    user, is_admin = session["user"], session.get("admin", False)
+    rec = db.series_record(series_id)
+    if not rec:
+        abort(404)
+    linked = [i for w in rec["works"] for i in _ids(w["calibre_ids"])]
+    mine = library.visible_ids(user, linked, is_admin)
+    rows = []
+    for w in rec["works"]:
+        own = [i for i in _ids(w["calibre_ids"]) if i in mine]
+        if own or is_admin:
+            rows.append({**w, "book_id": own[0] if own else None})
+    if not any(r["book_id"] for r in rows) and not is_admin:
+        abort(404)
+    # gaps from the reader's OWN whole-number positions only — never from what others hold
+    have = sorted({int(r["sort_position"]) for r in rows
+                   if r["book_id"] and r["sort_position"] is not None
+                   and float(r["sort_position"]).is_integer()})
+    missing = [n for n in range(1, have[-1]) if n not in have] if have else []
+    nxt = have[-1] + 1 if have else None
+    return render_template("series.html", s=rec["series"], rows=rows, missing=missing,
+                           nxt=nxt, admin=is_admin)
+
 @app.route("/download/<int:book_id>/<fmt>")
 @login_required
 def download(book_id, fmt):
@@ -511,8 +706,18 @@ def send_kindle(book_id):
     if not addr:
         flash("Set your Kindle address on the Devices page first.")
         return redirect(url_for("devices"))
+    # A ceiling on the SMTP account, not on the reader: see config.KINDLE_MAX_PER_DAY. Counted
+    # from the audit trail, which already records every send, so there is no second store to
+    # keep. Admins are exempt, as with MAX_REQUESTS_PER_DAY.
+    limit = 0 if is_admin else config.KINDLE_MAX_PER_DAY
+    if limit and db.audit_count("kindle_send", user, time.time() - 86400) >= limit:
+        _audit("kindle_quota", f"book {book_id}")
+        flash(f"You have sent {limit} books to your Kindle in the last 24 hours, which is the "
+              f"limit. Download the book from this page instead, or try again later.")
+        return redirect(url_for("my_library"))
     try:
-        flash(kindle.send(addr, f["path"], f["title"], f["filename"]))
+        flash(kindle.send(addr, f["path"], f["title"], f["filename"],
+                          author=f.get("authors"), book_title=f["title"]))
         _audit("kindle_send", f["filename"])
     except Exception as e:
         flash(f"Could not send: {e}")
@@ -532,8 +737,17 @@ def devices():
                 flash("Kindle address saved." if addr else "Kindle address cleared.")
             elif action == "kindle_test":
                 addr = _cwa_user(user).get("kindle_mail") or ""
+                # prefs.last_kindle_test was recorded and displayed but never read as a guard,
+                # so the button was an unmetered outbound-mail tap. A test proves the
+                # approved-sender step once; clicking it again inside five minutes cannot tell
+                # you anything the first one did not.
+                last = db.get_prefs(user)["last_kindle_test"] or 0
+                wait = int(config.KINDLE_TEST_COOLDOWN - (time.time() - last))
                 if not addr:
                     flash("Save your Kindle address first.")
+                elif wait > 0:
+                    flash(f"A test was just sent. Give Amazon a few minutes to deliver it — you "
+                          f"can send another in {max(1, wait // 60)} minute(s).")
                 else:
                     try:
                         note = kindle.send_test(addr)
@@ -593,6 +807,21 @@ def devices():
                     # covered when they were not (the restart is an admin action).
                     note += (" Shelfmark keeps you signed in on devices that were already signed in: "
                              "ask the admin to restart Shelfmark if this was because of a leaked password.")
+                    # The Kobo sync link is a standing bearer credential for this user's whole
+                    # library, sitting in a URL on a device, and nothing here revokes it — only
+                    # reset_kobo_token does. A message that carefully lists three other systems
+                    # and stays silent about that one reads as "you are covered" to someone who
+                    # changed their password BECAUSE something leaked. Only mentioned when a
+                    # token actually exists, so a reader without a Kobo is not sent looking for
+                    # a feature they do not use.
+                    try:
+                        has_kobo = bool(cwa.kobo_url(user, create=False))
+                    except cwa.CwaError:
+                        has_kobo = False
+                    if has_kobo:
+                        note += (" Your Kobo sync link is a separate key and is NOT changed: "
+                                 "regenerate it on this page (Kobo → Regenerate link) if this was "
+                                 "because of a leak.")
                     flash("Password changed for the portal and the library." + note)
         except cwa.CwaError as e:
             flash(str(e))
@@ -684,7 +913,14 @@ def intake():
     auth_hdr = request.headers.get("Authorization", "")
     bearer = auth_hdr[7:].strip() if auth_hdr[:7].lower() == "bearer " else ""
     tok = request.headers.get("X-Intake-Token") or bearer or request.form.get("token") or ""
-    if not hmac.compare_digest(tok, config.INTAKE_TOKEN):
+    # bytes, not str: hmac.compare_digest raises TypeError on two str operands when either
+    # holds a codepoint above U+00FF, so `X-Intake-Token: é中` was an unhandled exception — a
+    # traceback in the gunicorn log and a 500 to the caller — on the one anonymous,
+    # Authelia-bypassed, CSRF-exempt route this stack exposes. A wrong credential is a 401,
+    # and a 500 is neither what Caddy's log nor fail2ban classifies as an auth failure.
+    # Still timing-safe: compare_digest over bytes is what it is built for.
+    if not hmac.compare_digest(tok.encode("utf-8", "surrogatepass"),
+                               config.INTAKE_TOKEN.encode("utf-8", "surrogatepass")):
         return jsonify(error="unauthorized"), 401
     body = request.get_json(silent=True) or request.form
     user = (body.get("user") or "").strip()
