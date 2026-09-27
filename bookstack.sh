@@ -2332,7 +2332,9 @@ render_fail2ban() { # writes $ETC/fail2ban/{jail.local,filter.d/caddy-*.conf}; r
   [ "$on" = true ]
 }
 step_fail2ban() {
-  apt-get -y -qq install fail2ban || { msg "Could not install fail2ban (apt)."; return 1; }
+  # python3-systemd: the sshd jail reads the journal (backend = systemd). Debian 13 writes no
+  # /var/log/auth.log, and a minimal image may skip fail2ban's recommended packages.
+  apt-get -y -qq install fail2ban python3-systemd || { msg "Could not install fail2ban (apt)."; return 1; }
   if render_fail2ban; then note="Caddy jails ON: repeated failed logins (portal, Shelfmark, Authelia: 8 in 5 min) and Basic-auth guessing on the device paths /opds and /kosync (30 in 10 min) get the visitor's REAL IP banned at Cloudflare for 2 h (IP Access Rule on the zone).\nAudiobookshelf has no lockout of its own, so audio.$(envget DOMAIN) POST /login answering 401 is jailed separately: 10 in 10 min -> 1 h ban.\nThe API token must have Zone -> Firewall Services -> Edit; if bans fail, add it in Cloudflare and re-run this step."
   else note="Caddy jail OFF (no Cloudflare token/zone yet — run Configure + Cloudflare, then this step again)."; fi
   systemctl enable --now fail2ban >/dev/null 2>&1 || true
