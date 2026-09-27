@@ -474,6 +474,29 @@ successor of *calibre-web-automated-book-downloader*:
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
 
+## Seedbox — Shelfmark downloads on your seedbox, copied home (Library → Seedbox)
+Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or
+rTorrent. Those download on the **seedbox**; `scripts/seedbox-fetch.py` (every minute) **copies**
+each finished item back through the seedbox's Filebrowser into `library/seedbox` (Shelfmark's
+`/seedbox`), and Shelfmark's remote path mappings file it into the reader's dropbox.
+
+**Copy only: nothing on the seedbox is ever moved, deleted or changed** (private trackers: strict
+seeding, no hit-and-run). Enforced independently three times, and tested by fingerprinting the
+whole seedbox tree around every run (`tests/seedbox-test.sh`, against the real Filebrowser):
+1. the Filebrowser account must be **download-only**; the job reads the account's permissions
+   from its login token and refuses to run (with an alert) otherwise. Filebrowser itself then
+   refuses any write;
+2. the job can only send login, list and download requests; anything else is refused before it
+   leaves the server, and it contains no delete code;
+3. rTorrent is asked one read-only question (name / complete / directory). Torrents are copied
+   only once rTorrent reports them complete, and keep seeding.
+
+Shelfmark's own clean-up is pinned in `docker-compose.yml` where its web UI cannot change it:
+after an import it keeps the torrent and the Usenet job (`PROWLARR_TORRENT_ACTION=keep`,
+`PROWLARR_USENET_ACTION=copy`). It never removes a torrent on a cancel or failure (a hard rule in
+its code); a Usenet job it added and that is cancelled or fails is deleted by Shelfmark, which
+Usenet (no seeding) does not mind.
+
 ## Ephemera — optional, Tailscale-only (Operations → Ephemera)
 Adds a "request it and auto-download when it appears" queue and a newznab indexer mode —
 the one thing neither the portal nor Shelfmark does (they search when asked, once).

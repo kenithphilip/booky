@@ -367,6 +367,13 @@ services:
       - PROXY_AUTH_ADMIN_GROUP_NAME=admins
       - PROXY_AUTH_LOGOUT_URL=https://auth.${DOMAIN:-localhost}/logout
       - PROXY_AUTH_RESTRICT_SETTINGS_TO_ADMIN=true
+      # Seedbox safety (private trackers: strict seeding, no hit-and-run). Pinned here, where the web
+      # UI cannot change them (an env value always wins; measured on v1.3.15): after an import
+      # Shelfmark leaves the torrent in rTorrent untouched and the job in SABnzbd in place. It never
+      # removes a torrent on a cancel or failure anyway (hard rule in its code); a cancelled or
+      # failed Usenet job it added is deleted, which Usenet (no seeding) does not mind.
+      - PROWLARR_TORRENT_ACTION=keep
+      - PROWLARR_USENET_ACTION=copy
       - CWA_DB_PATH=/auth/app.db
       # Where downloads land. The per-user level is written into the NAMING TEMPLATES, not
       # into the destination path, for two reasons (both re-verified on the pinned
@@ -453,6 +460,9 @@ services:
       # Read access to the library keeps Shelfmark's "already in library" link working.
       - ./library/audiobooks:/audiobooks:ro
       - ./cwa/config:/auth:ro
+      # Library -> Seedbox: finished seedbox downloads are COPIED here (scripts/seedbox-fetch.py);
+      # Shelfmark's remote path mappings point at /seedbox and it files each into the reader's dropbox
+      - ./library/seedbox:/seedbox
     healthcheck:
       # TWO assertions, because the first one alone is blind in the direction that matters.
       # (a) /api/auth/check reports auth_mode "cwa". This proves Shelfmark STARTED with a

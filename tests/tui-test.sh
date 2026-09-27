@@ -1225,7 +1225,7 @@ printf "BACKUP_PING_URL='https://hc-ping.example/uuid'\n" > "$fs/.env"
 BACKUP_CHECK_DOW=$(date +%u) STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" --tag pre-update >"$T/backup.out" 2>&1 && ok "backup.sh runs" || { bad "backup.sh failed"; cat "$T/backup.out"; }
 expect '[ -f "$fs/.backup-snap/cwa_config_app.db" ] && [ -f "$fs/.backup-snap/library_books_metadata.db" ] && [ -f "$fs/.backup-snap/shelfmark_config_shelfmark.db" ] && grep -q "^cwa_config_app.db	cwa/config/app.db$" "$fs/.backup-snap/MANIFEST"' "consistent SQLite copies + MANIFEST (incl. shelfmark glob)"
 expect '[ "$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"select count(*) from user\").fetchone()[0])" "$fs/.backup-snap/cwa_config_app.db")" = 1 ]' "snapshot copy contains the committed row (WAL-safe backup API)"
-expect 'grep -q "restic: --retry-lock 30m backup $fs --exclude $fs/downloads .*--exclude $fs/cwa/config/processed_books --exclude $fs/library/staging --exclude $fs/ephemera/downloads --exclude $fs/abs/metadata/cache --exclude $fs/abs/metadata/logs --exclude \*.db-wal --exclude \*.db-shm --exclude \*.sqlite-wal --exclude \*.sqlite-shm --tag bookstack --tag pre-update" "$RLOG"' "restic backup with the excludes (incl. re-downloadable caches, F77), --retry-lock and the extra tag"
+expect 'grep -q "restic: --retry-lock 30m backup $fs --exclude $fs/downloads .*--exclude $fs/cwa/config/processed_books --exclude $fs/library/staging --exclude $fs/library/seedbox --exclude $fs/ephemera/downloads --exclude $fs/abs/metadata/cache --exclude $fs/abs/metadata/logs --exclude \*.db-wal --exclude \*.db-shm --exclude \*.sqlite-wal --exclude \*.sqlite-shm --tag bookstack --tag pre-update" "$RLOG"' "restic backup with the excludes (incl. re-downloadable caches, F77), --retry-lock and the extra tag"
 rl(){ grep -nF -- "$1" "$RLOG" | head -1 | cut -d: -f1; }
 expect '[ "$(rl "restic: --retry-lock 30m check --read-data-subset=1/52")" -lt "$(rl "restic: --retry-lock 30m forget")" ] && grep -q "restic: --retry-lock 30m forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-tag pre-update --prune" "$RLOG" && grep -q "restic: --retry-lock 30m stats latest --json" "$RLOG"' "weekly restic check runs BEFORE forget --prune; stats logged"
 expect '! grep -q "restic: .*init" "$RLOG" && ! grep -q "tag --remove" "$RLOG" && grep -q "curl: -fsS -m 10 --retry 3 https://hc-ping.example/uuid$" "$DLOG"' "backup.sh never inits; recent pre-update snapshots kept; success ping sent (C1)"
@@ -2095,6 +2095,37 @@ reset "D"; step_canary
 expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
 echo "== self-test: a refused connection reads as 000, not 000000"
 expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+
+echo "== Library -> Seedbox: copy finished seedbox downloads back (copy only)"
+sbe="$T/etc/bookstack/seedbox.env"; rm -f "$sbe"
+mkdir -p "$STACK_DIR/scripts"; cat > "$STACK_DIR/scripts/seedbox-fetch.py" <<'PYS'
+import os, sys
+c = dict(l.rstrip("\n").split("=", 1) for l in open(os.environ["SEEDBOX_ENV"]) if "=" in l)
+ok = c.get("SEEDBOX_FB_PASS") == "p$w'd \"x" and c.get("SEEDBOX_FB_USER") == "bookstack-reader"
+print("ok: stub check" if ok else "FAIL: stub check " + repr(c.get("SEEDBOX_FB_PASS")))
+sys.exit(0 if ok else 1)
+PYS
+reset "https://hcus-filebrowser.primeape.seedbox.link" "hcus" "front-pw" "bookstack-reader" "p\$w'd \"x" \
+      "/watch/downloads/sabnzbd/completed" "/data/watch/downloads/sabnzbd/completed" "" \
+      "https://hcus-rutorrent.primeape.seedbox.link/RPC2" "/rtorrent/bookstack" "/sdb/hcus/data/rtorrent/bookstack" ""
+step_seedbox; rc=$?
+expect '[ $rc = 0 ] && grep -qxF "SEEDBOX_FB_PASS=p\$w'"'"'d \"x" "$sbe" && [ "$(stat -c %a "$sbe" 2>/dev/null || stat -f %Lp "$sbe")" = 600 ]' "a password with \$, quotes and spaces is stored exactly as typed (the carrier reads it raw), 0600"
+expect 'grep -qxF "SEEDBOX_SOURCES=/watch/downloads/sabnzbd/completed/bookstack-ebooks|sabnzbd/bookstack-ebooks|sab;/watch/downloads/sabnzbd/completed/bookstack-audiobooks|sabnzbd/bookstack-audiobooks|sab;/rtorrent/bookstack|rtorrent|rt" "$sbe"' "both SABnzbd categories and the rTorrent folder become copy-only sources"
+expect '! grep -q "SEEDBOX" "$ENV_FILE"' "seedbox credentials never go into .env (which the containers read)"
+su="$T/etc/systemd/system/bookstack-seedbox"
+expect 'grep -q "^OnCalendar=\*:\*:00" "$su.timer" && grep -qF "ExecStart=/usr/bin/python3 $STACK_DIR/scripts/seedbox-fetch.py" "$su.service" && seen "systemctl: enable --now bookstack-seedbox.timer"' "every minute, through scripts/seedbox-fetch.py"
+expect 'grep -qF "Remote Path  /data/watch/downloads/sabnzbd/completed" "$LOG" && grep -qF "Remote Path  /sdb/hcus/data/rtorrent/bookstack" "$LOG" && grep -qF "Local Path   /seedbox/rtorrent" "$LOG" && grep -qF "Completed Path Wait (seconds):  3600" "$LOG"' "the exact Shelfmark path mappings and wait time are shown"
+expect 'grep -qF "COPY ONLY: nothing on the seedbox is ever moved, deleted or changed" "$LOG" && grep -qF "untick EVERYTHING except" "$LOG"' "the setup screen says copy-only and how to make the download-only Filebrowser account"
+expect 'grep -q "./library/seedbox:/seedbox" "$REPO/docker-compose.yml" && grep -q "PROWLARR_TORRENT_ACTION=keep" "$REPO/docker-compose.yml" && grep -q "PROWLARR_USENET_ACTION=copy" "$REPO/docker-compose.yml"' "Shelfmark sees /seedbox, and its own clean-up is pinned: torrents keep, Usenet copy"
+expect 'grep -q "library/seedbox" "$REPO/scripts/backup.sh"' "backups skip the transient seedbox copies"
+# a failing check: nothing saved unless the admin insists
+cp "$sbe" "$T/sbe.good"
+reset "E" "https://hcus-filebrowser.primeape.seedbox.link" "hcus" "front-pw" "bookstack-reader" "wrong" \
+      "/watch/downloads/sabnzbd/completed" "/data/watch/downloads/sabnzbd/completed" "" "<blank>" "no"
+step_seedbox; rc=$?
+expect '[ $rc = 1 ] && cmp -s "$sbe" "$T/sbe.good" && [ ! -e "$sbe.new" ] && grep -F "yesno: " "$LOG" | grep -q "The check found problems"' "a failing seedbox check saves nothing (the working settings stay)"
+reset "D"; step_seedbox
+expect '[ ! -f "$su.timer" ] && seen "systemctl: disable --now bookstack-seedbox.timer"' "turning it off stops the job"
 
 echo "== L20: restart unhealthy containers, carefully (scripts/heal.sh)"
 HL="$T/hl"; mkdir -p "$HL/bin"

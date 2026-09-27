@@ -141,6 +141,21 @@ if grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" 2>/dev/null; then
     && ok "Authelia config validates (gate active)" || bad "Authelia gate is in the Caddyfile but its config does not validate"
 fi
 [ -f "$STACK_DIR/caddy/cf-origin-pull-ca.pem" ] && ok "Cloudflare origin-pull CA present" || bad "cf-origin-pull-ca.pem missing (run Cloudflare step)"
+# Library -> Seedbox: finished seedbox downloads copied every minute
+if [ -f /etc/systemd/system/bookstack-seedbox.timer ]; then
+  sbst=$(python3 -c 'import json,time; d=json.load(open("/etc/bookstack/seedbox.state")); print(int(time.time())-int(d.get("last_ok",0)), d.get("fails",0), (d.get("last_error") or "-")[:200])' 2>/dev/null)
+  sbage=${sbst%% *}; sbrest=${sbst#* }; sbfails=${sbrest%% *}; sberr=${sbrest#* }
+  if [ -z "$sbst" ]; then warn "seedbox copying is on but has not completed a run yet (journalctl -u bookstack-seedbox -n 20)"
+  elif [ "${sbage:-999999}" -le 900 ]; then ok "seedbox copying ran OK $(( sbage / 60 )) min ago (copy-only, download-only account)"
+  else bad "seedbox copying has not succeeded for $(( sbage / 60 )) min (${sbfails} failed tries): ${sberr} — Library -> Seedbox -> Check the connection"; fi
+fi
+# Seedbox safety: Shelfmark's own clean-up after an import must leave the seedbox alone
+sm_act=$(docker exec shelfmark /app/.venv/bin/python -c 'from shelfmark.core.config import config; print(config.get("PROWLARR_TORRENT_ACTION"), config.get("PROWLARR_USENET_ACTION"))' 2>/dev/null | tail -1)
+case "$sm_act" in
+  "keep copy") ok "Shelfmark leaves seedbox downloads in place after an import (torrents: keep, Usenet: copy)";;
+  "") warn "could not read Shelfmark's completion actions";;
+  *) bad "Shelfmark's completion actions are '$sm_act', not 'keep copy': it could remove torrents or Usenet jobs from the seedbox after an import (re-run Install -> Deploy)";;
+esac
 # L08: the canary journey (a test reader's path, twice a day)
 if [ -f /etc/systemd/system/bookstack-canary.timer ]; then
   if systemctl is-failed bookstack-canary.service >/dev/null 2>&1; then bad "the last canary journey FAILED: what a family member would hit (journalctl -u bookstack-canary -n 60; /admin -> Canary journey)"
