@@ -62,6 +62,8 @@
 	# HTTP server, before any handler runs, so removing the header here only affects upstreams.
 	request_header -X-Real-IP
 	request_header -X-Client-IP
+	# L18: only the Tailscale-only upload. site sets this (header_up below); a client never can
+	request_header -X-Bookstack-Upload
 	request_header -True-Client-IP
 	request_header -Forwarded
 	request_header -CF-Connecting-IP
@@ -101,7 +103,9 @@
 }
 
 # Public sites: cert via Cloudflare DNS-01, and REQUIRE a Cloudflare client certificate.
-# Anyone hitting the origin directly (not through Cloudflare) is rejected at the TLS handshake.
+# A direct hit on the origin (not through Cloudflare) fails the TLS handshake. Which CA is
+# trusted is bookstack.sh's choice (aop_write_trust): Cloudflare's SHARED origin-pull CA, which
+# any Cloudflare zone's edge can satisfy, or this zone's own CA (Security -> Origin lock, L14).
 # {env.CF_API_TOKEN} is read at runtime, so the token never appears in the adapted config.
 # (The compose file fills it from CF_DNS_TOKEN: a Zone:DNS:Edit-only token.)
 (public_tls) {
@@ -435,6 +439,24 @@ monitor.@@DOMAIN@@ {
 	import private_tls
 	import hardening
 	reverse_proxy 127.0.0.1:3001
+}
+
+# ---- PRIVATE: large uploads (Tailscale only) -------------------------------------
+# Cloudflare caps a browser upload at 100 MB, so an audiobook zip cannot go through request.
+# This site is the portal again, reached over Tailscale (grey-cloud DNS to the tailnet IP), with
+# a 2 GB body limit; the portal raises its own limit only when this marker is present.
+upload.@@DOMAIN@@ {
+	import tailnet_only
+	import private_tls
+	import hardening
+	request_body {
+		max_size 2GB
+	}
+	reverse_proxy 127.0.0.1:8090 {
+		header_up X-Bookstack-Upload tailnet
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
+	}
 }
 
 # ---- PRIVATE: qBittorrent (Tailscale only, optional, Library -> Torrents) ----

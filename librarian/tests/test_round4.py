@@ -18,10 +18,15 @@ def test_the_devices_page_no_longer_promises_kobo_a_kepub(client, users):
     cps/kobo.py never converts. The page said the opposite."""
     login(client, "alice", users["alice"])
     html = client.get("/devices").get_data(as_text=True)
-    assert "KEPUB" not in html
+    # still true (v5): SYNC ships EPUB — letting sync convert is the trap in DECISIONS-PENDING
     assert "Kobo receives EPUB over sync" in html and "chapter" in html
-    # the download side is untouched: a KEPUB is still served if one ever exists
-    assert "kepub" in config.DOWNLOAD_FORMATS and "kepub" not in config.FORMATS
+    assert "sync delivers KEPUB" not in html and "KEPUB over sync" not in html
+    # what changed in v5 (L11): the portal converts on DOWNLOAD with its own pinned kepubify, so
+    # KEPUB is offered — exactly when the image carries the binary, and only for downloads
+    assert "kepub" in config.DOWNLOAD_FORMATS
+    assert ("kepub" in config.FORMATS) == bool(config.KEPUBIFY)
+    if config.KEPUBIFY:
+        assert "books you <em>download</em> for your Kobo come converted" in html
 
 
 # ---------------------------------------------------------------- item 3: the search sources

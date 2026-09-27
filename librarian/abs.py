@@ -226,6 +226,46 @@ def tag_folder(folder, owner, attempts=None, delay=5, sleep=time.sleep):
     return f"ABS did not index '{folder}' in time; set tag {owner_tag(owner)} in ABS"
 
 # ---- CLI (used by bookstack.sh) -------------------------------------------------------------
+# ---- L05: sign in with the family login (Authelia as the OpenID Connect provider) -----------
+OIDC_CLIENT_ID = "audiobookshelf"
+
+def oidc_settings(on, domain=None, secret=None):
+    """ABS auth settings: local login always stays (the apps' saved logins and this automation use
+    it); with `on`, OpenID through Authelia is added and the web login jumps straight to it.
+    Readers are matched to their EXISTING account by username (the Authelia login and the ABS
+    account share the name by construction), never auto-registered, and no group claim is used,
+    so each reader's tag restriction and permissions stay exactly as they are."""
+    if not on:
+        return {"authActiveAuthMethods": ["local"], "authOpenIDAutoLaunch": False}
+    domain = domain or config.DOMAIN
+    secret = secret or config.ABS_OIDC_SECRET
+    if not domain or not secret:
+        raise AbsError("DOMAIN and ABS_OIDC_SECRET are needed to sign in through Authelia")
+    auth = f"https://auth.{domain}"
+    return {"authActiveAuthMethods": ["local", "openid"],
+            "authOpenIDIssuerURL": auth, "authOpenIDAuthorizationURL": f"{auth}/api/oidc/authorization",
+            "authOpenIDTokenURL": f"{auth}/api/oidc/token", "authOpenIDUserInfoURL": f"{auth}/api/oidc/userinfo",
+            "authOpenIDJwksURL": f"{auth}/jwks.json", "authOpenIDLogoutURL": "",
+            "authOpenIDClientID": OIDC_CLIENT_ID, "authOpenIDClientSecret": secret,
+            "authOpenIDTokenSigningAlgorithm": "RS256", "authOpenIDButtonText": "Sign in with the family login",
+            "authOpenIDAutoLaunch": True, "authOpenIDAutoRegister": False, "authOpenIDMatchExistingBy": "username",
+            "authOpenIDMobileRedirectURIs": ["audiobookshelf://oauth"], "authOpenIDGroupClaim": "",
+            # ABS leaves this undefined until its own settings page saves it, and then builds the
+            # callback as "undefined/auth/openid/callback": the site root, matching Authelia's list
+            "authOpenIDSubfolderForRedirectURLs": "",
+            "authOpenIDAdvancedPermsClaim": ""}
+
+def set_oidc(on, token=None):
+    want = oidc_settings(on)
+    r = _req("PATCH", "/api/auth-settings", token=token, json=want)
+    if r.status_code != 200:
+        raise AbsError(f"Audiobookshelf refused the auth settings (HTTP {r.status_code}: {r.text[:120]})")
+    got = _json(_req("GET", "/api/auth-settings", token=token))
+    methods = sorted(got.get("authActiveAuthMethods") or [])
+    if methods != sorted(want["authActiveAuthMethods"]):
+        raise AbsError(f"Audiobookshelf did not switch its sign-in methods (now: {', '.join(methods) or 'none'})")
+    return {"methods": methods}
+
 def _password_args(sub, required=True):
     """--password <pw> or --password-stdin (keeps the secret out of argv / `ps` / docker inspect)."""
     g = sub.add_mutually_exclusive_group(required=required)
@@ -245,6 +285,7 @@ def _cli(argv=None):
     r = sp.add_parser("remove-user"); r.add_argument("name")
     sp.add_parser("list-users"); sp.add_parser("scan"); sp.add_parser("status")
     t = sp.add_parser("tag"); t.add_argument("folder"); t.add_argument("owner"); t.add_argument("--attempts", type=int, default=1)
+    sp.add_parser("oidc").add_argument("state", choices=("on", "off"))
     args = p.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -265,6 +306,8 @@ def _cli(argv=None):
             print(json.dumps(status()))
         elif args.cmd == "tag":
             print(json.dumps({"ok": True, "note": tag_folder(args.folder, args.owner, attempts=args.attempts)}))
+        elif args.cmd == "oidc":
+            print(json.dumps({"ok": True, **set_oidc(args.state == "on")}))
         return 0
     except (AbsError, requests.RequestException) as e:
         print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)

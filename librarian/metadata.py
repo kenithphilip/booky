@@ -88,6 +88,26 @@ def _get(url, budget, params=None, allow_redirects=True):
     return r
 
 
+def _post(url, budget, payload, headers):
+    """_get's twin for a JSON POST (Hardcover's GraphQL), same wall clock and same verdicts."""
+    left = budget - time.monotonic()
+    if left <= 0.2:
+        raise ProviderDown("out of time for this book")
+    c = max(0.05, min(CONNECT_TIMEOUT, left))
+    try:
+        r = requests.post(url, json=payload, headers={**UA, **headers},
+                          timeout=(c, max(0.05, min(READ_TIMEOUT, left - c))))
+    except requests.RequestException as e:
+        raise ProviderDown(f"{e.__class__.__name__}: {str(e)[:120]}")
+    if r.status_code in (401, 403):
+        raise ProviderDown(f"the key was refused ({r.status_code})")
+    if r.status_code == 429 or r.status_code >= 500:
+        raise ProviderDown(f"upstream {r.status_code}")
+    if r.status_code >= 400:
+        raise Miss(f"rejected ({r.status_code})")
+    return r
+
+
 def _json(r):
     try:
         return r.json()
@@ -160,9 +180,15 @@ def _bookinfo(base, name, q, budget):
 def _openlibrary(q, budget):
     """The keyless floor. Its isbn/language/publisher/subject arrays aggregate across EVERY
     edition of the work — 11 languages on one Neuromancer record — so taking [0] is
-    confidently wrong. Only work-level facts are taken, and they are marked exact=False."""
+    confidently wrong. Only work-level facts are taken, and they are marked exact=False —
+    except when the request already carries the Open Library WORK it was chosen as (a book
+    requested from its work page): then the record is looked up by key, exactly."""
     isbn = next((i["value"] for i in q.get("identifiers", []) if i["kind"] == "isbn13"), None)
-    if isbn:
+    work_key = next((i["value"] for i in q.get("identifiers", [])
+                     if i["kind"] in ("openlibrary_work", "olid") and str(i["value"]).endswith("W")), None)
+    if work_key:
+        params = {"q": f"key:/works/{work_key}", "limit": 1}
+    elif isbn:
         params = {"q": f"isbn:{isbn}", "limit": 1}
     elif q.get("title"):
         params = {"title": q["title"], "limit": 1}
@@ -178,7 +204,16 @@ def _openlibrary(q, budget):
         raise Miss("no docs")                      # HTTP 200 + docs:[] is an unambiguous miss
     d = docs[0]
     cover = f"https://covers.openlibrary.org/b/id/{d['cover_i']}-L.jpg" if d.get("cover_i") else None
+    key = (d.get("key") or "").rsplit("/", 1)[-1]
+    description = ""
+    try:                                   # the work record carries the blurb; best effort
+        wj = _json(_get(f"https://openlibrary.org/works/{key}.json", budget)) if key else {}
+        desc = wj.get("description")
+        description = (desc.get("value") if isinstance(desc, dict) else desc) or ""
+    except (Miss, ProviderDown):
+        pass
     return _clean({
+        "description": description.strip() if isinstance(description, str) else "",
         "title": d.get("title"), "full_title": d.get("subtitle") and
         f"{d.get('title')}: {d['subtitle']}" or d.get("title"),
         "short_title": d.get("title"),
@@ -186,7 +221,78 @@ def _openlibrary(q, budget):
         "pages": d.get("number_of_pages_median"),
         "cover_url": cover,
         "authors": [{"name": n} for n in (d.get("author_name") or [])[:3]],
-        "identifiers": _ids([("olid", (d.get("key") or "").rsplit("/", 1)[-1])], "openlibrary", False),
+        "identifiers": _ids([("olid", key)], "openlibrary", bool(work_key)),
+    })
+
+
+def _google(q, budget):
+    """Google Books, only with the owner's free API key: the keyless quota is shared by every
+    anonymous caller on Earth and was exhausted when tested (HTTP 429). `categories` is a tags
+    array and is dropped at _clean like every provider's genres."""
+    if not config.GOOGLE_BOOKS_API_KEY:
+        raise Miss("no key")
+    isbn = next((i["value"] for i in q.get("identifiers", []) if i["kind"] in ("isbn13", "isbn10")), None)
+    if isbn:
+        query = f"isbn:{isbn}"
+    elif q.get("title"):
+        query = f'intitle:"{q["title"]}"' + (f' inauthor:"{q["author"]}"' if q.get("author") else "")
+    else:
+        raise Miss("nothing to search with")
+    items = _json(_get("https://www.googleapis.com/books/v1/volumes", budget,
+                       params={"q": query, "maxResults": 1, "printType": "books",
+                               "key": config.GOOGLE_BOOKS_API_KEY})).get("items") or []
+    if not items:
+        raise Miss("no items")
+    v = items[0].get("volumeInfo") or {}
+    img = (v.get("imageLinks") or {}).get("thumbnail") or ""
+    ids = [(("isbn13" if x.get("type") == "ISBN_13" else "isbn10"), x.get("identifier"))
+           for x in v.get("industryIdentifiers") or [] if x.get("type") in ("ISBN_13", "ISBN_10")]
+    return _clean({
+        "title": v.get("title"), "full_title": v.get("subtitle") and f"{v.get('title')}: {v['subtitle']}" or v.get("title"),
+        "description": v.get("description"), "release_date": v.get("publishedDate"),
+        "pages": v.get("pageCount"), "language": v.get("language"), "publisher": v.get("publisher"),
+        "cover_url": img.replace("http://", "https://") or None,
+        "authors": [{"name": n} for n in (v.get("authors") or [])[:3]],
+        "identifiers": _ids(ids + [("google_books", items[0].get("id"))], "google", bool(isbn)),
+    })
+
+
+def _hardcover_api(q, budget):
+    """Hardcover's own API, only with the owner's token (Library -> Metadata sources): the best
+    series data there is. Query as CWA's cps/metadata_provider/hardcover.py does it; the token
+    goes on THIS request only (CWA stores it on a shared class dict — a cross-user leak)."""
+    if not config.HARDCOVER_API_KEY:
+        raise Miss("no token")
+    term = next((i["value"] for i in q.get("identifiers", []) if i["kind"] == "isbn13"), None) \
+        or " ".join(x for x in (q.get("title"), q.get("author")) if x)
+    if not term:
+        raise Miss("nothing to search with")
+    token = config.HARDCOVER_API_KEY.replace("Bearer ", "").strip()
+    data = _json(_post("https://api.hardcover.app/v1/graphql", budget,
+                       {"query": 'query S($q: String!) { search(query: $q, query_type: "Book", per_page: 5) { results } }',
+                        "variables": {"q": term}},
+                       {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}))
+    results = ((data.get("data") or {}).get("search") or {}).get("results") or {}
+    if isinstance(results, str):
+        import json as _j
+        try:
+            results = _j.loads(results)
+        except ValueError:
+            raise Miss("unreadable results")
+    hits = results.get("hits") or []
+    if not hits:
+        raise Miss("no hits")
+    d = hits[0].get("document") or {}
+    series = (d.get("featured_series") or {})
+    return _clean({
+        "title": d.get("title"), "full_title": d.get("subtitle") and f"{d.get('title')}: {d['subtitle']}" or d.get("title"),
+        "description": d.get("description"), "release_date": d.get("release_date"),
+        "first_publish_year": d.get("release_year"), "pages": d.get("pages"),
+        "cover_url": (d.get("image") or {}).get("url"),
+        "series": (series.get("series") or {}).get("name"), "series_position": series.get("position"),
+        "authors": [{"name": n} for n in (d.get("author_names") or [])[:3]],
+        "identifiers": _ids([("isbn13", i) for i in (d.get("isbns") or []) if len(str(i)) == 13][:5]
+                            + [("hardcover_book", d.get("id"))], "hardcover_api", False),
     })
 
 
@@ -194,12 +300,17 @@ def _openlibrary(q, budget):
 PROVIDERS = (
     ("bookinfo", lambda q, b: _bookinfo("https://api.bookinfo.pro", "bookinfo", q, b)),
     ("hardcover", lambda q, b: _bookinfo("https://hardcover.bookinfo.pro", "hardcover", q, b)),
+    ("hardcover_api", _hardcover_api),     # only with HARDCOVER_API_KEY
+    ("google", _google),                   # only with GOOGLE_BOOKS_API_KEY
     ("openlibrary", _openlibrary),
 )
+_KEYED = {"hardcover_api": lambda: bool(config.HARDCOVER_API_KEY),
+          "google": lambda: bool(config.GOOGLE_BOOKS_API_KEY)}
 
 
 def enabled_providers():
-    return [(n, f) for n, f in PROVIDERS if config.METADATA_PROVIDERS.get(n, True)]
+    return [(n, f) for n, f in PROVIDERS
+            if config.METADATA_PROVIDERS.get(n, True) and _KEYED.get(n, lambda: True)()]
 
 
 def fetch(query, now=None):

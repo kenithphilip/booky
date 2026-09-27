@@ -37,7 +37,10 @@ new=$(printf '%s\n%s\n' "$v4" "$v6")
 # add first (current ranges), then remove ranges no longer published: the site never has a gap
 while read -r cidr; do
   [ -n "$cidr" ] || continue
-  for p in 80 443; do ufw allow proto tcp from "$cidr" to any port "$p" comment cloudflare >/dev/null || fail "ufw could not add $cidr port $p"; done
+  # 443 only (L19): certificates use DNS-01 and Cloudflare is set to "Always Use HTTPS" with
+  # Full (strict) SSL, so nothing ever reaches the origin on port 80
+  ufw allow proto tcp from "$cidr" to any port 443 comment cloudflare >/dev/null || fail "ufw could not add $cidr port 443"
+  ufw --force delete allow proto tcp from "$cidr" to any port 80 >/dev/null 2>&1 || true
   ufw allow proto udp from "$cidr" to any port 443 comment cloudflare >/dev/null || fail "ufw could not add $cidr udp/443"
 done <<< "$new"
 

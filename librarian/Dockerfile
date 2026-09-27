@@ -11,6 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends libxml2 libxslt
 # --require-hashes refuses anything that was not audited into it.
 COPY requirements.lock .
 RUN pip install --require-hashes -r requirements.lock
+# kepubify (pgaskin/kepubify v4.0.4, statically linked): the portal converts an EPUB to KEPUB
+# when a reader DOWNLOADS one (L11). It is never used by Kobo sync — see DECISIONS-PENDING on
+# why letting sync convert is a trap. The release publishes no checksums, so these were
+# computed once (2026-09-26) and the build refuses any other file.
+ARG TARGETARCH
+RUN python -c "import hashlib,sys,urllib.request; \
+a={'amd64':('64bit','37d7628d26c5c906f607f24b36f781f306075e7073a6fe7820a751bb60431fc5'),'arm64':('arm64','5a15b8f6f6a96216c69330601bca29638cfee50f7bf48712795cff88ae2d03a3')}['${TARGETARCH:-amd64}']; \
+d=urllib.request.urlopen('https://github.com/pgaskin/kepubify/releases/download/v4.0.4/kepubify-linux-'+a[0], timeout=60).read(); \
+h=hashlib.sha256(d).hexdigest(); sys.exit('kepubify checksum mismatch: '+h) if h!=a[1] else None; \
+open('/usr/local/bin/kepubify','wb').write(d)" && chmod 755 /usr/local/bin/kepubify && kepubify --version
 COPY . .
 # The container runs as an unprivileged uid (compose "user:"), so the code must be readable
 # regardless of the file modes it was copied from (scp'd sources are often 0600).

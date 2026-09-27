@@ -6,7 +6,15 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <div class="card">
 <h3>Kobo</h3>
 {% if not kobo_on %}<p class="mut">Kobo sync is not switched on for this library yet — ask the admin (it is one click in the admin tools).</p>{% endif %}
+<details class="mut" style="margin:6px 0"><summary>Before you start (read once)</summary>
+<ul style="margin:6px 0;padding-left:18px">
+<li>While linked to this library, the Kobo's own store and OverDrive/Libby stop working on the device.</li>
+<li>Signing out, signing in again or a factory reset rewrites the config file: put the link back afterwards.</li>
+<li>Only EPUB (and KEPUB) books sync to a Kobo; PDFs and comics can be downloaded from My books.</li>
+<li>The first sync of a big library takes minutes; leave the Kobo on Wi-Fi until it finishes.</li>
+</ul></details>
 {% if kobo %}
+{% if kstat %}<p><strong>{{ kstat.books_on_device }}</strong> book{{ '' if kstat.books_on_device == 1 else 's' }} handed to your Kobo so far{% if kstat.last_reading %} · last reading position received {{ kstat.last_reading[:16] }} UTC{% else %} · no reading position received yet{% endif %}.</p>{% endif %}
 <p>Your personal sync link:</p>
 <p><span class="code">{{ kobo }}</span></p>
 <ol class="mut" style="margin-top:6px">
@@ -14,8 +22,16 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <li>Under <code>[OneStoreServices]</code> set <code>api_endpoint={{ kobo }}</code> (add the section if missing).</li>
 <li>Eject, then tap <em>Sync</em> on the device. Only your books arrive.</li>
 </ol>
+<form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_test">
+<button type="submit" class="sec">Test my link</button> <span class="mut">(asks the library exactly what a Kobo asks first)</span></form>
 <form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_reset">
 <button type="submit" class="sec">Regenerate link</button> <span class="mut">(the old link stops working; update the device)</span></form>
+<form method="post" style="margin-top:6px">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_prefs">
+<label><input type="checkbox" name="shelves_only" value="1" {{ 'checked' if kstat and kstat.shelves_only }}> Only sync the shelves I mark for Kobo in Calibre-Web (not my whole library)</label><br>
+<label class="mut"><input type="checkbox" name="hardcover_change" value="1"> Set my Hardcover token
+<input type="password" name="hardcover_token" placeholder="{{ 'set — type a new one or leave blank to remove' if kstat and kstat.hardcover else 'hardcover.app → Settings → API' }}" autocomplete="off" style="width:260px"></label>
+<span class="mut">(reading progress from the Kobo is shared with your Hardcover account, when the admin has Hardcover sync on)</span><br>
+<button type="submit" class="sec">Save Kobo options</button></form>
 <p class="mut" style="margin-top:8px">This link is a key in its own right: anyone holding it reads your whole library, and
 <strong>changing your password does not change it</strong>. If the link leaked, or a device carrying it was lost, regenerate it here.</p>
 {% else %}
@@ -45,13 +61,16 @@ Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files
 <h3>Preferences</h3>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="prefs">
 <div class="row"><label>Preferred download format
-<select name="preferred_format">{% for f in formats %}<option value="{{f}}" {{ 'selected' if prefs.preferred_format==f }}>{{ f }}{% if f=='epub' %} (Kobo, Kindle by mail, every app){% elif f=='azw3' %} (Kindle via USB only){% elif f=='mobi' %} (legacy Kindles, USB only){% endif %}</option>{% endfor %}</select></label></div>
+<select name="preferred_format">{% for f in formats %}<option value="{{f}}" {{ 'selected' if prefs.preferred_format==f }}>{{ f }}{% if f=='epub' %} (Kobo, Kindle by mail, every app){% elif f=='azw3' %} (Kindle via USB only){% elif f=='mobi' %} (legacy Kindles, USB only){% elif f=='kepub' %} (Kobo by download: exact page tracking){% endif %}</option>{% endfor %}</select></label></div>
+<div class="row"><label>I read in
+<select name="language">{% for code, name in cfg.LANGUAGES.items() %}<option value="{{ code }}" {{ 'selected' if prefs.language == code }}>{{ name }}</option>{% endfor %}</select></label>
+<span class="mut">Copies in another language are never fetched for you automatically.</span></div>
 <p><label><input type="checkbox" name="auto_kindle" value="1" {{ 'checked' if prefs.auto_kindle }} {{ '' if kindle_enabled else 'disabled' }}>
 Automatically e-mail every new ebook to my Kindle{% if not kindle_enabled %} <span class="mut">(needs outgoing mail)</span>{% endif %}</label></p>
 <p><label><input type="checkbox" name="notify_email" value="1" {{ 'checked' if prefs.notify_email }} {{ '' if kindle_enabled else 'disabled' }}>
 E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or denied{% if not kindle_enabled %} <span class="mut">(needs outgoing mail)</span>{% endif %}</label></p>
 <button type="submit">Save preferences</button></form>
-<p class="mut" style="margin-top:8px">Formats: the library converts books to EPUB on arrival (PDF and comics stay as they are). Kobo receives EPUB over sync — it reads normally, but the Kobo only remembers your place at each chapter, not the exact page. Kindle accepts EPUB or PDF by e-mail, AZW3/MOBI only over USB.</p>
+<p class="mut" style="margin-top:8px">Formats: the library converts books to EPUB on arrival (PDF and comics stay as they are). Kobo receives EPUB over sync — it reads normally, but the Kobo only remembers your place at each chapter, not the exact page. Choose KEPUB above and books you <em>download</em> for your Kobo come converted, with exact page tracking. Kindle accepts EPUB or PDF by e-mail, AZW3/MOBI only over USB.</p>
 </div>
 
 <div class="card">
@@ -75,7 +94,7 @@ E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or
 <div class="row"><label style="flex:1;min-width:160px">Current password<input type="password" name="current" autocomplete="current-password" required></label>
 <label style="flex:1;min-width:160px">New password<input type="password" name="new" minlength="8" autocomplete="new-password" required></label>
 <label style="flex:1;min-width:160px">Repeat<input type="password" name="repeat" minlength="8" autocomplete="new-password" required></label></div>
-<p><button type="submit">Change password</button> <span class="mut">Changes it for the portal, the library site, Shelfmark{% if abs_linked %} and Audiobookshelf{% endif %}.{% if cfg.AUTHELIA_ENABLED %} Not for the Authelia sign-in page: the admin changes that one.{% endif %}</span></p></form>
+<p><button type="submit">Change password</button> <span class="mut">Changes it for the portal, the library site, Shelfmark{% if abs_linked %} and Audiobookshelf{% endif %}.{% if cfg.AUTHELIA_ENABLED %} The sign-in page in front of the sites (Authelia) follows within a minute.{% endif %}</span></p></form>
 <p class="mut"><strong>Change your password only here.</strong> The library site has a password field of its own on
 its profile page; a password changed there does <em>not</em> reach{% if abs_linked %} Audiobookshelf, so the audiobook app
 would keep asking for the old one{% else %} the other apps{% endif %}.</p>

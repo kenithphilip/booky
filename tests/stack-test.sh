@@ -118,13 +118,30 @@ envset DOMAIN example.test; envset ADMIN_EMAIL admin@example.test; envset TZ UTC
 envset PUID "$(id -u)"; envset PGID "$(id -g)"; envset CF_API_TOKEN dummy; envset CF_DNS_TOKEN dummy
 envset LIBRARIAN_SECRET 'pa$$w0rd&|it'"'"'s"tricky'; envset INTAKE_TOKEN e2e-intake; envset PUBLIC_IP 127.0.0.1; envset BIND_IP 127.0.0.1; envset TAILSCALE_IP 127.0.0.1
 envset ADMIN_HASH '$2a$14$hash'; envset APPROVALS_REQUIRED true; envset SHELFMARK_LANGUAGE en; envset AUTHELIA_ENABLED true
+# L16: the portal's service login for Shelfmark's approval API (bookstack.sh ensure_shelfmark_service)
+SVC_PW="svc-e2e-$(date +%s)-pw"; envset SHELFMARK_SVC_USER svc-portal; envset SHELFMARK_SVC_PASS "$SVC_PW"
 compose config -q || { echo "compose files do not render"; exit 1; }
 
 # Authelia: same rendering the installer does (Security -> Authelia), plus one user via the
 # installer's own authelia_add_user (validates users_database.yml + argon2 hash for real)
-sed "s|@@DOMAIN@@|example.test|g" authelia/configuration.yml.template > authelia/configuration.yml
+# L05: the OpenID Connect provider for Audiobookshelf, rendered by the installer's own function
+envset ABS_OIDC_SECRET e2e-abs-oidc-secret-0123456789abcdef; envset AUTHELIA_OIDC_HMAC e2e-oidc-hmac-0123456789abcdef0123456789abcdef
+( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out authelia/oidc-jwks.pem 2>/dev/null )
+render_authelia_config >/dev/null 2>&1; grep -q "client_id: 'audiobookshelf'" authelia/configuration.yml || { echo "render_authelia_config did not render the OIDC client"; exit 1; }
+# one factor for the harness: the driver signs in with a password, it cannot enrol TOTP
+sed -i.bak -e "s|policy: two_factor|policy: one_factor|" -e "s|policy: 'two_factor'|policy: 'one_factor'|" authelia/configuration.yml && rm -f authelia/configuration.yml.bak
+# Authelia's OpenID endpoints only work over https, and Audiobookshelf's server calls them: a
+# throwaway CA and a certificate for auth.example.test, served by the gate, trusted by ABS
+mkdir -p tls
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=bookstack e2e CA" -keyout tls/ca.key -out tls/ca.pem \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign" >/dev/null 2>&1
+openssl req -newkey rsa:2048 -nodes -subj "/CN=auth.example.test" -keyout tls/auth.key -out tls/auth.csr >/dev/null 2>&1
+printf 'subjectAltName=DNS:auth.example.test\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > tls/ext
+openssl x509 -req -in tls/auth.csr -CA tls/ca.pem -CAkey tls/ca.key -CAcreateserial -days 2 -extfile tls/ext -out tls/auth.crt >/dev/null 2>&1
+chmod 644 tls/*.pem tls/*.crt tls/*.key
 echo "users: {}" > authelia/users_database.yml
 authelia_add_user alice Alice alice@example.test 'alice-authelia-pw1' >/dev/null 2>&1 || { echo "authelia_add_user failed"; exit 1; }
+authelia_add_user admin Admin admin@example.test 'admin-authelia-pw1' >/dev/null 2>&1 || { echo "authelia_add_user admin failed"; exit 1; }
 # Plain-HTTP Caddy "gate": the production per-host markers + the production snippet, injected
 # by the production injector (authelia/inject-gate.py), then two test-only substitutions:
 # (a) the Authelia address (127.0.0.1 on the host network in prod -> the service name here)
@@ -134,6 +151,15 @@ cat > caddy-test/Caddyfile <<'EOF'
 {
 	auto_https off
 	admin off
+	default_sni auth.example.test
+}
+https://auth.example.test {
+	tls /certs/auth.crt /certs/auth.key
+	reverse_proxy authelia:9091
+}
+http://shelf.example.test {
+	# @AUTHELIA_GATE:shelf@
+	reverse_proxy shelfmark:8084
 }
 http://books.example.test {
 	# @AUTHELIA_GATE:books@
@@ -187,6 +213,10 @@ curl -fs -o /dev/null http://127.0.0.1:18083/login || { echo "CWA never came up"
 # keep per-user copies, Kindle fixer, leave PDF/comics in their native format)
 docker exec -i calibre-web sqlite3 /config/cwa.db "UPDATE cwa_settings SET auto_convert=1, auto_convert_target_format='epub', auto_ingest_automerge='new_record', kindle_epub_fixer=0, auto_convert_ignored_formats='pdf,cbz,cbr,cb7', auto_backup_imports=0, auto_backup_conversions=0, auto_backup_epub_fixes=0, koreader_sync_enabled=1;" \
   && echo "   [ OK ] CWA conversion defaults applied (as apply_library_defaults does)" || echo "   [FAIL] could not apply CWA defaults"
+# L05: Calibre-Web trusts Remote-User behind the gate (what gate_sso_on runs), then a restart
+compose run --rm --no-deps -T librarian python -m cwa proxy-login on >/dev/null 2>&1 && compose restart calibre-web >/dev/null 2>&1 \
+  && echo "   [ OK ] Calibre-Web header login switched on through the portal CLI (L05)" || echo "   [FAIL] cwa proxy-login on"
+for _ in $(seq 1 120); do curl -fs -o /dev/null http://127.0.0.1:18083/login && break; sleep 2; done
 echo "== starting audiobookshelf and bootstrapping it through the portal image CLI (what Library -> Audiobookshelf runs)"
 compose up -d audiobookshelf
 for _ in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:23378/healthcheck && break; sleep 2; done
@@ -199,6 +229,8 @@ echo "== starting the rest"; compose up -d greenmail filesrv authelia librarian 
 SAMPLER_PID=$!
 for _ in $(seq 1 60); do curl -fs http://127.0.0.1:18090/healthz >/dev/null 2>&1 && break; sleep 2; done
 curl -fs http://127.0.0.1:18090/healthz >/dev/null || { echo "portal not healthy"; compose logs librarian | tail -40; exit 1; }
+printf '%s\n' "$SVC_PW" | docker exec -i librarian python -m cwa add-user svc-portal --email svc-portal@localhost --password-stdin --admin >/dev/null 2>&1 \
+  && echo "   [ OK ] Shelfmark service account created (L16)" || echo "   [FAIL] could not create the Shelfmark service account"
 got=$(docker exec librarian printenv LIBRARIAN_SECRET)
 [ "$got" = 'pa$$w0rd&|it'"'"'s"tricky' ] && echo "   [ OK ] quoted .env value reaches the container intact" || { echo "   [FAIL] .env quoting broken: got [$got]"; exit 1; }
 for _ in $(seq 1 60); do curl -fs http://127.0.0.1:18084/api/health >/dev/null 2>&1 && break; sleep 2; done
@@ -211,6 +243,33 @@ docker exec audiobookshelf ffmpeg -loglevel error -f lavfi -i anullsrc=r=22050:c
 sleep 3
 echo "== driving the user journeys"
 python3 "$REPO/tests/e2e_driver.py" "$STACK"; rc=$?
+echo "== L08: the canary journey (scripts/synthetic.py) against this stack"
+CE="$STACK/canary.env"; : > "$CE"; cok=1
+for n in canary-a canary-b; do
+  pw=$(openssl rand -hex 12); k=$([ "$n" = canary-a ] && echo A || echo B)
+  printf '%s\n' "$pw" | docker exec -i librarian python -m cwa add-user "$n" --password-stdin --no-abs >/dev/null 2>&1 || cok=0
+  printf 'CANARY_%s=%s\nCANARY_%s_PW=%s\n' "$k" "$n" "$k" "$pw" >> "$CE"
+done
+[ $cok = 1 ] && echo "   [ OK ] canary accounts created (no ABS account)" || { echo "   [FAIL] could not create the canary accounts"; rc=$((rc+1)); }
+printf '#!/usr/bin/env bash\necho "ALERT $1" >> "%s"\n' "$STACK/canary-alert.log" > "$STACK/canary-alert.sh"
+printf '#!/usr/bin/env bash\necho "PUSH $*" >> "%s"\n' "$STACK/canary-push.log" > "$STACK/canary-push.sh"; chmod +x "$STACK/canary-alert.sh" "$STACK/canary-push.sh"
+canary(){ STACK_DIR="$STACK" CANARY_ENV="$CE" CANARY_PORTAL=http://127.0.0.1:18090 CANARY_PUBLIC_PORTAL=http://127.0.0.1:18090 \
+  CANARY_PUBLIC_BOOKS=http://127.0.0.1:18083 CANARY_SHELF="${1:-http://127.0.0.1:18084}" CANARY_ALERT="$STACK/canary-alert.sh" \
+  CANARY_KUMA_PUSH="$STACK/canary-push.sh" CANARY_IMPORT_TIMEOUT=300 python3 "$REPO/scripts/synthetic.py"; }
+: > "$STACK/canary-alert.log"; : > "$STACK/canary-push.log"
+canary; crc=$?
+left=$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).execute("select count(*) from books where title like ?", ("Canary %",)).fetchone()[0])' "$STACK/library/books/metadata.db" 2>/dev/null)
+last=$(docker exec librarian python -m admin_cli canary recent --limit 1 2>/dev/null | tail -1)
+if [ $crc = 0 ] && grep -q "PUSH canary up" "$STACK/canary-push.log" && [ ! -s "$STACK/canary-alert.log" ] && [ "$left" = 0 ] \
+   && printf '%s' "$last" | python3 -c 'import json,sys; r=json.load(sys.stdin)["rows"][0]; sys.exit(0 if r["ok"] and r["import_secs"] is not None and len(r["steps"]) >= 8 else 1)'; then
+  echo "   [ OK ] the canary journey passes on a healthy stack: recorded with its import time, Kuma told, its book removed again"
+else echo "   [FAIL] canary journey on a healthy stack (exit $crc, left $left book(s), last run: ${last:0:300})"; cat "$STACK/canary-alert.log"; rc=$((rc+1)); fi
+: > "$STACK/canary-alert.log"; : > "$STACK/canary-push.log"
+canary http://127.0.0.1:9 >/dev/null; crc=$?
+if [ $crc = 1 ] && grep -q "ALERT Bookstack: canary journey FAILED at 'Shelfmark login'" "$STACK/canary-alert.log" && grep -q "PUSH canary down" "$STACK/canary-push.log" \
+   && docker exec librarian python -m admin_cli canary recent --limit 1 | tail -1 | grep -q '"failed": "Shelfmark login"'; then
+  echo "   [ OK ] a broken step fails the run, names the step in the alert, pushes DOWN to Kuma and shows on /admin"
+else echo "   [FAIL] canary journey with Shelfmark unreachable (exit $crc)"; cat "$STACK/canary-alert.log" "$STACK/canary-push.log"; rc=$((rc+1)); fi
 echo "== process stability"
 if compose logs librarian 2>/dev/null | grep -qE 'SIGBUS|SIGSEGV|Worker failed to boot|Fatal Python error'; then
   echo "   [FAIL] the portal worker crashed during the run:"; compose logs librarian 2>/dev/null | grep -B2 -A25 -E 'SIGBUS|SIGSEGV|Fatal Python error' | head -60; rc=$((rc+1))

@@ -248,7 +248,9 @@ check(not os.path.exists(f"{STACK}/library/dropbox/alice/shelfmark drop.epub"), 
 print("== 8. Send-to-Kindle from the portal + auto-Kindle, captured by the test mail server")
 if book_id:
     st, h, b = portal_post(p, f"/kindle/{book_id}", "/library", {"format": "epub"})
-    msgs = wait(lambda: imap_messages("alice_e2e@kindle.com", "E2E Portal Book") or None, 40, 3) or []
+    st2, h2, b2 = p.get(PORTAL + "/library")      # the POST redirects; the message is on the next page
+    check(st in (302, 303) and b"on its way" in b2, "Send to Kindle answers at once and queues the mail (L21: no 524 on a slow relay)", f"{st}")
+    msgs = wait(lambda: imap_messages("alice_e2e@kindle.com", "E2E Portal Book") or None, 90, 3) or []
     check(bool(msgs) and any(a and a.lower().endswith(".epub") for a in msgs[0]["attachments"]), "Send to Kindle delivered an EPUB attachment to the Kindle address", json.dumps(msgs)[:200])
     check(bool(msgs) and "library@example.test" in (msgs[0]["from"] or ""), "mail comes from the configured SMTP_FROM")
 # An EPUB with no dc:language (Amazon bounces those) is repaired by the portal on the way out;
@@ -261,7 +263,7 @@ if nl_id:
     lib_file = next((os.path.join(r, f) for r, _, fs in os.walk(f"{STACK}/library/books") for f in fs if f.endswith(".epub") and "No Language Book" in f), None)
     check(lib_file is not None and b"dc:language" not in zipfile.ZipFile(lib_file).read("OEBPS/content.opf"), "library copy left as uploaded (no import-time rewrite)")
     portal_post(p, f"/kindle/{nl_id}", "/library", {"format": "epub"})
-    nm = wait(lambda: imap_messages("alice_e2e@kindle.com", "No Language Book") or None, 40, 3) or []
+    nm = wait(lambda: imap_messages("alice_e2e@kindle.com", "No Language Book") or None, 90, 3) or []
     ok_fix = False
     if nm and PAYLOADS.get(nm[0]["subject"]):
         try:
@@ -269,7 +271,7 @@ if nl_id:
         except Exception as e:
             print("   (attachment not a zip:", e, ")")
     check(ok_fix, "Send to Kindle added dc:language to the mailed copy (portal-side Kindle fix)")
-    st, h, b = p.get(PORTAL + "/library"); check(b"Kindle fixes applied: encoding, language" in b or b"Kindle fixes applied: language" in b, "the user is told which Kindle fixes were applied")
+    st, h, b = p.get(PORTAL + "/status"); check(b"Kindle fixes applied: encoding, language" in b or b"Kindle fixes applied: language" in b, "the user is told which Kindle fixes were applied (Status: Sent to Kindle)")
 portal_post(p, "/devices", "/devices", {"action": "prefs", "preferred_format": "epub", "auto_kindle": "1"})
 auto = make_epub("Auto Kindle Book", "Test Harness")
 st, h, b = p.get(PORTAL + "/upload"); tok = csrf(b); p.post(PORTAL + "/upload", {"csrf": tok}, files={"file": ("auto kindle book.epub", auto)})
@@ -462,6 +464,56 @@ check(st == 200 and b'"OK"' in b, "Authelia accepts the user written by the inst
 st, h, b = Session().post(GATE + "/api/firstfactor", json_body={"username": "alice", "password": "wrong", "targetURL": "https://request.example.test/"}, headers={"Host": "auth.example.test", "X-Forwarded-Proto": "https"})
 check(st in (401, 403), "Authelia rejects a wrong password", str(st))
 
+print("== 12b. One login behind the gate (L05), and no side doors (L01)")
+GATE_SECRET = "e2e-gate-secret-0123456789abcdef0123456789abcdef"
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def authelia_cookie(user, pw):
+    st, h, b = Session().post(GATE + "/api/firstfactor", json_body={"username": user, "password": pw, "targetURL": "https://request.example.test/"},
+                              headers={"Host": "auth.example.test", "X-Forwarded-Proto": "https"})
+    m = re.search(r"authelia_session=([^;]+)", h.get("Set-Cookie", ""))
+    return (st, m.group(1) if m else None)
+st, ac = authelia_cookie("alice", "alice-authelia-pw1")
+check(st == 200 and ac, "signed in to Authelia as alice", str(st))
+gh = lambda host: {"Host": host, "Cookie": f"authelia_session={ac}", "X-Forwarded-Proto": "https", **BROWSER}
+st, h, b = Session().get(GATE + "/status", headers=gh("request.example.test"))
+check(st == 200 and b"alice" in b and b'name="password"' not in b, "the portal behind the gate: signed in as alice with NO second login", f"status {st} {b[:120]!r}")
+st, h, b = Session().get(GATE + "/", headers=gh("books.example.test"))
+check(st == 200 and b"alice" in b and b'id="password"' not in b, "Calibre-Web behind the gate: signed in as alice with NO second login", f"status {st}")
+# the header is worthless without the gate: direct, with a guessed secret, or smuggled through a bypass
+st, h, b = Session().get(PORTAL + "/status", headers={"Remote-User": "admin"})
+check(st in (302, 303) and "/login" in h.get("Location", ""), "the portal ignores Remote-User that did not come through the gate", str(st))
+st, h, b = Session().get(PORTAL + "/status", headers={"Remote-User": "admin", "X-Bookstack-Gate": "guess"})
+check(st in (302, 303), "...and a guessed gate secret", str(st))
+st, h, b = Session().get(GATE + "/opds", headers={"Host": "books.example.test", "Remote-User": "alice"})
+check(st == 401, "a Remote-User header smuggled through a bypassed path (/opds) is stripped: Calibre-Web still asks for the password", str(st))
+st, h, b = Session().get(GATE + "/status", headers={"Host": "request.example.test", "Remote-User": "admin", "X-Bookstack-Gate": GATE_SECRET, **BROWSER})
+check(st == 302 and "auth.example.test" in h.get("Location", ""), "even the right secret sent by a client does not get past the gate", str(st))
+# L01: Shelfmark (third-party, internet-facing) cannot open a connection to anything but its own network.
+# (Not the portal: in production it is on the host network, on no bridge at all; only this harness
+# joins it to Shelfmark's network so it can call shelfmark:8084 by name.)
+probe = ("import socket,sys\nbad=[]\nfor h,p in (('calibre-web',8083),('audiobookshelf',80),('authelia',9091),('greenmail',3025)):\n"
+         "    try:\n        socket.create_connection((h,p),3).close(); bad.append(h)\n    except OSError: pass\nprint(','.join(bad) or 'none')")
+r = subprocess.run(["docker", "exec", "shelfmark", "sh", "-c", 'command -v python3 >/dev/null && exec python3 -c "$0" || exec /app/.venv/bin/python -c "$0"', probe], capture_output=True, text=True)
+check(r.stdout.strip() == "none", "Shelfmark reaches none of Calibre-Web, Audiobookshelf, Authelia or the mail server (own network, L01)", r.stdout.strip() or r.stderr[:160])
+r = subprocess.run(["docker", "inspect", "-f", "{{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}}", "calibre-web", "shelfmark", "audiobookshelf"], capture_output=True, text=True)
+check(r.returncode == 0 and r.stdout.count("[ALL]") == 3, "Calibre-Web, Shelfmark and Audiobookshelf run with capabilities dropped (and still pass every journey above)", r.stdout.strip())
+# password sync: carol was created on /admin and changed her password in the portal (section 11)
+def gate_sync():
+    return subprocess.run(["python3", f"{REPO_DIR}/scripts/gate-sync.py"], env={**os.environ, "STACK_DIR": STACK}, capture_output=True, text=True, timeout=120)
+def authelia_ok(user, pw, secs=20):
+    return wait(lambda: authelia_cookie(user, pw)[0] == 200, secs, 2)
+r = gate_sync()
+check(r.returncode == 0 and "carol: ok (gate login created)" in r.stdout, "gate-sync created carol's gate login from the /admin creation (e-mail kept across her password change)", (r.stdout + r.stderr)[-200:])
+check(authelia_ok("carol", "carol-new-pw-e2e"), "Authelia accepts carol with the password she set in the portal (no restart: it watches its file)")
+pc3, _, _ = portal_login("carol", "carol-new-pw-e2e")
+portal_post(pc3, "/devices", "/devices", {"action": "password", "current": "carol-new-pw-e2e", "new": "carol-third-pw-e2e", "repeat": "carol-third-pw-e2e"})
+r = gate_sync()
+check("carol: ok (password updated)" in r.stdout, "a later portal password change is carried to the gate", (r.stdout + r.stderr)[-200:])
+check(authelia_ok("carol", "carol-third-pw-e2e"), "Authelia accepts the new password")
+check(authelia_cookie("carol", "carol-new-pw-e2e")[0] in (401, 403), "and no longer the old one")
+r = subprocess.run(["docker", "exec", "librarian", "python", "-m", "admin_cli", "gate", "pending"], capture_output=True, text=True)
+check('"rows": []' in r.stdout, "the queue is empty afterwards (no hash left behind)", r.stdout[-160:])
+
 print("== 13. Audiobookshelf: bootstrapped by the installer, accounts by the Users menu, tagging by the worker")
 def absctl(*args):
     return subprocess.run(["docker", "exec", "-i", "librarian", "python", "-m", "abs", *args], capture_output=True, text=True)
@@ -515,6 +567,88 @@ if root_tok:
     else:
         skip("audiobook journey", "no test mp3 or library")
 
+print("== 13b. One login for Shelfmark (header) and Audiobookshelf (OpenID Connect) behind the gate (L05)")
+import ssl
+NOVERIFY = ssl.create_default_context(); NOVERIFY.check_hostname = False; NOVERIFY.verify_mode = ssl.CERT_NONE
+class Raw:
+    """No redirects, cookies by hand: the flow crosses hosts (ABS, Authelia) like a browser does."""
+    def __init__(self): self.c = {}
+    def get(self, url, headers=None, tls=False):
+        h = dict(headers or {})
+        if self.c: h["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.c.items())
+        op = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=NOVERIFY))
+        try:
+            r = op.open(urllib.request.Request(url, headers=h), timeout=60); st, hd, b = r.status, r.headers, r.read()
+        except urllib.error.HTTPError as e:
+            st, hd, b = e.code, e.headers, e.read()
+        for sc in hd.get_all("Set-Cookie") or []:
+            k, _, v = sc.split(";", 1)[0].partition("=")
+            if v: self.c[k.strip()] = v.strip()
+        return st, hd, b
+def env_set(k, v):
+    subprocess.run(["bash", "-c", f'source "{REPO_DIR}/bookstack.sh"; envset {k} {v}'], env={**os.environ, "STACK_DIR": STACK, "BOOKSTACK_LIB": "1"}, capture_output=True)
+def recreate(*svcs):
+    return subprocess.run(["docker", "compose", "-p", "bookstack-e2e", "-f", "docker-compose.yml", "-f", "docker-compose.test.yml", "up", "-d", *svcs],
+                          cwd=STACK, capture_output=True, text=True)
+def groups_sync():
+    return subprocess.run(["bash", "-c", f'source "{REPO_DIR}/bookstack.sh"; authelia_sync_admin_groups'], env={**os.environ, "STACK_DIR": STACK, "BOOKSTACK_LIB": "1"}, capture_output=True, text=True)
+r = groups_sync()
+ub = open(f"{STACK}/authelia/users_database.yml").read()
+check(r.returncode == 0 and re.search(r"  admin:\n(?:    .*\n)*?      - admins", ub) and not re.search(r"  alice:\n(?:    .*\n)*?      - admins", ub),
+      "Authelia's admins group mirrors Calibre-Web's admins (admin in, alice out)", (r.stderr or "")[-160:])
+# --- Shelfmark: header login behind the gate
+env_set("SHELFMARK_AUTH_METHOD", "proxy"); r = recreate("shelfmark", "librarian")
+check(wait(lambda: b'"proxy"' in Session().get(SHELF + "/api/auth/check")[2], 120, 3), "Shelfmark restarted in proxy mode (healthcheck follows the mode)", r.stderr[-160:])
+wait(lambda: Session().get(PORTAL + "/healthz")[0] == 200, 60, 2)
+_, ac_alice = authelia_cookie("alice", "alice-authelia-pw1"); _, ac_admin = authelia_cookie("admin", "admin-authelia-pw1")
+sh = lambda ac: {"Host": "shelf.example.test", "Cookie": f"authelia_session={ac}", "X-Forwarded-Proto": "https", **BROWSER}
+st, h, b = Session().get(GATE + "/api/auth/check", headers=sh(ac_alice)); j = jload(b) or {}
+check(st == 200 and j.get("authenticated") and j.get("username") == "alice" and not j.get("is_admin"), "Shelfmark behind the gate: alice signed in with NO second login, not an admin", f"{st} {b[:160]!r}")
+st, h, b = Session().get(GATE + "/api/auth/check", headers=sh(ac_admin)); j = jload(b) or {}
+check(st == 200 and j.get("username") == "admin" and j.get("is_admin"), "...and the admin is an admin (from the admins group)", f"{st} {b[:160]!r}")
+st, h, b = Session().get(GATE + "/api/settings", headers={"Host": "shelf.example.test", "Remote-User": "admin", "Remote-Groups": "admins", **BROWSER})
+check(st == 302 and "auth.example.test" in h.get("Location", ""), "headers a client sends do not get past the gate", str(st))
+st, h, b = Session().get(SHELF + "/api/settings")
+check(st == 401, "Shelfmark refuses a request with no gate identity (401)", str(st))
+r = subprocess.run(["docker", "exec", "librarian", "python", "-c", "import shelfmark_api, json; print(json.dumps(shelfmark_api.pending(force=True), default=str)[:200])"], capture_output=True, text=True)
+check(r.returncode == 0 and "refused" not in r.stdout + r.stderr, "the portal's approval queue still reads Shelfmark (service identity by header)", (r.stdout + r.stderr)[-200:])
+# --- and back: the ordinary Calibre-Web login works again for the same accounts
+env_set("SHELFMARK_AUTH_METHOD", "cwa"); r = recreate("shelfmark", "librarian")
+check(wait(lambda: b'"cwa"' in Session().get(SHELF + "/api/auth/check")[2], 120, 3), "Shelfmark back in cwa mode when the gate goes", r.stderr[-160:])
+wait(lambda: Session().get(PORTAL + "/healthz")[0] == 200, 60, 2)
+st, h, b = Session().post(SHELF + "/api/auth/login", json_body={"username": "alice", "password": ALICE_PW})
+check(st == 200, "alice signs in to Shelfmark with her library password again (same account)", str(st))
+# --- Audiobookshelf: OpenID Connect through Authelia
+r = absctl("oidc", "on"); check(r.returncode == 0 and '"openid"' in r.stdout, "Audiobookshelf switched to sign in through Authelia (local login kept for the apps)", (r.stdout + r.stderr)[-200:])
+st, h, b = Session().get(ABS + "/status"); check("openid" in json.dumps(jload(b) or {}), "ABS advertises the OpenID login", b[:160])
+def abs_oidc_flow():
+    ab = Raw(); ah = {"Host": "audio.example.test", "X-Forwarded-Proto": "https"}
+    st, h, b = ab.get(ABS + "/auth/openid?callback=" + urllib.parse.quote("https://audio.example.test/audiobookshelf/login"), headers=ah)
+    loc = h.get("Location", "")
+    check(st == 302 and loc.startswith("https://auth.example.test/api/oidc/authorization?") and "redirect_uri=https%3A%2F%2Faudio.example.test%2Fauth%2Fopenid%2Fcallback" in loc,
+          "ABS sends the browser to Authelia's authorization endpoint", f"{st} {loc[:160]} {b[:160]!r}")
+    if not loc.startswith("https://"): return
+    az = Raw(); az.c["authelia_session"] = ac_alice
+    st, h, b = az.get(loc.replace("https://auth.example.test", "https://127.0.0.1:18443"), headers={"Host": "auth.example.test"})
+    back = h.get("Location", "")
+    check(st in (302, 303) and back.startswith("https://audio.example.test/auth/openid/callback?") and "code=" in back,
+          "Authelia (already signed in at the gate) answers with a code, no consent screen", f"{st} {back[:160]} {b[:120]!r}")
+    if not back.startswith("https://"): return
+    st, h, b = ab.get(back.replace("https://audio.example.test", ABS), headers=ah)
+    done = h.get("Location", "")
+    tok = urllib.parse.parse_qs(urllib.parse.urlparse(done).query).get("accessToken", [""])[0]
+    check(st == 302 and done.startswith("https://audio.example.test/audiobookshelf/login?setToken=") and tok, "ABS exchanged the code with Authelia (over TLS) and signed alice in", f"{st} {done[:120]} {b[:200]!r}")
+    st, h, b = Session().get(ABS + "/api/me", headers=bearer(tok)); me = jload(b) or {}
+    check(st == 200 and me.get("username") == "alice" and me.get("type") == "user" and me.get("itemTagsSelected") == ["owner:alice"],
+          "it is alice's EXISTING account: same type, still restricted to owner:alice", f"{st} {json.dumps({k: me.get(k) for k in ('username', 'type', 'itemTagsSelected')})}")
+try:
+    abs_oidc_flow()
+except Exception as e:
+    check(False, "the Audiobookshelf OpenID flow ran to the end", repr(e)[:200])
+st, h, b = Session().post(ABS + "/login", json_body={"username": "alice", "password": "alice-new-abs-pw1"})   # set in section 13
+check(st == 200, "the apps' local login still works beside it", str(st))
+r = absctl("oidc", "off"); check(r.returncode == 0 and '"openid"' not in r.stdout, "and it switches off again with the gate", (r.stdout + r.stderr)[-160:])
+
 print("== 14. Health endpoints")
 st, h, b = Session().get(PORTAL + "/healthz"); check(st == 200 and b == b"ok", "portal /healthz answers plain 'ok' to non-loopback callers")
 r = subprocess.run(["docker", "exec", "-i", "librarian", "python", "-c", "import urllib.request,sys; sys.stdout.write(urllib.request.urlopen('http://127.0.0.1:8090/healthz').read().decode())"], capture_output=True, text=True)
@@ -525,6 +659,53 @@ check(bool(hj.get("version")) and "cwa" in hj, "/healthz detail reports the port
 # run and the whole suite still went green, so the admin dashboard's headline line was untested.
 check(hj.get("cwa") == "ok", "the Calibre-Web liveness probe reports 'ok' against a live CWA", repr(hj.get("cwa")))
 st, h, b = Session().get(ABS + "/healthcheck"); check(st == 200, "audiobookshelf /healthcheck", str(st))
+
+print("== 15. v5: metadata-first search, conversion, cover fill, Shelfmark approvals (real services)")
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def host_job():
+    return subprocess.run(["bash", f"{REPO}/scripts/metadata-push.sh"], capture_output=True, text=True,
+                          env=dict(os.environ, STACK_DIR=STACK), timeout=900)
+def calibre(sql, *a):
+    c = sqlite3.connect(f"file:{STACK}/library/books/metadata.db?mode=ro", uri=True); r = c.execute(sql, a).fetchall(); c.close(); return r
+st, h, b = p.get(PORTAL + "/?q=pride+and+prejudice")
+if b"unavailable right now" in b:
+    skip("metadata-first search", "Open Library did not answer from this machine")
+else:
+    check(b'href="/work/OL' in b and b"free ebook" in b, "search finds BOOKS (Open Library works) with availability badges")
+if book_id:
+    fmts0 = {f for (f,) in calibre("SELECT format FROM data WHERE book=?", book_id)}
+    target = next(f for f in ("AZW3", "MOBI", "PDF", "RTF") if f not in fmts0)
+    portal_post(p, f"/book/{book_id}/convert", f"/book/{book_id}", {"format": target.lower()})
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-c", f"""
+import db, worker
+rid = [r for r in db.rows_by_status(('done',), limit=300) if (r['title'] or '').lower().startswith('e2e portal book')][0]['id']
+db.meta_store({{'title':'E2E Portal Book','authors':[{{'name':'Test Harness'}}],'_providers':['openlibrary'],
+  'description':'A book made by the end-to-end test.','cover_url':'https://covers.openlibrary.org/b/id/14348537-L.jpg',
+  'identifiers':[{{'kind':'goodreads_work','value':'e2e-cover-{book_id}'}}]}}, rid=rid, owner='alice')
+db.link_calibre(rid, {book_id}, 'alice'); print(worker.queue_device_pushes())"""], capture_output=True, text=True)
+    job = host_job()
+    fmts1 = {f for (f,) in calibre("SELECT format FROM data WHERE book=?", book_id)}
+    check(target in fmts1, f"Convert to {target}: Calibre's ebook-convert made it and added it to the same book", job.stdout[-200:])
+    if calibre("SELECT has_cover FROM books WHERE id=?", book_id)[0][0] != 1 and \
+            Session().get("https://covers.openlibrary.org/b/id/14348537-L.jpg")[0] not in (200, 302):
+        skip("cover fill", "Open Library's cover service did not answer from this machine")
+    else:
+        check(calibre("SELECT has_cover FROM books WHERE id=?", book_id)[0][0] == 1, "a missing cover was fetched from the provider's image host and set in Calibre", job.stdout[-200:])
+    check(bool(calibre("SELECT text FROM comments WHERE book=?", book_id)), "a missing description was filled in")
+    check([t for (t,) in calibre("SELECT t.name FROM tags t JOIN books_tags_link l ON l.tag=t.id WHERE l.book=? AND t.name LIKE 'owner:%'", book_id)] == ["owner:alice"],
+          "the owner tag is exactly as it was after all of it")
+st, h, b = ss.post(SHELF + "/api/requests", json_body={
+    "book_data": {"title": "The Time Machine", "author": "H. G. Wells", "provider": "openlibrary", "provider_id": "OL52267W"},
+    "release_data": {"source": "direct_download", "source_id": "0" * 32, "title": "The Time Machine", "format": "epub"},
+    "context": {"source": "direct_download", "content_type": "ebook", "request_level": "release"}})
+check(st == 201, "Shelfmark obeys the portal's approval rule: a reader's download becomes a pending request (L16)", f"{st} {b[:120]!r}")
+st, h, b = pa.get(PORTAL + "/status")
+m = re.search(rb'action="/shelfmark/(\d+)/deny"', b)
+check(b"Pending approval in Shelfmark" in b and b"The Time Machine" in b and bool(m), "it appears on the portal's Pending card")
+if m:
+    portal_post(pa, f"/shelfmark/{m.group(1).decode()}/deny", "/status", {"reason": "e2e: denied from the portal"})
+    st, h, b = ss.get(SHELF + "/api/requests")
+    check(b'"status":"rejected"' in b.replace(b" ", b"") and b"denied from the portal" in b, "denied from the portal, and the reader sees it (with the reason) in Shelfmark")
 
 print(f"\nE2E RESULT: {fails} failed")
 sys.exit(fails)

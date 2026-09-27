@@ -41,6 +41,7 @@ CWA_PROCESSED_DIR  = os.environ.get("CWA_PROCESSED_DIR", "") or os.path.join(os.
 DROPBOX_DIR   = os.environ.get("DROPBOX_DIR", "/dropbox")     # per-user subfolders, watched for files
 INTAKE_TOKEN  = os.environ.get("INTAKE_TOKEN", "")            # bearer token for POST /intake automation
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "95"))    # browser upload size cap (Cloudflare Free: 100 MB bodies)
+MAX_UPLOAD_TAILNET_MB = int(os.environ.get("MAX_UPLOAD_TAILNET_MB", "2048") or 2048)   # L18: upload.<domain>, Tailscale only
 MAX_EBOOK_MB  = int(os.environ.get("MAX_EBOOK_MB", "200"))    # worker download caps, per kind ...
 MAX_AUDIO_MB  = int(os.environ.get("MAX_AUDIO_MB", "2048"))   # ... (LibriVox zips of long books run past 1 GB)
 # pypdf holds a whole PDF (and its clone) in memory while it embeds the owner tag; a 262 MB
@@ -85,7 +86,9 @@ METADATA_ENABLED = _bool("METADATA_ENABLED", True)
 
 SOURCES = {
     "gutenberg":       _bool("SRC_GUTENBERG", True),
-    "standard_ebooks": _bool("SRC_STANDARD",  False),  # its OPDS feed now answers 401 without a Patrons Circle login
+    # its OPDS search feed needs a Patrons Circle login, but its downloads are public: book pages
+    # reach them through Open Library's cross-links (bookmeta.py), so it is on by default again
+    "standard_ebooks": _bool("SRC_STANDARD",  True),
     "internet_archive":_bool("SRC_ARCHIVE",   True),
     "librivox":        _bool("SRC_LIBRIVOX",  True),
     "mycatalog":       _bool("SRC_MYCATALOG", False),   # your own self-hosted OPDS catalog
@@ -103,6 +106,13 @@ SOURCE_LABELS = {
 def source_label(source):
     if source == "mycatalog":
         return MYCATALOG_NAME
+    if (source or "").startswith("opds:"):
+        try:
+            import catalogs
+            c = catalogs.get(source)
+            return c["name"] if c else source[5:]
+        except Exception:
+            return source[5:]
     return SOURCE_LABELS.get(source) or (source or "?").replace("_", " ")
 
 # --- Your own catalog (OPDS) -------------------------------------------------
@@ -130,11 +140,44 @@ LOCKOUT_WINDOW  = int(os.environ.get("LOCKOUT_WINDOW", "900"))     # ... within 
 LOCKOUT_SECONDS = int(os.environ.get("LOCKOUT_SECONDS", "900"))    # ... lock that pair for this long
 LOCKOUT_IP_FAILS = int(os.environ.get("LOCKOUT_IP_FAILS", "20"))   # any usernames from one IP
 MAX_REQUESTS_PER_DAY = int(os.environ.get("MAX_REQUESTS_PER_DAY", "30"))  # non-admins; 0 = unlimited
+# Keep looking (wanted.py): a reader may leave this many open "keep looking" entries; each is
+# given up (and the reader told) after WANTED_DAYS without a match.
+WANTED_MAX_PER_USER = int(os.environ.get("WANTED_MAX_PER_USER", "25") or 25)
+WANTED_DAYS = int(os.environ.get("WANTED_DAYS", "180") or 180)
+# The language a reader reads in, by default (each reader can change theirs on Devices). A copy
+# in another language is never requested automatically. ISO 639-1 codes.
+LANGUAGES = {"en": "English", "fr": "French", "de": "German", "es": "Spanish", "it": "Italian",
+             "pt": "Portuguese", "nl": "Dutch", "sv": "Swedish", "fi": "Finnish", "pl": "Polish",
+             "ru": "Russian", "hi": "Hindi", "ml": "Malayalam", "ta": "Tamil", "zh": "Chinese",
+             "ja": "Japanese", "la": "Latin", "el": "Greek"}
+BOOK_LANGUAGE = (os.environ.get("BOOK_LANGUAGE") or os.environ.get("SHELFMARK_LANGUAGE") or "en").lower()
+if BOOK_LANGUAGE not in LANGUAGES:
+    BOOK_LANGUAGE = "en"
+GOOGLE_BOOKS_API_KEY = os.environ.get("GOOGLE_BOOKS_API_KEY", "")
+# L16: the portal reads and decides Shelfmark's pending requests (shelfmark_api.py)
+# L17: optional Cloudflare Turnstile on the portal login (Security -> Login bot check). Off
+# unless both are set; when on, the login page alone may load Cloudflare's challenge script.
+# L08: the synthetic journey's two accounts (Operations -> Canary journey). Hidden from every user
+# list; the host job alone logs in as them.
+CANARY_USERS = tuple(n.strip() for n in os.environ.get("CANARY_USERS", "").split(",") if n.strip())
+TURNSTILE_SITEKEY = os.environ.get("TURNSTILE_SITEKEY", "")
+TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
+SHELFMARK_API = os.environ.get("SHELFMARK_API", "http://127.0.0.1:8084").rstrip("/")
+SHELFMARK_SVC_USER = os.environ.get("SHELFMARK_SVC_USER", "")
+SHELFMARK_SVC_PASS = os.environ.get("SHELFMARK_SVC_PASS", "")
+# L05: "proxy" while the Authelia gate is on (Shelfmark then trusts Remote-User from Caddy); the
+# portal, a host process Shelfmark trusts the same way, then sends the service name as the header
+SHELFMARK_AUTH_METHOD = (os.environ.get("SHELFMARK_AUTH_METHOD") or "cwa").strip().lower()
+ABS_OIDC_SECRET = os.environ.get("ABS_OIDC_SECRET", "")          # L05: Audiobookshelf's client secret at Authelia
+HARDCOVER_API_KEY = os.environ.get("HARDCOVER_API_KEY", "")
 SESSION_HOURS   = int(os.environ.get("SESSION_HOURS", "12"))
 TRUST_PROXY     = _bool("TRUST_PROXY", True)      # Caddy is the only thing in front (127.0.0.1 bind)
 ADMIN_EMAIL     = os.environ.get("ADMIN_EMAIL", "")
 KOSYNC_ENABLED  = _bool("KOSYNC_ENABLED", False)  # set by the TUI when CWA's KOReader sync is on
-AUTHELIA_ENABLED = _bool("AUTHELIA_ENABLED", False)  # users are then managed in the TUI only (Authelia has its own user file)
+AUTHELIA_ENABLED = _bool("AUTHELIA_ENABLED", False)
+# L05: with the gate on, Caddy adds X-Bookstack-Gate: <GATE_SECRET> to requests Authelia let
+# through (and strips any the client sent). Only then is Remote-User trusted: one login.
+GATE_SECRET = os.environ.get("GATE_SECRET", "")  # users are then managed in the TUI only (Authelia has its own user file)
 TORRENTS_ENABLED = _bool("TORRENTS_ENABLED", False)  # qBittorrent is an opt-in compose profile
 EPHEMERA_ENABLED = _bool("EPHEMERA_ENABLED", False)  # ditto; its vhost only exists when it is on
 
@@ -161,7 +204,18 @@ def admin_links():
 
 # --- Calibre library files (read-only) for direct download / Send-to-Kindle ----------
 LIBRARY_DIR = os.environ.get("LIBRARY_DIR", os.path.dirname(CALIBRE_DB))
-FORMATS     = ("epub", "azw3", "mobi", "pdf")   # preferred-format choices (kepub is never chosen; see below)
+import shutil as _shutil
+KEPUBIFY = _shutil.which("kepubify") or ""
+# preferred-format choices. 'kepub' is offered when the portal image carries kepubify (L11): the
+# portal converts on download, one book at a time, into a size-capped cache.
+FORMATS     = ("epub", "azw3", "mobi", "pdf") + (("kepub",) if KEPUBIFY else ())
+KEPUB_CACHE_DIR = os.environ.get("KEPUB_CACHE_DIR", os.path.join(os.path.dirname(os.environ.get("STATE_DB", "/state/librarian.db")), "kepub"))
+KEPUB_CACHE_MB = int(os.environ.get("KEPUB_CACHE_MB", "512") or 512)
+# On-demand conversion ("Convert to…" on a book's page): Calibre's own ebook-convert, run by
+# the host job inside the CWA container, one at a time. Heavy on 2 cores, hence a daily limit.
+CONVERT_TARGETS = ("epub", "azw3", "mobi", "pdf", "txt", "docx", "fb2", "rtf")
+CONVERT_SOURCES = ("epub", "azw3", "mobi", "fb2", "docx", "rtf", "txt", "pdf")   # best source first
+CONVERT_MAX_PER_DAY = int(os.environ.get("CONVERT_MAX_PER_DAY", "10") or 10)
 # What /download serves if the file is there. 'kepub' stays in this list on purpose even
 # though nothing in this stack produces one today: CWA v4.0.6 only autodetects kepubify at
 # /opt/kepubify/kepubify-linux-{64,32}bit and its image installs it at /usr/bin/kepubify, so

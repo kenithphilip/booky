@@ -12,7 +12,7 @@ PUBLIC = {"X-Forwarded-For": "203.0.113.5"}          # a client behind Caddy, no
 
 def _alive(monkeypatch):
     now = time.time()
-    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "housekeeping": now})
+    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "housekeeping": now, "wanted": now})
 
 def test_anonymous_is_redirected_and_healthz_is_plain_for_the_public(client, monkeypatch):
     for p in ("/", "/status", "/library", "/devices", "/upload", "/admin", "/download/1/epub"):
@@ -26,7 +26,7 @@ def test_anonymous_is_redirected_and_healthz_is_plain_for_the_public(client, mon
 def test_healthz_json_on_loopback_or_for_admins_and_503_when_degraded(client, users, monkeypatch):
     _alive(monkeypatch)
     r = client.get("/healthz")                               # test client = 127.0.0.1
-    assert r.status_code == 200 and r.get_json()["ok"] and set(r.get_json()["heartbeats"]) == {"queue", "dropbox", "housekeeping"}
+    assert r.status_code == 200 and r.get_json()["ok"] and set(r.get_json()["heartbeats"]) == {"queue", "dropbox", "housekeeping", "wanted"}
     assert r.get_json()["ingest_pending"] == 0 and r.get_json()["free_gb"] > 0
     worker.HEARTBEAT["dropbox"] = time.time() - 500
     r = client.get("/healthz", headers=PUBLIC); assert r.status_code == 503 and r.data == b"degraded"
@@ -188,7 +188,9 @@ def test_devices_page_manages_kindle_kobo_prefs_and_test_mail(client, users, mon
     # guards against, reading as coverage while proving nothing. CWA v4.0.6 autodetects
     # kepubify only at /opt/kepubify/kepubify-linux-{64,32}bit and its image installs it at
     # /usr/bin/kepubify, so no KEPUB promise belongs anywhere on this page.
-    assert b"/opds/</span>" in r.data and b"USB only" in r.data and b"kepub" not in r.data.lower()
+    assert b"/opds/</span>" in r.data and b"USB only" in r.data
+    # KEPUB is a choice exactly when the image carries kepubify (L11: converted on download)
+    assert (b'value="kepub"' in r.data) == bool(config.KEPUBIFY)
     r = post(client, "/devices", action="kindle", kindle_mail="alice_9@kindle.com")
     assert b"Kindle address saved" in r.data and cwa.get_user("alice")["kindle_mail"] == "alice_9@kindle.com"
     r = post(client, "/devices", action="kindle", kindle_mail="nope"); assert b"does not look like" in r.data
@@ -200,7 +202,9 @@ def test_devices_page_manages_kindle_kobo_prefs_and_test_mail(client, users, mon
     assert cwa.kobo_token("alice", create=False) != m.group(1).decode() and b"regenerated" in r.data
     r = post(client, "/devices", action="prefs", preferred_format="azw3", auto_kindle="1")
     p = db.get_prefs("alice"); assert (p["preferred_format"], p["auto_kindle"], p["notify_email"]) == ("azw3", True, False)
-    r = post(client, "/devices", action="prefs", preferred_format="kepub"); assert db.get_prefs("alice")["preferred_format"] == "azw3"
+    r = post(client, "/devices", action="prefs", preferred_format="kepub")
+    assert db.get_prefs("alice")["preferred_format"] == ("kepub" if config.KEPUBIFY else "azw3")
+    r = post(client, "/devices", action="prefs", preferred_format="exe"); assert db.get_prefs("alice")["preferred_format"] in ("kepub", "azw3")
     assert b"Kobo sync is not switched on" in client.get("/devices").data
     cwa.enable_kobo_sync()
     assert b"Kobo sync is not switched on" not in client.get("/devices").data
@@ -277,7 +281,11 @@ def test_send_to_kindle_only_mails_formats_amazon_accepts(client, users, monkeyp
     db.set_prefs("alice", preferred_format="azw3")
     r = client.get("/library"); assert r.data.count(b"Send to Kindle") == 1 and b"no Kindle format yet" in r.data
     r = post(client, "/kindle/1", format="azw3")            # pref/format azw3 -> the EPUB goes out
-    assert b"sent to alice@kindle.com" in r.data and sent == [("alice@kindle.com", "Alice Book - Ann Author.epub")]
+    assert b"on its way" in r.data and sent == [], "queued: the worker mails it (L21), not the web request"
+    import worker
+    while worker.kindle_once(): pass
+    assert sent == [("alice@kindle.com", "Alice Book - Ann Author.epub")]
+    assert b"sent to alice@kindle.com" in client.get("/status").data, "the result shows on Status"
     r = post(client, "/kindle/3"); assert b"No Kindle-compatible format yet" in r.data and len(sent) == 1
     assert post(client, "/kindle/2").status_code == 404      # bob's book
     r = client.get("/devices"); assert b"lib@example.test" in r.data      # approved-sender hint shows the real From
@@ -321,10 +329,11 @@ def test_admin_dashboard_user_creation_and_needs_tag_list(client, users, monkeyp
     r = post(client, "/admin", action="add_user", name="bad name", email="b@example.test", password="carolpass1"); assert b"Could not create" in r.data
     r = post(client, "/admin", action="add_user", name="dave", password="davepass12")           # F49: a real e-mail is required
     assert b"real e-mail address" in r.data and cwa.get_user("dave") is None
-    monkeypatch.setattr(config, "AUTHELIA_ENABLED", True)                                       # F24: TUI is the only way then
-    assert b"bookstack.sh" in client.get("/admin").data
+    monkeypatch.setattr(config, "AUTHELIA_ENABLED", True)          # L05: the gate login comes along (was F24: TUI only)
     r = post(client, "/admin", action="add_user", name="erin", email="e@example.test", password="erinpass12")
-    assert b"Authelia is on" in r.data and cwa.get_user("erin") is None
+    assert cwa.get_user("erin") and b"same password" in r.data
+    row = [g for g in db.gate_pending() if g["user"] == "erin"][0]
+    assert row["email"] == "e@example.test" and row["hash"].startswith("$pbkdf2-sha512$") and "erinpass12" not in row["hash"]
     monkeypatch.setattr(config, "AUTHELIA_ENABLED", False)
     # unisolated user is flagged
     c = sqlite3.connect(config.CWA_DB); c.execute("UPDATE user SET allowed_tags='' WHERE name='bob'"); c.commit(); c.close()
@@ -558,8 +567,8 @@ def test_search_page_flags_duplicates_and_lists_sources(client, users, monkeypat
     monkeypatch.setattr(fetchers, "search", lambda q: [{"source": "gutenberg", "kind": "ebook", "title": "Emma", "author": "Austen",
                                                         "identifier": "gutenberg:158", "format": "epub", "download_url": "https://x", "is_torrent": False}])
     login(client, "alice", users["alice"])
-    r = client.get("/?q=emma")
-    assert b"in library" not in r.data and b"Request" in r.data and b"gutenberg" in r.data     # F53: bob's copy is not hers
+    r = client.get("/?q=emma&mode=catalogs")
+    assert b"in library" not in r.data and b"Request" in r.data and b"Project Gutenberg" in r.data     # F53: bob's copy is not hers
     add_calibre_book(2, "Emma", "Austen", tags=["owner:alice"])
-    assert b"in library" in client.get("/?q=emma").data
+    assert b"in library" in client.get("/?q=emma&mode=catalogs").data
     assert b"No matches" in client.get("/?q=zzz").data or True

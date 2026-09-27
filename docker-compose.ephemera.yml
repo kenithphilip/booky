@@ -83,6 +83,8 @@ services:
       - LG_BASE_URL=${EPHEMERA_LG_BASE_URL:-}
       - AA_API_KEY=${EPHEMERA_AA_API_KEY:-}
       - FLARESOLVERR_URL=http://flaresolverr:8191
+    # L01: shares a network with FlareSolverr only — not with Shelfmark, not with anything else
+    networks: { eph: {} }
     ports:
       - "127.0.0.1:8286:8286"
     volumes:
@@ -99,3 +101,11 @@ services:
         condition: service_started
         required: false
     # Caddy serves it at ephemera.<domain> (Tailscale only, basic_auth)
+
+  # FlareSolverr (docker-compose.yml) joins Ephemera's network too; the two readers of it never
+  # share one with each other.
+  flaresolverr:
+    networks: { eph: {} }
+
+networks:
+  eph: {}

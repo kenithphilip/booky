@@ -16,37 +16,57 @@ PREF_TYPES = ("epub", "kepub", "mobi", "azw3", "pdf")
 # fetchers imports this module.)
 TIMEOUT = 10
 
-def _auth():
-    if config.MYCATALOG_USER:
-        return (config.MYCATALOG_USER, config.MYCATALOG_PASS)
-    return None
+DC = "http://purl.org/dc/terms/"
+DC11 = "http://purl.org/dc/elements/1.1/"
 
-def search(q, limit=12, budget=None):
-    url = config.MYCATALOG_URL
+
+def _legacy():
+    return {"source": "mycatalog", "url": config.MYCATALOG_URL, "user": config.MYCATALOG_USER,
+            "password": config.MYCATALOG_PASS}
+
+
+def _ids(e):
+    """dc:identifier values an OPDS entry carries (urn:isbn:…, urn:uuid:…, plain ISBNs): the
+    evidence the work page scores a copy with."""
+    out = []
+    for tag in (f"{{{DC}}}identifier", f"{{{DC11}}}identifier"):
+        for el in e.findall(tag):
+            v = (el.text or "").strip().lower()
+            if v.startswith("urn:isbn:") or v.replace("-", "").isdigit():
+                out.append(("isbn", v.replace("urn:isbn:", "")))
+            elif v.startswith("urn:uuid:"):
+                out.append(("uuid", v[9:]))
+    return out
+
+
+def search(q, limit=12, budget=None, catalog=None):
+    """Search ONE OPDS catalog (catalogs.py). catalog=None: the v4 single catalog in .env."""
+    cat = catalog or _legacy()
+    url = cat["url"]
     if not url:
         return []
     if "{q}" in url:
         url = url.replace("{q}", urllib.parse.quote(q))
     out = []
     try:
-        # Build one when the caller did not, exactly as the other four adapters do. Without it
-        # the fallback (3, TIMEOUT) is a per-connection timeout, not a wall-clock bound: a
-        # catalog that accepts the connection and then stalls could outlive both SOURCE_BUDGET
-        # and the page's own SEARCH_DEADLINE, which is what the budget exists to prevent.
-        # imported here, not at module scope: fetchers imports this module, so a top-level
-        # import would be circular
+        # Build one when the caller did not, exactly as the other adapters do. Without it
+        # the fallback is a per-connection timeout, not a wall-clock bound: a catalog that
+        # accepts the connection and then stalls could outlive both SOURCE_BUDGET and the
+        # page's own SEARCH_DEADLINE, which is what the budget exists to prevent.
+        # imported here, not at module scope: fetchers imports this module
         import fetchers
         budget = budget or fetchers._Budget()
-        r = requests.get(url, headers=UA, auth=_auth(), timeout=budget.pair(read=TIMEOUT))
+        auth = (cat["user"], cat["password"]) if cat.get("user") else None
+        r = requests.get(url, headers=UA, auth=auth, timeout=budget.pair(read=TIMEOUT))
         r.raise_for_status()
         root = etree.fromstring(r.content)
         ql = q.lower().strip()
+        base = urllib.parse.urlsplit(cat["url"])
         for e in root.findall(f"{{{ATOM}}}entry"):
             title = (e.findtext(f"{{{ATOM}}}title") or "").strip()
             author = (e.findtext(f"{{{ATOM}}}author/{{{ATOM}}}name") or "").strip()
-            if ql and ql not in f"{title} {author}".lower():
+            if ql and not all(w in f"{title} {author}".lower() for w in ql.split()):
                 continue
-            # choose the best acquisition link
             best = None
             for link in e.findall(f"{{{ATOM}}}link"):
                 rel, typ, href = link.get("rel", ""), link.get("type", ""), link.get("href", "")
@@ -58,13 +78,13 @@ def search(q, limit=12, budget=None):
                 continue
             href = best[1]
             if href.startswith("/"):
-                base = urllib.parse.urlsplit(config.MYCATALOG_URL)
                 href = f"{base.scheme}://{base.netloc}{href}"
             fmt = next((t for t in PREF_TYPES if t in (best[2] or "").lower()), "epub")
-            out.append({"source": "mycatalog", "kind": "ebook",
+            lang = (e.findtext(f"{{{DC}}}language") or e.findtext(f"{{{DC11}}}language") or "").strip() or None
+            out.append({"source": cat["source"], "kind": "ebook",
                         "title": title or "(untitled)", "author": author or "Unknown",
-                        "identifier": f"mycatalog:{href}", "format": fmt,
-                        "download_url": href, "is_torrent": False})
+                        "identifier": f"{cat['source']}:{href}", "format": fmt, "language": lang,
+                        "src_ids": _ids(e), "download_url": href, "is_torrent": False})
             if len(out) >= limit:
                 break
     except Exception:

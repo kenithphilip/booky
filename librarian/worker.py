@@ -11,7 +11,7 @@ import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddre
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
-import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe
+import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe, wanted
 from tagger import (add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError,
                     MAX_ZIP_MEMBERS as TAG_MAX_ZIP_MEMBERS)
 
@@ -98,7 +98,9 @@ REDIRECTS = (301, 302, 303, 307, 308)
 
 def _trusted_netlocs():
     """The admin's own catalog / Gutenberg mirror may legitimately sit on the tailnet or LAN."""
-    return {urlsplit(u).netloc.lower() for u in (config.MYCATALOG_URL, config.GUTENBERG_MIRROR) if u} - {""}
+    import catalogs
+    return ({urlsplit(u).netloc.lower() for u in (config.MYCATALOG_URL, config.GUTENBERG_MIRROR) if u}
+            | catalogs.trusted_netlocs()) - {""}
 
 def _check_target(url):
     """Refuse URLs whose host resolves to loopback, private, link-local, CGNAT, multicast or
@@ -130,11 +132,13 @@ def _check_target(url):
 def _auth_for(req, url):
     """Catalog credentials go to the configured catalog origin only — never to a host the
     request form supplied or a redirect pointed at."""
-    if (req or {}).get("source") != "mycatalog" or not config.MYCATALOG_USER:
+    import catalogs
+    cat = catalogs.get((req or {}).get("source"))
+    if not cat or not cat["user"]:
         return None
-    c, p = urlsplit(config.MYCATALOG_URL), urlsplit(url)
+    c, p = urlsplit(cat["url"]), urlsplit(url)
     if c.netloc and (p.scheme, p.netloc.lower()) == (c.scheme, c.netloc.lower()):
-        return (config.MYCATALOG_USER, config.MYCATALOG_PASS)
+        return (cat["user"], cat["password"])
     return None
 
 def _limit_for(kind):
@@ -826,6 +830,36 @@ def _folder_leftovers(path):
     return [os.path.relpath(os.path.join(r, n), path) for r, _d, ns in os.walk(path) for n in ns
             if _ext(n) not in SIDECAR_EXTS and not n.startswith(".")]
 
+def _opf_sidecar(book_path):
+    """The Calibre-style sidecar next to a book — '<name>.opf' or the folder's 'metadata.opf'
+    (a Calibre library export keeps one per book folder). Used to be deleted unread as noise;
+    it is often the ONLY identification a MOBI or AZW3 carries."""
+    from lxml import etree
+    from tagger import _read_opf_meta
+    d = os.path.dirname(book_path)
+    for cand in (os.path.splitext(book_path)[0] + ".opf", os.path.join(d, "metadata.opf")):
+        if not os.path.isfile(cand) or os.path.islink(cand) or os.path.getsize(cand) > 2 * 1024 * 1024:
+            continue
+        try:
+            root = etree.parse(cand, etree.XMLParser(resolve_entities=False, no_network=True)).getroot()
+        except (etree.XMLSyntaxError, OSError):
+            continue
+        meta = root.find("{http://www.idpf.org/2007/opf}metadata")
+        if meta is None:
+            meta = next((e for e in root.iter() if isinstance(e.tag, str) and e.tag.endswith("metadata")), None)
+        if meta is not None:
+            got = _read_opf_meta(meta)
+            if got.get("title") or got.get("identifiers"):
+                return got
+    return None
+
+def _ingest_with_sidecar(f, owner, rid):
+    side = _opf_sidecar(f)
+    note = _ingest_file_entry(f, owner, rid)
+    if side:
+        db.merge_file_meta(rid, side)
+    return note
+
 def _ebook_folder(p, owner, name, box):
     """A folder of ebooks (a Calibre export, an rsync of a collection): every ebook file in it
     becomes its own request; the folder goes away once only sidecar files are left."""
@@ -838,7 +872,7 @@ def _ebook_folder(p, owner, name, box):
             f = os.path.join(root, n)
             rel = os.path.relpath(f, p)
             handled += _handle(f, owner, f"{name}/{rel}", "ebook", box, f"{name} - {rel.replace(os.sep, ' - ')}",
-                               lambda rid, f=f: _ingest_file_entry(f, owner, rid))
+                               lambda rid, f=f: _ingest_with_sidecar(f, owner, rid))
     if not _folder_leftovers(p) and not any(_ext(n) in config.EBOOK_EXTS for _r, _d, ns in os.walk(p) for n in ns):
         shutil.rmtree(p, ignore_errors=True)
     return handled
@@ -1283,6 +1317,14 @@ def reconcile_imports(now=None):
                                          "request, but the file had already been handed over)")
                 changed += 1
             continue
+        if r["status"] == "done" and not r.get("calibre_id"):
+            # Already reported done, but never joined to its Calibre row: for an EPUB carrying
+            # its own metadata Calibre renames the file and the marker is gone, so the book was
+            # invisible to the metadata push and the book page (seen on the real stack).
+            cid = _find_imported(r)
+            if cid:
+                db.link_calibre(r["id"], cid, r["owner"])
+            continue
         # An 'importing' row is only closed here when we KNOW its file reached the ingest
         # folder: either metadata.db has it, or this loop is the one that re-opened it (a row
         # that is still downloading has neither and must be left alone).
@@ -1361,9 +1403,11 @@ def housekeeping_once(now=None):
     now = now or time.time()
     process_tag_jobs(now)
     _guarded(nudge_ingest_once, now)
+    _guarded(kindle_once, now)
     if now - _LAST_RECONCILE[0] >= RECONCILE_EVERY:
         _LAST_RECONCILE[0] = now
         _guarded(reconcile_imports)
+        _guarded(reconcile_untagged, now)
     if now - _LAST_ENRICH[0] >= ENRICH_EVERY:
         _LAST_ENRICH[0] = now
         _guarded(enrich_once, now)
@@ -1373,6 +1417,7 @@ def housekeeping_once(now=None):
         cwa.checkpoint_passive()
         _guarded(check_password_drift)
         _guarded(fail_orphaned_pending)
+        _guarded(db.candidate_purge)
 
 ENRICH_EVERY = 120          # seconds between enrichment passes
 ENRICH_BATCH = 3            # books per pass: 2 cores, beside Calibre conversions
@@ -1397,6 +1442,8 @@ def enrich_once(now=None):
         query = {"title": r["file_title"] or r["title"],
                  "author": r["file_author"] or r["author"] or "",
                  "identifiers": db.file_ids(r["id"])}
+        if r.get("work_key"):                  # chosen from its work page: identified exactly
+            query["identifiers"] = query["identifiers"] + [{"kind": "openlibrary_work", "value": r["work_key"]}]
         key = metadata.cache_key(query)
         if metadata.negative_cached(key, now=now):
             # the whole chain already drew a blank on this one; re-asking three providers about
@@ -1419,6 +1466,286 @@ def enrich_once(now=None):
                      r["id"], query["title"][:60], metadata.describe_trace(trace))
     return done
 
+# ---- keep looking (wanted.py) ----------------------------------------------------------------
+WANTED_EVERY = 60           # seconds between passes; each entry has its own schedule (wanted.SCHEDULE)
+WANTED_BATCH = 2            # entries looked for per pass: every one is a search of every catalog
+
+def _owner_admin(owner):
+    try:
+        u = cwa.get_user(owner)
+    except Exception:
+        return None
+    if not u:
+        return None
+    return bool(u["role"] & cwa.ROLE_ADMIN)
+
+def _wanted_ids(w, now):
+    """ISBNs for a wanted book, from the metadata chain, asked ONCE per entry (on its first
+    look). Used only to VERIFY a search result, never as the query. Adopted only when the
+    chain's book has the same normalised title and does not disagree on the author, so a
+    namesake's edition cannot vouch for the wrong result."""
+    if w["identifiers"] or w["checks"] or not config.METADATA_ENABLED:
+        return w["identifiers"] or []
+    query = {"title": w["title"], "author": w["author"] or "", "identifiers": []}
+    key = metadata.cache_key(query)
+    if metadata.negative_cached(key, now=now):
+        return []
+    try:
+        merged, _trace = metadata.fetch(query, now=now)
+    except Exception:
+        log.exception("metadata lookup failed for wanted %s", w["id"])
+        return []
+    if not merged:
+        metadata.remember_miss(key, now=now)
+        return []
+    names = " ".join(a.get("name") or "" for a in merged.get("authors") or [])
+    if dedupe.norm_title(merged.get("title")) != dedupe.norm_title(w["title"]):
+        return []
+    wa, ma = dedupe.author_tokens(w["author"]), dedupe.author_tokens(names)
+    if wa and ma and not wa & ma:
+        return []
+    return [i for i in merged.get("identifiers") or [] if str(i.get("kind", "")).startswith("isbn")]
+
+def _wanted_request(w, r, conf, reasons, is_admin):
+    """Turn a match into an ordinary request, under the same rules a click on Request obeys:
+    enabled source, a download address that source really hands out, the approval setting and
+    the reader's daily limit. Returns (rid, status) or (None, why)."""
+    req = {"kind": wanted.result_kind(r), "source": r.get("source"), "identifier": r.get("identifier"),
+           "title": r.get("title"), "author": r.get("author"), "download_url": r.get("download_url"),
+           # the evidence the source gave, so the download is checked against it
+           "expect_size": r.get("expect_size"), "expect_md5": r.get("expect_md5"),
+           "expect_sha1": r.get("expect_sha1"), "src_ids": r.get("src_ids"),
+           "work_key": w.get("work_key") or r.get("work_key"), "language": r.get("language")}
+    import fetchers                           # lazy: fetchers imports opds, which imports worker
+    if not fetchers.source_enabled(req["source"]) or not req["download_url"]:
+        return None, "that source is switched off"
+    if not fetchers.url_allowed(req["source"], req["download_url"]):
+        log.warning("wanted %s: refused a download address %s did not hand out", w["id"], req["source"])
+        return None, "the download address was not one that source hands out"
+    status = "queued" if (is_admin or not config.APPROVALS_REQUIRED) else "pending"
+    limit = 0 if is_admin else config.MAX_REQUESTS_PER_DAY
+    rid, _left, resets = db.add_if_under_quota(w["owner"], req, limit, status=status)
+    if rid is None:
+        return None, f"your daily request limit is used up (it resets at {time.strftime('%H:%M', time.localtime(resets))})"
+    db.set_match(rid, conf, reasons, wanted_kind=w["kind"])
+    db.audit("wanted_request", user=w["owner"],
+             detail=f"wanted #{w['id']} -> request #{rid} {req['title']} [{req['source']}] ({conf:.2f}) -> {status}")
+    if status == "pending":
+        notify.send("requested", db.get(rid))
+    return rid, status
+
+def _wanted_from_work(w, ids):
+    """The book's own catalogue links first (bookmeta.copies): a new Gutenberg, LibriVox or
+    Standard Ebooks copy appears there, already tied to this exact work, and each copy is read
+    and verified — language included. (result, confidence, reasons) like wanted.best, or None."""
+    import bookmeta
+    try:
+        work = bookmeta.work(w["work_key"])
+        if not work:
+            return None
+        lang = db.get_prefs(w["owner"])["language"]
+        rejected = set(w.get("rejected") or [])
+        for c in bookmeta.copies(work, lang):
+            if c["kind"] != (w["kind"] or "ebook") or c["download_url"] in rejected:
+                continue
+            m = c["match"]
+            if m["verdict"] == "reject":
+                continue
+            conf = 1 - m["distance"] if m["verdict"] == "auto" else min(wanted.AUTO - 0.05, 1 - m["distance"])
+            return dict(c, work_key=work["key"], language=lang), round(conf, 3), m["reasons"]
+    except bookmeta.Unavailable as e:
+        log.info("wanted %s: Open Library unavailable (%s); falling back to the catalogues", w["id"], e)
+    return None
+
+def _wanted_note(w, event, detail=None):
+    notify.send(event, {"owner": w["owner"], "title": w["title"], "author": w["author"],
+                        "source": "wanted", "status": event, "detail": detail})
+
+def check_wanted(w, now=None):
+    """One look for one wanted book. Returns what happened: 'requested', 'candidate',
+    'in-library', 'waiting', 'nothing', 'gone' or 'cancelled'."""
+    now = now or time.time()
+    is_admin = _owner_admin(w["owner"])
+    if is_admin is None:
+        db.wanted_update(w["id"], only_if_open=True, status="cancelled",
+                         detail="the account that asked for it no longer exists")
+        return "gone"
+    # already here? (uploaded meanwhile, or found by Shelfmark) — then there is nothing to find
+    ids = _wanted_ids(w, now)
+    hit = dedupe.Index(w["owner"], False).match(w["title"], w["author"], ids)
+    if hit and hit["how"] != "title":
+        if db.wanted_update(w["id"], only_if_open=True, status="found", identifiers=ids,
+                            last_check=now, detail=f"already in your library (matched by {hit['how']})"):
+            return "in-library"
+        return "cancelled"
+    import fetchers
+    nxt = now + wanted.next_delay(w["checks"] + 1)
+    base = dict(checks=w["checks"] + 1, last_check=now, next_check=nxt, identifiers=ids)
+    got = _wanted_from_work(w, ids) if w.get("work_key") else None
+    results = []
+    if not got:
+        results = fetchers.search(wanted.query(w))
+        lang = db.get_prefs(w["owner"])["language"]
+        got = wanted.best(dict(w, identifiers=ids, language=lang), results, rejected=w["rejected"])
+    if not got:
+        db.wanted_update(w["id"], only_if_open=True, **base,
+                         detail=f"looked {w['checks'] + 1} time(s); not in any catalog yet ({len(results)} unrelated result(s))")
+        return "nothing"
+    r, conf, reasons = got
+    if conf >= wanted.AUTO:
+        rid, why = _wanted_request(w, r, conf, reasons, is_admin)
+        if rid:
+            if db.wanted_update(w["id"], only_if_open=True, **base, status="found", rid=rid,
+                                confidence=conf, reasons=reasons, candidate=r,
+                                detail=f"found at {config.SOURCE_LABELS.get(r.get('source'), r.get('source'))}; request #{rid} ({why})"):
+                _wanted_note(w, "wanted-found", f"from {config.SOURCE_LABELS.get(r.get('source'), r.get('source'))}")
+                return "requested"
+            return "cancelled"
+        # a match we cannot request right now (limit, source off): keep it, retry sooner
+        db.wanted_update(w["id"], only_if_open=True, **dict(base, next_check=now + 3600),
+                         status="candidate", candidate=r, confidence=conf, reasons=reasons,
+                         detail=f"found, not requested yet: {why}")
+        return "waiting"
+    fresh = (w.get("candidate") or {}).get("download_url") != r.get("download_url")
+    if db.wanted_update(w["id"], only_if_open=True, **base, status="candidate", candidate=r,
+                        confidence=conf, reasons=reasons,
+                        detail="a possible match turned up; confirm it is the right book"):
+        if fresh:
+            _wanted_note(w, "wanted-candidate", "; ".join(reasons))
+        return "candidate"
+    return "cancelled"
+
+def wanted_once(now=None):
+    """Expire old entries, then look for the few that are due."""
+    now = now or time.time()
+    for w in db.wanted_expired(now - config.WANTED_DAYS * 86400):
+        if db.wanted_update(w["id"], only_if_open=True, status="expired",
+                            detail=f"not found in {config.WANTED_DAYS} days; stopped looking"):
+            _wanted_note(w, "wanted-expired")
+    if _disk_paused():
+        return 0                             # nothing new is queued while the disk is full
+    n = 0
+    for w in db.wanted_due(now, WANTED_BATCH):
+        _beat("wanted")
+        try:
+            check_wanted(w, now)
+        except Exception:
+            log.exception("keep-looking check failed for wanted %s", w["id"])
+            db.wanted_update(w["id"], only_if_open=True, next_check=now + 3600)
+        n += 1
+    return n
+
+def _find_imported(r):
+    """The Calibre book of a finished request: the ' [owner-rid]' marker, else the reader's OWN
+    owner tag + arrived after the file was handed over + a title agreeing with the file's own +
+    not already joined to another request — and exactly one such book. Anything less certain
+    stays unjoined; a wrong join would push one book's metadata onto another."""
+    import sqlite3, matching
+    cid = _in_calibre(_ingest_marker(r["owner"], r["id"]))
+    if cid:
+        return cid
+    want = matching.clean(r.get("file_title") or r.get("title") or "")
+    if not want:
+        return None
+    try:
+        c = library._conn()
+        try:
+            rows = c.execute(
+                "SELECT b.id, b.title FROM books b JOIN books_tags_link l ON l.book=b.id JOIN tags t ON t.id=l.tag "
+                "WHERE t.name=? AND b.timestamp >= datetime(?, 'unixepoch', '-600 seconds')",
+                (f"{config.OWNER_PREFIX}{r['owner']}", r.get("created") or r.get("updated") or 0)).fetchall()
+        finally:
+            c.close()
+    except sqlite3.Error as e:
+        log.warning("could not read metadata.db to join request %s: %s", r["id"], e)
+        return None
+    taken = db.linked_calibre_ids()
+    hits = [b for b, t in rows if b not in taken and matching.similarity(want, matching.clean(t)) >= 0.9]
+    return int(hits[0]) if len(hits) == 1 else None
+
+# ---- L21: Send-to-Kindle jobs ---------------------------------------------------------------------
+KINDLE_RETRY = (60, 300, 1800)       # a relay that is briefly down gets three more tries
+
+def kindle_once(now=None):
+    """Mail the queued Send-to-Kindle jobs. The file is resolved again here, with the same
+    visibility rule the click used: a book removed or re-tagged meanwhile is not sent."""
+    now = now or time.time()
+    n = 0
+    for j in db.kindle_due(now):
+        f = next((x for x in (library.file_for(j["owner"], j["book_id"], fmt, bool(j["is_admin"]))
+                              for fmt in config.KINDLE_FORMATS) if x), None)
+        addr = (cwa.get_user(j["owner"]) or {}).get("kindle_mail") or ""
+        if not f or not addr:
+            db.kindle_update(j["id"], status="failed",
+                             detail="the book or your Kindle address is no longer available")
+            continue
+        try:
+            msg = kindle.send(addr, f["path"], f["title"], f["filename"], author=f.get("authors"), book_title=f["title"])
+            db.kindle_update(j["id"], status="sent", detail=msg, attempts=j["attempts"] + 1)
+        except Exception as e:
+            tries = j["attempts"] + 1
+            if tries > len(KINDLE_RETRY):
+                db.kindle_update(j["id"], status="failed", attempts=tries, detail=f"could not send: {str(e)[:200]}")
+                notify.send("error", {"owner": j["owner"], "title": j["title"], "source": "kindle", "status": "error",
+                                      "detail": f"Send-to-Kindle failed: {str(e)[:200]}"})
+            else:
+                db.kindle_update(j["id"], attempts=tries, next_try=now + KINDLE_RETRY[tries - 1],
+                                 detail=f"retrying: {str(e)[:150]}")
+        n += 1
+    return n
+
+# ---- L10: owner tags for books whose file could not carry one ----------------------------------
+UNTAGGED_WINDOW = 7 * 86400          # needs-tag rows younger than this are still reconciled
+
+def _untagged_match(r):
+    """The Calibre book for a needs-tag request, or None. The ' [owner-rid]' marker first (it
+    survives when Calibre took the title from the file name: TXT, FB2 without metadata); then a
+    strict fallback for a MOBI/AZW3 whose own metadata replaced the name — same format, arrived
+    after the file was placed, NO owner tag yet, title agreeing with what the file said, and
+    exactly one such book. Anything less certain is left for the admin, as before."""
+    import sqlite3, matching
+    cid = r.get("calibre_id") or _in_calibre(_ingest_marker(r["owner"], r["id"]))
+    if cid:
+        return int(cid)
+    ext = (r.get("detail") or "").split(":", 1)[1].strip().split(" ", 1)[0] if ":" in (r.get("detail") or "") else ""
+    want = r.get("file_title") or r.get("title") or ""
+    if not want:
+        return None
+    try:
+        c = library._conn()
+        try:
+            rows = c.execute(
+                "SELECT b.id, b.title FROM books b JOIN data d ON d.book=b.id "
+                "WHERE b.timestamp >= datetime(?, 'unixepoch', '-120 seconds') "
+                + ("AND lower(d.format)=? " if ext.isalpha() else "") +
+                "AND NOT EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag "
+                "WHERE l.book=b.id AND t.name LIKE ?)",
+                ((r["updated"] or r["created"]),) + ((ext.lower(),) if ext.isalpha() else ()) + (f"{config.OWNER_PREFIX}%",)).fetchall()
+        finally:
+            c.close()
+    except sqlite3.Error as e:
+        log.warning("could not read metadata.db for untagged book %s: %s", r["id"], e)
+        return None
+    wt = matching.clean(want)
+    hits = [row[0] for row in rows if matching.similarity(wt, matching.clean(row[1])) >= 0.9]
+    return int(hits[0]) if len(hits) == 1 else None
+
+def reconcile_untagged(now=None):
+    """Queue the host job that adds the owner tag in Calibre (scripts/metadata-push.sh)."""
+    now = now or time.time()
+    queued = 0
+    for r in db.rows_by_status((NEEDS_TAG,), limit=100):
+        if r.get("kind") == "audio" or (r.get("updated") or 0) < now - UNTAGGED_WINDOW:
+            continue                          # audiobooks are Audiobookshelf's; old rows are the admin's
+        if db.tag_push_open_for(r["id"]):
+            continue
+        cid = _untagged_match(r)
+        if cid and db.queue_tag_push(cid, r["id"], r["owner"], now):
+            db.link_calibre(r["id"], cid, r["owner"])
+            db.set_status(r["id"], NEEDS_TAG, f"{r.get('detail') or NEEDS_TAG}; the owner tag is being added in Calibre")
+            queued += 1
+    return queued
+
 PLACEHOLDER_AUTHORS = {"", "unknown", "unknown author", "anonymous"}
 
 def _calibre_current(calibre_id):
@@ -1435,7 +1762,15 @@ def _calibre_current(calibre_id):
                 "WHERE l.book=?", (calibre_id,))]
             series = c.execute("SELECT s.name FROM books_series_link l JOIN series s "
                                "ON s.id=l.series WHERE l.book=?", (calibre_id,)).fetchone()
-            return {"title": r[0] or "", "authors": authors, "series": series[0] if series else None}
+            extra = c.execute("SELECT has_cover, pubdate FROM books WHERE id=?", (calibre_id,)).fetchone()
+            comments = c.execute("SELECT text FROM comments WHERE book=?", (calibre_id,)).fetchone()
+            pub = c.execute("SELECT 1 FROM books_publishers_link WHERE book=?", (calibre_id,)).fetchone()
+            langs = c.execute("SELECT 1 FROM books_languages_link WHERE book=?", (calibre_id,)).fetchone()
+            ids = {k: v for k, v in c.execute("SELECT type, val FROM identifiers WHERE book=?", (calibre_id,))}
+            return {"title": r[0] or "", "authors": authors, "series": series[0] if series else None,
+                    "has_cover": bool(extra and extra[0]), "pubdate": (extra[1] or "") if extra else "",
+                    "comments": bool(comments and (comments[0] or "").strip()), "publisher": bool(pub),
+                    "languages": bool(langs), "identifiers": ids}
         finally:
             c.close()
     except sqlite3.Error:
@@ -1461,6 +1796,17 @@ def _title_sort(title):
         if t.startswith(art) and len(t) > len(art):
             return f"{t[len(art):]}, {art.strip()}"
     return t
+
+COVER_HOSTS = ("covers.openlibrary.org", "books.google.com", "books.googleusercontent.com",
+               "i.gr-assets.com", "images.gr-assets.com", "assets.hardcover.app")
+
+def cover_ok(url):
+    """A cover address the host job may fetch: https, one of the providers' image hosts."""
+    try:
+        p = urlsplit(url or "")
+    except ValueError:
+        return False
+    return p.scheme == "https" and (p.hostname or "").lower() in COVER_HOSTS and p.username is None
 
 def queue_device_pushes(limit=20):
     """Decide what Calibre should learn from the portal's metadata, and queue it for the host.
@@ -1489,6 +1835,22 @@ def queue_device_pushes(limit=20):
                 fields["series"] = s["name"]
                 if s.get("sort_position") is not None:
                     fields["series_index"] = s["sort_position"]
+        # v5, the second half — each strictly FILL-ONLY, like the fields above
+        if not cur["comments"] and (c.get("description") or "").strip():
+            fields["comments"] = c["description"].strip()[:20000]
+        if not cur["publisher"] and c.get("publisher"):
+            fields["publisher"] = c["publisher"][:200]
+        if (not cur["pubdate"] or cur["pubdate"].startswith("0101")) and re.fullmatch(r"\d{4}(-\d{2}(-\d{2})?)?", c.get("release_date") or ""):
+            fields["pubdate"] = c["release_date"]
+        lang = __import__("matching").lang(c.get("language"))
+        if not cur["languages"] and lang:
+            fields["languages"] = lang
+        isbn = db.work_isbn13(c["work_id"])
+        if isbn and "isbn" not in cur["identifiers"]:
+            # calibredb replaces the identifier SET, so the ones Calibre has are written back with it
+            fields["identifiers"] = ",".join(f"{k}:{v}" for k, v in {**cur["identifiers"], "isbn": isbn}.items())
+        if not cur["has_cover"] and cover_ok(c.get("cover_url")):
+            fields["cover_url"] = c["cover_url"]
         if fields and db.queue_push(c["calibre_id"], fields, rid=c["rid"], owner=c["owner"]):
             queued += 1
         elif not fields:
@@ -1595,6 +1957,9 @@ def run_forever():
     _beat("queue")
     threading.Thread(target=_loop, args=("dropbox", scan_dropbox_once, 10), daemon=True).start()
     threading.Thread(target=_loop, args=("housekeeping", housekeeping_once, 15), daemon=True).start()
+    # its own thread: a keep-looking pass is catalog searches (up to ~12 s each) and, once per
+    # entry, the metadata chain — never allowed to hold up tag jobs or import reconciliation
+    threading.Thread(target=_loop, args=("wanted", wanted_once, WANTED_EVERY), daemon=True).start()
     if config.IMAP_HOST:
         import imap
         threading.Thread(target=imap.poll_forever, daemon=True).start()

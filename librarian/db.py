@@ -43,7 +43,15 @@ def init():
                           ("calibre_id", "INTEGER"),
                           ("match_confidence", "REAL"), ("match_reasons", "TEXT"),
                           ("wanted_kind", "TEXT"), ("wanted_language", "TEXT"),
-                          ("wanted_abridged", "INTEGER")):
+                          ("wanted_abridged", "INTEGER"),
+                          # What the SOURCE said the file will be, carried from the search result
+                          # to the download so worker.verify_download can check it. Missing until
+                          # v5: the Request form posted six fields and dropped these, so the
+                          # Internet Archive size/SHA-1 check never ran on a real request.
+                          ("expect_size", "INTEGER"), ("expect_md5", "TEXT"), ("expect_sha1", "TEXT"),
+                          ("src_ids", "TEXT"),            # JSON [[kind, value], ...]
+                          ("work_key", "TEXT"),           # the Open Library work it was chosen as
+                          ("language", "TEXT")):
             if col not in rcols:
                 c.execute(f"ALTER TABLE requests ADD COLUMN {col} {decl}")
         # Audiobook owner tags still to be applied in ABS. Persisted (not a daemon thread) so a
@@ -197,7 +205,60 @@ def init():
             rejected TEXT,                      -- JSON list of download URLs the reader said no to
             rid INTEGER,                        -- the request it became
             detail TEXT, created REAL, updated REAL)""")
+        wcols = {r[1] for r in c.execute("PRAGMA table_info(wanted)")}
+        if "work_key" not in wcols:           # the Open Library work, when asked for from its page
+            c.execute("ALTER TABLE wanted ADD COLUMN work_key TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS wanted_due ON wanted(status, next_check)")
+        # Copies offered on a page, held server-side: the Request button posts an opaque token,
+        # so a download address or its expected checksum can never be edited in the browser.
+        # L10: owner tags the HOST must add in Calibre for books whose FILE could not carry one
+        # (MOBI/AZW3/FB2/TXT/DJVU, and comics CWA's Kindle fixer stripped). Narrower than
+        # device_push on purpose: one operation, "add owner:<x> to a book that has NO owner tag".
+        c.execute("""CREATE TABLE IF NOT EXISTS tag_push(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, calibre_id INTEGER NOT NULL, rid INTEGER,
+            owner TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',   -- pending | done | failed
+            attempts INTEGER DEFAULT 0, last_error TEXT, created REAL, updated REAL)""")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open ON tag_push(calibre_id) WHERE status = 'pending'")
+        # L21: Send-to-Kindle runs in the worker, not inside the web request (a slow relay with a
+        # 45 MB attachment could outlast Cloudflare's 100 s and show a 524 for a mail that went out)
+        c.execute("""CREATE TABLE IF NOT EXISTS kindle_jobs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, is_admin INTEGER DEFAULT 0,
+            book_id INTEGER NOT NULL, title TEXT, status TEXT NOT NULL DEFAULT 'queued',   -- queued | sent | failed
+            detail TEXT, attempts INTEGER DEFAULT 0, next_try REAL, created REAL, updated REAL)""")
+        # v5: what the providers already sent and meta_store threw away — the device push fills
+        # these into Calibre when Calibre has none (a missing cover, an empty description)
+        mcols = {r[1] for r in c.execute("PRAGMA table_info(meta_work)")}
+        for col in ("cover_url", "publisher", "language", "pages"):
+            if col not in mcols:
+                c.execute(f"ALTER TABLE meta_work ADD COLUMN {col} {'INTEGER' if col == 'pages' else 'TEXT'}")
+        pcols2 = {r[1] for r in c.execute("PRAGMA table_info(device_push)")}
+        if "gen" not in pcols2:           # which vocabulary a push was decided with (see PUSH_GEN)
+            c.execute("ALTER TABLE device_push ADD COLUMN gen INTEGER DEFAULT 1")
+        # on-demand format conversion, done by the host (scripts/metadata-push.sh, third pass)
+        c.execute("""CREATE TABLE IF NOT EXISTS convert_jobs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, calibre_id INTEGER NOT NULL, owner TEXT NOT NULL,
+            src_fmt TEXT NOT NULL, dst_fmt TEXT NOT NULL, src_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed
+            attempts INTEGER DEFAULT 0, detail TEXT, created REAL, updated REAL)""")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS convert_open ON convert_jobs(calibre_id, dst_fmt) WHERE status='pending'")
+        # L05: passwords the portal changed, waiting for the host to write them into Authelia's
+        # user file (scripts/gate-sync.py). A PBKDF2 hash, never the password; deleted once applied.
+        c.execute("""CREATE TABLE IF NOT EXISTS gate_pw(
+            user TEXT PRIMARY KEY, hash TEXT NOT NULL, email TEXT, display TEXT, admin INTEGER DEFAULT 0,
+            created REAL, attempts INTEGER DEFAULT 0, detail TEXT)""")
+        # L08: the synthetic canary journey's runs (scripts/synthetic.py records them)
+        c.execute("""CREATE TABLE IF NOT EXISTS canary_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, ok INTEGER NOT NULL,
+            secs REAL, import_secs REAL, failed TEXT, steps TEXT)""")
+        # the admin's own OPDS catalogs (catalogs.py)
+        c.execute("""CREATE TABLE IF NOT EXISTS catalogs(
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, user TEXT, password TEXT,
+            enabled INTEGER DEFAULT 1, created REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS candidates(
+            token TEXT PRIMARY KEY, owner TEXT NOT NULL, data TEXT NOT NULL, created REAL)""")
+        pcols = {r[1] for r in c.execute("PRAGMA table_info(prefs)")}
+        if "language" not in pcols:
+            c.execute("ALTER TABLE prefs ADD COLUMN language TEXT")
         c.execute("""CREATE TABLE IF NOT EXISTS meta_provider_state(
             provider TEXT PRIMARY KEY,
             failures INTEGER DEFAULT 0, opened_at REAL, retry_after REAL,
@@ -211,20 +272,26 @@ def get_prefs(owner):
     if fmt not in config.FORMATS:               # e.g. a 'kepub' pref stored before that choice was dropped
         fmt = config.DEFAULT_FORMAT
     return {"preferred_format": fmt, "auto_kindle": bool(d.get("auto_kindle")),
-            "notify_email": bool(d.get("notify_email")), "last_kindle_test": d.get("last_kindle_test")}
+            "notify_email": bool(d.get("notify_email")), "last_kindle_test": d.get("last_kindle_test"),
+            # the language this reader reads in: copies in another language are never taken
+            "language": d.get("language") or config.BOOK_LANGUAGE}
 
-def set_prefs(owner, preferred_format=None, auto_kindle=None, notify_email=None, last_kindle_test=None):
+def set_prefs(owner, preferred_format=None, auto_kindle=None, notify_email=None, last_kindle_test=None,
+              language=None):
     cur = get_prefs(owner)
+    lg = language if language in config.LANGUAGES else cur["language"]
     fmt = preferred_format if preferred_format in config.FORMATS else cur["preferred_format"]
     ak = cur["auto_kindle"] if auto_kindle is None else bool(auto_kindle)
     ne = cur["notify_email"] if notify_email is None else bool(notify_email)
     lkt = cur["last_kindle_test"] if last_kindle_test is None else float(last_kindle_test)
     with _lock, _conn() as c:
-        c.execute("""INSERT INTO prefs(owner,preferred_format,auto_kindle,notify_email,last_kindle_test,updated) VALUES(?,?,?,?,?,?)
+        c.execute("""INSERT INTO prefs(owner,preferred_format,auto_kindle,notify_email,last_kindle_test,language,updated)
+                     VALUES(?,?,?,?,?,?,?)
                      ON CONFLICT(owner) DO UPDATE SET preferred_format=excluded.preferred_format,
                      auto_kindle=excluded.auto_kindle, notify_email=excluded.notify_email,
-                     last_kindle_test=excluded.last_kindle_test, updated=excluded.updated""",
-                  (owner, fmt, 1 if ak else 0, 1 if ne else 0, lkt, time.time()))
+                     last_kindle_test=excluded.last_kindle_test, language=excluded.language,
+                     updated=excluded.updated""",
+                  (owner, fmt, 1 if ak else 0, 1 if ne else 0, lkt, lg, time.time()))
 
 # ---- brute-force lockout ------------------------------------------------------------------
 def _attempt_row(c, key):
@@ -344,6 +411,21 @@ def requests_today(owner, now=None):
     with _conn() as c:
         return c.execute(_QUOTA_SQL, (owner, now - 86400, *UNCOUNTED)).fetchone()[0]
 
+_INSERT_SQL = """INSERT INTO requests
+    (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated,src_size,src_mtime,
+     expect_size,expect_md5,expect_sha1,src_ids,work_key,language)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+def _insert_args(owner, r, status, now):
+    size = r.get("expect_size")
+    return (owner, r["kind"], r["source"], r.get("identifier"), r["title"], r.get("author"),
+            r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now,
+            r.get("src_size"), r.get("src_mtime"),
+            int(size) if str(size or "").isdigit() else None, r.get("expect_md5") or None,
+            r.get("expect_sha1") or None,
+            json.dumps([list(x) for x in r["src_ids"]]) if r.get("src_ids") else None,
+            r.get("work_key") or None, r.get("language") or None)
+
 def add_if_under_quota(owner, r, limit, status="queued", now=None):
     """Count and insert in ONE immediate transaction, so parallel submissions cannot each see
     'still under the limit' and all get through. Returns (rid, remaining, resets_at); rid is
@@ -358,12 +440,7 @@ def add_if_under_quota(owner, r, limit, status="queued", now=None):
             if limit and used >= limit:
                 c.execute("COMMIT")
                 return None, 0, resets
-            cur = c.execute("""INSERT INTO requests
-                (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated,src_size,src_mtime)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (owner, r["kind"], r["source"], r.get("identifier"), r["title"], r.get("author"),
-                 r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now,
-                 r.get("src_size"), r.get("src_mtime")))
+            cur = c.execute(_INSERT_SQL, _insert_args(owner, r, status, now))
             c.execute("COMMIT")
             remaining = max(0, limit - used - 1) if limit else 0
             return cur.lastrowid, remaining, (oldest or now) + 86400
@@ -384,18 +461,38 @@ def find_open_by_url(owner, url):
 def add(owner, r, status="queued"):
     now = time.time()
     with _lock, _conn() as c:
-        cur = c.execute("""INSERT INTO requests
-            (owner,kind,source,identifier,title,author,download_url,is_torrent,status,created,updated,src_size,src_mtime)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (owner, r["kind"], r["source"], r.get("identifier"), r["title"], r.get("author"),
-             r.get("download_url"), 1 if r.get("is_torrent") else 0, status, now, now,
-             r.get("src_size"), r.get("src_mtime")))
+        cur = c.execute(_INSERT_SQL, _insert_args(owner, r, status, now))
         return cur.lastrowid
 
 def get(rid):
     with _conn() as c:
         row = c.execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
         return dict(row) if row else None
+
+def merge_file_meta(rid, meta):
+    """Like set_file_meta, but only fills what is still empty: a sidecar .opf is a second
+    opinion, never allowed to overwrite what the file itself said. Identifiers accumulate."""
+    if not rid or not meta:
+        return
+    try:
+        with _lock, _conn() as c:
+            row = c.execute("SELECT file_title, file_author, file_language, file_ids FROM requests WHERE id=?",
+                            (rid,)).fetchone()
+            if not row:
+                return
+            try:
+                ids = json.loads(row["file_ids"]) if row["file_ids"] else []
+            except ValueError:
+                ids = []
+            have = {(i.get("kind"), i.get("value")) for i in ids}
+            ids += [i for i in meta.get("identifiers") or [] if (i.get("kind"), i.get("value")) not in have]
+            c.execute("UPDATE requests SET file_title=?, file_author=?, file_language=?, file_ids=? WHERE id=?",
+                      (row["file_title"] or meta.get("title") or None,
+                       row["file_author"] or meta.get("author") or None,
+                       row["file_language"] or meta.get("language") or None,
+                       json.dumps(ids) if ids else None, rid))
+    except sqlite3.Error:
+        pass
 
 def set_file_meta(rid, meta):
     """Record what the FILE said about itself (tagger.py read it while embedding the owner tag).
@@ -444,14 +541,21 @@ def meta_store(merged, rid=None, owner=None, now=None):
             fid = next((i["value"] for i in merged.get("identifiers", [])
                         if i["kind"].startswith("goodreads")), None) or f"rid:{rid}"
             c.execute("INSERT INTO meta_work(provider,foreign_id,title,full_title,short_title,"
-                      "description,first_publish_year,release_date,updated) VALUES(?,?,?,?,?,?,?,?,?) "
+                      "description,first_publish_year,release_date,cover_url,publisher,language,pages,updated) "
+                      "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
                       "ON CONFLICT(provider,foreign_id) DO UPDATE SET title=excluded.title, "
                       "full_title=excluded.full_title, short_title=excluded.short_title, "
                       "description=excluded.description, first_publish_year=excluded.first_publish_year, "
-                      "release_date=excluded.release_date, updated=excluded.updated",
+                      "release_date=excluded.release_date, cover_url=COALESCE(excluded.cover_url, meta_work.cover_url), "
+                      "publisher=COALESCE(excluded.publisher, meta_work.publisher), "
+                      "language=COALESCE(excluded.language, meta_work.language), "
+                      "pages=COALESCE(excluded.pages, meta_work.pages), updated=excluded.updated",
                       (prov, fid, merged.get("title"), merged.get("full_title"),
                        merged.get("short_title"), merged.get("description"),
-                       merged.get("first_publish_year"), merged.get("release_date"), now))
+                       merged.get("first_publish_year"), merged.get("release_date"),
+                       merged.get("cover_url"), merged.get("publisher") if isinstance(merged.get("publisher"), str) else None,
+                       merged.get("language") if isinstance(merged.get("language"), str) else None,
+                       merged.get("pages") if isinstance(merged.get("pages"), int) else None, now))
             wid = c.execute("SELECT id FROM meta_work WHERE provider=? AND foreign_id=?",
                             (prov, fid)).fetchone()["id"]
             for i in merged.get("identifiers", []):
@@ -504,7 +608,7 @@ def needs_enrichment(limit=5):
     Calibre conversions, and a provider's cold path was measured at 28.4 s."""
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id, owner, title, author, file_title, file_author, file_ids, kind "
+            "SELECT id, owner, title, author, file_title, file_author, file_ids, kind, work_key "
             "FROM requests WHERE work_id IS NULL AND status IN ('done','needs-tag') "
             "ORDER BY id DESC LIMIT ?", (limit,))]
 
@@ -518,7 +622,13 @@ def meta_work_for(rid):
 # caller can widen it by accident. `tags` above all is absent and must stay absent: owner:<user>
 # IS the per-reader isolation, CWA appends tags rather than replacing them, and a provider genre
 # landing on a reader's denied-tags list would hide the book from its owner.
-PUSH_FIELDS = ("title", "sort", "authors", "series", "series_index")
+# What the host may write into Calibre, and nothing else — three copies of this list exist on
+# purpose (here, pending_pushes' re-filter, scripts/metadata-push.sh ALLOWED). `tags` is absent
+# and must stay absent. cover_url is not a Calibre field: the host fetches the image and sets
+# Calibre's `cover` from it. Every field is FILL-ONLY (worker.queue_device_pushes).
+PUSH_FIELDS = ("title", "sort", "authors", "series", "series_index",
+               "comments", "publisher", "pubdate", "languages", "identifiers", "cover_url")
+PUSH_GEN = 2          # v5 added the second half of the vocabulary: books pushed before get one more look
 
 def queue_push(calibre_id, fields, rid=None, owner=None, now=None):
     """Queue one Calibre metadata update. Returns the push id, or None when nothing is left
@@ -530,8 +640,8 @@ def queue_push(calibre_id, fields, rid=None, owner=None, now=None):
     try:
         with _lock, _conn() as c:
             cur = c.execute("INSERT OR IGNORE INTO device_push(calibre_id,rid,owner,fields,status,"
-                            "created,updated) VALUES(?,?,?,?,'pending',?,?)",
-                            (int(calibre_id), rid, owner, json.dumps(clean, ensure_ascii=False), now, now))
+                            "created,updated,gen) VALUES(?,?,?,?,'pending',?,?,?)",
+                            (int(calibre_id), rid, owner, json.dumps(clean, ensure_ascii=False), now, now, PUSH_GEN))
             return cur.lastrowid if cur.rowcount else None
     except sqlite3.Error:
         return None
@@ -542,8 +652,8 @@ def push_nothing_needed(calibre_id, rid=None, owner=None, now=None):
     now = now or time.time()
     try:
         with _lock, _conn() as c:
-            c.execute("INSERT INTO device_push(calibre_id,rid,owner,fields,status,created,updated) "
-                      "VALUES(?,?,?,'{}','skipped',?,?)", (int(calibre_id), rid, owner, now, now))
+            c.execute("INSERT INTO device_push(calibre_id,rid,owner,fields,status,created,updated,gen) "
+                      "VALUES(?,?,?,'{}','skipped',?,?,?)", (int(calibre_id), rid, owner, now, now, PUSH_GEN))
     except sqlite3.Error:
         pass
 
@@ -583,11 +693,12 @@ def push_candidates(limit=20):
     with _conn() as c:
         return [dict(r) for r in c.execute(
             "SELECT q.id AS rid, q.owner, q.calibre_id, q.work_id, q.title AS req_title, "
-            "w.title, w.full_title "
+            "w.title, w.full_title, w.description, w.publisher, w.language, w.release_date, w.cover_url "
             "FROM requests q JOIN meta_work w ON w.id = q.work_id "
             "WHERE q.calibre_id IS NOT NULL "
-            "AND NOT EXISTS (SELECT 1 FROM device_push p WHERE p.calibre_id = q.calibre_id) "
-            "ORDER BY q.id DESC LIMIT ?", (limit,))]
+            "AND NOT EXISTS (SELECT 1 FROM device_push p WHERE p.calibre_id = q.calibre_id "
+            "AND (p.status = 'pending' OR COALESCE(p.gen, 1) >= ?)) "
+            "ORDER BY q.id DESC LIMIT ?", (PUSH_GEN, limit))]
 
 def work_authors(work_id):
     with _conn() as c:
@@ -957,7 +1068,7 @@ def _wanted_row(row):
             d[k] = [] if k != "candidate" else None
     return d
 
-def wanted_add(owner, kind, title, author, first_check, limit, same, now=None):
+def wanted_add(owner, kind, title, author, first_check, limit, same, now=None, work_key=None):
     """Insert a wanted entry unless the owner is at `limit` open ones or already has one for
     the same book (`same(a, b)` decides). One transaction, like add_if_under_quota.
     Returns (id, None) or (None, reason) with reason 'limit' or 'duplicate:<id>'."""
@@ -978,8 +1089,8 @@ def wanted_add(owner, kind, title, author, first_check, limit, same, now=None):
                 c.execute("COMMIT")
                 return None, "limit"
             cur = c.execute("""INSERT INTO wanted(owner, kind, title, author, status, checks,
-                               next_check, created, updated) VALUES(?,?,?,?,'looking',0,?,?,?)""",
-                            (owner, kind, title, author or "", first_check, now, now))
+                               next_check, created, updated, work_key) VALUES(?,?,?,?,'looking',0,?,?,?,?)""",
+                            (owner, kind, title, author or "", first_check, now, now, work_key))
             c.execute("COMMIT")
             return cur.lastrowid, None
         except Exception:
@@ -1038,3 +1149,248 @@ def wanted_expired(before):
 def wanted_counts():
     with _conn() as c:
         return {r[0]: r[1] for r in c.execute("SELECT status, COUNT(*) FROM wanted GROUP BY status")}
+
+def set_match(rid, confidence, reasons, wanted_kind=None):
+    """How sure the portal was that this request is the book that was wanted, and why."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE requests SET match_confidence=?, match_reasons=?, "
+                  "wanted_kind=COALESCE(?, wanted_kind) WHERE id=?",
+                  (confidence, json.dumps(reasons) if not isinstance(reasons, str) else reasons,
+                   wanted_kind, rid))
+
+
+# ---- candidates offered on a page (the Request button posts a token, never a URL) -------------
+CANDIDATE_TTL = 24 * 3600
+
+def candidate_put(owner, cand, now=None):
+    import secrets
+    token = secrets.token_urlsafe(16)
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO candidates(token, owner, data, created) VALUES(?,?,?,?)",
+                  (token, owner, json.dumps(cand), now or time.time()))
+    return token
+
+def candidate_get(token, owner, now=None):
+    """The copy behind a token, only for the reader it was offered to and only for a day."""
+    now = now or time.time()
+    with _conn() as c:
+        row = c.execute("SELECT data, created FROM candidates WHERE token=? AND owner=?",
+                        (token or "", owner)).fetchone()
+    if not row or row["created"] < now - CANDIDATE_TTL:
+        return None
+    try:
+        return json.loads(row["data"])
+    except ValueError:
+        return None
+
+def candidate_purge(now=None):
+    with _lock, _conn() as c:
+        return c.execute("DELETE FROM candidates WHERE created < ?",
+                         ((now or time.time()) - CANDIDATE_TTL,)).rowcount
+
+
+# ---- the admin's own OPDS catalogs (catalogs.py) ---------------------------------------------
+def catalog_rows():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM catalogs ORDER BY name")]
+
+def catalog_put(cid, name, url, user, password, enabled=True):
+    """Insert or update. A blank password on update keeps the stored one."""
+    with _lock, _conn() as c:
+        old = c.execute("SELECT password FROM catalogs WHERE id=?", (cid,)).fetchone()
+        pw = password if password or not old else old["password"]
+        c.execute("""INSERT INTO catalogs(id, name, url, user, password, enabled, created) VALUES(?,?,?,?,?,?,?)
+                     ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, user=excluded.user,
+                     password=excluded.password, enabled=excluded.enabled""",
+                  (cid, name, url, user or "", pw or "", 1 if enabled else 0, time.time()))
+
+def catalog_delete(cid):
+    with _lock, _conn() as c:
+        return c.execute("DELETE FROM catalogs WHERE id=?", (cid,)).rowcount > 0
+
+
+# ---- L10: owner tags added by the host (scripts/metadata-push.sh, second pass) --------------
+def queue_tag_push(calibre_id, rid, owner, now=None):
+    now = now or time.time()
+    try:
+        with _lock, _conn() as c:
+            c.execute("INSERT INTO tag_push(calibre_id, rid, owner, created, updated) VALUES(?,?,?,?,?)",
+                      (int(calibre_id), rid, owner, now, now))
+        return True
+    except sqlite3.IntegrityError:
+        return False                          # one open job per book
+
+def tag_push_open_for(rid):
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM tag_push WHERE rid=? AND status IN ('pending','done')", (rid,)).fetchone() is not None
+
+def pending_tag_pushes(limit=50):
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id, calibre_id, rid, owner FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
+
+def tag_push_result(push_id, ok, error=None, max_attempts=5):
+    """Record the host's outcome. Success marks the request done; repeated failure gives up."""
+    now = time.time()
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM tag_push WHERE id=?", (push_id,)).fetchone()
+        if not row:
+            raise ValueError(f"no tag job {push_id}")
+        attempts = (row["attempts"] or 0) + 1
+        st = "done" if ok else ("failed" if attempts >= max_attempts or (error or "").startswith("refused:") else "pending")
+        c.execute("UPDATE tag_push SET status=?, attempts=?, last_error=?, updated=? WHERE id=?",
+                  (st, attempts, None if ok else (error or "")[:300], now, push_id))
+        return dict(row, status=st)
+
+
+# ---- L21: Send-to-Kindle jobs ---------------------------------------------------------------
+def kindle_enqueue(owner, is_admin, book_id, title, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        return c.execute("INSERT INTO kindle_jobs(owner, is_admin, book_id, title, next_try, created, updated) "
+                         "VALUES(?,?,?,?,?,?,?)", (owner, 1 if is_admin else 0, book_id, title, now, now, now)).lastrowid
+
+def kindle_due(now, limit=2):
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM kindle_jobs WHERE status='queued' AND next_try <= ? ORDER BY id LIMIT ?", (now, limit))]
+
+def kindle_update(jid, **f):
+    f["updated"] = time.time()
+    cols = ", ".join(f"{k}=?" for k in f)
+    with _lock, _conn() as c:
+        c.execute(f"UPDATE kindle_jobs SET {cols} WHERE id=?", (*f.values(), jid))
+
+def kindle_recent(owner=None, limit=10):
+    sql = "SELECT * FROM kindle_jobs" + (" WHERE owner=?" if owner else "") + " ORDER BY id DESC LIMIT ?"
+    with _conn() as c:
+        return [dict(r) for r in c.execute(sql, ((owner,) if owner else ()) + (limit,))]
+
+
+def linked_calibre_ids():
+    with _conn() as c:
+        return {r[0] for r in c.execute("SELECT calibre_id FROM requests WHERE calibre_id IS NOT NULL")}
+
+
+def work_isbn13(work_id):
+    with _conn() as c:
+        r = c.execute("SELECT value FROM meta_identifier WHERE scope='work' AND target_id=? AND kind='isbn13' "
+                      "ORDER BY exact DESC LIMIT 1", (work_id,)).fetchone()
+    return r["value"] if r else None
+
+
+# ---- on-demand conversion ------------------------------------------------------------------
+def convert_queue(calibre_id, owner, src_fmt, dst_fmt, src_path, now=None):
+    now = now or time.time()
+    try:
+        with _lock, _conn() as c:
+            return c.execute("INSERT INTO convert_jobs(calibre_id, owner, src_fmt, dst_fmt, src_path, created, updated) "
+                             "VALUES(?,?,?,?,?,?,?)", (int(calibre_id), owner, src_fmt, dst_fmt, src_path, now, now)).lastrowid
+    except sqlite3.IntegrityError:
+        return None                                # already converting to that format
+
+def convert_count(owner, since):
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM convert_jobs WHERE owner=? AND created>=?", (owner, since)).fetchone()[0]
+
+def convert_for_book(calibre_id):
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM convert_jobs WHERE calibre_id=? ORDER BY id DESC LIMIT 10",
+                                           (calibre_id,))]
+
+def pending_converts(limit=3):
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT id, calibre_id, owner, src_fmt, dst_fmt, src_path FROM convert_jobs "
+                                           "WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
+
+def convert_result(job_id, ok, detail="", max_attempts=2):
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM convert_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise ValueError(f"no conversion job {job_id}")
+        attempts = (row["attempts"] or 0) + 1
+        st = "done" if ok else ("failed" if attempts >= max_attempts else "pending")
+        c.execute("UPDATE convert_jobs SET status=?, attempts=?, detail=?, updated=? WHERE id=?",
+                  (st, attempts, (detail or "")[:300], time.time(), job_id))
+        return dict(row, status=st)
+
+# ---- L08: synthetic canary journey --------------------------------------------------------
+CANARY_KEEP = 200
+
+def canary_record(run):
+    """One run of scripts/synthetic.py: {ok, secs, import_secs, steps:[{name, ok, secs, note}]}."""
+    steps = [{"name": str(x.get("name", ""))[:60], "ok": bool(x.get("ok")),
+              "secs": round(float(x.get("secs") or 0), 1), "note": str(x.get("note") or "")[:200]}
+             for x in (run.get("steps") or [])][:40]
+    failed = next((x["name"] for x in steps if not x["ok"]), None)
+    ok = bool(run.get("ok")) and failed is None
+    imp = run.get("import_secs")
+    with _lock, _conn() as c:
+        rid = c.execute("INSERT INTO canary_runs(ts, ok, secs, import_secs, failed, steps) VALUES(?,?,?,?,?,?)",
+                        (float(run.get("ts") or time.time()), int(ok), round(float(run.get("secs") or 0), 1),
+                         None if imp is None else round(float(imp), 1), failed, json.dumps(steps))).lastrowid
+        c.execute("DELETE FROM canary_runs WHERE id <= ?", (rid - CANARY_KEEP,))
+    return {"id": rid, "ok": ok, "failed": failed}
+
+def canary_recent(n=10):
+    with _conn() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM canary_runs ORDER BY id DESC LIMIT ?", (int(n),))]
+    for r in rows:
+        r["steps"] = json.loads(r["steps"] or "[]")
+        r["ok"] = bool(r["ok"])
+    return rows
+
+# ---- L05: password sync into the Authelia gate ----------------------------------------------
+GATE_ROUNDS = 310000          # PBKDF2-SHA512, OWASP 2023; Authelia verifies it (measured on 4.39.28)
+
+def gate_hash(password, salt=None):
+    """Authelia's `$pbkdf2-sha512$<rounds>$<salt>$<key>` (passlib's adapted base64)."""
+    import base64, hashlib, os as _os
+    ab64 = lambda b: base64.b64encode(b).decode().rstrip("=").replace("+", ".")
+    salt = salt or _os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha512", password.encode(), salt, GATE_ROUNDS, 64)
+    return f"$pbkdf2-sha512${GATE_ROUNDS}${ab64(salt)}${ab64(key)}"
+
+def gate_flag_path():
+    import os as _os
+    return _os.path.join(_os.path.dirname(config.STATE_DB), "gate-sync.flag")
+
+def gate_queue(user, password, email=None, display=None, admin=False):
+    """Queue a password (and, with an e-mail, a whole new login) for the gate; touch the flag the
+    host's path unit watches so it lands within seconds."""
+    h = gate_hash(password)
+    with _lock, _conn() as c:
+        # a password change right after the account was created must not drop the pending
+        # creation's e-mail (the gate login could then never be made): newest hash, kept details
+        c.execute("INSERT INTO gate_pw(user, hash, email, display, admin, created, attempts, detail) "
+                  "VALUES(?,?,?,?,?,?,0,NULL) ON CONFLICT(user) DO UPDATE SET hash=excluded.hash, "
+                  "email=COALESCE(excluded.email, gate_pw.email), display=COALESCE(excluded.display, gate_pw.display), "
+                  "admin=MAX(excluded.admin, gate_pw.admin), created=excluded.created, attempts=0, detail=NULL",
+                  (user, h, email or None, display or None, int(bool(admin)), time.time()))
+    try:
+        with open(gate_flag_path(), "a"):
+            pass
+        import os as _os
+        _os.utime(gate_flag_path(), None)
+    except OSError:
+        pass                                   # the host's 10-minute timer still picks it up
+    return h
+
+def gate_pending():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT user, hash, email, display, admin, created, attempts "
+                                            "FROM gate_pw ORDER BY created")]
+
+def gate_done(user, outcome, detail=""):
+    """ok -> the row goes; missing/failed -> kept for the admin to see, retried a few times."""
+    with _lock, _conn() as c:
+        if outcome == "ok":
+            c.execute("DELETE FROM gate_pw WHERE user=?", (user,))
+            return "applied"
+        c.execute("UPDATE gate_pw SET attempts=attempts+1, detail=? WHERE user=?", (detail[:200] or outcome, user))
+        row = c.execute("SELECT attempts FROM gate_pw WHERE user=?", (user,)).fetchone()
+        if row and row[0] >= 5:
+            c.execute("DELETE FROM gate_pw WHERE user=?", (user,))
+            return "dropped"
+        return "kept"
+

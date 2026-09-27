@@ -12,7 +12,11 @@ from email.message import EmailMessage
 import config, db
 
 USER_EVENTS = {"done": "is in your library", "denied": "was denied", "error": "could not be added",
-               "needs-tag": "was imported but the admin has to tag it to you first"}
+               "needs-tag": "was imported but the admin has to tag it to you first",
+               # keep looking (wanted.py): the entry's own events, told to the reader who asked
+               "wanted-found": "turned up in a catalog and has been requested for you",
+               "wanted-candidate": "may have turned up: confirm it is the right book on your Status page",
+               "wanted-expired": "did not turn up in any catalog, so we have stopped looking"}
 EVENTS = set(USER_EVENTS) | {"requested", "approved"}
 
 def send(event, req):

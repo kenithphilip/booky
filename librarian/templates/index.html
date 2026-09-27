@@ -2,8 +2,15 @@
 <form method="get" class="row" style="margin-bottom:6px">
 <input type="text" name="q" value="{{q}}" placeholder="Search title or author…" style="flex:1">
 <button type="submit">Search</button><span class="busy">Searching the catalogs — this can take a few seconds…</span></form>
-<p class="mut">Searching: {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.last }}{% endfor %}{% if cfg.SHELF_URL %} · Not here? Try <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">Shelfmark</a>, which searches further afield.{% endif %}</p>
-{% if q and not results %}<div class="card">No matches in the catalogs above.</div>{% endif %}
+<p class="mut">{% if q %}<a href="{{ url_for('index', q=q) }}">Search for the book instead</a> (recommended) · {% endif %}Searching the catalogues directly: {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.last }}{% endfor %}{% if cfg.SHELF_URL %} · Not here? Try <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">Shelfmark</a>, which searches further afield.{% endif %}</p>
+{% if q and not results %}<div class="card">No matches in the catalogs above.
+<p class="mut" style="margin:6px 0 0">Not published yet, or not in these catalogs yet? We can keep looking and request it
+for you the moment it turns up. With the author filled in, a match is requested automatically; without it, we ask you first.</p>
+<form method="post" action="{{ url_for('wanted_add') }}" class="row" style="flex-wrap:wrap;gap:6px;margin-top:8px">{{ csrf_field() }}
+<input type="text" name="title" value="{{ q }}" maxlength="300" required placeholder="Title" style="flex:2;min-width:160px">
+<input type="text" name="author" maxlength="200" placeholder="Author (recommended)" style="flex:1;min-width:140px">
+<select name="kind"><option value="ebook">Ebook</option><option value="audio">Audiobook</option></select>
+<button type="submit">Keep looking</button></form></div>{% endif %}
 {% if not q %}
 <div class="card"><h3 style="margin-top:0">Start here</h3>
 <ul class="mut" style="margin:0;padding-left:18px">
@@ -26,9 +33,16 @@
 <span class="badge">{{ source_label(r.source) }}</span>
 <span class="badge">{{ 'audiobook' if r.kind=='audio' else r.format }}</span>
 {% if r.dupe %}<span class="badge" title="{{ {'isbn': 'Same ISBN as a book you have', 'uuid': 'This exact file is already in your library', 'title+author': 'Same title and author as a book you have', 'title': 'Same title as a book you have (no author to compare)'}.get(r.dupe.how, 'Already in the library') }}">{{ 'maybe in library' if r.dupe.how == 'title' else 'in library' }}</span>{% endif %}
-<form method="post" action="{{url_for('make_request')}}">{{ csrf_field() }}
-{% for k in ['kind','source','identifier','title','author','download_url'] %}
-<input type="hidden" name="{{k}}" value="{{ r[k] }}">{% endfor %}
+<form method="post" action="{{url_for('get_copy')}}">{{ csrf_field() }}
+<input type="hidden" name="token" value="{{ r.token }}">
 <button type="submit">Request</button></form></div></div></div>
 {% endfor %}
+{% if q and results %}<details class="card"><summary>Not the book you wanted? Keep looking for it</summary>
+<p class="mut" style="margin:6px 0 0">We check the catalogs again on a schedule and request it when an exact match turns up.
+Results above that are merely similar are never taken.</p>
+<form method="post" action="{{ url_for('wanted_add') }}" class="row" style="flex-wrap:wrap;gap:6px;margin-top:8px">{{ csrf_field() }}
+<input type="text" name="title" value="{{ q }}" maxlength="300" required placeholder="Title" style="flex:2;min-width:160px">
+<input type="text" name="author" maxlength="200" placeholder="Author (recommended)" style="flex:1;min-width:140px">
+<select name="kind"><option value="ebook">Ebook</option><option value="audio">Audiobook</option></select>
+<button type="submit">Keep looking</button></form></details>{% endif %}
 {% endblock %}

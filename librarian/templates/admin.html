@@ -13,6 +13,9 @@ stay on the box rather than behind a browser session.</p>
 <div class="mut">Worker: <strong class="{{ 'st-done' if health.ok else 'st-error' }}">{{ 'healthy' if health.ok else 'DEGRADED — ' + health.problems|join(', ') }}</strong>
 · ingest backlog <strong>{{ health.ingest_pending }}</strong>{% if health.ingest_oldest_s > 900 %} <span class="st-error">(oldest {{ (health.ingest_oldest_s // 60)|int }} min — CWA import stuck?)</span>{% endif %}<br>
 Calibre-Web: <strong class="{{ 'st-done' if health.cwa == 'ok' else 'st-error' }}">{{ 'answering' if health.cwa == 'ok' else health.cwa }}</strong><br>
+{% if health.library_read != 'ok' %}Library catalogue: <strong class="st-error">{{ health.library_read }}</strong><br>{% endif %}
+{% if health.metadata_down %}Metadata providers stood down (circuit breaker, retried automatically): <strong class="st-error">{{ health.metadata_down|join(', ') }}</strong><br>{% endif %}
+{% if wanted_counts %}Still looking: <strong>{{ wanted_counts.get('looking', 0) }}</strong> looking, <strong>{{ wanted_counts.get('candidate', 0) }}</strong> waiting for the reader to confirm · <a href="{{ url_for('status') }}">Status</a><br>{% endif %}
 Alerts: <strong class="{{ '' if alerts_ok else 'st-error' }}">{{ 'configured' if alerts_ok else 'NOBODY is told about failures — set up Alerts (ntfy / webhook) in the admin tools' }}</strong><br>
 Kobo sync: <strong>{{ 'on' if kobo_on else 'OFF — enable in the admin tools' }}</strong><br>
 Audiobookshelf automation: <strong>{{ 'linked' if abs_linked else 'not set up (Library → Audiobookshelf)' }}</strong><br>
@@ -23,6 +26,19 @@ Portal sources: {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.l
 Portal build: <strong>{{ health.version }}</strong> <span class="mut">(compare with the checkout before trusting a test run)</span></div></div>
 </div>
 
+{% if canary_on or canary %}
+<div class="card"><h3>Canary journey <span class="mut">(two hidden test accounts walk a reader's path twice a day: upload, import with the owner tag, download, isolation, OPDS and Kobo through Cloudflare, Shelfmark)</span></h3>
+{% if canary %}{% set last = canary[0] %}
+<div class="mut">Last run {{ last.ts|ago_or_in }}: <strong class="{{ 'st-done' if last.ok else 'st-error' }}">{{ 'passed' if last.ok else 'FAILED at ' + (last.failed or 'the journey') }}</strong>{% if last.import_secs is not none %} · import took <strong>{{ last.import_secs|round|int }} s</strong>{% endif %}</div>
+<table><tr><th>When</th><th>Result</th><th>Import</th><th>Total</th><th>Detail</th></tr>
+{% for r in canary %}<tr><td>{{ r.ts|ago_or_in }}</td><td class="{{ 'st-done' if r.ok else 'st-error' }}">{{ 'ok' if r.ok else 'failed' }}</td>
+<td>{{ (r.import_secs|round|int ~ ' s') if r.import_secs is not none else '—' }}</td><td>{{ r.secs|round|int }} s</td>
+<td class="mut">{% for st in r.steps if not st.ok %}{{ st.name }}: {{ st.note }}{{ '; ' if not loop.last }}{% endfor %}</td></tr>{% endfor %}</table>
+<div class="mut">Import time is the earliest sign of a struggling Calibre-Web: it climbs before anything fails.</div>
+{% else %}<div class="mut">No run recorded yet (the timer runs at 06:20 and 18:20; Operations → Canary journey runs one now).</div>{% endif %}
+</div>
+{% endif %}
+
 {% if needs_tag %}
 <div class="card"><h3>Imported without an owner tag <span class="mut">({{ needs_tag|length }}; MOBI/AZW3/FB2/TXT cannot carry it, audiobooks when Audiobookshelf could not be reached)</span></h3>
 <p class="mut">These are in the library but invisible to their owner until you add the tag: ebooks in Calibre-Web (edit the book → Tags → <code>owner:&lt;user&gt;</code>), audiobooks in Audiobookshelf (edit the item → Tags). Then mark the row resolved here.</p>
@@ -30,6 +46,26 @@ Portal build: <strong>{{ health.version }}</strong> <span class="mut">(compare w
 {% for r in needs_tag %}<tr><td>{{ r.title }}</td><td><code>owner:{{ r.owner }}</code></td><td class="mut">{{ r.detail or '' }}</td>
 <td><form method="post" action="{{ url_for('dismiss', rid=r.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Mark resolved</button></form></td></tr>{% endfor %}</table></div>
 {% endif %}
+
+<div class="card" id="catalogs"><h3>Your catalogs <span class="mut">(OPDS: Calibre, Calibre-Web, COPS, Kavita, Komga, BookLore, a library's feed…)</span></h3>
+<p class="mut">Each one is searched on the search page, for a chosen book on its page, and by keep-looking; its login is sent to it and nowhere else. Other kinds of source live in Shelfmark.</p>
+{% for c in catalogs %}<div class="row" style="justify-content:space-between;border-top:1px solid var(--line);padding:6px 0">
+<div><strong>{{ c.name }}</strong> <span class="mut code">{{ c.url }}</span>{% if c.user %} <span class="mut">(login: {{ c.user }})</span>{% endif %}
+<span class="badge">{{ 'on' if c.enabled else 'off' }}</span>{% if c.legacy %} <span class="mut">(from .env — change it in bookstack.sh → Library → Sources)</span>{% endif %}</div>
+{% if not c.legacy %}<div class="row">
+<form method="post" action="{{ url_for('admin_catalogs') }}">{{ csrf_field() }}<input type="hidden" name="id" value="{{ c.id }}"><input type="hidden" name="action" value="{{ 'disable' if c.enabled else 'enable' }}"><button type="submit" class="sec">{{ 'Turn off' if c.enabled else 'Turn on' }}</button></form>
+<form method="post" action="{{ url_for('admin_catalogs') }}">{{ csrf_field() }}<input type="hidden" name="id" value="{{ c.id }}"><input type="hidden" name="action" value="remove"><button type="submit" class="danger">Remove</button></form>
+</div>{% endif %}</div>{% endfor %}
+{% if not catalogs %}<p class="mut">None yet.</p>{% endif %}
+<form method="post" action="{{ url_for('admin_catalogs') }}" class="row" style="flex-wrap:wrap;gap:6px;margin-top:8px">{{ csrf_field() }}
+<input type="text" name="id" placeholder="id (e.g. home)" maxlength="31" style="width:110px" required>
+<input type="text" name="name" placeholder="Name readers see" style="width:170px" required>
+<input type="text" name="url" placeholder="https://… OPDS feed; {q} where the search term goes" style="flex:1;min-width:240px" required>
+<input type="text" name="user" placeholder="login (optional)" style="width:130px" autocomplete="off">
+<input type="password" name="password" placeholder="password" style="width:130px" autocomplete="new-password">
+<label class="mut"><input type="checkbox" name="force" value="1"> save anyway</label>
+<button type="submit" name="action" value="test" class="sec">Test</button>
+<button type="submit" name="action" value="add">Add</button></form></div>
 
 <div class="card"><h3>Applications</h3>
 <div class="grid">{% for label, url, scope in links %}
@@ -43,16 +79,13 @@ Portal build: <strong>{{ health.version }}</strong> <span class="mut">(compare w
 {% if u.bad_name %}<br><span class="st-error">name has spaces/symbols: uploads and the dropbox cannot work for this account</span>{% endif %}</td>
 <td class="mut">{{ u.kindle_mail or '—' }}</td></tr>{% endfor %}</table>
 <h3 style="margin-top:14px">Add a user</h3>
-{% if authelia %}<p class="mut">Authelia is on, so users are added in the admin tools (<code>bookstack.sh</code> → Users): that also creates their Authelia login.</p>
-{% else %}
 <form method="post" class="row" style="align-items:flex-end">{{ csrf_field() }}<input type="hidden" name="action" value="add_user">
 <label style="flex:1;min-width:140px">Username <span class="mut">(lowercase)</span><input type="text" name="name" required pattern="[a-z0-9._-]+" autocomplete="off"></label>
 <label style="flex:1;min-width:160px">E-mail (their real address)<input type="email" name="email" required></label>
 <label style="flex:1;min-width:160px">Password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
 <label class="mut"><input type="checkbox" name="admin" value="1"> admin</label>
 <button type="submit">Create</button></form>
-<p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.</p>
-{% endif %}
+<p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.{% if authelia %} Their login on the sign-in page in front of the sites (Authelia) is created with the same password; they set up 2FA the first time they sign in.{% endif %}</p>
 <p class="mut">Everything else about an account lives in the admin tools on the server (<code>bookstack.sh</code> → <em>Users</em>):
 <strong>4</strong> reset a Kobo link, <strong>5</strong> reset a password, <strong>6</strong> remove a user.</p>
 </div>

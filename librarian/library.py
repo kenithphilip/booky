@@ -114,6 +114,8 @@ def file_for(owner, book_id, fmt, is_admin=False):
     except Exception:
         return None
     if not r:
+        if fmt == "kepub" and config.KEPUBIFY:
+            return _kepub_from_epub(owner, book_id, is_admin)
         return None
     path = os.path.join(config.LIBRARY_DIR, r[0], f"{r[1]}.{r[2].lower()}")
     # never follow anything that escapes the library root
@@ -124,11 +126,51 @@ def file_for(owner, book_id, fmt, is_admin=False):
     return {"path": real, "title": r[3], "authors": r[4] or "", "format": fmt, "filename": filename,
             "mimetype": MIMETYPES.get(fmt, "application/octet-stream")}
 
+_KEPUB_LOCK = __import__("threading").Semaphore(1)   # one conversion at a time on 2 cores
+
+def _kepub_from_epub(owner, book_id, is_admin):
+    """The book's EPUB converted to KEPUB for a Kobo reader who downloads it (L11). Cached by
+    book id and the EPUB's own mtime, so a re-converted book is never served stale; the cache
+    is trimmed oldest-first to KEPUB_CACHE_MB. Visibility is the EPUB's: same owner scope."""
+    import subprocess, tempfile
+    src = file_for(owner, book_id, "epub", is_admin)
+    if not src:
+        return None
+    os.makedirs(config.KEPUB_CACHE_DIR, exist_ok=True)
+    key = f"{book_id}-{int(os.path.getmtime(src['path']))}.kepub.epub"
+    out = os.path.join(config.KEPUB_CACHE_DIR, key)
+    if not os.path.isfile(out):
+        with _KEPUB_LOCK:
+            if not os.path.isfile(out):
+                with tempfile.TemporaryDirectory(dir=config.KEPUB_CACHE_DIR) as tmp:
+                    r = subprocess.run([config.KEPUBIFY, "--output", tmp, src["path"]],
+                                       capture_output=True, timeout=180)
+                    made = [f for f in os.listdir(tmp) if f.endswith(".kepub.epub")]
+                    if r.returncode != 0 or not made:
+                        return None
+                    os.replace(os.path.join(tmp, made[0]), out)
+        _trim_kepub_cache()
+    base = src["filename"][: -len(".epub")] if src["filename"].endswith(".epub") else src["filename"]
+    return dict(src, path=out, format="kepub", filename=f"{base}.kepub.epub", mimetype=MIMETYPES["kepub"])
+
+def _trim_kepub_cache():
+    d = config.KEPUB_CACHE_DIR
+    files = sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".kepub.epub")),
+                   key=os.path.getmtime)
+    total = sum(os.path.getsize(f) for f in files)
+    while files and total > config.KEPUB_CACHE_MB * 1024 * 1024:
+        f = files.pop(0)
+        total -= os.path.getsize(f)
+        os.remove(f)
+
 def best_format(book, preferred):
-    """Pick the file to hand out: preferred if present, else epub, else the first available."""
+    """Pick the file to hand out: preferred if present, else epub, else the first available.
+    A KEPUB preference is met from the EPUB when the portal can convert (L11)."""
     fmts = book.get("formats") or []
     if preferred in fmts:
         return preferred
+    if preferred == "kepub" and config.KEPUBIFY and "epub" in fmts:
+        return "kepub"
     if "epub" in fmts:
         return "epub"
     return fmts[0] if fmts else None

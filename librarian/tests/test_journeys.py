@@ -539,7 +539,7 @@ def test_j23_the_portal_says_how_many_are_left(client, users, monkeypatch):
 def test_j24_a_dead_calibre_web_is_visible_to_the_admin(client, users, monkeypatch):
     import requests as _r
     now = time.time()
-    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "housekeeping": now})
+    monkeypatch.setattr(worker, "HEARTBEAT", {"queue": now, "dropbox": now, "housekeeping": now, "wanted": now})
     monkeypatch.setattr(config, "CWA_URL", "http://127.0.0.1:65530")
     monkeypatch.setitem(app_health_cache(), "at", 0.0)
     monkeypatch.setattr(_r, "get", lambda *a, **k: (_ for _ in ()).throw(_r.ConnectionError("refused")))

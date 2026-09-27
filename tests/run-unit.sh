@@ -13,5 +13,6 @@ if [[ -z "${SKIP_AUDIT:-}" ]]; then
   uvx pip-audit --require-hashes --strict -r librarian/requirements.lock
 fi
 docker build -q -t bookstack/librarian:test librarian/ >/dev/null
-docker run --rm -e LIBRARIAN_TEST=1 -v "$PWD/librarian/tests:/app/tests:ro" bookstack/librarian:test \
+# scripts/ too, read-only: test_canary loads scripts/synthetic.py (host-side, stdlib only)
+docker run --rm -e LIBRARIAN_TEST=1 -v "$PWD/librarian/tests:/app/tests:ro" -v "$PWD/scripts:/scripts:ro" bookstack/librarian:test \
   sh -c 'pip install -q pytest >/dev/null 2>&1 && python -m pytest -q -p no:cacheprovider tests "$@"' -- "$@"

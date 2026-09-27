@@ -65,7 +65,8 @@ def test_a_job_interrupted_by_two_restarts_is_not_requeued_forever():
     assert db.get(rid)["status"] == "queued"
 
 def test_prefs_defaults_and_validation():
-    assert db.get_prefs("alice") == {"preferred_format": "epub", "auto_kindle": False, "notify_email": False, "last_kindle_test": None}
+    assert db.get_prefs("alice") == {"preferred_format": "epub", "auto_kindle": False, "notify_email": False,
+                                     "last_kindle_test": None, "language": "en"}
     db.set_prefs("alice", preferred_format="azw3", auto_kindle=True)
     assert db.get_prefs("alice")["preferred_format"] == "azw3" and db.get_prefs("alice")["auto_kindle"] is True
     db.set_prefs("alice", notify_email=True)
@@ -73,7 +74,11 @@ def test_prefs_defaults_and_validation():
     db.set_prefs("alice", preferred_format="exe")                      # unknown format ignored
     assert db.get_prefs("alice")["preferred_format"] == "azw3"
     with db._conn() as c:
-        c.execute("UPDATE prefs SET preferred_format='kepub' WHERE owner='alice'")    # stored before kepub was dropped
+        c.execute("UPDATE prefs SET preferred_format='kepub' WHERE owner='alice'")
+    # a stored KEPUB preference is honoured when the image can convert (L11), else it falls back
+    assert db.get_prefs("alice")["preferred_format"] == ("kepub" if config.KEPUBIFY else "epub")
+    with db._conn() as c:
+        c.execute("UPDATE prefs SET preferred_format='lit' WHERE owner='alice'")      # never a choice
     assert db.get_prefs("alice")["preferred_format"] == "epub"
     db.set_prefs("alice", last_kindle_test=1700000000.0)
     assert db.get_prefs("alice")["last_kindle_test"] == 1700000000.0 and db.get_prefs("alice")["notify_email"] is True
@@ -779,7 +784,9 @@ def test_standard_ebooks_failure_is_not_cached(monkeypatch):
     assert fetchers.standard_ebooks("emma") == [] and fetchers._SE_CACHE["feed"] is None
     assert fetchers.standard_ebooks("emma")[0]["download_url"] == "https://standardebooks.org/ebooks/emma.epub"
     assert fetchers.standard_ebooks("emma") and len(calls) == 2                       # success is cached
-    assert config.SOURCES["standard_ebooks"] is False                                  # off by default now
+    # on by default again (v5): its search feed needs a login, but book pages reach its public
+    # downloads through Open Library's cross-links (bookmeta.py)
+    assert config.SOURCES["standard_ebooks"] is True
 
 def test_url_allowed_per_source(monkeypatch):
     ok, no = fetchers.url_allowed, lambda s, u: not fetchers.url_allowed(s, u)
@@ -813,6 +820,7 @@ def test_opds_adapter_picks_best_format_and_resolves_relative_links(monkeypatch)
     assert seen["url"] == "https://books.mine.tld/opds/search/my%20novel" and seen["auth"] is None
     assert out == [{"source": "mycatalog", "kind": "ebook", "title": "My Novel", "author": "Me",
                     "identifier": "mycatalog:https://books.mine.tld/get/epub/1", "format": "epub",
+                    "language": None, "src_ids": [],
                     "download_url": "https://books.mine.tld/get/epub/1", "is_torrent": False}]
     assert fetchers.url_allowed("mycatalog", out[0]["download_url"])
 

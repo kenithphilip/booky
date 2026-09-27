@@ -123,6 +123,20 @@ def _same_origin(p, configured):
     return bool(c.hostname) and p.scheme == c.scheme and p.hostname == c.hostname.lower() \
         and p.port == c.port and p.username is None
 
+def source_enabled(source):
+    """Built-in catalogues by their switch in config.SOURCES; the admin's own OPDS catalogs by
+    their row (catalogs.py)."""
+    if (source or "").startswith("opds:"):
+        import catalogs
+        c = catalogs.get(source)
+        return bool(c and c["enabled"])
+    return config.SOURCES.get(source) is True
+
+def enabled_sources():
+    import catalogs
+    return [s for s, on in config.SOURCES.items() if on and s != "mycatalog"] + \
+           [c["source"] for c in catalogs.all_catalogs()]
+
 def url_allowed(source, url):
     try:
         p = urlsplit(url or "")
@@ -131,6 +145,10 @@ def url_allowed(source, url):
             return False
         if source == "mycatalog":
             return _same_origin(p, config.MYCATALOG_URL)
+        if (source or "").startswith("opds:"):
+            import catalogs
+            c = catalogs.get(source)
+            return bool(c) and _same_origin(p, c["url"])
         if source == "gutenberg" and config.GUTENBERG_MIRROR and _same_origin(p, config.GUTENBERG_MIRROR):
             return True
         if p.scheme != "https":
@@ -280,7 +298,13 @@ def _ia_epub(meta):
                     "openlibrary_work": md.get("openlibrary_work"),
                     "openlibrary_edition": md.get("openlibrary_edition"),
                     "lccn": md.get("lccn"), "publisher": md.get("publisher"),
-                    "date": md.get("date"), "language": md.get("language")}
+                    "date": md.get("date"), "language": md.get("language"),
+                    # what the copy says it is, for bookmeta's cross-link verification
+                    "title": md.get("title"),
+                    "creator": md.get("creator") if isinstance(md.get("creator"), str)
+                               else ", ".join(md.get("creator") or []),
+                    "collection": md.get("collection") if isinstance(md.get("collection"), list)
+                                  else [md.get("collection")] if md.get("collection") else []}
     return None
 
 def _ia_epub_cached(ident, budget):
@@ -399,10 +423,18 @@ def librivox(q, limit=6, budget=None):
                 url = b.get("url_zip_file")
                 if not url:
                     continue
+                secs = int(b.get("totaltimesecs") or 0) if str(b.get("totaltimesecs") or "").isdigit() else 0
+                parts = int(b.get("num_sections") or 0) if str(b.get("num_sections") or "").isdigit() else 0
                 out.append({"source": "librivox", "kind": "audio",
                             "title": b.get("title", "?"),
                             "author": ", ".join(a.get("last_name", "") for a in b.get("authors", [])) or "Unknown",
                             "identifier": f"librivox:{b.get('id')}", "format": "zip",
+                            # Stage A evidence LibriVox gives for free: the reader sees how long
+                            # it is, and a copy in another language is never taken for them
+                            "language": b.get("language"), "duration_seconds": secs or None,
+                            "part_count": parts or None,
+                            "detail": f"LibriVox, {secs // 3600} h {secs % 3600 // 60} min" if secs else "LibriVox",
+                            "src_ids": [("librivox", str(b.get("id")))],
                             "download_url": url, "is_torrent": False})
         except Exception:
             pass
@@ -443,10 +475,13 @@ def search(q, deadline=SEARCH_DEADLINE):
     (SOURCE_BUDGET) covering all of its own HTTP calls so an abandoned one stops working
     shortly after the page has been rendered, and the shared _SEARCH pool caps how many
     adapter threads the whole portal can have in flight however many readers are searching."""
-    names = [n for n, on in config.SOURCES.items() if on and n in _ADAPTERS]
-    if not names:
+    import catalogs
+    names = [n for n, on in config.SOURCES.items() if on and n in _ADAPTERS and n != "mycatalog"]
+    cats = catalogs.all_catalogs()
+    if not names and not cats:
         return []
     results, until = [], time.monotonic() + deadline
     futures = [_SEARCH.submit(_ADAPTERS[n], q) for n in names]
+    futures += [_SEARCH.submit(opds.search, q, 12, None, c) for c in cats]
     _collect(futures, until, results.extend)
     return _dedupe(results)

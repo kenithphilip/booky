@@ -11,7 +11,12 @@
 #                    tailnet policy allows it: the portal's download fence refuses 100.64.0.0/10
 #                    and private ranges, and the Tailscale step should apply the tailnet ACL that
 #                    gives this machine (tag:bookstack) no outbound access.
-#   everything else  bound to 127.0.0.1 only; reachable solely through Caddy
+#   everything else  bound to 127.0.0.1 only; reachable solely through Caddy. Each sits on a
+#                    network of its own (L01): cwa, abs, dl, fetch (Shelfmark + FlareSolverr), plus
+#                    auth (Authelia) and eph (Ephemera + FlareSolverr) in the overlays. Shelfmark,
+#                    the internet-facing third-party app, cannot open a connection to Calibre-Web,
+#                    Audiobookshelf, qBittorrent or Authelia; the host-network services reach
+#                    every one of them on its 127.0.0.1 port, as before.
 #   qbittorrent      OPT-IN (profile "torrents", Library -> Torrents). Additionally opens 6881
 #                    to the internet for peer traffic (that's all it exposes). Written as
 #                    0.0.0.0:6881 on purpose: the Docker daemon's default publish address is
@@ -46,6 +51,8 @@ services:
       # CF_API_TOKEN (zone settings, rules, firewall) stays on the host. The fallback keeps an
       # older .env without CF_DNS_TOKEN renewing certificates until Configure runs again.
       - CF_API_TOKEN=${CF_DNS_TOKEN:-${CF_API_TOKEN:-}}
+      # L05: added to requests the Authelia gate let through (authelia/caddy-gate.snippet)
+      - BOOKSTACK_GATE_SECRET=${GATE_SECRET:-}
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/cf-origin-pull-ca.pem:/etc/caddy/cf-origin-pull-ca.pem:ro
@@ -62,6 +69,10 @@ services:
     pids_limit: 1024
     mem_limit: 1600m
     mem_reservation: 512m
+    # L01: s6/gosu start as root to drop to PUID; these five capabilities are all that needs
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    networks: { cwa: {} }
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -83,6 +94,8 @@ services:
     user: "${PUID}:${PGID}"
     mem_limit: 768m
     mem_reservation: 256m
+    cap_drop: [ALL]                # L01: runs as PUID from the first instruction; needs none
+    networks: { abs: {} }
     environment:
       - TZ=${TZ}
       # Keep Node's heap under the container fence so a big library scan GCs instead of OOMing.
@@ -122,6 +135,10 @@ services:
     container_name: qbittorrent
     mem_limit: 512m
     mem_reservation: 128m
+    # L01: s6/gosu start as root to drop to PUID; these five capabilities are all that needs
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    networks: { dl: {} }
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -172,6 +189,23 @@ services:
       - DOMAIN=${DOMAIN}
       - ADMIN_EMAIL=${ADMIN_EMAIL:-}  # gets a mail when a request awaits approval (needs SMTP)
       - MAX_REQUESTS_PER_DAY=${MAX_REQUESTS_PER_DAY:-30}
+      - WANTED_MAX_PER_USER=${WANTED_MAX_PER_USER:-25}
+      - WANTED_DAYS=${WANTED_DAYS:-180}
+      - BOOK_LANGUAGE=${SHELFMARK_LANGUAGE:-en}          # default reading language (Devices changes a reader's own)
+      - GOOGLE_BOOKS_API_KEY=${GOOGLE_BOOKS_API_KEY:-}   # optional metadata source (Library -> Metadata sources)
+      # L16: the portal reads and decides Shelfmark's pending requests as this CWA admin account
+      - TURNSTILE_SITEKEY=${TURNSTILE_SITEKEY:-}    # L17, optional: Security -> Login bot check
+      - CANARY_USERS=${CANARY_USERS:-}              # L08: the canary journey's hidden accounts
+      - GATE_SECRET=${GATE_SECRET:-}                # L05: Remote-User is trusted only beside it
+      - TURNSTILE_SECRET=${TURNSTILE_SECRET:-}
+      - SHELFMARK_API=http://127.0.0.1:8084
+      - SHELFMARK_SVC_USER=${SHELFMARK_SVC_USER:-}
+      - SHELFMARK_SVC_PASS=${SHELFMARK_SVC_PASS:-}
+      - SHELFMARK_AUTH_METHOD=${SHELFMARK_AUTH_METHOD:-cwa}   # L05: proxy behind the gate
+      - ABS_OIDC_SECRET=${ABS_OIDC_SECRET:-}               # L05: Audiobookshelf's client at Authelia
+      - HARDCOVER_API_KEY=${HARDCOVER_API_KEY:-}
+      - CONVERT_MAX_PER_DAY=${CONVERT_MAX_PER_DAY:-10}      # on-demand conversions per reader per day
+      - MAX_UPLOAD_TAILNET_MB=${MAX_UPLOAD_TAILNET_MB:-2048} # L18: upload.<domain> (Tailscale only)
       - KOSYNC_ENABLED=${KOSYNC_ENABLED:-false}
       # Abuse controls and session length. These were only in librarian/config.py, so tightening
       # them after an attack — or loosening them because the household kept locking itself out —
@@ -202,7 +236,7 @@ services:
       - STAGING_DIR=/staging
       - AUDIO_DIR=/audiobooks
       - SRC_GUTENBERG=${SRC_GUTENBERG:-true}
-      - SRC_STANDARD=${SRC_STANDARD:-false}   # its feed now needs a Patrons Circle login
+      - SRC_STANDARD=${SRC_STANDARD:-true}    # search feed needs a login; downloads are public (book pages)
       - SRC_ARCHIVE=${SRC_ARCHIVE:-true}
       - SRC_LIBRIVOX=${SRC_LIBRIVOX:-true}
       - IA_COLLECTIONS=${IA_COLLECTIONS:-gutenberg,opensource,americana,cdl}
@@ -311,6 +345,11 @@ services:
         exec /usr/bin/dumb-init -- /app/entrypoint.sh
     mem_limit: 768m
     mem_reservation: 128m
+    # L01: gosu drops to PUID; these five capabilities are all the entrypoint needs. On `fetch`
+    # with FlareSolverr only: Shelfmark cannot open a connection to any other service.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    networks: { fetch: {} }
     environment:
       - PUID=${PUID}
       - PGID=${PGID}
@@ -318,7 +357,16 @@ services:
       - DOCKERMODE=true
       - SESSION_COOKIE_SECURE=true
       # Log in with Calibre-Web accounts (CWA admins are Shelfmark admins). Read-only mount.
-      - AUTH_METHOD=cwa
+      # L05: "proxy" while the Authelia gate is on — one login: Caddy strips Remote-User/Groups
+      # on every path and sets them from Authelia's answer, and nothing but FlareSolverr shares
+      # Shelfmark's network. The same accounts are taken over by username (measured on v1.3.15:
+      # cwa -> proxy -> cwa keeps every user id), admin comes ONLY from the "admins" group.
+      - AUTH_METHOD=${SHELFMARK_AUTH_METHOD:-cwa}
+      - PROXY_AUTH_USER_HEADER=Remote-User
+      - PROXY_AUTH_ADMIN_GROUP_HEADER=Remote-Groups
+      - PROXY_AUTH_ADMIN_GROUP_NAME=admins
+      - PROXY_AUTH_LOGOUT_URL=https://auth.${DOMAIN:-localhost}/logout
+      - PROXY_AUTH_RESTRICT_SETTINGS_TO_ADMIN=true
       - CWA_DB_PATH=/auth/app.db
       # Where downloads land. The per-user level is written into the NAMING TEMPLATES, not
       # into the destination path, for two reasons (both re-verified on the pinned
@@ -374,10 +422,26 @@ services:
       # v1.3.15 an env value always wins over the Settings page (core/config.py get(): "Deployment-
       # level ENV values always win"), so the admin UI cannot point Shelfmark at a solver that is
       # not running. EXT_BYPASSER_TIMEOUT stays under RELEASE_SEARCH_TIMEOUT (Cloudflare's 100 s).
+      # Metadata-first ("universal") search is Shelfmark's DEFAULT mode, and it has no metadata
+      # source unless one is switched on: the pinned v1.3.15 then answers every search with "No
+      # metadata provider configured" (measured). Open Library is keyless; Hardcover and Google
+      # Books need keys, which Library -> Metadata sources writes into shelfmark/metadata.env
+      # (optional file below) — never as empty env values here, because Shelfmark treats an
+      # empty env var as SET and would lock the key field blank in its own Settings page.
+      - OPENLIBRARY_ENABLED=true
+      # L16: Shelfmark obeys the SAME approval rule as the portal. With APPROVALS_REQUIRED a
+      # reader picks a file and it waits; the admin approves it on the portal's Pending card
+      # (librarian/shelfmark_api.py) and it downloads to that READER's dropbox. Admins bypass.
+      - REQUESTS_ENABLED=${APPROVALS_REQUIRED:-false}
+      - REQUEST_POLICY_DEFAULT_EBOOK=request_release
+      - REQUEST_POLICY_DEFAULT_AUDIOBOOK=request_release
       - USING_EXTERNAL_BYPASSER=${FLARESOLVERR_ENABLED:-false}
       - EXT_BYPASSER_URL=http://flaresolverr:8191
       - EXT_BYPASSER_PATH=/v1
       - EXT_BYPASSER_TIMEOUT=${FLARESOLVERR_TIMEOUT_MS:-60000}
+    env_file:
+      - path: ./shelfmark/metadata.env
+        required: false
     ports:
       - "127.0.0.1:8084:8084"
     depends_on:
@@ -412,7 +476,7 @@ services:
       # account and go blind again. scripts/selftest.sh makes that probe instead — once, on
       # demand — where a single attempt can never reach the lockout.
       # $$ so compose leaves the expansion to the container's shell (as in the entrypoint above).
-      test: ["CMD-SHELL", "gosu \"$${PUID:-1000}:$${PGID:-1000}\" head -c 16 /auth/app.db 2>/dev/null | grep -q '^SQLite format 3' && curl -sf http://127.0.0.1:8084/api/auth/check | grep -q '\"auth_mode\": *\"cwa\"'"]
+      test: ["CMD-SHELL", "gosu \"$${PUID:-1000}:$${PGID:-1000}\" head -c 16 /auth/app.db 2>/dev/null | grep -q '^SQLite format 3' && curl -sf http://127.0.0.1:8084/api/auth/check | grep -q \"\\\"auth_mode\\\": *\\\"$${AUTH_METHOD:-cwa}\\\"\""]
       interval: 60s
       timeout: 10s
       retries: 3
@@ -471,6 +535,8 @@ services:
     container_name: flaresolverr
     profiles: ["solver"]
     mem_limit: 1024m
+    cap_drop: [ALL]                # L01: runs as its own user; Chromium starts with --no-sandbox
+    networks: { fetch: {} }
     environment:
       - TZ=${TZ}
       - LOG_LEVEL=info
@@ -484,3 +550,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+# L01: one network per service (see the header). Nothing on these reaches the host's loopback;
+# the host-network services (Caddy, the portal, Kuma) reach each service on its 127.0.0.1 port.
+networks:
+  cwa: {}
+  abs: {}
+  dl: {}
+  fetch: {}

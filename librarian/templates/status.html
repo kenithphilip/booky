@@ -14,6 +14,24 @@
 {% endfor %}
 {% endif %}
 
+{% if admin and (shelf_pending or shelf_error) %}
+<h2>Pending approval in Shelfmark</h2>
+{% if shelf_error %}<div class="card st-error">Could not read Shelfmark's queue: {{ shelf_error }}</div>{% endif %}
+{% for r in shelf_pending %}
+<div class="card"><div class="row" style="justify-content:space-between">
+<div><strong>{{ r.title }}</strong>{% if r.author %} <span class="mut">— {{ r.author }}</span>{% endif %}<br>
+<span class="mut">by {{ r.requester }} · {{ r.source or 'any source' }}{% if r.format %} · {{ r.format }}{% endif %} · {{ 'a chosen file' if r.level == 'release' else 'the book (you pick the file in Shelfmark)' }}</span>
+{% if r.note %}<br><span class="mut">“{{ r.note }}”</span>{% endif %}</div>
+<div class="row">
+{% if r.level == 'release' %}<form method="post" action="{{ url_for('shelfmark_decide', req_id=r.id, action='approve') }}">{{ csrf_field() }}<button type="submit">Approve</button></form>
+{% else %}<a class="btn sec" href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">Pick a file in Shelfmark</a>{% endif %}
+<form method="post" action="{{ url_for('shelfmark_decide', req_id=r.id, action='deny') }}" class="row">{{ csrf_field() }}
+<input type="text" name="reason" maxlength="200" placeholder="Reason (optional, shown to them)" style="width:200px">
+<button type="submit" class="danger">Deny</button></form>
+</div></div></div>
+{% endfor %}
+{% endif %}
+
 {% if admin and failed %}
 <div class="row" style="justify-content:space-between;align-items:center">
 <h2 style="margin-bottom:0">Failed (dead-letter)</h2>
@@ -30,6 +48,40 @@
 </div></div></div>
 {% endfor %}
 {% endif %}
+
+{% if looking %}
+<h2>Still looking</h2>
+<p class="mut">Books no catalog had yet. They are checked again within the hour, then every few hours, then daily, for
+{{ cfg.WANTED_DAYS }} days.</p>
+{% for w in looking %}
+<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
+<div><strong>{{ w.title }}</strong>{% if w.author %} <span class="mut">— {{ w.author }}</span>{% endif %}
+<span class="badge">{{ 'audiobook' if w.kind == 'audio' else 'ebook' }}</span>
+<span class="badge st-{{ w.status }}">{{ {'looking': 'looking', 'candidate': 'possible match', 'found': 'found', 'cancelled': 'cancelled', 'expired': 'gave up'}.get(w.status, w.status) }}</span>
+{% if admin %}<span class="mut">for {{ w.owner }}</span>{% endif %}<br>
+<span class="mut">{{ w.detail or 'waiting for its first look' }}{% if w.status in ('looking', 'candidate') and w.next_check %} · next look {{ w.next_check | ago_or_in }}{% endif %}</span>
+{% if w.status == 'candidate' and w.candidate %}
+<div style="margin-top:6px">Found: <strong>{{ w.candidate.title }}</strong> <span class="mut">— {{ w.candidate.author or 'no author given' }} · {{ source_label(w.candidate.source) }} · from <span class="code">{{ w.cand_host }}</span></span>
+{% if w.reasons %}<br><span class="mut" style="font-size:12px">Why: {{ w.reasons | join('; ') }}</span>{% endif %}</div>
+{% endif %}</div>
+<div class="row" style="flex:none">
+{% if w.status == 'candidate' and w.candidate %}
+<form method="post" action="{{ url_for('wanted_accept', wid=w.id) }}">{{ csrf_field() }}<button type="submit">Yes, request it</button></form>
+<form method="post" action="{{ url_for('wanted_reject', wid=w.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Not it</button></form>
+{% endif %}
+{% if w.status in ('looking', 'candidate') %}
+<form method="post" action="{{ url_for('wanted_cancel', wid=w.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Stop looking</button></form>
+{% endif %}
+</div></div></div>
+{% endfor %}
+{% endif %}
+
+{% if kindle_sends %}<h2>Sent to Kindle</h2><div class="card"><table>
+<tr><th>Book</th>{% if admin %}<th>Reader</th>{% endif %}<th>Status</th><th>Detail</th><th>When</th></tr>
+{% for k in kindle_sends %}<tr><td>{{ k.title }}</td>{% if admin %}<td>{{ k.owner }}</td>{% endif %}
+<td class="st-{{ 'done' if k.status == 'sent' else 'error' if k.status == 'failed' else 'queued' }}">{{ {'queued': 'sending', 'sent': 'sent', 'failed': 'failed'}.get(k.status, k.status) }}</td>
+<td class="mut">{{ k.detail or '' }}</td><td class="mut">{{ k.updated | ago_or_in }}</td></tr>{% endfor %}
+</table></div>{% endif %}
 
 <h2>{{ 'All requests' if admin else 'My requests' }}</h2>
 <p class="mut">Finished books appear under <a href="{{ url_for('my_library') }}">My books</a> and on your linked devices.</p>

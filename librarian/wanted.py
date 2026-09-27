@@ -54,6 +54,10 @@ def score(want, result):
     """(confidence, reasons) for one search result, or None when it is not this book."""
     if result_kind(result) != (want.get("kind") or "ebook"):
         return None
+    import matching
+    wl, rl = matching.lang(want.get("language")), matching.lang(result.get("language"))
+    if wl and rl and wl != rl:
+        return None                               # never another language for this reader
     wt, rt = dedupe.norm_title(want.get("title")), dedupe.norm_title(result.get("title"))
     if not wt or wt != rt:
         return None

@@ -137,6 +137,14 @@ def add_calibre_book(book_id, title, author, tags=(), formats=("epub",), lib_dir
 @pytest.fixture(autouse=True)
 def fresh_env(monkeypatch):
     """Fresh CWA db, calibre db, state db and folders for every test; config restored."""
+    # Offline by default: the metadata-first search must never reach Open Library from a test
+    # (tests/test_bookmeta.py replaces this with the recorded real responses).
+    import requests as _rq, bookmeta
+    def _offline(*a, **k):
+        raise _rq.ConnectionError("tests are offline")
+    monkeypatch.setattr(bookmeta.requests, "get", _offline)
+    for c in (bookmeta._SEARCH, bookmeta._RECORD, bookmeta._COPIES):
+        c.clear()
     _reset_dirs()
     make_cwa_db(config.CWA_DB)
     make_calibre_db(config.CALIBRE_DB)

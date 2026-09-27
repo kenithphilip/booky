@@ -102,6 +102,10 @@ CLI_ACT='{"ok": true}'
 CLI_ACT_FAIL=0
 curl(){ echo "curl: $*" >> "$LOG"; case "$*" in *ipify*) echo "${IPIFY:-203.0.113.5}";;
   *127.0.0.1:8090/healthz*) [ "${FAIL_HEALTHZ:-0}" = 1 ] && return 22; return 0;;
+  *"/healthz?aop="*) printf '%s' "${AOP_PROBE:-200}";;   # L14: a request through Cloudflare
+  *"/bookstack/config"*) printf '%s' "${REST_PROBE:-404}";;   # the home rest-server (404 = logged in, no repo yet)
+  *authenticated_origin_pull_ca.pem*) local o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done
+     if [ -n "${CF_SHARED_PEM:-}" ]; then cp "$CF_SHARED_PEM" "$o"; else printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$o"; fi;;
   *127.0.0.1:9091/api/health*) [ "${FAIL_AUTHELIA_HEALTH:-0}" = 1 ] && return 7; return 0;;
   *) return 0;; esac; }
 chown(){ echo "chown: $*" >> "$LOG"; }
@@ -240,7 +244,7 @@ reset; STACK_USER=books; ensure_stack_user; rc=$?
 expect '[ $rc = 0 ] && [ "$STACK_USER" = debian ] && [ "$STACK_HOME" = /home/debian ] && ! seen "useradd:" && seen "gpasswd: -d debian docker" && ! seen "usermod: -aG docker"' "uid 1000 taken by the image's default user -> that account is reused, no useradd (was: abort)"
 printf 'root:x:0:0::/root:/bin/bash\n' > "$PASSWD"
 reset; STACK_USER=books; ensure_stack_user; rc=$?
-expect '[ $rc = 0 ] && [ "$STACK_USER" = books ] && seen "useradd: -m -u 1000 -s /bin/bash books" && grep -q "^books:x:1000:" "$PASSWD" && ! seen "usermod: -aG docker"' "fresh image -> 'books' created with uid 1000"
+expect '[ $rc = 0 ] && [ "$STACK_USER" = books ] && seen "useradd: -m -u 1000 -s /usr/sbin/nologin books" && grep -q "^books:x:1000:" "$PASSWD" && ! seen "usermod: -aG docker"' "fresh image -> 'books' created with uid 1000"
 reset; STACK_USER=books; ensure_stack_user; rc=$?
 expect '[ $rc = 0 ] && [ "$STACK_USER" = books ] && ! seen "useradd:"' "re-run is idempotent (existing books/1000 reused)"
 printf 'root:x:0:0::/root:/bin/bash\nbooks:x:1001:1001::/home/books:/bin/bash\n' > "$PASSWD"
@@ -504,7 +508,46 @@ expect '[ $rc = 0 ] && [ "$(envget AUTHELIA_ENABLED)" = true ] && grep -q forwar
 # A17: the portal reads AUTHELIA_ENABLED at start-up; that flag is what stops /admin offering
 # "Add a user", which would create an account with no Authelia login and no way in anywhere
 expect 'seen "compose up -d librarian" && [ "$(line_of "caddy reload")" -lt "$(line_of "compose up -d librarian")" ]' "enabling Authelia restarts the portal, so its add-user guard rail is actually live (A17)"
+# L05: one login behind the gate
+expect '[[ "$(envget GATE_SECRET)" =~ ^[0-9a-f]{64}$ ]] && grep -q "request_header -X-Bookstack-Gate" "$STACK_DIR/caddy/Caddyfile" && grep -q "request_header @authelia_protected X-Bookstack-Gate {env.BOOKSTACK_GATE_SECRET}" "$STACK_DIR/caddy/Caddyfile"' "a gate secret is generated; Caddy strips any client copy and vouches only for requests Authelia let through (L05)"
+expect 'grep -A12 "reverse_proxy 127.0.0.1:8090\|request\.example\.test" "$STACK_DIR/caddy/Caddyfile" >/dev/null && ! grep -q "BOOKSTACK_GATE_SECRET=[0-9a-f]" "$STACK_DIR/caddy/Caddyfile" && grep -q "BOOKSTACK_GATE_SECRET=\${GATE_SECRET:-}" "$REPO/docker-compose.yml" && grep -q "GATE_SECRET=\${GATE_SECRET:-}" "$REPO/docker-compose.yml"' "the secret is a runtime placeholder, never written into the Caddyfile; compose hands it to Caddy and the portal"
+expect 'seen "exec librarian python -m cwa proxy-login on" && seen "compose restart calibre-web" && seen "systemctl: enable --now bookstack-gate-sync.path bookstack-gate-sync.timer"' "Calibre-Web's header login is switched on and the password sync units are installed (L05)"
+gu="$T/etc/systemd/system/bookstack-gate-sync"
+expect 'grep -qF "PathModified=$STACK_DIR/librarian/state/gate-sync.flag" "$gu.path" && grep -qF "ExecStart=/usr/bin/python3 $STACK_DIR/scripts/gate-sync.py" "$gu.service" && grep -q "^OnCalendar=\*:0/10" "$gu.timer" && grep -q "^OnFailure=bookstack-alert@gate-sync.service" "$gu.service"' "gate-sync runs the moment the portal queues a password (path unit), with a 10-minute safety net"
+expect 'grep -q "watch: true" "$REPO/authelia/configuration.yml.template"' "Authelia re-reads its user file itself (no restart that would sign everyone out)"
+ac="$STACK_DIR/authelia/configuration.yml"
+expect '[ "$(envget SHELFMARK_AUTH_METHOD)" = proxy ] && seen "compose up -d shelfmark librarian" && grep -q "AUTH_METHOD=\${SHELFMARK_AUTH_METHOD:-cwa}" "$REPO/docker-compose.yml" && grep -q "PROXY_AUTH_ADMIN_GROUP_NAME=admins" "$REPO/docker-compose.yml"' "Shelfmark switches to the header login behind the gate; admin rights only from the admins group (L05)"
+expect '[[ "$(envget ABS_OIDC_SECRET)" =~ ^[0-9a-f]{64}$ ]] && [[ "$(envget AUTHELIA_OIDC_HMAC)" =~ ^[0-9a-f]{64}$ ]] && [ -s "$STACK_DIR/authelia/oidc-jwks.pem" ] && [ "$(stat -c %a "$STACK_DIR/authelia/oidc-jwks.pem" 2>/dev/null || stat -f %Lp "$STACK_DIR/authelia/oidc-jwks.pem")" = 600 ]' "Audiobookshelf's OpenID client secret, Authelia's HMAC secret and an RSA signing key (0600) are generated"
+expect 'grep -q "client_id: .audiobookshelf." "$ac" && grep -qE "client_secret: .\\\$pbkdf2-sha512\\\$" "$ac" && ! grep -qF "$(envget ABS_OIDC_SECRET)" "$ac" && ! grep -qF "$(envget AUTHELIA_OIDC_HMAC)" "$ac" && grep -q "https://audio.example.test/auth/openid/callback" "$ac" && grep -q "consent_mode: .implicit." "$ac"' "the rendered OpenID block: only the HASH of the client secret, no HMAC secret, the audio. callback, no consent click"
+expect 'grep -q "BOOKSTACK_OIDC_HMAC=\${AUTHELIA_OIDC_HMAC:-}" "$REPO/docker-compose.authelia.yml" && grep -qx "authelia/oidc-jwks.pem" "$REPO/.gitignore"' "the HMAC secret reaches Authelia through its environment; the signing key never enters git"
 step_authelia_off >/dev/null; expect '[ "$(envget AUTHELIA_ENABLED)" = false ] && ! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Authelia disable removes the gate"
+expect 'seen "exec librarian python -m cwa proxy-login off" && [ ! -f "$gu.path" ] && seen "systemctl: disable --now bookstack-gate-sync.path bookstack-gate-sync.timer"' "and turns Calibre-Web's header login and the password sync off again (L05)"
+expect '[ "$(envget SHELFMARK_AUTH_METHOD)" = cwa ]' "and Shelfmark goes back to its Calibre-Web login"
+# the admins group follows Calibre-Web's admins
+cat > "$T/adm-users.yml" <<'YML'
+users:
+  admin:
+    displayname: "admin"
+    password: "$argon2id$x"
+    email: "a@x.test"
+    groups:
+      - users
+  alice:
+    displayname: "Alice"
+    password: "$argon2id$y"
+    email: "al@x.test"
+    groups:
+      - users
+      - admins
+YML
+cp "$T/adm-users.yml" "$STACK_DIR/authelia/users_database.yml"; authelia_sync_admin_groups
+expect 'python3 - "$STACK_DIR/authelia/users_database.yml" <<"PYC"
+import sys, re
+s = open(sys.argv[1]).read()
+blk = lambda u: re.search(r"  " + u + r":\n((?:    .*\n?)*)", s).group(1)
+ok = "      - admins" in blk("admin") and "      - admins" not in blk("alice") and "      - users" in blk("alice") and "$argon2id$y" in blk("alice")
+sys.exit(0 if ok else 1)
+PYC' "Authelia's admins group mirrors Calibre-Web: admin gains it, a reader who had it loses it, nothing else changes"
 reset; step_authelia_off >/dev/null; expect 'seen "compose up -d librarian"' "disabling it restarts the portal too, so /admin stops linking to a stopped Authelia (A17)"
 cp "$T/users.keep" "$f"; envset AUTHELIA_ENABLED true; render_caddy_all
 
@@ -663,6 +706,14 @@ cf(){ echo "cf: $*" >> "$LOG"; local m="$1" path="$2" data="" n
   [ "${3:-}" = --data ] && data="$4"
   case "$m $path" in
     "GET /zones?name="*) echo '{"result":[{"id":"zone-STUB"}]}';;
+    # L14 zone-level origin pulls: an upload gets a fresh id; its status is CF_AOP_STATUS
+    "POST "*/origin_tls_client_auth) [ "${CF_AOP_RC:-0}" = 0 ] || return 22
+       n=$(( $(cat "$CFSTORE/aop_n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$CFSTORE/aop_n"
+       printf '%s' "$data" > "$CFSTORE/aop_upload"; printf '{"result":{"id":"aop-%s","status":"pending_deployment"}}\n' "$n";;
+    "PUT "*/origin_tls_client_auth/settings) printf '%s' "$data" | command jq -r .enabled > "$CFSTORE/aop_enabled"; echo '{"success":true}';;
+    "GET "*/origin_tls_client_auth/settings) printf '{"result":{"enabled":%s}}\n' "$(cat "$CFSTORE/aop_enabled" 2>/dev/null || echo false)";;
+    "GET "*/origin_tls_client_auth/*) printf '{"result":{"status":"%s"}}\n' "${CF_AOP_STATUS:-active}";;
+    "DELETE "*/origin_tls_client_auth/*) echo '{"success":true}';;
     "PATCH "*/settings/*) [ "${path##*/}" = "${CF_FAIL_SETTING:-}" ] && return 22
        printf '%s' "$data" | command jq -r .value > "$CFSTORE/set_${path##*/}"; echo '{"success":true}';;
     "GET "*/settings/*) printf '{"result":{"value":"%s"}}\n' "$(cat "$CFSTORE/set_${path##*/}" 2>/dev/null)";;
@@ -737,7 +788,7 @@ PY
 echo "== cloudflare step"
 envset TAILSCALE_IP 100.64.0.1; envset CF_API_TOKEN cf-token-123
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STACK_DIR/scripts/cf-ips.sh"; chmod +x "$STACK_DIR/scripts/cf-ips.sh"
-rm -f "$CFSTORE"/*; reset; step_cloudflare && ok "step_cloudflare ran" || bad "step_cloudflare failed"
+rm -f "$CFSTORE"/*; reset "no"; step_cloudflare && ok "step_cloudflare ran" || bad "step_cloudflare failed"
 expect 'seen "cf: PATCH /zones/zone-STUB/settings/browser_check --data {\"value\":\"off\"}" && seen "cf: PATCH /zones/zone-STUB/settings/email_obfuscation --data {\"value\":\"off\"}" && seen "settings/rocket_loader --data {\"value\":\"off\"}"' "Browser Integrity Check, e-mail obfuscation and Rocket Loader set OFF"
 expect 'seen "cf: PUT /zones/zone-STUB/rulesets/phases/http_request_cache_settings/entrypoint" && grep -F "http_request_cache_settings/entrypoint --data" "$LOG" | grep -q "\"cache\":false" && grep -F "cache_settings/entrypoint --data" "$LOG" | grep -q "books.example.test"' "no-cache Cache Rule for the four public hosts"
 expect '! seen "Bot Fight Mode: ON" && grep -F "msgbox" "$LOG" | grep -q "Do NOT enable Bot Fight Mode"' "Bot Fight Mode advice: must stay OFF"
@@ -745,20 +796,53 @@ expect '[ -f "$T/etc/cron.d/bookstack-cfips" ] && grep -q "^PATH=/usr/local/sbin
 expect 'grep -q "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/cf-ips.sh" "$T/etc/cron.d/bookstack-cfips"' "the cf-ips cron line carries STACK_DIR, so a failed nightly refresh can still find the alert channel (V09)"
 # A34: auth. is published only while Authelia runs; otherwise it is a public hostname that 502s
 expect '! grep -q "name\":\"auth.example.test" "$LOG"' "auth. is NOT published while Authelia is off (A34)"
-envset AUTHELIA_ENABLED true; rm -f "$CFSTORE"/*; reset; step_cloudflare >/dev/null
+envset AUTHELIA_ENABLED true; rm -f "$CFSTORE"/*; reset "no"; step_cloudflare >/dev/null
 expect 'grep -q "name\":\"auth.example.test" "$LOG"' "with Authelia on it IS published (A34)"
 envset AUTHELIA_ENABLED false
 # A33: 127.0.0.1 is the placeholder Configure writes before Tailscale exists
-tsbak3=$(envget TAILSCALE_IP); envset TAILSCALE_IP 127.0.0.1; rm -f "$CFSTORE"/*; reset; step_cloudflare; rc=$?
+tsbak3=$(envget TAILSCALE_IP); envset TAILSCALE_IP 127.0.0.1; rm -f "$CFSTORE"/*; reset "no"; step_cloudflare; rc=$?
 expect '[ $rc = 0 ] && ! grep -q "name\":\"monitor.example.test" "$LOG" && grep -F msgbox "$LOG" | grep -q "127.0.0.1 placeholder"' "no tailnet IP yet: monitor./dl./ephemera. are NOT published and the summary says so (A33)"
-envset TAILSCALE_IP "$tsbak3"; rm -f "$CFSTORE"/*; reset; step_cloudflare >/dev/null
+envset TAILSCALE_IP "$tsbak3"; rm -f "$CFSTORE"/*; reset "no"; step_cloudflare >/dev/null
 expect 'seen "cf: POST /zones/zone-STUB/dns_records --data {\"type\":\"A\",\"name\":\"monitor.example.test\",\"content\":\"100.64.0.1\",\"ttl\":1,\"proxied\":false}" && ! grep -q "name\":\"dl.example.test" "$LOG" && ! grep -q "name\":\"aria.example.test" "$LOG" && seen "dns_records?type=A&name=aria.example.test"' "tailnet-only hosts grey-clouded; no dl. while torrents are off; stale aria. looked up for deletion"
 expect 'seen "cf: GET /zones/zone-STUB/settings/ssl" && seen "cf: GET /zones/zone-STUB/settings/tls_client_auth" && grep -F msgbox "$LOG" | grep -q "read back and verified"' "SSL mode and origin pulls are read back before success is claimed (F13)"
 rm -f "$CFSTORE"/*; CF_FAIL_SETTING=tls_client_auth; reset; step_cloudflare; rc=$?; CF_FAIL_SETTING=""
 expect '[ $rc = 1 ] && grep -F "NOT fully configured" "$LOG" | grep -q "tls_client_auth" && ! grep -F msgbox "$LOG" | grep -q "Cloudflare configured"' "a failed zone setting is listed and the step fails instead of claiming success (F13)"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$STACK_DIR/scripts/cf-ips.sh"; rm -f "$CFSTORE"/*; reset; step_cloudflare; rc=$?
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STACK_DIR/scripts/cf-ips.sh"; rm -f "$CFSTORE"/*; reset "no"; step_cloudflare; rc=$?
 expect '[ $rc = 1 ] && grep -F "NOT fully configured" "$LOG" | grep -q "firewall allowlist"' "a failed firewall allowlist makes the step fail"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$STACK_DIR/scripts/cf-ips.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STACK_DIR/scripts/cf-ips.sh"; rm -f "$CFSTORE"/*; reset "no"; step_cloudflare >/dev/null
+expect '[ "$(aop_mode)" = shared ] && cmp -s "$STACK_DIR/caddy/cf-origin-pull-ca.pem" "$STACK_DIR/caddy/cf-shared-ca.pem" && grep -F "yesno: " "$LOG" | grep -q "Lock the origin to THIS zone only" && grep -qF "SHARED client certificate" "$LOG"' "by default Caddy trusts Cloudflare's shared CA, the step offers the per-zone lock and the summary says which one is in force (L14)"
+
+echo "== L14: this zone's own origin-pull certificate"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STACK_DIR/scripts/cf-ips.sh"; chmod +x "$STACK_DIR/scripts/cf-ips.sh"
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=cf-shared -days 30 -keyout "$T/shk.pem" -out "$T/shared.pem" >/dev/null 2>&1
+export CF_SHARED_PEM="$T/shared.pem"
+rm -f "$CFSTORE"/*; envset AOP_MODE ""; envset AOP_CERT_ID ""; reset "yes"; step_cloudflare; rc=$?
+ad="$T/etc/bookstack/aop"; tr="$STACK_DIR/caddy/cf-origin-pull-ca.pem"
+expect '[ $rc = 0 ] && [ "$(envget AOP_MODE)" = zone ] && [ "$(envget AOP_CERT_ID)" = aop-1 ] && cmp -s "$tr" "$ad/ca.pem" && [ "$(cat "$CFSTORE/aop_enabled")" = true ]' "set up: uploaded, enabled at Cloudflare, proven, and Caddy now trusts ONLY this zone's CA"
+expect 'openssl verify -CAfile "$ad/ca.pem" "$ad/client.pem" >/dev/null 2>&1 && openssl x509 -in "$ad/client.pem" -noout -text | grep -q "CA:FALSE" && openssl x509 -in "$ad/client.pem" -noout -text | grep -q "TLS Web Client Authentication" && openssl x509 -in "$ad/client.pem" -noout -text | grep -qE "(Public-Key|Public Key): \(4096 bit\)"' "the leaf is what Cloudflare requires: RSA 4096, CA:FALSE, clientAuth, signed by our CA"
+expect '[ "$(stat -c %a "$ad/client.key" 2>/dev/null || stat -f %Lp "$ad/client.key")" = 600 ] && [ "$(stat -c %a "$ad/ca.key" 2>/dev/null || stat -f %Lp "$ad/ca.key")" = 600 ] && [ "$(stat -c %a "$ad" 2>/dev/null || stat -f %Lp "$ad")" = 700 ] && ! ls "$STACK_DIR/caddy" | grep -q "\.key"' "private keys stay in /etc/bookstack/aop (0700/0600); only the CA certificate reaches caddy/"
+expect 'command jq -e ".certificate | startswith(\"-----BEGIN CERTIFICATE\")" "$CFSTORE/aop_upload" >/dev/null && command jq -e ".private_key | test(\"PRIVATE KEY\")" "$CFSTORE/aop_upload" >/dev/null && ! command jq -r .certificate "$CFSTORE/aop_upload" | grep -q "$(sed -n 2p "$ad/ca.pem")"' "the upload carries the LEAF and its key, not the CA (Cloudflare: 'missing leaf certificate')"
+expect 'seen "docker: compose" && grep -F "docker: " "$LOG" | grep -q "restart caddy" && seen "curl: -s -o /dev/null -m 15 -w %{http_code} https://request.example.test/healthz?aop=" && grep -qF "Origin locked to THIS zone" "$LOG"' "the switch is proven with a real request through Cloudflare after a Caddy RESTART (no reused connection)"
+# the probe fails: back to trusting both, nothing broken
+envset AOP_MODE both; AOP_PROBE=526 reset; AOP_PROBE=526 step_origin_lock; rc=$?
+expect '[ $rc = 1 ] && [ "$(envget AOP_MODE)" = both ] && [ "$(grep -c "BEGIN CERTIFICATE" "$tr")" = 2 ] && grep -qF "put back to trusting both" "$LOG"' "Cloudflare still presents the shared certificate: Caddy goes back to trusting both, and says so"
+reset; step_origin_lock; expect '[ "$(envget AOP_MODE)" = zone ] && cmp -s "$tr" "$ad/ca.pem"' "a later run finishes the switch"
+# renewal: a new leaf from the same CA; the old upload is deleted only after the proof
+cp "$ad/ca.pem" "$T/ca.before"; cp "$ad/client.pem" "$T/leaf.before"
+reset "yes"; step_origin_lock
+expect '[ "$(envget AOP_CERT_ID)" = aop-2 ] && [ -z "$(envget AOP_OLD_CERT_ID)" ] && seen "cf: DELETE /zones/zone-STUB/origin_tls_client_auth/aop-1" && cmp -s "$ad/ca.pem" "$T/ca.before" && ! cmp -s "$ad/client.pem" "$T/leaf.before" && [ "$(envget AOP_MODE)" = zone ]' "renewal: new leaf from the SAME CA, uploaded, proven, then the old upload deleted"
+# the token lacks SSL and Certificates: nothing changes
+cp "$tr" "$T/tr.before"; cp "$ad/client.pem" "$T/leaf2"; CF_AOP_RC=1 reset "yes"; CF_AOP_RC=1 step_origin_lock; rc=$?
+expect '[ $rc = 1 ] && grep -qF "SSL and Certificates" "$LOG" && [ ! -e "$ad/client.pem.new" ] && cmp -s "$tr" "$T/tr.before" && cmp -s "$ad/client.pem" "$T/leaf2" && [ "$(envget AOP_MODE)" = zone ] && [ "$(envget AOP_CERT_ID)" = aop-2 ]' "an upload Cloudflare refuses (token without SSL and Certificates) changes nothing, and says which permission is missing"
+# not deployed yet at Cloudflare
+envset AOP_MODE ""; envset AOP_CERT_ID ""; aop_write_trust shared; CF_AOP_STATUS=pending_deployment reset; CF_AOP_STATUS=pending_deployment step_origin_cert; rc=$?
+expect '[ $rc = 1 ] && [ "$(aop_mode)" = shared ] && cmp -s "$tr" "$STACK_DIR/caddy/cf-shared-ca.pem" && grep -qF "has not deployed it yet" "$LOG"' "a certificate Cloudflare has not rolled out yet leaves Caddy on the shared CA"
+expect 'declare -f step_deploy | grep -q "aop_tighten" && declare -f menu_security | grep -q step_origin_lock' "Deploy finishes a pending switch; Security -> Origin lock exists"
+# re-running the Cloudflare step keeps a finished per-zone lock
+envset AOP_MODE zone; aop_write_trust zone; rm -f "$CFSTORE"/*; reset; step_cloudflare >/dev/null
+expect 'cmp -s "$tr" "$ad/ca.pem" && ! grep -F "yesno: " "$LOG" | grep -q "Lock the origin"' "re-running Install -> Cloudflare keeps the per-zone trust (it does not fall back to the shared CA)"
+envset AOP_MODE ""; aop_write_trust shared; unset CF_SHARED_PEM
 
 echo "== deploy: Caddy last, admin password loop, ABS init before exposure"
 rm -f "$STACK_DIR/caddy/cf-origin-pull-ca.pem"; reset; step_deploy; expect 'seen "Run the Cloudflare step first"' "deploy refuses without origin-pull CA"
@@ -865,7 +949,7 @@ exit 0
 EOS
 chmod +x "$bin/restic"
 RX='restic: (--retry-lock 30m )?'   # restic_run probes for --retry-lock, so it is present or not
-reset "/mnt/backup" "resticpass-123" "resticpass-123" "https://hc-ping.example/uuid" "no"; step_backup && ok "step_backup" || bad "step_backup failed"
+reset "O" "/mnt/backup" "resticpass-123" "resticpass-123" "no" "https://hc-ping.example/uuid" "no"; step_backup && ok "step_backup" || bad "step_backup failed"
 renv="$T/etc/bookstack/restic.env"; u="$T/etc/systemd/system"
 expect 'grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv" && grep -q "^RESTIC_PASSWORD=resticpass-123$" "$renv" && [ "$(stat -c %a "$renv" 2>/dev/null || stat -f %Lp "$renv")" = 600 ]' "restic.env written 0600 with repo + password"
 expect 'grep -qE "${RX}cat config" "$RLOG" && ! grep -qE "${RX}init" "$RLOG" && [ "$(envget BACKUP_PING_URL)" = https://hc-ping.example/uuid ]' "existing repository opened (not re-initialised); optional ping URL stored (C1)"
@@ -888,14 +972,46 @@ expect 'bash -n "$pbs" && [ "$(head -1 "$pbs")" = "#!/usr/bin/env bash" ]' "the 
 expect 'grep -q "scripts/selftest.sh" "$pbs" && grep -q "scripts/alert.sh" "$pbs" && grep -q "starting" "$pbs" && grep -qF "STACK_DIR=$STACK_DIR" "$pbs"' "the wrapper waits out the healthcheck start periods, runs selftest.sh and alerts through alert.sh, with STACK_DIR baked in (F.6)"
 cp "$pbu" "$T/pbu.1"; cp "$pbs" "$T/pbs.1"; install_backup_units
 expect 'cmp -s "$pbu" "$T/pbu.1" && cmp -s "$pbs" "$T/pbs.1" && [ "$(grep -c "env bash" "$pbs")" = 1 ] && [ "$(ls "$u" | grep -c postboot)" = 1 ]' "a second install_backup_units rewrites the unit and wrapper in place instead of duplicating either (F.6)"
-\# A01: a password that does not open the repository must NOT replace /etc/bookstack/restic.env
+# A01: a password that does not open the repository must NOT replace /etc/bookstack/restic.env
 cp "$renv" "$T/renv.good"; : > "$RLOG"; export RESTIC_NOREPO=1
-reset "/mnt/backup" "typo-password-9" "typo-password-9" "no"; step_backup; rc=$?; export RESTIC_NOREPO=0
+reset "O" "/mnt/backup" "typo-password-9" "typo-password-9" "no"; step_backup; rc=$?; export RESTIC_NOREPO=0
 expect '[ $rc = 1 ] && cmp -s "$renv" "$T/renv.good" && [ ! -e "$renv.new" ] && ! grep -qE "${RX}init" "$RLOG" && grep -F msgbox "$LOG" | grep -q "still opens your existing backups"' "a wrong/rotated restic password leaves the existing key file untouched and refuses to init over it (A01)"
 expect 'grep -F "yesno: " "$LOG" | grep -q "key add"' "and the prompt says a restic password cannot be changed by typing a new one (it needs key add)"
-: > "$RLOG"; export RESTIC_NOREPO=1; reset "/mnt/backup" "resticpass-123" "resticpass-123" "yes" "" "no"; step_backup; export RESTIC_NOREPO=0
+: > "$RLOG"; export RESTIC_NOREPO=1; reset "O" "/mnt/backup" "resticpass-123" "resticpass-123" "yes" "no" "" "no"; step_backup; export RESTIC_NOREPO=0
 expect 'grep -qE "${RX}init" "$RLOG" && grep -q "^RESTIC_PASSWORD=resticpass-123$" "$renv" && [ ! -e "$renv.new" ]' "a brand-new repository is initialised by the Backups step (only there, F67) and the key file is moved into place afterwards"
-reset "s3:s3.example/bucket" "resticpass-123" "resticpass-123" "<cancel>"; step_backup; expect '[ $? = 1 ] && grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv"' "Cancel at the S3 key prompt aborts without touching restic.env"
+reset "S" "s3:s3.example/bucket" "resticpass-123" "resticpass-123" "<cancel>"; step_backup; expect '[ $? = 1 ] && grep -q "^RESTIC_REPOSITORY=/mnt/backup$" "$renv"' "Cancel at the S3 key prompt aborts without touching restic.env"
+echo "== L15: an append-only nightly key; retention with a separate key"
+expect '! grep -q "^RESTIC_APPEND_ONLY" "$renv" && [ ! -f "$u/bookstack-prune.timer" ]' "answering No keeps the old behaviour: no flag, no prune timer"
+# append-only, prune key kept on the laptop
+: > "$RLOG"; reset "O" "/mnt/backup" "resticpass-123" "resticpass-123" "yes" "no" "" "no"; step_backup
+expect 'grep -q "^RESTIC_APPEND_ONLY=1$" "$renv" && [ ! -f "$u/bookstack-prune.timer" ] && [ ! -f "$T/etc/bookstack/restic-prune.env" ] && grep -qF "RESTIC_PRUNE_ENV=./prune.env bash prune.sh" "$LOG"' "append-only + laptop: flag stored, nothing on the server can prune, the laptop recipe is shown"
+expect 'grep -F "yesno: " "$LOG" | grep -q "without deleteFiles\|WITHOUT deleteFiles" && grep -F "yesno: " "$LOG" | grep -q "listBuckets,listFiles,readFiles,writeFiles"' "the question says exactly which B2 key capabilities make a key append-only"
+# append-only, prune key on the server (rest-server style: a different user in the address)
+: > "$RLOG"; reset "O" "/mnt/backup" "resticpass-123" "resticpass-123" "yes" "yes" "rest:https://prune:pw@host/repo" "" "no"; step_backup
+pf="$T/etc/bookstack/restic-prune.env"
+expect 'grep -q "^RESTIC_REPOSITORY=rest:https://prune:pw@host/repo$" "$pf" && grep -q "^RESTIC_PASSWORD=resticpass-123$" "$pf" && [ "$(stat -c %a "$pf" 2>/dev/null || stat -f %Lp "$pf")" = 600 ] && [ ! -e "$pf.new" ]' "the prune key file: its own address, the same repository password, 0600"
+expect 'grep -q "^OnCalendar=\*-\*-15 03:00:00" "$u/bookstack-prune.timer" && grep -qF "Environment=RESTIC_PRUNE_ENV=$pf" "$u/bookstack-prune.service" && grep -q "scripts/prune.sh" "$u/bookstack-prune.service" && grep -q "^OnFailure=bookstack-alert@prune.service" "$u/bookstack-prune.service" && seen "systemctl: enable --now bookstack-prune.timer"' "monthly prune timer on the 15th (never the 1st's restore test or the 01:00 backup), alerting on failure"
+# an empty prune key is not stored
+rm -f "$pf"; : > "$RLOG"
+reset "S" "s3:s3.example/bucket" "resticpass-123" "resticpass-123" "AKID" "secret" "yes" "yes" "<blank>" "x" "" "no"; step_backup
+expect '[ ! -f "$pf" ] && grep -F msgbox "$LOG" | grep -q "No prune key entered"' "an empty prune key is refused, not stored"
+# back to a key that may delete: the prune timer and key go away
+reset "O" "/mnt/backup" "resticpass-123" "resticpass-123" "no" "" "no"; step_backup
+expect '! grep -q "^RESTIC_APPEND_ONLY" "$renv" && [ ! -f "$u/bookstack-prune.timer" ] && seen "systemctl: disable --now bookstack-prune.timer"' "switching back to a deleting key removes the monthly prune timer"
+echo "== backups to a computer at home (rest-server over Tailscale, free, append-only)"
+: > "$RLOG"; reset "H" "100.101.102.103" "8000" "resticpass-123" "resticpass-123" "" "no"; step_backup; rc=$?
+expect '[ $rc = 0 ] && grep -qE "^RESTIC_REPOSITORY=rest:http://bookstack:[A-Za-z0-9]{32}@100\.101\.102\.103:8000/bookstack/$" "$renv" && grep -q "^RESTIC_APPEND_ONLY=1$" "$renv" && grep -q "^RESTIC_PRUNE_WHERE=home$" "$renv"' "the home target: a generated login in the repository address, append-only, pruned at home"
+expect 'grep -qF "bookstack:\$2a\$14\$STUBHASH/abc" "$LOG" && grep -qF -- "--append-only --private-repos" "$LOG" && grep -qF "restic/rest-server:0.14.0" "$LOG" && grep -qF "\"dst\": [\"tag:backup:8000\"]" "$LOG" && grep -qF "forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune" "$LOG"' "the setup screen gives the .htpasswd line (bcrypt), the append-only docker command, the one Tailscale rule and the monthly prune for that computer"
+expect 'seen "curl: -s -o /dev/null -m 10 -w %{http_code} -u bookstack:" && ! grep -F "yesno: " "$LOG" | grep -q "Is this key APPEND-ONLY" && [ ! -f "$u/bookstack-prune.timer" ] && grep -F "docker-stdin: " "$LOG" | grep -q .' "it checks the login against the home server before storing anything; no append-only question (it IS append-only); the password reaches Caddy's hasher on stdin"
+hr1=$(grep "^RESTIC_REPOSITORY=" "$renv")
+reset "H" "" "" "yes" "resticpass-123" "resticpass-123" "" "no"; step_backup
+expect '[ "$(grep "^RESTIC_REPOSITORY=" "$renv")" = "$hr1" ] && ! grep -qF "Set up the backup server at home" "$LOG"' "running Backups again keeps the home server's login (no new .htpasswd line needed)"
+reset "H" "192.168.1.5"; step_backup; rc=$?
+expect '[ $rc = 1 ] && grep -F msgbox "$LOG" | grep -q "not a Tailscale address" && [ "$(grep "^RESTIC_REPOSITORY=" "$renv")" = "$hr1" ]' "a LAN address is refused (the server reaches home only over Tailscale); nothing changed"
+REST_PROBE=401 reset "H" "100.101.102.103" "8000" "no" "no"; REST_PROBE=401 step_backup; rc=$?
+expect '[ $rc = 1 ] && grep -F "yesno: " "$LOG" | grep -q "refused the login (HTTP 401)" && [ "$(grep "^RESTIC_REPOSITORY=" "$renv")" = "$hr1" ]' "a home server that refuses the login is reported (HTTP 401) and nothing is stored"
+REST_PROBE=000 reset "H" "100.101.102.103" "8000" "yes" "no"; REST_PROBE=000 step_backup; rc=$?
+expect '[ $rc = 1 ] && grep -F "yesno: " "$LOG" | grep -q "Could not reach the backup server"' "an unreachable home server says what to check (on, Tailscale, container, rule)"
 # C1: alerts step
 printf '#!/usr/bin/env bash\necho "alert.sh $*" >> "%s"\n' "$LOG" > "$STACK_DIR/scripts/alert.sh"; chmod +x "$STACK_DIR/scripts/alert.sh"
 reset "https://ntfy.sh/family-secret-topic" "yes"; step_alerts; rc=$?
@@ -1118,6 +1234,24 @@ expect '! grep -q "restic: .* check" "$RLOG"' "no check on the other days of the
 expect 'grep -q "restic: --retry-lock 30m tag --remove pre-update abc12345ffffffff" "$RLOG"' "pre-update snapshots older than 90 days lose their keep tag (F77)"
 : > "$RLOG"; : > "$DLOG"; RESTIC_NOREPO=1 STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >"$T/b2.out" 2>&1; rc=$?
 expect '[ $rc != 0 ] && ! grep -q "restic: .*init" "$RLOG" && ! grep -q "restic: .* backup" "$RLOG" && grep -q "not reachable or not initialised" "$T/b2.out" && grep -q "hc-ping.example/uuid/fail" "$DLOG"' "unreachable repository: fails without creating one, failure ping sent (F67, C1)"
+# L15: the nightly job records the snapshot it wrote; next night it must still be there
+expect 'grep -q "^last_snapshot=abc12345ffffffff$" "$T/backup.state"' "backup.sh records the snapshot it wrote (L15)"
+printf '#!/usr/bin/env bash\necho "ALERT $*" >> "%s"\n' "$T/balert.log" > "$T/balert.sh"; chmod +x "$T/balert.sh"; : > "$T/balert.log"
+: > "$RLOG"; BACKUP_ALERT="$T/balert.sh" STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >/dev/null 2>&1
+expect '[ ! -s "$T/balert.log" ]' "the previous snapshot is still there: no alert"
+sed -i.bak "s/^last_snapshot=.*/last_snapshot=deadbeef00000000/" "$T/backup.state"
+: > "$RLOG"; BACKUP_ALERT="$T/balert.sh" STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >"$T/b4.out" 2>&1; rc=$?
+expect '[ $rc = 0 ] && grep -q "ALERT Bookstack: a backup snapshot has DISAPPEARED" "$T/balert.log" && grep -q "high$" "$T/balert.log" && grep -q "restic: --retry-lock 30m backup" "$RLOG"' "a vanished snapshot raises a high alert, and tonight's backup is still taken (L15)"
+printf 'RESTIC_REPOSITORY=rest:http://bookstack:homesecret123@100.101.102.103:8000/bookstack/\nRESTIC_PASSWORD=x\nRESTIC_APPEND_ONLY=1\n' > "$T/restic-ao.env"; cp "$T/backup.state" "$T/backup-ao.state" 2>/dev/null
+: > "$RLOG"; BACKUP_CHECK_DOW=$(date +%u) RESTIC_SNAP_TIME=2020-01-01T00:00:00Z BACKUP_STATE="$T/backup-ao.state" STACK_DIR="$fs" RESTIC_ENV="$T/restic-ao.env" bash "$REPO/scripts/backup.sh" >"$T/b5.out" 2>&1; rc=$?
+expect '[ $rc = 0 ] && grep -q "restic: --retry-lock 30m backup" "$RLOG" && grep -q "restic: --retry-lock 30m check" "$RLOG" && ! grep -qE "restic: .*(forget|prune|tag --remove)" "$RLOG" && grep -q "append-only key: no forget/prune" "$T/b5.out"' "append-only key: backup and check run, nothing that deletes or rewrites a snapshot does (L15)"
+expect 'grep -q "^RESTIC_APPEND_ONLY=1$" "$fs/.backup-snap/host/etc/bookstack/restic.env" && ! grep -q "^RESTIC_PASSWORD" "$fs/.backup-snap/host/etc/bookstack/restic.env"' "the redacted stub records the append-only mode (not a secret), still no password"
+expect 'grep -qx "RESTIC_REPOSITORY=rest:http://REDACTED@100.101.102.103:8000/bookstack/" "$fs/.backup-snap/host/etc/bookstack/restic.env" && ! grep -rq homesecret123 "$fs/.backup-snap"' "a home server's login never reaches a snapshot (the address is kept, the user:password is not)"
+: > "$RLOG"; RESTIC_SNAP_TIME=2020-01-01T00:00:00Z STACK_DIR="$fs" RESTIC_PRUNE_ENV="$T/restic.env" bash "$REPO/scripts/prune.sh" >"$T/p.out" 2>&1; rc=$?
+expect '[ $rc = 0 ] && grep -q "restic: --retry-lock 30m tag --remove pre-update abc12345ffffffff" "$RLOG" && grep -q "restic: --retry-lock 30m forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --keep-tag pre-update --prune" "$RLOG"' "prune.sh alone applies the retention policy with the key it is given (the timer or a laptop)"
+RESTIC_KEEP_DAILY=3 STACK_DIR="$T/nowhere" RESTIC_PRUNE_ENV="$T/restic.env" bash "$REPO/scripts/prune.sh" >/dev/null 2>&1
+expect 'grep -q "forget --keep-daily 3 --keep-weekly 4" "$RLOG"' "and runs away from the server (no .env) with RESTIC_KEEP_* from the shell"
+RESTIC_PRUNE_ENV="$T/missing.env" bash "$REPO/scripts/prune.sh" >"$T/p2.out" 2>&1; expect '[ $? != 0 ] && grep -q "does not exist" "$T/p2.out"' "prune.sh without a key file refuses instead of guessing"
 echo "not a database" > "$fs/cwa/config/cwa.db"; : > "$RLOG"
 STACK_DIR="$fs" RESTIC_ENV="$T/restic.env" bash "$REPO/scripts/backup.sh" >"$T/b3.out" 2>&1; rc=$?; rm -f "$fs/cwa/config/cwa.db"
 expect '[ $rc != 0 ] && grep -q "restic: --retry-lock 30m backup" "$RLOG" && grep -q "BACKUP INCOMPLETE: no consistent copy of: cwa/config/cwa.db" "$T/b3.out"' "a DB that cannot be snapshotted: backup still taken, run reported as failed (F68)"
@@ -1200,7 +1334,8 @@ expect '[ $? != 0 ] && ! grep -q "^ufw:" "$DLOG" && grep -q "^ALERT" "$DLOG"' "g
 head -3 "$T/v4.good" > "$CF_V4_FILE"; : > "$DLOG"; cfips
 expect '[ $? != 0 ] && ! grep -q "^ufw:" "$DLOG"' "too few v4 ranges (3 < 10): rejected, ufw untouched"
 grep -v "^173.245.4.0/22$" "$T/v4.good" > "$CF_V4_FILE"; : > "$DLOG"; cfips
-expect '[ $? = 0 ] && [ "$(grep -c "ufw: --force delete" "$DLOG")" = 3 ] && grep -q "ufw: --force delete allow proto tcp from 173.245.4.0/22 to any port 80" "$DLOG" && [ "$(line_of_d() { grep -n "$1" "$DLOG" | head -1 | cut -d: -f1; }; line_of_d "ufw: allow")" -lt "$(grep -n "ufw: --force delete" "$DLOG" | head -1 | cut -d: -f1)" ]' "a range Cloudflare stopped publishing is removed (3 rules), after the current ones were (re)added"
+expect '[ $? = 0 ] && [ "$(grep -c "ufw: --force delete.* from 173.245.4.0/22 " "$DLOG")" = 3 ] && [ "$(line_of_d() { grep -n "$1" "$DLOG" | head -1 | cut -d: -f1; }; line_of_d "ufw: allow")" -lt "$(grep -n "ufw: --force delete.*173.245.4.0/22" "$DLOG" | head -1 | cut -d: -f1)" ]' "a range Cloudflare stopped publishing is removed (all 3 of its rules), after the current ones were (re)added"
+expect '! grep -q "ufw: allow .* port 80 " "$DLOG" && grep -q "ufw: --force delete allow proto tcp from 173.245.0.0/22 to any port 80" "$DLOG"' "port 80 is never opened any more, and the old port-80 rule of every current range is removed (L19)"
 cp "$T/v4.good" "$CF_V4_FILE"
 
 echo "== ephemera enable/disable"
@@ -1641,8 +1776,35 @@ envset FLARESOLVERR_ENABLED false; envset EPHEMERA_ENABLED false
 expect 'declare -f menu_ops | grep -q step_flaresolverr' "the toggle is in the Operations menu"
 for f in docker-compose.yml docker-compose.ephemera.yml; do :; done
 expect 'grep -q "USING_EXTERNAL_BYPASSER=\${FLARESOLVERR_ENABLED:-false}" "$REPO/docker-compose.yml" && grep -q "EXT_BYPASSER_URL=http://flaresolverr:8191" "$REPO/docker-compose.yml"' "Shelfmark's external bypasser follows FLARESOLVERR_ENABLED (env wins over its Settings page)"
-expect '! grep -q "^  flaresolverr:" "$REPO/docker-compose.ephemera.yml" && grep -A6 "depends_on:" "$REPO/docker-compose.ephemera.yml" | grep -q "flaresolverr:" && grep -q "required: false" "$REPO/docker-compose.ephemera.yml"' "the Ephemera overlay no longer defines its own FlareSolverr, and depends on the shared one without requiring it"
+expect '! grep -A3 "^  flaresolverr:" "$REPO/docker-compose.ephemera.yml" | grep -q "image:" && grep -A6 "depends_on:" "$REPO/docker-compose.ephemera.yml" | grep -q "flaresolverr:" && grep -q "required: false" "$REPO/docker-compose.ephemera.yml"' "the Ephemera overlay no longer defines its own FlareSolverr, and depends on the shared one without requiring it"
 expect '! grep -rq "only enable Ephemera on >= 8 GB\|Needs >= 8 GB\|enabled on < 8 GB" "$REPO/docker-compose.ephemera.yml" "$REPO/scripts/selftest.sh" "$REPO/bookstack.sh"' "the unmeasured '8 GB' claim is gone from the overlay, the self-test and the installer"
+
+echo "== Shelfmark's own metadata-first search has a provider"
+expect 'grep -q "OPENLIBRARY_ENABLED=true" "$REPO/docker-compose.yml"' "Open Library (keyless) is switched on: Shelfmark's default 'universal' mode answered 'No metadata provider configured' without it"
+expect '! sed -n "/^  shelfmark:/,/^  uptime-kuma:/p" "$REPO/docker-compose.yml" | grep -qE "(HARDCOVER|GOOGLEBOOKS)_API_KEY="' "optional keys never reach Shelfmark as empty env values (an empty env var locks its own key field blank)"
+expect 'sed -n "/^  shelfmark:/,/^  uptime-kuma:/p" "$REPO/docker-compose.yml" | grep -q "path: ./shelfmark/metadata.env"' "keys go through an optional env file the installer writes only when a key exists"
+
+echo "== Metadata sources and your own catalogs"
+envset HARDCOVER_API_KEY ""; envset GOOGLE_BOOKS_API_KEY ""
+( metadata_key_ok(){ [ "$2" = good-key ]; }
+  reset "good-key" "bad-key"; step_metadata_sources >/dev/null; echo "hc=$(envget HARDCOVER_API_KEY) gb=$(envget GOOGLE_BOOKS_API_KEY)" > "$T/md.out" )
+expect 'grep -q "^hc=good-key gb=$" "$T/md.out" && grep -q "REFUSED by googleapis.com" "$LOG"' "a key is tested against its service before it is kept; a refused one is not saved"
+mdf="$STACK_DIR/shelfmark/metadata.env"
+expect 'grep -qx "HARDCOVER_ENABLED=true" "$mdf" && grep -qx "HARDCOVER_API_KEY=good-key" "$mdf" && ! grep -q GOOGLEBOOKS "$mdf"' "Shelfmark's key file holds only the keys that exist"
+expect 'seen "up -d librarian shelfmark"' "both are recreated so the keys are live"
+( metadata_key_ok(){ return 0; }; reset "-" ""; step_metadata_sources >/dev/null )
+expect '[ -z "$(envget HARDCOVER_API_KEY)" ] && ! grep -q HARDCOVER "$mdf"' "'-' removes a key, from .env and from Shelfmark's file"
+expect 'declare -f step_deploy | grep -q write_shelfmark_metadata_env && declare -f step_update | grep -q write_shelfmark_metadata_env' "Deploy and Update regenerate it from .env (.env is the only source of truth)"
+CLI_ACT='{"ok": true, "rows": [{"id": "home", "source": "opds:home", "name": "Home", "url": "https://b.example/opds", "user": "me", "enabled": true, "legacy": false}], "detail": "OPDS feed answered with 3 entries"}'
+reset "A" "home" "Home" "https://b.example/opds/{q}" "me" "catpass" "0"; step_catalogs >/dev/null
+expect 'grep -q "admin_cli catalogs add home Home https://b.example/opds/{q} --user me --password-stdin" "$LOG" && grep -q "docker-stdin: catpass" "$LOG" && ! grep -F "docker: " "$LOG" | grep -q catpass' "Your catalogs: added through admin_cli, the password over stdin only"
+reset "E" "BAD ID" "0"; step_catalogs >/dev/null
+expect 'grep -F msgbox "$LOG" | grep -q "is not a catalog id" && ! grep -q "catalogs disable\|catalogs enable" "$LOG"' "an id that is not an id never reaches the python expression or the portal"
+CLI_ACT='{"ok": true, "rows": [{"id": 4, "owner": "alice", "kind": "ebook", "title": "Emma", "author": "Jane Austen", "status": "looking", "checks": 1, "next_check": 0, "detail": "", "rid": null, "work_key": null}]}'
+reset "ok" "4"; step_wanted >/dev/null
+expect 'grep -q "admin_cli wanted cancel 4" "$LOG"' "Keep looking: the admin sees every reader's list and can cancel an entry"
+CLI_ACT='{"ok": true}'
+expect 'declare -f menu_library | grep -q step_catalogs && declare -f menu_library | grep -q step_wanted && declare -f menu_library | grep -q step_metadata_sources' "all three are in the Library menu"
 
 echo "== Monitoring: Uptime Kuma is configured by bookstack, not by hand"
 envset KUMA_USER ""; envset KUMA_PASS ""; for j in SELFTEST DISK METAPUSH CFIPS BACKUP; do envset "KUMA_PUSH_$j" ""; done
@@ -1754,6 +1916,201 @@ expect 'grep -q "restic --no-lock snapshots" "$st" && grep -q "if \[ \"\$SCHEDUL
 expect 'grep -q "probe_user=\"__bookstack_selftest_\$(date +%s)_\$\$__\"" "$st"' "the Shelfmark probe name changes every run, so 24 runs a day never reach its 10-failure lockout"
 expect 'grep -q "u \"\$ku:\$kp\" http://127.0.0.1:3001/metrics" "$st"' "the self-test reads Kuma's own view (/metrics) instead of trusting that a setup once ran"
 
+echo "== Metadata push, second pass: L10 owner tags (never moves a book between readers)"
+TP="$T/tp"; mkdir -p "$TP/bin" "$TP/stack/scripts"
+printf "PUID='1000'\nPGID='1000'\n" > "$TP/stack/.env"
+printf '#!/usr/bin/env bash\necho "ALERT $*" >> "%s/log"\n' "$TP" > "$TP/stack/scripts/alert.sh"; chmod +x "$TP/stack/scripts/alert.sh"
+cat > "$TP/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$TP/log"
+case "$*" in
+  *"admin_cli pushes pending"*) echo '{"ok":true,"rows":[]}';;
+  *"admin_cli tags pending"*) echo '{"ok":true,"rows":[{"id":9,"calibre_id":77,"rid":3,"owner":"alice"}]}';;
+  *"admin_cli tags result"*) echo '{"ok":true,"status":"done"}';;
+  *"calibredb list"*)
+    # what the real CWA image does as uid 1000 without HOME: a warning on STDOUT before the JSON
+    [ "${TP_NOHOME:-0}" = 1 ] && case "$*" in *"HOME=/tmp"*) ;; *) echo "No write access to /root/.config/calibre using a temporary dir instead";; esac
+    echo "No write access to /root/.config/calibre using a temporary dir instead"
+    n=$(cat "$TP/n" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$TP/n"
+    case "${TP_CASE:-clean}" in
+      clean)  [ "$n" -ge 2 ] && echo '[{"id":77,"tags":["Classics","owner:alice"]}]' || echo '[{"id":77,"tags":["Classics"]}]';;
+      owned)  echo '[{"id":77,"tags":["owner:bob"]}]';;
+      clobber) [ "$n" -ge 2 ] && echo '[{"id":77,"tags":["owner:alice"]}]' || echo '[{"id":77,"tags":["Classics"]}]';;
+    esac;;
+  *"calibredb set_metadata"*) : ;;
+esac
+EOS
+chmod +x "$TP/bin/docker"
+tprun(){ : > "$TP/log"; rm -f "$TP/n"; TP="$TP" TP_CASE="$1" PATH="$TP/bin:$PATH" STACK_DIR="$TP/stack" bash "$REPO/scripts/metadata-push.sh" >/dev/null 2>&1; }
+tprun clean
+expect 'grep -q -- "-e HOME=/tmp calibre-web" "$TP/log"' "calibredb gets a writable HOME (as uid 1000 it otherwise prints a warning on stdout, measured on the real image)"
+expect 'grep "calibredb set_metadata 77" "$TP/log" | grep -q -- "--field tags:Classics,owner:alice" && grep -q "tags result 9 ok" "$TP/log"' \
+  "the owner tag is ADDED to the existing tags (calibredb replaces the list, so the old tags are written back with it)"
+tprun owned
+expect '! grep -q "calibredb set_metadata" "$TP/log" && grep "tags result 9 fail" "$TP/log" | grep -q "refused: the book already has"' \
+  "a book that already has an owner is refused, never re-tagged (that would move it to another reader)"
+tprun clobber
+expect 'grep -q "ALERT Bookstack: adding an owner tag changed other tags" "$TP/log" && grep -q "tags result 9 fail" "$TP/log"' \
+  "any other tag changing on the way is a high alert and a failure, never success"
+
+echo "== Metadata push: descriptions/covers (fill-only) and on-demand conversions"
+CV="$T/cv"; mkdir -p "$CV/bin" "$CV/stack/scripts"
+printf "PUID='1000'\nPGID='1000'\n" > "$CV/stack/.env"
+printf '#!/usr/bin/env bash\necho "ALERT $*" >> "%s/log"\n' "$CV" > "$CV/stack/scripts/alert.sh"; chmod +x "$CV/stack/scripts/alert.sh"
+cat > "$CV/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$CV/log"
+case "$*" in
+  *"admin_cli pushes pending"*) echo '{"ok":true,"rows":[{"id":1,"calibre_id":5,"fields":{"comments":"A comedy.","publisher":"Penguin","cover_url":"https://evil.example/x.jpg"}}]}';;
+  *"admin_cli tags pending"*) echo '{"ok":true,"rows":[]}';;
+  *"admin_cli converts pending"*) echo '{"ok":true,"rows":[{"id":7,"calibre_id":5,"owner":"alice","src_fmt":"epub","dst_fmt":"azw3","src_path":"Jane Austen/Emma (5)/Emma - Jane Austen.epub"},{"id":8,"calibre_id":5,"owner":"alice","src_fmt":"epub","dst_fmt":"pdf","src_path":"../../etc/passwd"}]}';;
+  *"admin_cli"*) echo '{"ok":true,"status":"done"}';;
+  *"calibredb list"*) echo '[{"id":5,"tags":["owner:alice"]}]';;
+  *) : ;;
+esac
+EOS
+chmod +x "$CV/bin/docker"
+: > "$CV/log"; CV="$CV" PATH="$CV/bin:$PATH" STACK_DIR="$CV/stack" bash "$REPO/scripts/metadata-push.sh" >/dev/null 2>&1
+expect 'grep "calibredb set_metadata 5" "$CV/log" | grep -q -- "--field comments:A comedy." && grep "calibredb set_metadata 5" "$CV/log" | grep -q -- "--field publisher:Penguin"' "descriptions and publishers reach Calibre (fill-only fields decided by the portal)"
+expect '! grep -q "cover:" "$CV/log"' "a cover from a host that is not a provider's image host is never fetched or set"
+expect 'grep -q "ebook-convert /calibre-library/Jane Austen/Emma (5)/Emma - Jane Austen.epub /tmp/bookstack-convert-7.azw3" "$CV/log" && grep -q "calibredb add_format --dont-replace 5 /tmp/bookstack-convert-7.azw3" "$CV/log"' "a conversion runs Calibre's ebook-convert in the CWA container and adds the result to THE SAME book"
+expect 'grep -q -- "-u 1000:1000 -e HOME=/tmp calibre-web /app/calibre/ebook-convert" "$CV/log"' "as the library user, with a writable HOME"
+expect '! grep -q "etc/passwd" "$CV/log" || ! grep "ebook-convert" "$CV/log" | grep -q "etc/passwd"' "a job whose path leaves the library is refused before anything runs"
+expect 'grep -q "converts result 8 fail --reason refused" "$CV/log"' "and reported as refused"
+
+echo "== L19: host hardening extras"
+write_sysctl >/dev/null 2>&1; write_journald >/dev/null 2>&1
+for k in kernel.kptr_restrict kernel.dmesg_restrict kernel.yama.ptrace_scope kernel.unprivileged_bpf_disabled fs.protected_regular; do
+  grep -q "^$k" "$ETC/sysctl.d/90-bookstack.conf" || bad "sysctl lacks $k"; done
+ok "kernel hardening sysctls are written"
+expect 'grep -q "^Storage=persistent" "$ETC/systemd/journald.conf.d/90-bookstack.conf" && grep -q "^SystemMaxUse=200M" "$ETC/systemd/journald.conf.d/90-bookstack.conf"' "the journal survives reboots, capped at 200 MB"
+expect 'declare -f harden_ssh | grep -q "AllowTcpForwarding no" && declare -f harden_ssh | grep -q "LoginGraceTime 20" && ! declare -f harden_ssh | grep -q "^AllowUsers"' "sshd gets the extra hardening, and no AllowUsers that could lock out a provider's login account"
+expect '! grep -q "tailscale.com/install.sh | sh" "$REPO/bookstack.sh" && declare -f install_tailscale_apt | grep -q "pkgs.tailscale.com/stable"' "Tailscale comes from its signed apt repository, not curl | sh"
+
+echo "== L09: certificate and token expiry watch (scripts/cert-watch.sh)"
+CW="$T/cw"; mkdir -p "$CW/certs/acme/books.example.test" "$CW/bin"
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=books.example.test -days 5 -keyout "$CW/k.pem" -out "$CW/certs/acme/books.example.test/books.example.test.crt" >/dev/null 2>&1
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=ca -days 400 -keyout "$CW/k2.pem" -out "$CW/ca.pem" >/dev/null 2>&1
+printf '#!/usr/bin/env bash\necho "ALERT $1 $2" >> "%s/log"\n' "$CW" > "$CW/alert.sh"; chmod +x "$CW/alert.sh"
+printf "CF_API_TOKEN='tok'\n" > "$CW/.env"
+cat > "$CW/bin/curl" <<'EOS'
+#!/usr/bin/env bash
+printf '%s\n' "$CW_TOKEN_ANSWER"
+EOS
+chmod +x "$CW/bin/curl"
+cwrun(){ : > "$CW/log"; PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER="${1:-"{\"result\":{\"status\":\"active\"}}"}" bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1; }
+cwrun; rc=$?
+expect '[ $rc = 1 ] && grep -q "certificate for books.example.test expires in [0-9] days" "$CW/log" && grep -q "renewal is failing" "$CW/log"' "a certificate under 14 days is an alert: Caddy's renewal has been failing"
+rm -rf "$CW/certs/acme"; cwrun '{"result":{"status":"disabled"}}'
+expect 'grep -q "Cloudflare API token is .disabled." "$CW/log"' "a Cloudflare token that is no longer active is an alert"
+cwrun '{"result":{"status":"active"}}'; rc=$?
+expect '[ $rc = 0 ] && [ ! -s "$CW/log" ]' "all fine: silent, exit 0"
+openssl req -x509 -newkey rsa:2048 -nodes -subj /CN=leaf -days 20 -keyout "$CW/k3.pem" -out "$CW/aop.pem" >/dev/null 2>&1
+printf "CF_API_TOKEN='tok'\nAOP_MODE=zone\n" > "$CW/.env"; : > "$CW/log"
+PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_AOP="$CW/aop.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER='{"result":{"status":"active"}}' bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1; rc=$?
+expect '[ $rc = 1 ] && grep -q "origin-pull certificate expires in [0-9]* days" "$CW/log" && grep -q "Origin lock" "$CW/log"' "L14: this zone's own origin-pull certificate is watched too (every public site fails when it lapses)"
+: > "$CW/log"; PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_AOP="$CW/nope.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER='{"result":{"status":"active"}}' bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1
+expect 'grep -q "aop.*missing\|nope.pem is missing" "$CW/log"' "and a zone lock whose certificate file is gone is an alert"
+printf "CF_API_TOKEN='tok'\n" > "$CW/.env"
+expect 'declare -f install_disk_watch | grep -q install_cert_watch' "installed on Deploy (daily cron, output to the journal)"
+
+echo "== L06: update notices (scripts/update-check.sh)"
+UC="$T/uc"; mkdir -p "$UC"; printf "IMG_CWA='crocodilestick/calibre-web-automated:v4.0.6'\nIMG_KUMA='louislam/uptime-kuma:1'\n" > "$UC/.env"
+printf '#!/usr/bin/env bash\necho "ALERT $1" >> "%s/log"\n' "$UC" > "$UC/alert.sh"; chmod +x "$UC/alert.sh"
+: > "$UC/log"; ( export https_proxy=http://127.0.0.1:9 http_proxy=http://127.0.0.1:9; STACK_DIR="$UC" UPDATE_STATE="$UC/state" UPDATE_ALERT="$UC/alert.sh" bash "$REPO/scripts/update-check.sh" > "$UC/out" 2>&1 ); rc=$?
+expect '[ $rc = 0 ] && grep -q "nothing new" "$UC/out" && [ ! -s "$UC/log" ]' "no registry reachable: a quiet 'nothing new', never a false alarm or a failed job"
+expect 'grep -q "floating tags" "$REPO/scripts/update-check.sh" && ! grep -q "docker pull\|compose up\|compose pull" "$REPO/scripts/update-check.sh"' "it only reports: floating tags are left alone and nothing is pulled or restarted"
+expect 'declare -f install_disk_watch | grep -q install_update_check' "installed on Deploy (weekly, output to the journal)"
+
+echo "== L17: login bot check and the 2FA nudge"
+( curl(){ echo '{"success":false,"error-codes":["invalid-input-secret"]}'; }; reset "0x4AAA" "wrong-secret"; step_turnstile >/dev/null )
+expect '[ -z "$(envget TURNSTILE_SITEKEY)" ] && grep -F msgbox "$LOG" | grep -q "secret key is wrong"' "a wrong Turnstile secret is caught by asking Cloudflare, and nothing is saved"
+( curl(){ echo '{"success":false,"error-codes":["invalid-input-response"]}'; }; reset "0x4AAA" "good-secret"; step_turnstile >/dev/null )
+expect '[ "$(envget TURNSTILE_SITEKEY)" = 0x4AAA ] && [ "$(envget TURNSTILE_SECRET)" = good-secret ] && seen "up -d librarian"' "a real secret is saved and the portal recreated"
+envset TURNSTILE_SITEKEY ""; envset TURNSTILE_SECRET ""
+expect 'declare -f step_quick | grep -q step_authelia && grep -q "no second factor in front of" "$REPO/scripts/selftest.sh"' "Quick install offers SSO + 2FA, and the self-test warns while there is none"
+
+echo "== L18: large uploads over Tailscale"
+expect 'grep -q "^upload.@@DOMAIN@@ {" "$REPO/caddy/Caddyfile.template" && sed -n "/^upload.@@DOMAIN@@ {/,/^}/p" "$REPO/caddy/Caddyfile.template" | grep -q "import tailnet_only" && sed -n "/^upload.@@DOMAIN@@ {/,/^}/p" "$REPO/caddy/Caddyfile.template" | grep -q "max_size 2GB"' "upload. is a Tailscale-only site with a 2 GB body limit"
+expect 'grep -q "request_header -X-Bookstack-Upload" "$REPO/caddy/Caddyfile.template" && sed -n "/^upload.@@DOMAIN@@ {/,/^}/p" "$REPO/caddy/Caddyfile.template" | grep -q "header_up X-Bookstack-Upload tailnet"' "the marker is stripped from every client and set only by that site"
+expect 'grep -q "private=\"monitor upload\"" "$REPO/bookstack.sh"' "its DNS record points at the tailnet address (grey cloud), like the other admin sites"
+
+echo "== L02: qBittorrent gets a real Web UI password before first start"
+envset QBIT_PASS ""; qbt_seed_config >/dev/null 2>&1
+qc="$STACK_DIR/qbt/config/qBittorrent/qBittorrent.conf"
+expect '[[ "$(envget QBIT_PASS)" =~ ^[A-Za-z0-9]{20}$ ]] && grep -q "^WebUI\\\\Username=admin" "$qc" && grep -qE "^WebUI\\\\Password_PBKDF2=\"@ByteArray\([A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+\)\"" "$qc"' "a generated password, stored in .env; only its PBKDF2 hash in qBittorrent's own format"
+qp1=$(envget QBIT_PASS); qbt_seed_config >/dev/null 2>&1
+expect '[ "$(envget QBIT_PASS)" = "$qp1" ] && [ "$(grep -c "^\[Preferences\]" "$qc")" = 1 ] && [ "$(grep -c "Password_PBKDF2" "$qc")" = 1 ] && grep -q "TempPathEnabled=true" "$qc"' "re-seeding keeps the password and edits the file in place (one section, one hash)"
+expect 'python3 - "$qc" "$qp1" <<"PYV"
+import sys, re, base64, hashlib
+line = [l for l in open(sys.argv[1]) if "Password_PBKDF2" in l][0]
+salt, key = re.search(r"ByteArray\(([^:]+):([^)]+)\)", line).groups()
+sys.exit(0 if base64.b64decode(key) == hashlib.pbkdf2_hmac("sha512", sys.argv[2].encode(), base64.b64decode(salt), 100000, 64) else 1)
+PYV' "the stored hash really is that password (PBKDF2-SHA512, 100000 rounds)"
+
+echo "== L01: container isolation"
+python3 - "$REPO" <<'PYN' && ok "every bridge service sits on a network of its own; Shelfmark shares one with FlareSolverr only, Ephemera too, never with each other (L01)" || bad "compose networks (L01)"
+import re, sys
+r = sys.argv[1]
+def svc(path, name):
+    s = open(f"{r}/{path}").read()
+    m = re.search(r"(?ms)^  " + re.escape(name) + r":\n(.*?)(?=^  [a-z-]+:\n|^[a-z]|\Z)", s)
+    return m.group(1) if m else ""
+def nets(body):
+    m = re.search(r"networks: \{ ([a-z]+): \{\} \}", body)
+    return m.group(1) if m else None
+want = {("docker-compose.yml", "calibre-web"): "cwa", ("docker-compose.yml", "audiobookshelf"): "abs",
+        ("docker-compose.yml", "qbittorrent"): "dl", ("docker-compose.yml", "shelfmark"): "fetch",
+        ("docker-compose.yml", "flaresolverr"): "fetch", ("docker-compose.authelia.yml", "authelia"): "auth",
+        ("docker-compose.ephemera.yml", "ephemera"): "eph"}
+bad = [f"{n}: {nets(svc(p, n))} != {w}" for (p, n), w in want.items() if nets(svc(p, n)) != w]
+if "flaresolverr:\n    networks: { eph: {} }" not in open(f"{r}/docker-compose.ephemera.yml").read():
+    bad.append("flaresolverr does not join eph in the Ephemera overlay")
+print("\n".join(bad)); sys.exit(1 if bad else 0)
+PYN
+expect 'for sv in calibre-web shelfmark qbittorrent; do python3 -c "import re,sys; s=open(sys.argv[1]).read(); b=re.search(r\"(?ms)^  \"+sys.argv[2]+r\":\\n(.*?)(?=^  [a-z-]+:\\n)\", s).group(1); sys.exit(0 if \"cap_drop: [ALL]\" in b and \"cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]\" in b else 1)" "$REPO/docker-compose.yml" "$sv" || exit 1; done' "the root-starting images keep only the five capabilities their entrypoints need (L01)"
+expect 'grep -A8 "^  audiobookshelf:" "$REPO/docker-compose.yml" | grep -q "cap_drop: \[ALL\]" && grep -A8 "container_name: flaresolverr" "$REPO/docker-compose.yml" | grep -q "cap_drop: \[ALL\]"' "Audiobookshelf and FlareSolverr run with no capabilities at all (L01)"
+
+echo "== L08: the canary journey (scripts/synthetic.py on a timer)"
+ce="$T/etc/bookstack/canary.env"; rm -f "$ce" "$T/etc/systemd/system/bookstack-canary."*
+reset "yes" "<blank>" "no"; step_canary; rc=$?
+expect '[ $rc = 0 ] && grep -q "^CANARY_A=canary-a$" "$ce" && grep -q "^CANARY_B=canary-b$" "$ce" && grep -qE "^CANARY_A_PW=[A-Za-z0-9]{24}$" "$ce" && grep -qE "^CANARY_B_PW=[A-Za-z0-9]{24}$" "$ce" && [ "$(stat -c %a "$ce" 2>/dev/null || stat -f %Lp "$ce")" = 600 ]' "two canary accounts with generated passwords, kept in /etc/bookstack/canary.env (0600)"
+expect '[ "$(grep "^CANARY_A_PW=" "$ce" | cut -d= -f2)" != "$(grep "^CANARY_B_PW=" "$ce" | cut -d= -f2)" ] && ! grep -q "CANARY_A_PW\|CANARY_B_PW" "$ENV_FILE"' "different passwords, and never in .env (which the portal container reads)"
+expect 'grep -F "docker: " "$LOG" | grep -q "exec -i librarian python -m cwa add-user canary-a --password-stdin --no-abs" && grep -F "docker: " "$LOG" | grep -q "add-user canary-b --password-stdin --no-abs" && ! grep -F "docker: " "$LOG" | grep -q "add-user canary-a --password [^-]"' "created through the portal's CLI, password on stdin, no Audiobookshelf account"
+expect '[ "$(envget CANARY_USERS)" = "canary-a,canary-b" ] && grep -q "CANARY_USERS=\${CANARY_USERS:-}" "$REPO/docker-compose.yml" && seen "docker: compose up -d librarian"' "CANARY_USERS reaches the portal (it hides them), which is restarted"
+cu="$T/etc/systemd/system/bookstack-canary"
+expect 'grep -q "^OnCalendar=\*-\*-\* 06,18:20:00" "$cu.timer" && grep -qF "ExecStart=/usr/bin/python3 $STACK_DIR/scripts/synthetic.py" "$cu.service" && grep -qF "Environment=CANARY_ENV=$ce" "$cu.service" && seen "systemctl: enable --now bookstack-canary.timer"' "twice a day, 06:20 and 18:20, running scripts/synthetic.py with the canary credentials"
+expect '[ -n "$(envget KUMA_PUSH_CANARY)" ] && kuma_config | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d[\"push\"].get(\"canary\") else 1)"' "a Kuma push monitor for it (only once the timer exists)"
+expect 'declare -f copy_code_trees | grep -qF "scripts/\"*.py" && grep -q "canary" "$REPO/scripts/kuma-push.sh" && grep -q "push-canary" "$REPO/monitoring/kuma_bootstrap.py"' "Deploy ships synthetic.py; kuma-push.sh and the bootstrap know the canary job"
+expect 'python3 -m py_compile "$REPO/scripts/synthetic.py"' "synthetic.py compiles"
+reset "D"; step_canary
+expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
+echo "== L20: restart unhealthy containers, carefully (scripts/heal.sh)"
+HL="$T/hl"; mkdir -p "$HL/bin"
+cat > "$HL/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$HL/log"
+case "$*" in
+  "inspect -f {{if .State.Health}}{{.State.Health.Status}}{{end}} calibre-web") echo "${HL_CWA:-unhealthy}";;
+  "inspect -f {{if .State.Health}}{{.State.Health.Status}}{{end}} "*) echo healthy;;
+  *"range .State.Health.Log"*) echo "sync returned 500";;
+  "restart "*) : ;;
+esac
+EOS
+chmod +x "$HL/bin/docker"
+printf '#!/usr/bin/env bash\necho "ALERT $1" >> "%s/log"\n' "$HL" > "$HL/alert.sh"; chmod +x "$HL/alert.sh"
+hlrun(){ HL="$HL" HL_CWA="${1:-unhealthy}" PATH="$HL/bin:$PATH" HEAL_STATE="$HL/state" HEAL_ALERT="$HL/alert.sh" bash "$REPO/scripts/heal.sh"; }
+rm -f "$HL/state"; : > "$HL/log"; hlrun
+expect '! grep -q "docker restart" "$HL/log"' "one unhealthy reading is not enough (a slow start is not a fault)"
+hlrun
+expect 'grep -q "docker restart calibre-web" "$HL/log" && grep -q "ALERT Bookstack: restarted calibre-web" "$HL/log"' "two in a row: restarted, and the admin is told"
+: > "$HL/log"; hlrun; hlrun
+expect '! grep -q "docker restart" "$HL/log" && grep -q "still unhealthy after a restart" "$HL/log"' "still unhealthy within 30 min: no restart loop, an alert for a person instead"
+: > "$HL/log"; hlrun; hlrun
+expect '[ "$(grep -c "still unhealthy" "$HL/log")" = 0 ]' "and that alert is sent once, not every 2 minutes"
+expect '! grep -q "caddy\|qbittorrent" <<< "$(grep -o "HEAL_SERVICES:-[^}]*" "$REPO/scripts/heal.sh")"' "caddy and qbittorrent are never auto-restarted"
+expect 'declare -f install_disk_watch | grep -q install_heal && grep -q "bookstack-heal" "$REPO/bookstack.sh"' "installed on Deploy as a cron job whose output reaches the journal"
+
 # ---------------------------------------------------------------------------------------------
 echo "== Backlog truth (docs/RESEARCH-GAPS.md vs the code)"
 # Step 0. The backlog and the code drifted apart silently for three audit rounds: L13 shipped its
@@ -1768,12 +2125,26 @@ GAPS="$REPO/docs/RESEARCH-GAPS.md"
 declared(){ sed -n "/^### $1 — /,/^### /p" "$GAPS" | sed -n 's/^- \*\*Status\*\*: \([a-z_]*\).*/\1/p' | head -1; }
 # id | "present" probe (exit 0 = the code IS there) | what it looks for
 probe(){ case "$1" in
-  L06) grep -qi 'diun' "$REPO/docker-compose.yml";;                       # update notices
+  L06) [ -x "$REPO/scripts/update-check.sh" ] && grep -q install_update_check "$REPO/bookstack.sh";;   # update notices (no Diun: no socket)
   L07) [ -f "$REPO/monitoring/kuma_bootstrap.py" ] && grep -q setup_monitoring "$REPO/bookstack.sh";;  # Kuma configured
+  L21) grep -q "def kindle_once" "$REPO/librarian/worker.py";;
+  L01) grep -q "networks: { fetch: {} }" "$REPO/docker-compose.yml" && grep -q "cap_drop: \[ALL\]" "$REPO/docker-compose.yml";;
+  L05) grep -q "def _gate_sso" "$REPO/librarian/app.py" && [ -f "$REPO/scripts/gate-sync.py" ] && grep -q "def proxy_login_settings" "$REPO/librarian/cwa.py";;
+  L08) [ -f "$REPO/scripts/synthetic.py" ] && grep -q "step_canary" "$REPO/bookstack.sh" && grep -q "def canary_record" "$REPO/librarian/db.py";;
+  L14) grep -q "origin_tls_client_auth" "$REPO/bookstack.sh" && grep -q "AOP_MODE" "$REPO/scripts/cert-watch.sh";;
+  L15) grep -q "RESTIC_APPEND_ONLY" "$REPO/scripts/backup.sh" && [ -x "$REPO/scripts/prune.sh" ] && grep -q "step_prune_key" "$REPO/bookstack.sh";;
+  L02) grep -q "Password_PBKDF2" "$REPO/bookstack.sh" && grep -q "QBIT_PASS" "$REPO/scripts/selftest.sh";;
+  L18) grep -q "^upload.@@DOMAIN@@ {" "$REPO/caddy/Caddyfile.template" && grep -q "_upload_limit" "$REPO/librarian/app.py";;
+  L17) grep -q "def _turnstile_ok" "$REPO/librarian/app.py" && grep -q "step_turnstile" "$REPO/bookstack.sh";;
+  L12) grep -q "def kobo_status" "$REPO/librarian/cwa.py" && grep -q "kobo_test" "$REPO/librarian/app.py";;
+  L09) [ -x "$REPO/scripts/cert-watch.sh" ] && grep -q install_cert_watch "$REPO/bookstack.sh";;
+  L16) grep -q "REQUESTS_ENABLED=\${APPROVALS_REQUIRED" "$REPO/docker-compose.yml" && [ -f "$REPO/librarian/shelfmark_api.py" ];;
+  L11) grep -q "kepubify" "$REPO/librarian/Dockerfile" && grep -q "def _kepub_from_epub" "$REPO/librarian/library.py";;
+  L10) grep -q "def reconcile_untagged" "$REPO/librarian/worker.py" && grep -q '"tags", "pending"' "$REPO/scripts/metadata-push.sh";;
   L08) grep -rqi 'canary' "$REPO/bookstack.sh" "$REPO/scripts";;          # scheduled journey
   L13) grep -q 'auto_metadata_fetch_enabled' "$REPO/bookstack.sh";;       # CWA metadata fetch
   L15) grep -rq 'append-only\|append_only' "$REPO/scripts" "$REPO/bookstack.sh";;
-  L20) grep -qi 'autoheal' "$REPO/docker-compose.yml";;                   # restart unhealthy
+  L20) [ -x "$REPO/scripts/heal.sh" ] && grep -q install_heal "$REPO/bookstack.sh";;   # restart unhealthy (host cron, no socket)
   *) return 2;; esac; }
 for id in L01 L02 L03 L04 L05 L06 L07 L08 L09 L10 L11 L12 L13 L14 L15 L16 L17 L18 L19 L20 L21 L22; do
   d=$(declared "$id")

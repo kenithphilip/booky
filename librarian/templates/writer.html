@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block body %}
+<div class="card"><div class="row" style="gap:16px;align-items:flex-start">
+{% if a.photo %}<img src="{{ url_for('cover', u=a.photo) }}" alt="" style="width:110px;border-radius:6px;border:1px solid var(--line);flex:none">{% endif %}
+<div><h2 style="margin-top:0">{{ a.name }}</h2>
+{% if a.born or a.died %}<p class="mut">{{ a.born }}{% if a.died %} – {{ a.died }}{% endif %}</p>{% endif %}
+{% if a.bio %}<p style="white-space:pre-line">{{ a.bio }}</p>{% endif %}</div></div></div>
+{% if series %}<h2>Series</h2>
+{% for s in series %}<div class="card"><strong>{{ s.title }}</strong>
+<ol style="margin:6px 0 0;padding-left:22px">{% for i in s.books %}<li value="{{ i.sort|int if i.sort else loop.index }}"><a href="{{ url_for('index', q=i.title ~ ' ' ~ a.name) }}">{{ i.title }}</a></li>{% endfor %}</ol></div>{% endfor %}
+{% elif series is none and a.goodreads %}<p class="mut">Series for {{ a.name }} are being looked up in the background — reload this page in a minute to see them.</p>{% endif %}
+<h2>Books</h2>
+{% for w in works %}
+<div class="card"><div class="row" style="justify-content:space-between">
+<div class="row" style="gap:12px">{% if w.cover %}<img src="{{ url_for('cover', u=w.cover) }}" alt="" loading="lazy" style="width:36px;height:54px;object-fit:cover;border-radius:3px;border:1px solid var(--line)">{% endif %}
+<div><a href="{{ url_for('work_page', key=w.key) }}"><strong>{{ w.title }}</strong></a>{% if w.year %} <span class="mut">{{ w.year }}</span>{% endif %}</div></div>
+<div class="row">{% if w.dupe %}<span class="badge">{{ 'maybe in library' if w.dupe.how == 'title' else 'in library' }}</span>{% endif %}
+{% if w.has_ebook %}<span class="badge">free ebook</span>{% endif %}{% if w.has_audio %}<span class="badge">free audiobook</span>{% endif %}</div>
+</div></div>
+{% endfor %}
+{% if not works %}<div class="card">Open Library lists no works for this author.</div>{% endif %}
+<p class="mut" style="font-size:12px">Author information from Open Library.</p>
+{% endblock %}

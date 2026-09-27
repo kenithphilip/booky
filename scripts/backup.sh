@@ -25,14 +25,10 @@ R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry
 envget(){ local raw; raw=$({ grep -E "^$1=" "$STACK_DIR/.env" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
 PING_URL=$(envget BACKUP_PING_URL)
-# Retention, tunable from the environment or $STACK_DIR/.env (Install -> Backups writes them) so
-# an admin never has to edit this file — copy_code_trees restores it from the checkout on every
-# Deploy and every Update, which would silently revert the edit. A non-numeric value falls back
-# to the default rather than handing `restic forget` an argument it refuses.
+# Retention (RESTIC_KEEP_DAILY/WEEKLY/MONTHLY, from the environment or $STACK_DIR/.env) is read
+# by scripts/prune.sh, which applies it — here when this key may delete, else elsewhere (L15).
+# num() stays: RESTIC_CHECK_GROUPS below uses it. A non-numeric value falls back to the default.
 num(){ local v="${!1:-}"; [ -n "$v" ] || v=$(envget "$1"); case "$v" in ''|*[!0-9]*) v="$2";; esac; printf '%s' "$v"; }
-KEEP_DAILY=$(num RESTIC_KEEP_DAILY 7)
-KEEP_WEEKLY=$(num RESTIC_KEEP_WEEKLY 4)
-KEEP_MONTHLY=$(num RESTIC_KEEP_MONTHLY 6)
 finish(){
   local rc=$?
   if [ -n "$PING_URL" ]; then
@@ -86,7 +82,9 @@ mkdir -p "$SNAP/host/etc/bookstack"
   echo "# a snapshot must never carry the key that decrypts it or the credentials that can"
   echo "# delete it. Take them from your password manager and add them back by hand, then"
   echo "# bookstack.sh -> Install -> Backups to re-write the real /etc/bookstack/restic.env."
-  echo "RESTIC_REPOSITORY=${RESTIC_REPOSITORY:-}"
+  # a rest: address carries the home server's login (user:password@): never in a snapshot either
+  echo "RESTIC_REPOSITORY=$(printf '%s' "${RESTIC_REPOSITORY:-}" | sed -E 's#^(rest:https?://)[^@/]+@#\1REDACTED@#')"
+  echo "RESTIC_APPEND_ONLY=${RESTIC_APPEND_ONLY:-0}"
   echo "STACK_DIR=$STACK_DIR"
 } > "$SNAP/host/etc/bookstack/restic.env"
 for p in /etc/bookstack/backup.state /etc/fail2ban/jail.local /etc/fail2ban/filter.d/caddy-auth.conf \
@@ -99,11 +97,40 @@ mkdir -p "$SNAP/host/etc/systemd/system"; cp -p /etc/systemd/system/bookstack-* 
 command -v ufw >/dev/null && ufw status verbose > "$SNAP/host/ufw-status.txt" 2>/dev/null || true
 chmod -R go-rwx "$SNAP"
 
+# Same key=value state file idiom as /etc/bookstack/disk.state, kept beside restic.env so it
+# survives a redeploy (copy_code_trees overwrites everything under $STACK_DIR/scripts).
+BSTATE="${BACKUP_STATE:-$(dirname "${RESTIC_ENV:-/etc/bookstack/restic.env}")/backup.state}"
+# The `|| true` is not decoration: with `set -e -o pipefail` a grep that finds nothing (1) or
+# cannot open the file yet (2) becomes the pipeline's status and ends the whole backup.
+bstate_get(){ { grep -E "^$1=" "$BSTATE" 2>/dev/null || true; } | head -1 | cut -d= -f2-; }
+bstate_set(){ # a counter we cannot persist would restart at 1 every week: say so, loudly
+  if ! { mkdir -p "$(dirname "$BSTATE")" && { grep -vE "^$1=" "$BSTATE" 2>/dev/null || true; echo "$1=$2"; } > "$BSTATE.tmp" && mv "$BSTATE.tmp" "$BSTATE"; } 2>/dev/null; then
+    echo "WARNING: could not write $BSTATE; the weekly verification will keep re-reading group 1 instead of rotating through the repository." >&2
+  fi
+}
+
 restic "${R[@]}" cat config >/dev/null 2>&1 || {
   echo "ERROR: the restic repository $RESTIC_REPOSITORY is not reachable or not initialised." >&2
   echo "       Not creating one here (an unmounted local path would get a new repo on the root disk)." >&2
   echo "       Check the mount / network / keys, or re-run bookstack.sh -> Install -> Backups." >&2
   exit 1; }
+# L15: the snapshot the LAST run wrote must still be there. Every retention policy keeps the
+# newest snapshot, so nothing legitimate removes it: gone means someone with a key that can
+# delete (or, on B2, hide) has been at the repository. Alert at once — on B2 with a key that
+# lacks deleteFiles, hidden files are recoverable until the bucket's lifecycle rule expires them.
+last=$(bstate_get last_snapshot)
+if [ -n "$last" ]; then
+  have=$(restic "${R[@]}" snapshots --json 2>/dev/null | python3 -c '
+import sys, json
+print("yes" if sys.argv[1] in {x.get("id") for x in (json.load(sys.stdin) or [])} else "no")' "$last" 2>/dev/null || echo "?")
+  if [ "$have" = no ]; then
+    echo "WARNING: snapshot $last, written by the previous backup, is no longer in the repository" >&2
+    "${BACKUP_ALERT:-$STACK_DIR/scripts/alert.sh}" "Bookstack: a backup snapshot has DISAPPEARED" \
+"Snapshot ${last:0:8}, written by the previous nightly backup, is no longer in $RESTIC_REPOSITORY. No retention policy removes the newest snapshot, so something with a key that can delete (or hide) has touched the repository.
+
+Do not prune. On Backblaze B2, hidden files can be restored (b2 ls --versions, then unhide) until the bucket's lifecycle rule removes them. Then rotate the bucket keys and look at who had them." high >/dev/null 2>&1 || true
+  fi
+fi
 # Re-downloadable data and caches are not worth the repository space.
 restic "${R[@]}" backup "$STACK_DIR" \
   --exclude "$STACK_DIR/downloads" \
@@ -127,17 +154,6 @@ restic "${R[@]}" backup "$STACK_DIR" \
 # The counter advances only after a check that PASSED: a failure stops this script (set -e)
 # before the prune, and next week re-reads the same group instead of moving past it. A week the
 # box is off is a delay, not a gap, for the same reason.
-# Same key=value state file idiom as /etc/bookstack/disk.state, kept beside restic.env so it
-# survives a redeploy (copy_code_trees overwrites everything under $STACK_DIR/scripts).
-BSTATE="${BACKUP_STATE:-$(dirname "${RESTIC_ENV:-/etc/bookstack/restic.env}")/backup.state}"
-# The `|| true` is not decoration: with `set -e -o pipefail` a grep that finds nothing (1) or
-# cannot open the file yet (2) becomes the pipeline's status and ends the whole backup.
-bstate_get(){ { grep -E "^$1=" "$BSTATE" 2>/dev/null || true; } | head -1 | cut -d= -f2-; }
-bstate_set(){ # a counter we cannot persist would restart at 1 every week: say so, loudly
-  if ! { mkdir -p "$(dirname "$BSTATE")" && { grep -vE "^$1=" "$BSTATE" 2>/dev/null || true; echo "$1=$2"; } > "$BSTATE.tmp" && mv "$BSTATE.tmp" "$BSTATE"; } 2>/dev/null; then
-    echo "WARNING: could not write $BSTATE; the weekly verification will keep re-reading group 1 instead of rotating through the repository." >&2
-  fi
-}
 CHECK_GROUPS=$(num RESTIC_CHECK_GROUPS 52); [ "$CHECK_GROUPS" -ge 1 ] || CHECK_GROUPS=52
 if [ "$(date +%u)" = "${BACKUP_CHECK_DOW:-7}" ]; then
   n=$(bstate_get check_group); case "$n" in ''|*[!0-9]*) n=1;; esac
@@ -146,18 +162,19 @@ if [ "$(date +%u)" = "${BACKUP_CHECK_DOW:-7}" ]; then
   bstate_set check_group "$(( n % CHECK_GROUPS + 1 ))"
 fi
 restic "${R[@]}" stats latest --json || true
-# pre-update snapshots (Operations -> Update) are kept 90 days, then the normal policy applies
-old_pre=$(restic "${R[@]}" snapshots --tag pre-update --json 2>/dev/null | python3 -c '
-import sys, json, re, datetime
-now = datetime.datetime.now(datetime.timezone.utc)
-for x in json.load(sys.stdin) or []:
-    t = datetime.datetime.fromisoformat(re.sub(r"\.\d+", "", x["time"]).replace("Z", "+00:00"))
-    if (now - t).days > 90: print(x["id"])' 2>/dev/null || true)
-if [ -n "$old_pre" ]; then
-  # shellcheck disable=SC2086
-  restic "${R[@]}" tag --remove pre-update $old_pre >/dev/null
+new_snap=$(restic "${R[@]}" snapshots --json --path "$STACK_DIR" 2>/dev/null | python3 -c '
+import sys, json
+s = sorted(json.load(sys.stdin) or [], key=lambda x: x["time"])
+print(s[-1]["id"] if s else "")' 2>/dev/null || true)
+[ -n "$new_snap" ] && bstate_set last_snapshot "$new_snap"
+# Retention. With an append-only key (RESTIC_APPEND_ONLY=1, set by Install -> Backups) nothing
+# here may delete: scripts/prune.sh runs with a SEPARATE key, monthly from the bookstack-prune
+# timer or from the admin's own computer. Otherwise this key prunes, as it always did.
+if [ "${RESTIC_APPEND_ONLY:-0}" = 1 ]; then
+  echo "append-only key: no forget/prune here (scripts/prune.sh applies retention with the separate prune key)"
+else
+  RESTIC_PRUNE_ENV="${RESTIC_ENV:-/etc/bookstack/restic.env}" "${PRUNE_SH:-$(dirname "${BASH_SOURCE[0]}")/prune.sh}"
 fi
-restic "${R[@]}" forget --keep-daily "$KEEP_DAILY" --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY" --keep-tag pre-update --prune
 
 if [ -n "$snapfail" ]; then
   echo "BACKUP INCOMPLETE: no consistent copy of:$snapfail (the raw files are in the snapshot, possibly without their WAL)" >&2

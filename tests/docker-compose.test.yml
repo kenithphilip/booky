@@ -16,6 +16,9 @@ services:
     ports: !override ["127.0.0.1:18083:8083"]
   audiobookshelf:
     ports: !override ["127.0.0.1:23378:80"]
+    environment:
+      NODE_EXTRA_CA_CERTS: /certs/ca.pem          # trusts the harness CA for auth.example.test
+    volumes: ["./tls/ca.pem:/certs/ca.pem:ro"]
   shelfmark:
     ports: !override ["127.0.0.1:18084:8084"]
     environment:
@@ -23,6 +26,8 @@ services:
 
   librarian:
     network_mode: !reset null
+    # production reaches every service on the host's loopback; here it needs their networks
+    networks: [default, cwa, abs, fetch]
     ports: ["127.0.0.1:18090:8090"]
     environment:
       BIND: "0.0.0.0"
@@ -37,6 +42,7 @@ services:
       # would point at the portal's own container: the Calibre-Web liveness probe (the headline
       # health line on /admin) then failed for the whole run and nothing noticed.
       CWA_URL: http://calibre-web:8083
+      SHELFMARK_API: http://shelfmark:8084
       SMTP_HOST: greenmail
       SMTP_PORT: "3025"
       SMTP_SECURITY: none
@@ -51,10 +57,10 @@ services:
       IMAP_FOLDER: INBOX
       IMAP_REQUIRE_AUTH: "false"
       KOSYNC_ENABLED: "true"   # the installer sets this when CWA KOReader sync is on
-      # The gate container in front of CWA/ABS/portal IS Authelia-enabled in this harness, but the
-      # portal's own flag stays false so the driver can still exercise admin-page user creation
-      # (the "Authelia on -> use the TUI" guard is covered by the unit tests).
-      AUTHELIA_ENABLED: "false"   # GreenMail adds no Authentication-Results header
+      # The gate in front of CWA/ABS/portal is Authelia; the portal knows it (L05): Remote-User is
+      # trusted beside this secret, which the gate adds to requests Authelia let through.
+      AUTHELIA_ENABLED: "true"
+      GATE_SECRET: e2e-gate-secret-0123456789abcdef0123456789abcdef
     depends_on:
       greenmail:
         condition: service_started
@@ -84,10 +90,23 @@ services:
       AUTHELIA_SESSION_SECRET: e2e-session-secret-0123456789abcdef0123456789abcdef
       AUTHELIA_STORAGE_ENCRYPTION_KEY: e2e-storage-key-0123456789abcdef0123456789abcdef
       AUTHELIA_IDENTITY_VALIDATION_RESET_PASSWORD_JWT_SECRET: e2e-jwt-secret-0123456789abcdef0123456789abcdef
+      # as docker-compose.authelia.yml: the rendered OIDC block reads its HMAC secret from here
+      X_AUTHELIA_CONFIG_FILTERS: template
+      BOOKSTACK_OIDC_HMAC: e2e-oidc-hmac-0123456789abcdef0123456789abcdef
+      BOOKSTACK_SMTP_PASS: ""
 
   gate:
     image: caddy:2
     container_name: gate
-    ports: ["127.0.0.1:18080:80"]
-    volumes: ["./caddy-test/Caddyfile:/etc/caddy/Caddyfile:ro"]
+    ports: ["127.0.0.1:18080:80", "127.0.0.1:18443:443"]
+    # auth.example.test on ABS's network is this gate (TLS with the harness CA), as it is the
+    # public name through Cloudflare in production
+    networks:
+      default: {}
+      cwa: {}
+      fetch: {}
+      abs: { aliases: [auth.example.test] }
+    environment:
+      BOOKSTACK_GATE_SECRET: e2e-gate-secret-0123456789abcdef0123456789abcdef
+    volumes: ["./caddy-test/Caddyfile:/etc/caddy/Caddyfile:ro", "./tls:/certs:ro"]
     depends_on: [authelia]

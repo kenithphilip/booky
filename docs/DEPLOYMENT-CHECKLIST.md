@@ -169,6 +169,22 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
       login probe's fixed name would have hit its 10-failure lockout every 10 hours once hourly.
 - [x] Installer suite 564 / 0.
 
+## Verified locally in v5 (metadata engine, conversions, backlog L01-L22)
+- Portal unit suite 482 passed; installer suite (tests/tui-test.sh) green; full stack test
+  (tests/stack-test.sh) on the real containers, incl. section 15 (metadata-first search, EPUB ->
+  AZW3, cover and description fill, Shelfmark approvals) and the canary journey (import 20 s,
+  book removed again; a broken step alerts with its name and pushes DOWN to Kuma).
+- L01: per-service networks; Shelfmark cannot open a connection to Calibre-Web, ABS, the
+  portal or Authelia; capabilities dropped (CWA, Shelfmark, qBittorrent keep CHOWN, SETUID,
+  SETGID, DAC_OVERRIDE, FOWNER; ABS and FlareSolverr none) — every journey still passes, and
+  qBittorrent 5.2.3 / FlareSolverr 3.5.2 were started the same way and worked.
+- L02: the seeded qBittorrent password logs in on 5.2.3 (PBKDF2 in its own format).
+- L05: behind the gate the portal and Calibre-Web open without a second login; Remote-User is
+  ignored without the gate secret and stripped on bypassed paths; a portal password change
+  reaches Authelia (PBKDF2-SHA512, verified by Authelia 4.39.28) without restarting it.
+- L14/L15: exercised against stubs only (Cloudflare API, restic/B2) — the VPS checks below
+  are the real proof.
+
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,
@@ -202,6 +218,35 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
       screen reports that Ephemera reaches FlareSolverr.
 - [ ] (Only if Shelfmark's protected sources are used) `Operations → FlareSolverr` on; its
       success screen confirms Shelfmark reaches `flaresolverr:8191`.
+- [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
+      runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
+      check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on
+      that computer shows the repository. Set a monthly reminder for the prune command.
+- [ ] v5, backups (L15, bucket instead): the B2 key used by the nightly job has NO deleteFiles
+      (`b2 key list` shows listBuckets,listFiles,readFiles,writeFiles only) and the bucket
+      lifecycle keeps hidden files 30 days; Install -> Backups answered Yes to "append-only";
+      Self-test says "backup key is append-only". Prune once by hand from your own computer
+      (`RESTIC_PRUNE_ENV=./prune.env bash scripts/prune.sh`) or check
+      `systemctl list-timers bookstack-prune.timer` if the prune key lives on the server.
+- [ ] v5, origin lock (L14): token has SSL and Certificates: Edit; Security -> Origin lock ends
+      with "Origin locked to THIS zone"; `curl -sI https://request.<domain>/healthz` still
+      answers (not 525/526); Self-test says "only this zone's own Cloudflare client certificate".
+- [ ] v5, one login (L05, only with Authelia on): after signing in at auth.<domain>,
+      request.<domain>, books.<domain> and shelf.<domain> open without asking again, and
+      audio.<domain> goes to Authelia and straight back signed in (it calls
+      https://auth.<domain> from the server through Cloudflare: if it fails, look for a WAF
+      event on /api/oidc/token); change a password on
+      Devices, then sign out and back in at auth.<domain> with the NEW password within a minute
+      (`journalctl -u bookstack-gate-sync -n 5` shows "password updated").
+- [ ] v5, canary (L08): Operations -> Canary journey -> on; the first run passes; /admin shows
+      the "Canary journey" card with an import time; Kuma shows "Canary journey" green.
+- [ ] v5, torrents (L02, only if used): Library -> Torrents shows the Web UI login; it works at
+      dl.<domain> with QBIT_PASS; Self-test says "qBittorrent Web UI accepts the stored admin
+      password".
+- [ ] v5, metadata: search a title on the portal, open its page, Request a verified copy; the
+      book arrives with cover and description (`journalctl -t bookstack-metapush`).
+- [ ] v5, isolation (L01): `docker exec shelfmark python3 -c "import socket;
+      socket.create_connection(('calibre-web',8083),3)"` fails (Name or service not known).
 - [ ] Plan conditions still hold (see "The plan" at the top): audiobooks < 40 GB, one shared
       FlareSolverr, batch jobs overnight.
 - [ ] After the first week: `Operations → Backup restore test` green; `df /srv` < 70 % **and**

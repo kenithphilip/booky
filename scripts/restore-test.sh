@@ -73,8 +73,8 @@ for h in etc/ssh/sshd_config.d/01-bookstack.conf etc/docker/daemon.json etc/sysc
 done
 # The other half of the same loop: it must NOT carry the keys to the repository it lives in.
 if [ -f "$r/.backup-snap/host/etc/bookstack/restic.env" ]; then
-  if grep -qE '^(RESTIC_PASSWORD|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)=..' "$r/.backup-snap/host/etc/bookstack/restic.env"; then
-    bad "the snapshot's copy of restic.env still holds the repository password or the object-store keys: every snapshot contains the key that decrypts it and the credentials that can delete it"
+  if grep -qE '^(RESTIC_PASSWORD|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID)=..|^RESTIC_REPOSITORY=rest:https?://[^@/]*:[^@/]*@' "$r/.backup-snap/host/etc/bookstack/restic.env"; then
+    bad "the snapshot's copy of restic.env still holds the repository password, the object-store keys or the home server's login: every snapshot contains the key that decrypts it and the credentials that can reach it"
   else ok "the snapshot's restic.env is the redacted stub (no password, no object-store keys)"; fi
 fi
 

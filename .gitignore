@@ -28,3 +28,5 @@ mnt/
 .claude/
 .ruff_cache/
 .pytest_cache/
+caddy/cf-shared-ca.pem
+authelia/oidc-jwks.pem

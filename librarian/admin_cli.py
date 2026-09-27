@@ -12,7 +12,7 @@ Every arm prints ONE line of JSON on stdout and exits 0; a failure prints
 {"ok": false, "error": "..."} and exits non-zero. bookstack.sh calls it as
     docker exec -i librarian python -m admin_cli <arm> ...
 """
-import argparse, base64, binascii, json, os, shutil, sys
+import argparse, base64, binascii, json, os, shutil, sys, time
 import config, db
 
 # ---- parked files ----------------------------------------------------------------------
@@ -164,6 +164,108 @@ def _pushes(args):
     st = db.push_result(args.push_id, args.outcome == "ok", error=args.reason)
     return {"ok": True, "status": st}
 
+def _tags(args):
+    """L10's host side: owner tags the portal needs added in Calibre (the portal cannot write
+    metadata.db itself — read-only mount, no Docker socket, on purpose)."""
+    if args.what == "pending":
+        return {"ok": True, "rows": db.pending_tag_pushes(args.limit)}
+    row = db.tag_push_result(args.push_id, args.outcome == "ok", error=args.reason)
+    if args.outcome == "ok" and row.get("rid"):
+        rec = db.get(row["rid"])
+        if rec and rec["status"] == "needs-tag":
+            db.set_status(row["rid"], "done", f"tagged owner:{row['owner']} in Calibre by the host job")
+            import notify
+            notify.send("done", db.get(row["rid"]))
+    db.audit("tag_push", None, "host", f"#{args.push_id} {args.outcome} {args.reason[:120]}")
+    return {"ok": True, "status": row["status"]}
+
+def _converts(args):
+    """On-demand conversions for the host job (the portal has no Calibre and no Docker socket)."""
+    if args.what == "pending":
+        return {"ok": True, "rows": db.pending_converts(args.limit)}
+    row = db.convert_result(args.job_id, args.outcome == "ok", args.reason)
+    db.audit("convert_result", None, "host", f"#{args.job_id} {args.outcome} {args.reason[:120]}")
+    return {"ok": True, "status": row["status"]}
+
+def _catalogs(args):
+    """The admin's own OPDS catalogs (catalogs.py). The password arrives on stdin, never argv."""
+    import catalogs
+    if args.what == "list":
+        return {"ok": True, "rows": [{k: c[k] for k in ("id", "source", "name", "url", "user", "enabled", "legacy")}
+                                     for c in catalogs.all_catalogs(include_disabled=True)]}
+    if args.what in ("add", "test"):
+        pw = sys.stdin.read().rstrip("\n") if args.password_stdin else ""
+        if args.what == "test":
+            ok, why = catalogs.test(args.url, args.user or "", pw)
+            return {"ok": ok, "detail": why} if ok else {"ok": False, "error": why}
+        bad = catalogs.validate(args.id, args.name, args.url)
+        if bad:
+            raise ValueError(bad)
+        ok, why = catalogs.test(args.url, args.user or "", pw)
+        if not ok and not args.force:
+            raise ValueError(f"not saved: {why} (re-run with --force to save it anyway)")
+        db.catalog_put(args.id, args.name.strip(), args.url.strip(), args.user or "", pw, True)
+        db.audit("catalog_add", None, "tui", f"{args.id} {args.url[:120]}")
+        return {"ok": True, "detail": why}
+    if args.what == "remove":
+        if not db.catalog_delete(args.id):
+            raise ValueError(f"no catalog '{args.id}'")
+        db.audit("catalog_remove", None, "tui", args.id)
+        return {"ok": True}
+    row = next((r for r in db.catalog_rows() if r["id"] == args.id), None)
+    if not row:
+        raise ValueError(f"no catalog '{args.id}'")
+    db.catalog_put(row["id"], row["name"], row["url"], row["user"], "", args.what == "enable")
+    db.audit(f"catalog_{args.what}", None, "tui", args.id)
+    return {"ok": True}
+
+def _wanted(args):
+    """Keep-looking entries for the TUI: every reader's, open and recently closed."""
+    if args.what == "list":
+        rows = db.wanted_list(None)
+        return {"ok": True, "rows": [{k: w.get(k) for k in ("id", "owner", "kind", "title", "author", "status",
+                                                           "checks", "next_check", "detail", "rid", "work_key")}
+                                     for w in rows]}
+    if not db.wanted_update(args.wid, only_if_open=True, status="cancelled", detail="cancelled by the admin (TUI)"):
+        raise ValueError(f"entry {args.wid} is not open")
+    db.audit("wanted_cancel", None, "tui", str(args.wid))
+    return {"ok": True}
+
+def _canary(args):
+    """L08: the synthetic journey (scripts/synthetic.py, on the host) records its runs here, and —
+    only while the Turnstile bot check guards the login form, which no script can pass — asks for
+    a session for one of the canary accounts. Never for any other account."""
+    if args.what == "record":
+        run = json.loads(sys.stdin.read() or "{}")
+        out = db.canary_record(run)
+        if not out["ok"]:
+            db.audit("canary_failed", None, "host", f"{out['failed'] or 'journey'}"[:200])
+        return {"ok": True, "id": out["id"], "passed": out["ok"], "failed": out["failed"]}
+    if args.what == "recent":
+        return {"ok": True, "rows": db.canary_recent(args.limit)}
+    import secrets, auth
+    from flask import Flask
+    from flask.sessions import SecureCookieSessionInterface
+    if args.name not in config.CANARY_USERS:
+        raise ValueError(f"'{args.name}' is not a canary account (CANARY_USERS)")
+    fp = auth.fingerprint(args.name)
+    if not fp or fp is auth.UNAVAILABLE:
+        raise ValueError(f"canary account '{args.name}' is missing from Calibre-Web")
+    shell = Flask("canary"); shell.secret_key = config.SECRET_KEY    # the portal's own key and defaults
+    tok = secrets.token_urlsafe(32)
+    cookie = SecureCookieSessionInterface().get_signing_serializer(shell).dumps(
+        {"_permanent": True, "user": args.name, "admin": False, "fp": fp[0], "chk": time.time(), "csrf": tok})
+    db.audit("canary_session", args.name, "host", "minted (the login form has the Turnstile check)")
+    return {"ok": True, "cookie": cookie, "csrf": tok}
+
+def _gate(args):
+    """L05: the host applies portal password changes to Authelia's user file (scripts/gate-sync.py)."""
+    if args.what == "pending":
+        return {"ok": True, "rows": db.gate_pending()}
+    st = db.gate_done(args.user, args.outcome, args.reason)
+    db.audit("gate_sync", args.user, "host", f"{args.outcome} {args.reason}"[:200])
+    return {"ok": True, "status": st}
+
 def _parser():
     p = argparse.ArgumentParser(prog="admin_cli", description="Admin actions for bookstack.sh")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -192,9 +294,53 @@ def _parser():
     rs.add_argument("push_id", type=int)
     rs.add_argument("outcome", choices=("ok", "fail"))
     rs.add_argument("--reason", default="")
+
+    tg = sp.add_parser("tags").add_subparsers(dest="what", required=True)
+    tg.add_parser("pending").add_argument("--limit", type=int, default=50)
+    tr = tg.add_parser("result")
+    tr.add_argument("push_id", type=int)
+    tr.add_argument("outcome", choices=("ok", "fail"))
+    tr.add_argument("--reason", default="")
+
+    cv = sp.add_parser("converts").add_subparsers(dest="what", required=True)
+    cv.add_parser("pending").add_argument("--limit", type=int, default=3)
+    cr = cv.add_parser("result")
+    cr.add_argument("job_id", type=int)
+    cr.add_argument("outcome", choices=("ok", "fail"))
+    cr.add_argument("--reason", default="")
+
+    ca = sp.add_parser("catalogs").add_subparsers(dest="what", required=True)
+    ca.add_parser("list")
+    for name in ("add", "test"):
+        a = ca.add_parser(name)
+        if name == "add":
+            a.add_argument("id"); a.add_argument("name")
+            a.add_argument("--force", action="store_true")
+        a.add_argument("url")
+        a.add_argument("--user", default="")
+        a.add_argument("--password-stdin", action="store_true")
+    for name in ("remove", "enable", "disable"):
+        ca.add_parser(name).add_argument("id")
+
+    wa = sp.add_parser("wanted").add_subparsers(dest="what", required=True)
+    wa.add_parser("list")
+    wa.add_parser("cancel").add_argument("wid", type=int)
+
+    cn = sp.add_parser("canary").add_subparsers(dest="what", required=True)
+    cn.add_parser("record")
+    cn.add_parser("recent").add_argument("--limit", type=int, default=10)
+    cn.add_parser("session").add_argument("name")
+
+    gt = sp.add_parser("gate").add_subparsers(dest="what", required=True)
+    gt.add_parser("pending")
+    gd = gt.add_parser("done")
+    gd.add_argument("user"); gd.add_argument("outcome", choices=("ok", "missing", "failed"))
+    gd.add_argument("--reason", default="")
     return p
 
-ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes}
+ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
+        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts,
+        "canary": _canary, "gate": _gate}
 
 def main(argv=None):
     args = _parser().parse_args(argv)

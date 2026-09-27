@@ -10,6 +10,9 @@ totp:
 authentication_backend:
   file:
     path: /config/users_database.yml
+    # L05: the host's gate-sync writes portal password changes here; Authelia re-reads the file
+    # instead of being restarted (a restart would sign every family member out)
+    watch: true
     password:
       algorithm: argon2
 
@@ -97,6 +100,13 @@ storage:
 # and the rendered smtp block reads it with the template function env "BOOKSTACK_SMTP_PASS"
 # piped through quote (double curly braces; not spelled out here because the filter would
 # expand it inside this comment too).
+# L05: Authelia as the OpenID Connect provider for Audiobookshelf (it has no header login).
+# bookstack.sh fills the block between these markers once the gate is on: the signing key is read
+# from /config/oidc-jwks.pem and the HMAC secret from the container env by the template filter,
+# the client secret is stored hashed. Empty = no OpenID Connect at all.
+# @OIDC_BEGIN@
+# @OIDC_END@
+
 # @NOTIFIER_BEGIN@
 notifier:
   # Writes password-reset messages to a file by default (no mail dependency).

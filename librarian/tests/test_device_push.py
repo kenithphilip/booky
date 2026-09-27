@@ -13,12 +13,14 @@ from conftest import add_calibre_book, calibre_conn
 
 
 def test_the_allowlist_is_enforced_where_the_row_is_written(users):
-    pid = db.queue_push(7, {"title": "T", "tags": "owner:mallory", "comments": "x",
-                            "identifiers": "isbn:1", "series": "S"})
+    # v5 allows comments/identifiers/cover_url (fill-only); tags, rating, timestamp stay out
+    pid = db.queue_push(7, {"title": "T", "tags": "owner:mallory", "rating": "10",
+                            "timestamp": "2020-01-01", "comments": "x", "series": "S"})
     assert pid
     with db._conn() as c:
         stored = json.loads(c.execute("SELECT fields FROM device_push WHERE id=?", (pid,)).fetchone()[0])
-    assert stored == {"title": "T", "series": "S"}
+    assert stored == {"title": "T", "comments": "x", "series": "S"}
+    assert "tags" not in db.PUSH_FIELDS
 
 
 def test_the_allowlist_is_enforced_again_on_the_way_out(users):

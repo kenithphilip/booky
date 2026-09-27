@@ -268,14 +268,18 @@ def test_send_to_kindle_has_a_daily_ceiling_for_non_admins(client, users, monkey
                         lambda to, path, title=None, filename=None, **kw: (sent.append(to), f"sent to {to}")[1])
     login(client, "alice", users["alice"])
     cwa.set_kindle_mail("alice", "alice@kindle.com")
+    import worker
     for _ in range(3):
-        assert b"sent to alice@kindle.com" in post(client, "/kindle/1").data
+        assert b"on its way" in post(client, "/kindle/1").data
     r = post(client, "/kindle/1")
+    while worker.kindle_once(): pass
     assert b"which is the limit" in r.data and len(sent) == 3
     # yesterday's sends do not count against today
     with sqlite3.connect(config.STATE_DB) as c:
         c.execute("UPDATE audit SET ts=ts-90000 WHERE event='kindle_send'")
-    assert b"sent to alice@kindle.com" in post(client, "/kindle/1").data and len(sent) == 4
+    assert b"on its way" in post(client, "/kindle/1").data
+    while worker.kindle_once(): pass
+    assert len(sent) == 4
 
 
 def test_an_admin_is_exempt_from_the_kindle_ceiling(client, users, monkeypatch):
@@ -291,7 +295,9 @@ def test_an_admin_is_exempt_from_the_kindle_ceiling(client, users, monkeypatch):
     login(client, "admin", users["admin"])
     cwa.set_kindle_mail("admin", "admin@kindle.com")
     for _ in range(3):
-        assert b"sent to admin@kindle.com" in post(client, "/kindle/1").data
+        assert b"on its way" in post(client, "/kindle/1").data
+    import worker
+    while worker.kindle_once(): pass
     assert len(sent) == 3
 
 

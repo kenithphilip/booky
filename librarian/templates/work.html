@@ -1,0 +1,45 @@
+{% extends "base.html" %}{% block body %}
+<div class="card"><div class="row" style="gap:16px;align-items:flex-start">
+{% if w.cover_large %}<img src="{{ url_for('cover', u=w.cover_large) }}" alt="" style="width:140px;border-radius:6px;border:1px solid var(--line);flex:none">{% endif %}
+<div style="flex:1">
+<h2 style="margin-top:0">{{ w.title }}</h2>{% if w.subtitle %}<p class="mut" style="margin-top:-8px">{{ w.subtitle }}</p>{% endif %}
+<p>{% for a in w.authors %}{% if a.key %}<a href="{{ url_for('writer_page', key=a.key) }}">{{ a.name }}</a>{% else %}{{ a.name }}{% endif %}{{ ', ' if not loop.last }}{% endfor %}
+{% if w.first_published %}<span class="mut"> · first published {{ w.first_published }}</span>{% endif %}
+{% if w.pages %}<span class="mut"> · about {{ w.pages }} pages</span>{% endif %}</p>
+{% if w.dupe %}<p><span class="badge">{{ 'maybe in your library' if w.dupe.how == 'title' else 'already in your library' }}</span>
+{% if w.dupe.book_id %} <a href="{{ url_for('book_page', book_id=w.dupe.book_id) }}">open it</a>{% endif %}</p>{% endif %}
+{% if w.description %}<p style="white-space:pre-line">{{ w.description }}</p>{% endif %}
+</div></div></div>
+
+<h2>Copies we can fetch for you</h2>
+<p class="mut">Found through the book's own catalogue links and checked against it{% if lang %}, in {{ cfg.LANGUAGES.get(lang, lang) }}{% endif %}.</p>
+{% for c in offer %}
+<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
+<div><strong>{{ c.title }}</strong> <span class="mut">— {{ c.author or 'no author given' }}</span>
+<span class="badge">{{ 'audiobook' if c.kind == 'audio' else 'ebook' }}</span>
+<span class="badge">{{ 'good match' if c.match.verdict == 'auto' else 'check this one' }}</span><br>
+<span class="mut">{{ c.detail }}</span><br>
+<span class="mut" style="font-size:12px">Why: {{ c.match.reasons | join('; ') }}</span></div>
+<form method="post" action="{{ url_for('get_copy') }}" style="flex:none">{{ csrf_field() }}
+<input type="hidden" name="token" value="{{ c.token }}"><button type="submit">Request</button></form>
+</div></div>
+{% endfor %}
+{% if not offer %}<div class="card">No free copy of this book is available in the catalogues this library uses{% if refused %} (the ones found were not a match — see below){% endif %}.</div>{% endif %}
+
+<div class="card"><strong>Not there, or want another edition?</strong>
+<div class="row" style="flex-wrap:wrap;gap:8px;margin-top:6px">
+<form method="post" action="{{ url_for('wanted_add') }}" class="row">{{ csrf_field() }}
+<input type="hidden" name="title" value="{{ w.title }}"><input type="hidden" name="author" value="{{ w.author }}">
+<input type="hidden" name="work_key" value="{{ w.key }}">
+<select name="kind"><option value="ebook">Ebook</option><option value="audio">Audiobook</option></select>
+<button type="submit">Keep looking for it</button></form>
+{% if shelf %}<a class="btn sec" href="{{ shelf }}" target="_blank" rel="noopener">Search more sources in Shelfmark</a>{% endif %}
+{% if shelf_audio %}<a class="btn sec" href="{{ shelf_audio }}" target="_blank" rel="noopener">…audiobook in Shelfmark</a>{% endif %}
+</div>
+<p class="mut" style="margin:6px 0 0">Keep looking checks this book's catalogue links and the catalogues again on a schedule, and requests an exact match when one appears.</p></div>
+
+{% if refused %}<details class="card"><summary>{{ refused|length }} cop{{ 'y' if refused|length == 1 else 'ies' }} found that did not match</summary>
+{% for c in refused %}<p class="mut">{{ c.title }} — {{ c.author or '?' }} · {{ c.detail }}: {{ c.match.reasons | join('; ') }}</p>{% endfor %}
+</details>{% endif %}
+<p class="mut" style="font-size:12px">Book information from Open Library · <a href="https://openlibrary.org/works/{{ w.key }}" target="_blank" rel="noopener">view there</a></p>
+{% endblock %}

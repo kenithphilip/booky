@@ -61,7 +61,8 @@ def render(snippet, host):
     if paths:
         return snippet.replace("not path @@BYPASS@@", "not path_regexp " + bypass_regexp(paths)).replace("@@BYPASS@@", bypass_regexp(paths))
     lines = [l for l in snippet.split("\n") if "@@BYPASS@@" not in l]
-    return "\n".join(lines).replace("forward_auth @authelia_protected ", "forward_auth ")
+    return ("\n".join(lines).replace("forward_auth @authelia_protected ", "forward_auth ")
+            .replace("request_header @authelia_protected ", "request_header "))
 
 
 def inject(src, snippet):

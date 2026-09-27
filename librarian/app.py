@@ -7,7 +7,7 @@ from flask import (Flask, request, session, redirect, url_for, render_template, 
 from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
-import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle
+import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
 import abs as absapi
 
 app = Flask(__name__)
@@ -25,6 +25,9 @@ if config.TRUST_PROXY:
 
 CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'none'; "
        "form-action 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'")
+# the login page with Turnstile on (L17): Cloudflare's challenge script and frame, nothing else
+CSP_TURNSTILE = CSP.replace("script-src 'none'", "script-src https://challenges.cloudflare.com") + \
+    "; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com"
 REVALIDATE_SECONDS = 60      # how often a logged-in session is checked against the account
 ENRICH_DEADLINE = 6          # seconds the search page waits for covers/blurbs before rendering
 
@@ -64,12 +67,41 @@ def _friendly_detail(detail, is_admin=False):
         return d.split(" (moved to")[0].split(" (could not")[0]
     return d
 
+@app.template_filter("ago_or_in")
+def _ago_or_in(ts, now=None):
+    """'in 3 h' / '5 min ago' for a Unix time — a reader cares how long, not the timestamp."""
+    if not ts:
+        return ""
+    d = float(ts) - (now or time.time())
+    a = abs(d)
+    n = (f"{int(a // 86400)} d" if a >= 86400 else f"{int(a // 3600)} h" if a >= 3600
+         else f"{max(1, int(a // 60))} min")
+    return f"in {n}" if d > 0 else f"{n} ago"
+
 @app.context_processor
 def _inject():
     return {"csrf_field": lambda: Markup(f'<input type="hidden" name="csrf" value="{_csrf_token()}">'),
             "kindle_enabled": kindle.configured(), "cfg": config,
             "source_label": config.source_label, "friendly_detail": _friendly_detail,
             "mail_intake": _mail_intake_address}
+
+def _kobo_link_test(user):
+    """Ask Calibre-Web, as the Kobo would, whether this reader's link works: the same
+    /kobo/<token>/v1/initialization call a device makes first (L12)."""
+    tok = cwa.kobo_token(user, create=False)
+    if not tok:
+        return "You have no Kobo link yet: generate one first."
+    import requests as _r
+    try:
+        r = _r.get(f"{config.CWA_URL.rstrip('/')}/kobo/{tok}/v1/initialization", timeout=10,
+                   headers={"User-Agent": "Kobo bookstack-link-test"})
+    except Exception:
+        return "The library did not answer the test — it may be restarting; try again in a minute."
+    if r.status_code == 200 and "Resources" in r.text:
+        return "Your Kobo link works: the library answered exactly as it answers a Kobo."
+    if r.status_code in (401, 403):
+        return "The library refused this link. Regenerate it and update the device."
+    return f"The library answered HTTP {r.status_code} to the test. Ask the admin to check Kobo sync (Users menu)."
 
 def _mail_intake_address(user):
     """'books+alice@example.com' when e-mail intake is configured, else None: without this the
@@ -87,6 +119,32 @@ def _csrf_check():
         sent = request.form.get("csrf", "") or request.headers.get("X-CSRF-Token", "")
         if not tok or not sent or not hmac.compare_digest(tok, sent):
             abort(400, "Invalid or missing form token. Reload the page and try again.")
+
+@app.before_request
+def _gate_sso():
+    """L05: one login. Authelia already checked this person (password + 2FA) and Caddy says so
+    with the gate secret; Remote-User names an existing Calibre-Web account. Without the secret
+    (a request that did not come through the gate) the header means nothing."""
+    if not (config.AUTHELIA_ENABLED and config.GATE_SECRET):
+        return None
+    who = request.headers.get("Remote-User", "").strip()
+    sent = request.headers.get("X-Bookstack-Gate", "")
+    if not who or not sent or not hmac.compare_digest(sent, config.GATE_SECRET):
+        return None
+    if session.get("user") == who:
+        return None
+    r = auth.fingerprint(who)
+    if not r or r is auth.UNAVAILABLE:
+        if session.get("user"):              # the gate says someone else: never keep the old identity
+            session.clear()
+        return None
+    session.clear()
+    session.permanent = True
+    session["user"], session["admin"] = who, r[1]
+    session["fp"], session["chk"], session["sso"] = r[0], time.time(), True
+    _csrf_token()
+    _audit("login_sso", "via the Authelia gate", user=who)
+    return None
 
 @app.before_request
 def _revalidate_session():
@@ -112,6 +170,15 @@ def _headers(resp):
     resp.headers.setdefault("Referrer-Policy", "same-origin")
     resp.headers.setdefault("X-Frame-Options", "DENY")
     return resp
+
+def _upload_limit():
+    """L18: over Tailscale (upload.<domain>, which bypasses Cloudflare's 100 MB cap) the portal
+    accepts large uploads. Keyed on a header only that Caddy site sets and every site strips from
+    clients — never on Host, which a client controls. Registered FIRST (below): the CSRF hook reads
+    the form, and a body parsed under the normal limit before this ran was refused anyway."""
+    if request.headers.get("X-Bookstack-Upload") == "tailnet":
+        request.max_content_length = config.MAX_UPLOAD_TAILNET_MB * 1024 * 1024
+app.before_request_funcs.setdefault(None, []).insert(0, _upload_limit)
 
 def login_required(f):
     @wraps(f)
@@ -149,9 +216,33 @@ def _cwa_user(name):
 @app.errorhandler(413)
 def _too_large(_e):
     """Werkzeug's bare '413 Request Entity Too Large' page told a family member nothing."""
+    big = f" Over Tailscale, https://upload.{config.DOMAIN} takes files up to {config.MAX_UPLOAD_TAILNET_MB} MB." if config.DOMAIN else ""
     flash(f"That file is larger than {config.MAX_UPLOAD_MB} MB, which is the limit for browser "
-          f"uploads. Put it in your dropbox folder instead (ask the admin how), or e-mail it in.")
+          f"uploads through Cloudflare.{big} Or put it in your dropbox folder (ask the admin how), or e-mail it in.")
     return redirect(url_for("upload")), 302
+
+def _turnstile_on():
+    return bool(config.TURNSTILE_SITEKEY and config.TURNSTILE_SECRET)
+
+def _turnstile_ok():
+    """Server-side siteverify. An explicit 'no' from Cloudflare refuses the login; Cloudflare
+    being unreachable does not lock the household out (the lockout and fail2ban still apply),
+    and is audited."""
+    import requests as _r
+    try:
+        r = _r.post("https://challenges.cloudflare.com/turnstile/v0/siteverify", timeout=8,
+                    data={"secret": config.TURNSTILE_SECRET, "response": request.form.get("cf-turnstile-response", ""),
+                          "remoteip": _ip()})
+        return bool(r.json().get("success"))
+    except Exception:
+        _audit("turnstile_unreachable", "siteverify did not answer; login allowed")
+        return True
+
+def _login_page(status=200, headers=None):
+    resp = app.make_response((render_template("login.html", turnstile=config.TURNSTILE_SITEKEY if _turnstile_on() else ""), status, headers or {}))
+    if _turnstile_on():
+        resp.headers["Content-Security-Policy"] = CSP_TURNSTILE
+    return resp
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -164,13 +255,18 @@ def login():
             _audit("login_locked", f"{username} ({wait}s left)", user=username)
             flash(f"Too many failed attempts. Try again in {max(1, wait // 60)} minute(s).")
             _csrf_token()
-            return render_template("login.html"), 429, {"Retry-After": str(max(1, wait))}
+            return _login_page(429, {"Retry-After": str(max(1, wait))})
+        if _turnstile_on() and not _turnstile_ok():
+            _audit("login_bot_check_failed", username, user=username or None)
+            flash("The automatic bot check did not pass. Wait for the check box to finish, then sign in again.")
+            _csrf_token()
+            return _login_page(400)
         u = auth.verify(username, request.form.get("password", ""))
         if u is auth.UNAVAILABLE:              # CWA restarting: not the user's fault, not a failure
             _audit("login_unavailable", username, user=username or None)
             flash("The library is restarting. Try again in a minute.")
             _csrf_token()
-            return render_template("login.html"), 503
+            return _login_page(503)
         if u:
             session.clear()
             session.permanent = True
@@ -184,15 +280,20 @@ def login():
         _audit("login_fail", username + (" -> locked" if locked else ""), user=username or None)
         flash("Invalid login." + (" Too many attempts: this account is locked for a while from your address." if locked else ""))
         _csrf_token()
-        return render_template("login.html"), 401       # 401 so Caddy's log / fail2ban can count it
+        return _login_page(401)       # 401 so Caddy's log / fail2ban can count it
     _csrf_token()
-    return render_template("login.html")
+    return _login_page()
 
 @app.route("/logout", methods=["POST"])
 def logout():
     if session.get("user"):
         _audit("logout")
-    session.clear(); return redirect(url_for("login"))
+    sso = session.get("sso")
+    session.clear()
+    if sso and config.DOMAIN:
+        # the gate would sign them straight back in: end the Authelia session too
+        return redirect(f"https://auth.{config.DOMAIN}/logout?rd=https://request.{config.DOMAIN}/")
+    return redirect(url_for("login"))
 
 @app.route("/logout", methods=["GET"])
 def logout_get():
@@ -204,10 +305,53 @@ def logout_get():
     return redirect(url_for("login"))
 
 # ---- search & requests -----------------------------------------------------------
+def _lib_index():
+    return dedupe.Index(session["user"], session.get("admin", False))
+
+def _in_library(seen, w):
+    return seen.match(w["title"], w["author"], [{"kind": "isbn", "value": i} for i in w.get("isbns", [])[:40]])
+
 @app.route("/", methods=["GET"])
 @login_required
 def index():
+    """Metadata-first: find the BOOK (Open Library), then its copies on the book's page. The
+    old keyword search of the download catalogues is one click away (mode=catalogs), and is
+    what the page falls back to when Open Library does not answer."""
     q = request.args.get("q", "").strip()
+    mode = request.args.get("mode", "books")
+    if q and mode != "catalogs":
+        lang = db.get_prefs(session["user"])["language"]
+        try:
+            works = bookmeta.search(q, limit=20)
+        except bookmeta.Unavailable as e:
+            flash(f"Book search is unavailable right now ({e}); showing the catalogues directly.")
+            works = None
+        if works is not None:
+            seen = _lib_index()
+            for w in works:
+                w["dupe"] = _in_library(seen, w)
+            bookmeta.prefetch(works, lang)
+            return render_template("books.html", q=q, works=works, shelf=_shelf_link(q=q))
+    return _catalog_search(q)
+
+def _shelf_link(q=None, title=None, author=None, isbn=None, kind="ebook"):
+    """A search for the same book in Shelfmark, which reaches the wider sources the admin has
+    enabled there (with its own metadata-first mode, per-user downloads and request rules)."""
+    if not config.SHELF_URL:
+        return None
+    from urllib.parse import urlencode
+    p = {"content_type": "audiobook" if kind == "audio" else "ebook"}
+    if q:
+        p["q"] = q
+    if title:
+        p["q"] = title
+    if author:
+        p["author"] = author
+    if isbn:
+        p["isbn"] = isbn
+    return f"{config.SHELF_URL.rstrip('/')}/?{urlencode(p)}"
+
+def _catalog_search(q):
     results = fetchers.search(q) if q else []
     if results:
         # ONE scoped read of the library for the whole page (it was one query per result), and
@@ -232,15 +376,83 @@ def index():
                 f.cancel()      # queued work never starts; a running one holds its own timeout
             except Exception:
                 pass
-    return render_template("index.html", q=q, results=results,
-                           sources=[s for s, on in config.SOURCES.items() if on])
+    for r in results:
+        r["token"] = db.candidate_put(session["user"], r)
+    return render_template("index.html", q=q, results=results, sources=fetchers.enabled_sources())
+
+@app.route("/work/<key>")
+@login_required
+def work_page(key):
+    """One book as the metadata knows it, and every copy of it this stack can fetch — each
+    checked against the book and the reader's language, with the reasons shown."""
+    try:
+        w = bookmeta.work(key)
+    except bookmeta.Unavailable as e:
+        flash(f"Book details are unavailable right now ({e}).")
+        return redirect(url_for("index"))
+    if not w:
+        abort(404)
+    lang = db.get_prefs(session["user"])["language"]
+    w["dupe"] = _in_library(_lib_index(), w)
+    try:
+        found = bookmeta.copies(w, lang)
+    except Exception:
+        found = []
+    offer, refused = [], []
+    for c in found:
+        if c["match"]["verdict"] == "reject":
+            refused.append(c)
+        else:
+            c["token"] = db.candidate_put(session["user"], dict(c, work_key=w["key"], language=lang))
+            offer.append(c)
+    return render_template("work.html", w=w, offer=offer, refused=refused, lang=lang,
+                           shelf=_shelf_link(title=w["title"], author=w["author"],
+                                             isbn=(w["isbns"] or [None])[0]),
+                           shelf_audio=_shelf_link(title=w["title"], author=w["author"], kind="audio"))
+
+@app.route("/writer/<key>")
+@login_required
+def writer_page(key):
+    try:
+        a = bookmeta.author(key)
+        works = bookmeta.author_works(key) if a else []
+    except bookmeta.Unavailable as e:
+        flash(f"Author details are unavailable right now ({e}).")
+        return redirect(url_for("index"))
+    if not a:
+        abort(404)
+    seen = _lib_index()
+    for w in works:
+        w["dupe"] = _in_library(seen, w)
+    series = bookmeta.series_for_author(a.get("goodreads"))
+    return render_template("writer.html", a=a, works=works, series=series)
+
+@app.route("/get", methods=["POST"])
+@login_required
+def get_copy():
+    """Request a copy offered on a page. The form carries only a token: the address, the
+    expected size and checksum and the match reasons come from the server's own record, so
+    nothing a browser sends can point the worker somewhere else."""
+    c = db.candidate_get(request.form.get("token"), session["user"])
+    if not c:
+        flash("That offer has expired; open the book again to see its copies.")
+        return redirect(url_for("index"))
+    m = c.get("match") or {}
+    if m.get("verdict") == "reject":
+        abort(400, "That copy was not a match for the book.")
+    r = {k: c.get(k) for k in ("kind", "source", "identifier", "title", "author", "download_url",
+                               "expect_size", "expect_md5", "expect_sha1", "src_ids", "work_key", "language")}
+    r["kind"] = "audio" if r["source"] == "librivox" else "ebook"
+    return _queue_request(r, confidence=1 - m["distance"] if m else None, reasons=m.get("reasons"))
 
 @app.route("/request", methods=["POST"])
 @login_required
 def make_request():
+    if request.form.get("token"):
+        return get_copy()
     r = {k: request.form.get(k) for k in
          ("kind", "source", "identifier", "title", "author", "download_url")}
-    if not r["title"] or not r["download_url"] or config.SOURCES.get(r.get("source")) is not True:
+    if not r["title"] or not r["download_url"] or not fetchers.source_enabled(r.get("source")):
         flash("Could not queue that item.")
         return redirect(url_for("status"))
     # The form echoes the URL the adapter produced; a tampered one must not reach the worker.
@@ -249,6 +461,17 @@ def make_request():
         _audit("request_refused", f"{r['source']} {r['download_url'][:120]}")
         abort(400, "That download address is not one this source hands out.")
     r["kind"] = "audio" if r["source"] == "librivox" else "ebook"
+    return _queue_request(r)
+
+def _queue_request(r, confidence=None, reasons=None):
+    """The one way a reader's click becomes a request: source enabled, address allowed, the
+    approval setting and the daily limit — whichever page the click came from."""
+    if not r.get("title") or not r.get("download_url") or not fetchers.source_enabled(r.get("source")):
+        flash("Could not queue that item.")
+        return redirect(url_for("status"))
+    if not fetchers.url_allowed(r["source"], r["download_url"]):
+        _audit("request_refused", f"{r['source']} {r['download_url'][:120]}")
+        abort(400, "That download address is not one this source hands out.")
     is_admin = session.get("admin", False)
     status = "queued" if (is_admin or not config.APPROVALS_REQUIRED) else "pending"
     limit = 0 if is_admin else config.MAX_REQUESTS_PER_DAY
@@ -261,6 +484,8 @@ def make_request():
               f"You can request again after {datetime.datetime.fromtimestamp(resets).strftime('%H:%M')}. "
               f"(Denied and failed requests do not count.)")
         return redirect(url_for("status"))
+    if confidence is not None:
+        db.set_match(rid, round(confidence, 3), reasons or [])
     rec = db.get(rid)
     _audit("request", f"#{rid} {r['title']} [{r['source']}] -> {status}")
     note = f" {left} of {limit} requests left today." if limit else ""
@@ -506,8 +731,127 @@ def status():
         r["retryable"] = _retryable(r)
     for r in rows:                          # a user may clear their own failed rows (J40)
         r["can_dismiss"] = r["status"] == "error"
+    kindle_sends = db.kindle_recent(None if is_admin else session["user"])
+    shelf_pending, shelf_error = [], None
+    if is_admin:
+        import shelfmark_api
+        try:
+            shelf_pending = shelfmark_api.pending()
+        except shelfmark_api.ShelfmarkError as e:
+            shelf_error = str(e)
+    looking = db.wanted_list(None if is_admin else session["user"])
+    for w in looking:
+        c = w.get("candidate") or {}
+        w["cand_host"] = urlsplit(c.get("download_url") or "").hostname or ""
     return render_template("status.html", rows=rows, pending=pending, failed=failed,
-                           admin=is_admin)
+                           admin=is_admin, looking=looking, kindle_sends=kindle_sends,
+                           shelf_pending=shelf_pending, shelf_error=shelf_error)
+
+@app.route("/shelfmark/<int:req_id>/<action>", methods=["POST"])
+@admin_required
+def shelfmark_decide(req_id, action):
+    """Approve or deny a Shelfmark request from the portal's Pending card (L16)."""
+    import shelfmark_api
+    if action not in ("approve", "deny"):
+        abort(404)
+    note = (request.form.get("reason") or "").strip()
+    try:
+        shelfmark_api.decide(req_id, action == "approve", note)
+        _audit(f"shelfmark_{action}", f"request #{req_id}" + (f": {note[:80]}" if note else ""))
+        flash("Approved in Shelfmark: it downloads now, to the reader's own library." if action == "approve"
+              else "Denied in Shelfmark; the reader sees your reason there.")
+    except shelfmark_api.ShelfmarkError as e:
+        flash(f"Shelfmark did not accept that: {e}")
+    return redirect(url_for("status"))
+
+# ---- keep looking (wanted.py) ------------------------------------------------------------------
+WANTED_TITLE_MAX, WANTED_AUTHOR_MAX = 300, 200
+
+def _own_wanted(wid):
+    """The entry if it is this reader's (or the reader is an admin), else a 404: an id in a
+    form is a guess away from someone else's list."""
+    w = db.wanted_get(wid)
+    if not w or (w["owner"] != session["user"] and not session.get("admin", False)):
+        abort(404)
+    return w
+
+@app.route("/wanted", methods=["POST"])
+@login_required
+def wanted_add():
+    title = (request.form.get("title") or "").strip()[:WANTED_TITLE_MAX]
+    author = (request.form.get("author") or "").strip()[:WANTED_AUTHOR_MAX]
+    kind = "audio" if request.form.get("kind") == "audio" else "ebook"
+    if not dedupe.norm_title(title):
+        flash("Type the book's title to keep looking for it.")
+        return redirect(url_for("index"))
+    limit = 0 if session.get("admin", False) else config.WANTED_MAX_PER_USER
+    # the first look is an hour out: the reader has just searched every catalog and found nothing
+    work_key = request.form.get("work_key") or None
+    if work_key and not bookmeta._KEY.fullmatch(work_key):
+        work_key = None
+    # from a book's page the reader has only seen its catalogue links, not a keyword search:
+    # the first look can come sooner there
+    first = time.time() + (600 if work_key else wanted.SCHEDULE[0])
+    wid, why = db.wanted_add(session["user"], kind, title, author, first_check=first, limit=limit,
+                             same=wanted.same_want, work_key=work_key)
+    if wid is None:
+        if why == "limit":
+            flash(f"You are already keeping an eye out for {limit} books. Cancel one on your Status page first.")
+        else:
+            flash(f"You are already looking for \"{title}\" — it is on your Status page.")
+        return redirect(url_for("status"))
+    _audit("wanted_add", f"#{wid} {title} / {author or '-'} [{kind}]")
+    flash(f"We'll keep looking for \"{title}\"{' by ' + author if author else ''} and request it as soon as "
+          f"a catalog has it{'' if author else ' (without an author we will ask you to confirm the match)'}."
+          f" You can see it under Still looking.")
+    return redirect(url_for("status"))
+
+@app.route("/wanted/<int:wid>/cancel", methods=["POST"])
+@login_required
+def wanted_cancel(wid):
+    w = _own_wanted(wid)
+    if db.wanted_update(wid, only_if_open=True, status="cancelled",
+                        detail=f"cancelled by {session['user']}"):
+        _audit("wanted_cancel", f"#{wid} {w['title']}")
+    return redirect(url_for("status"))
+
+@app.route("/wanted/<int:wid>/accept", methods=["POST"])
+@login_required
+def wanted_accept(wid):
+    """The reader says the candidate is the right book: request it, under every rule an
+    ordinary Request click obeys (worker._wanted_request)."""
+    w = _own_wanted(wid)
+    cand = w.get("candidate")
+    if w["status"] != "candidate" or not cand:
+        flash("There is nothing to confirm for that one any more.")
+        return redirect(url_for("status"))
+    is_admin = worker._owner_admin(w["owner"])
+    rid, why = worker._wanted_request(w, cand, w.get("confidence") or wanted.FLOOR,
+                                      list(w.get("reasons") or []) + [f"confirmed by {session['user']}"],
+                                      bool(is_admin))
+    if not rid:
+        flash(f"Could not request it: {why}.")
+        return redirect(url_for("status"))
+    db.wanted_update(wid, only_if_open=True, status="found", rid=rid,
+                     detail=f"confirmed by {session['user']}; request #{rid} ({why})")
+    flash(f"Requested: {cand.get('title')}" + (" — waiting for admin approval." if why == "pending" else " — it will appear in your library shortly."))
+    return redirect(url_for("status"))
+
+@app.route("/wanted/<int:wid>/reject", methods=["POST"])
+@login_required
+def wanted_reject(wid):
+    """Not the right book: remember that exact download so it is never offered again, and go
+    back to looking."""
+    w = _own_wanted(wid)
+    cand = w.get("candidate") or {}
+    if w["status"] == "candidate" and cand.get("download_url"):
+        rejected = list(w.get("rejected") or []) + [cand["download_url"]]
+        db.wanted_update(wid, only_if_open=True, status="looking", candidate=None, confidence=None,
+                         reasons=[], rejected=rejected[-50:],
+                         next_check=time.time() + wanted.next_delay(w["checks"]),
+                         detail="you said the last match was not it; still looking")
+        _audit("wanted_reject", f"#{wid} {w['title']} <- {cand.get('source')}")
+    return redirect(url_for("status"))
 
 @app.route("/upload", methods=["GET", "POST"])
 @login_required
@@ -618,8 +962,43 @@ def book_page(book_id):
         # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
         description=b["description"] or work.get("description") or "",
         first_year=work.get("first_publish_year"),
+        # no cover in Calibre: show the provider's (through the local proxy) until the host job
+        # has written it into Calibre for the devices
+        provider_cover=work.get("cover_url") if (work.get("cover_url") or "").startswith("https://covers.openlibrary.org/") else None,
         authors=meta.get("authors") or [], series=meta.get("series"),
-        kindle_mail=_cwa_user(user).get("kindle_mail") or "")
+        kindle_mail=_cwa_user(user).get("kindle_mail") or "",
+        convert_to=[f for f in config.CONVERT_TARGETS if f not in b["formats"]]
+                   if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
+        converting=db.convert_for_book(book_id))
+
+@app.route("/book/<int:book_id>/convert", methods=["POST"])
+@login_required
+def book_convert(book_id):
+    """Queue a conversion of one of this reader's books into a format the library lacks."""
+    user, is_admin = session["user"], session.get("admin", False)
+    b = library.book_detail(user, book_id, is_admin)
+    if not b:
+        abort(404)
+    dst = (request.form.get("format") or "").lower()
+    if dst not in config.CONVERT_TARGETS or dst in b["formats"]:
+        flash("That format is not one the library can make, or the book already has it.")
+        return redirect(url_for("book_page", book_id=book_id))
+    src = next((f for f in config.CONVERT_SOURCES if f in b["formats"] and f != dst), None)
+    f = library.file_for(user, book_id, src, is_admin) if src else None
+    if not f:
+        flash("There is no file of this book the library can convert from.")
+        return redirect(url_for("book_page", book_id=book_id))
+    if not is_admin and db.convert_count(user, time.time() - 86400) >= config.CONVERT_MAX_PER_DAY:
+        flash(f"You have asked for {config.CONVERT_MAX_PER_DAY} conversions in the last 24 hours, which is the limit.")
+        return redirect(url_for("book_page", book_id=book_id))
+    rel = os.path.relpath(f["path"], os.path.realpath(config.LIBRARY_DIR))
+    if rel.startswith("..") or os.path.isabs(rel):
+        abort(400)
+    jid = db.convert_queue(book_id, user, src, dst, rel)
+    _audit("convert", f"book {book_id} {src} -> {dst}" + ("" if jid else " (already queued)"))
+    flash(f"Converting to {dst.upper()} — it appears on this page, on your devices and in downloads "
+          f"within about 15 minutes." if jid else f"A {dst.upper()} copy is already being made.")
+    return redirect(url_for("book_page", book_id=book_id))
 
 @app.route("/book/<int:book_id>/cover")
 @login_required
@@ -715,12 +1094,12 @@ def send_kindle(book_id):
         flash(f"You have sent {limit} books to your Kindle in the last 24 hours, which is the "
               f"limit. Download the book from this page instead, or try again later.")
         return redirect(url_for("my_library"))
-    try:
-        flash(kindle.send(addr, f["path"], f["title"], f["filename"],
-                          author=f.get("authors"), book_title=f["title"]))
-        _audit("kindle_send", f["filename"])
-    except Exception as e:
-        flash(f"Could not send: {e}")
+    # queued, not sent here: the worker mails it (worker.kindle_once), so a slow mail relay can
+    # never outlast Cloudflare's 100 s and show a 524 for a mail that did go out. Counted now,
+    # at the click, so the daily limit means what it says.
+    jid = db.kindle_enqueue(user, is_admin, book_id, f["title"])
+    _audit("kindle_send", f"{f['filename']} (job {jid})")
+    flash(f"Sending \"{f['title']}\" to your Kindle — it is on its way; the result shows on your Status page.")
     return redirect(url_for("my_library"))
 
 # ---- devices: Kindle address, Kobo link, preferences ---------------------------------
@@ -767,7 +1146,8 @@ def devices():
                 has_addr = bool(_cwa_user(user).get("kindle_mail"))
                 db.set_prefs(user, preferred_format=request.form.get("preferred_format"),
                              auto_kindle=want_auto and has_addr,
-                             notify_email=request.form.get("notify_email") == "1")
+                             notify_email=request.form.get("notify_email") == "1",
+                             language=request.form.get("language"))
                 if want_auto and not has_addr:
                     flash("Preferences saved, but automatic Send-to-Kindle stays off until you "
                           "save your Kindle address above.")
@@ -777,6 +1157,13 @@ def devices():
                 cwa.kobo_url(user, create=True); _audit("kobo_link"); flash("Your Kobo sync link is ready.")
             elif action == "kobo_reset":
                 cwa.reset_kobo_token(user); _audit("kobo_reset"); flash("Kobo link regenerated — update the device.")
+            elif action == "kobo_test":
+                flash(_kobo_link_test(user))
+            elif action == "kobo_prefs":
+                cwa.set_kobo_prefs(user, shelves_only=request.form.get("shelves_only") == "1",
+                                   hardcover_token=request.form.get("hardcover_token") if request.form.get("hardcover_change") == "1" else None)
+                _audit("kobo_prefs")
+                flash("Kobo options saved.")
             elif action == "password":
                 cur, new, rep = request.form.get("current", ""), request.form.get("new", ""), request.form.get("repeat", "")
                 ok = auth.verify(user, cur)
@@ -799,7 +1186,8 @@ def devices():
                         session["fp"], session["chk"] = fp[0], time.time()
                         db.set_pw_fingerprint(user, fp[0])   # this change IS synced: do not warn about it
                     if config.AUTHELIA_ENABLED:
-                        note += " The sign-in page in front of the sites (Authelia) keeps its own password: ask the admin to change it too."
+                        db.gate_queue(user, new)
+                        note += " The sign-in page in front of the sites (Authelia) takes the new password within a minute."
                     _audit("password_change")
                     # NOT Shelfmark: it signs its own session cookie and only checks app.db at
                     # login, so an old cookie keeps working until the container is restarted.
@@ -839,18 +1227,53 @@ def devices():
     prefs = db.get_prefs(user)
     if prefs["last_kindle_test"]:
         prefs["last_kindle_test"] = datetime.datetime.fromtimestamp(prefs["last_kindle_test"]).strftime("%Y-%m-%d %H:%M")
-    return render_template("devices.html", u=u, prefs=prefs, kobo=kobo,
+    try:
+        kstat = cwa.kobo_status(user) if kobo else None
+    except Exception:
+        kstat = None
+    return render_template("devices.html", u=u, prefs=prefs, kobo=kobo, kstat=kstat,
                            kobo_on=kobo_on, formats=config.FORMATS, kosync=config.KOSYNC_ENABLED,
                            abs_linked=absapi.configured())
 
 # ---- admin dashboard ---------------------------------------------------------------
+@app.route("/admin/catalogs", methods=["POST"])
+@admin_required
+def admin_catalogs():
+    """Add / test / enable / disable / remove one of the admin's own OPDS catalogs."""
+    import catalogs
+    act = request.form.get("action")
+    cid = (request.form.get("id") or "").strip().lower()
+    if act in ("add", "test"):
+        name, url = (request.form.get("name") or "").strip(), (request.form.get("url") or "").strip()
+        user, pw = (request.form.get("user") or "").strip(), request.form.get("password") or ""
+        ok, why = catalogs.test(url, user, pw) if url else (False, "no address given")
+        if act == "test":
+            flash(f"Test: {why}.")
+            return redirect(url_for("admin") + "#catalogs")
+        bad = catalogs.validate(cid, name, url)
+        if bad:
+            flash(f"Catalog not saved: {bad}.")
+        elif not ok and request.form.get("force") != "1":
+            flash(f"Catalog not saved: {why}. Tick 'save anyway' to keep it regardless.")
+        else:
+            db.catalog_put(cid, name, url, user, pw, True)
+            _audit("catalog_add", f"{cid} {url[:120]}")
+            flash(f"Catalog '{name}' saved ({why}). It is searched from now on.")
+    elif act in ("enable", "disable"):
+        row = next((r for r in db.catalog_rows() if r["id"] == cid), None)
+        if row:
+            db.catalog_put(row["id"], row["name"], row["url"], row["user"], "", act == "enable")
+            _audit(f"catalog_{act}", cid)
+    elif act == "remove":
+        if db.catalog_delete(cid):
+            _audit("catalog_remove", cid)
+            flash("Catalog removed.")
+    return redirect(url_for("admin") + "#catalogs")
+
 @app.route("/admin", methods=["GET", "POST"])
 @admin_required
 def admin():
     if request.method == "POST" and request.form.get("action") == "add_user":
-        if config.AUTHELIA_ENABLED:
-            flash("Authelia is on: add users in the admin tools (bookstack.sh -> Users) so they also get an Authelia login.")
-            return redirect(url_for("admin"))
         try:
             pw = request.form.get("password", "")
             email = request.form.get("email", "").strip()
@@ -864,6 +1287,10 @@ def admin():
                     absapi.ensure_user(u["name"], pw); note = " Audiobookshelf account created."
                 except Exception:
                     note = " (Audiobookshelf account could not be created — Users → Repair in the admin tools.)"
+            if config.AUTHELIA_ENABLED:
+                # the gate's own login, same password; the host writes it into Authelia's file
+                db.gate_queue(u["name"], pw, email=email, display=u["name"], admin=bool(u["role"] & 1))
+                note += " Their sign-in page login (Authelia, same password; 2FA is set up at first sign-in) is ready within a minute."
             _audit("user_add", u["name"] + (" (admin)" if u["role"] & 1 else ""))
             flash(f"User {u['name']} created" + ("" if u["role"] & 1 else f" (isolated to {cwa.owner_tag(u['name'])})") + "." + note)
         except cwa.CwaError as e:
@@ -896,11 +1323,14 @@ def admin():
     for a in audit_rows:
         a["when"] = datetime.datetime.fromtimestamp(a["ts"]).strftime("%Y-%m-%d %H:%M")
     return render_template("admin.html", links=config.admin_links(), counts=counts,
+                           wanted_counts=db.wanted_counts(),
+                           catalogs=__import__("catalogs").all_catalogs(include_disabled=True),
                            users=users, disk=disk, kobo_on=kobo_on, audit=audit_rows, needs_tag=needs_tag,
                            abs_linked=absapi.configured(), quota=config.MAX_REQUESTS_PER_DAY,
-                           sources=[s for s, on in config.SOURCES.items() if on], health=_health(),
+                           sources=fetchers.enabled_sources(), health=_health(),
                            alerts_ok=bool(config.NOTIFY_WEBHOOK or (config.ADMIN_EMAIL and kindle.configured())),
-                           authelia=config.AUTHELIA_ENABLED)
+                           authelia=config.AUTHELIA_ENABLED, canary=db.canary_recent(10),
+                           canary_on=bool(config.CANARY_USERS))
 
 # ---- automation & health ------------------------------------------------------------
 @app.route("/intake", methods=["POST"])
@@ -976,7 +1406,7 @@ def _health():
     """What /healthz and the admin page report: are the worker loops alive, can we write
     /ingest, is there disk, can CWA's app.db be opened. Never raises."""
     now = time.time()
-    loops = ["queue", "dropbox", "housekeeping"] + (["imap"] if config.IMAP_HOST else [])
+    loops = ["queue", "dropbox", "housekeeping", "wanted"] + (["imap"] if config.IMAP_HOST else [])
     ages = {n: (round(now - worker.HEARTBEAT[n]) if n in worker.HEARTBEAT else None) for n in loops}
     problems = [f"{n} loop stale" for n, a in ages.items() if a is None or a > STALE_SECONDS]
     pending, oldest = 0, 0
@@ -1007,7 +1437,18 @@ def _health():
             "version": config.BUILD_VERSION,
             # the library being down is shown to the admin but does not make the PORTAL
             # unhealthy: compose would restart the portal for Calibre-Web's problem
-            "cwa": cwa_problem or "ok"}
+            "cwa": cwa_problem or "ok",
+            # Degraded, not down — reported, never a reason for compose to restart the portal:
+            # a catalogue read that had to ignore Calibre's write-ahead log (recent books may be
+            # missing from My books), and metadata providers the circuit breaker stood down.
+            "library_read": library.STALE_READ[0] or "ok",
+            "metadata_down": _breakers()}
+
+def _breakers():
+    try:
+        return [b["provider"] for b in db.open_breakers()]
+    except Exception:
+        return []
 
 def _is_loopback(addr):
     try:

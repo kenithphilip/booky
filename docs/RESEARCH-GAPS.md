@@ -226,7 +226,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: high.
 
 ### L04 — Use CWA's native per-user auto-send instead of mailing the raw EPUB pre-import
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: dropped   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `_auto_kindle` runs on the `.part` file before CWA imports it (`worker.py:62`), so
   the mailed copy never gets the Kindle EPUB fixer or fetched metadata, and non-EPUB uploads
   are never auto-sent. CWA v4 has per-user `auto_send_enabled` with a delay
@@ -239,9 +239,17 @@ Checked against the files; no action needed beyond the residuals named.
   when CWA mail is configured, else falls back to the portal SMTP; stack-test with the
   GreenMail sink.
 - **Effort**: medium. **Priority**: medium (later).
+- **Why dropped (2026-09-26, v5, CWA v4.0.6 source read)**: CWA's auto-send is fed by the same
+  book-picking fallback that makes its auto-metadata unsafe here — when calibredb's output cannot
+  be parsed, `ingest_processor.py:476` takes `SELECT id FROM books ORDER BY last_modified DESC
+  LIMIT 1` (and `:953` `ORDER BY timestamp DESC`), and that id drives auto-send (`:991`). In a
+  shared library that is "whoever imported last", i.e. one reader's book mailed to another
+  reader's Kindle. The portal's own auto-send stays: it mails the file it just placed for that
+  reader, applies the Kindle language/encoding fixes, counts against KINDLE_MAX_PER_DAY, and
+  Send-to-Kindle from My books now runs in the worker (L21).
 
 ### L05 — One login when Authelia is on: header SSO into CWA/portal/Shelfmark + password sync + e-mail reset
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: README accepts double login and a separate Authelia password store;
   `authelia_add_user` keeps its own argon2 hash, and the self-service password change does
   not update it.
@@ -254,9 +262,38 @@ Checked against the files; no action needed beyond the residuals named.
   Authelia entry (argon2 via `argon2-cffi` in the librarian image). Keep `/kobo`, `/opds`,
   `/kosync` on their own Basic/token auth.
 - **Effort**: medium. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**:
+  - **The portal** trusts `Remote-User` only beside `X-Bookstack-Gate: <GATE_SECRET>`. Caddy
+    strips both headers (and `Remote-*`) on every path and adds the secret only to requests
+    Authelia let through. The session comes from Calibre-Web's account, so admin rights follow
+    Calibre-Web, never a header. Logging out of the portal ends the Authelia session too.
+  - **Calibre-Web's** header login is pinned ON with exactly `Remote-User` and auto-create off
+    while the gate is on, OFF otherwise. `cwa harden` follows the gate, so a Deploy no longer
+    undoes it. It is safe only because no container can reach Calibre-Web (L01).
+  - **Password sync.** The portal's password change and its /admin user creation queue a
+    PBKDF2-SHA512 hash, which Authelia 4.39.28 verifies. `scripts/gate-sync.py` on the host
+    (systemd path unit plus a 10-minute timer) writes it into `users_database.yml`, and
+    Authelia re-reads the file (`watch: true`), so nobody is signed out. The SMTP notifier for
+    self-service reset already existed.
+  - **Proven live.** Behind the gate, the portal and Calibre-Web open without a second login.
+    A direct or guessed header is ignored, and one smuggled through `/opds` is stripped. Carol's
+    portal-made login and two password changes reach Authelia, and the old password stops
+    working.
+  - **Shelfmark** (added later the same day) runs `AUTH_METHOD=proxy` behind the gate, with
+    `PROXY_AUTH_ADMIN_GROUP_NAME=admins` fed from `Remote-Groups`. Authelia's `admins` group is
+    kept equal to Calibre-Web's admins. Measured on v1.3.15: cwa -> proxy -> cwa keeps every
+    account id (takeover by username, which is the same person here). Without the header it
+    answers 401, and a reader gets 403 on admin settings. Proxy mode is not OIDC: Shelfmark's
+    OIDC links accounts by e-mail and otherwise creates `alice_1`, whose downloads would land
+    in a dropbox of no real user.
+  - **Audiobookshelf** gets OpenID Connect with Authelia as the provider (it has no header
+    login). Matching is by username, auto-register and group claims are off, and local login
+    is kept for the apps and this automation. The web login goes to Authelia and back with
+    implicit consent. Proven live over TLS: alice lands in her existing, still tag-restricted
+    account.
 
 ### L10 — Post-import owner reconciliation for formats that cannot carry a tag
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: after N06, mobi/azw3/fb2/txt/djvu still import untagged.
 - **How**: on placement record `(rid, owner, basename, placed_at)`; a 30 s loop opens
   `metadata.db` read-only, finds `data.name` matching the placed basename with `timestamp ≥
@@ -265,9 +302,19 @@ Checked against the files; no action needed beyond the residuals named.
   for librarian. Mark the request `done`; after CWA's `ingest_timeout_minutes` mark `error`.
   This is the only place the portal would write Calibre's DB; keep it tiny.
 - **Effort**: medium. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: done through the host, not by giving the portal a writable
+  library (the plan above): the portal still mounts the library read-only and has no Docker
+  socket. `worker.reconcile_untagged` finds the Calibre book (the `[owner-rid]` marker, else a
+  strict fallback: same format, arrived after placement, NO owner tag, title agreeing with the
+  file's own, exactly one candidate) and queues a `tag_push`; `scripts/metadata-push.sh`'s second
+  pass adds `owner:<x>` with calibredb, refusing any book that already has an owner tag and
+  verifying every other tag is unchanged. Proven on the real stack: an untagged TXT got
+  owner:alice with its Classics tag kept; a second job for bob was refused. Found on the way:
+  calibredb run as uid 1000 prints a warning on STDOUT, which broke every JSON read of the
+  metadata push on the real image — fixed (HOME=/tmp + tolerant parsing).
 
 ### L11 — Real KEPUB downloads with kepubify (or drop the option)
-- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `config.FORMATS` offers `kepub` and Devices labels it "(Kobo)", but CWA converts
   to EPUB and only kepubifies transiently on Kobo sync, so `library.best_format` silently
   falls back to EPUB. N07 relabels it now; this makes it real.
@@ -275,9 +322,15 @@ Checked against the files; no action needed beyond the residuals named.
   `library.file_for(owner, id, 'kepub')` converts the EPUB once into a size-capped cache
   under `/state` and serves `<title>.kepub.epub`.
 - **Effort**: medium. **Priority**: low (later).
+- **Resolution (2026-09-26, v5)**: pinned kepubify v4.0.4 in the portal image (SHA-256 computed
+  once for amd64 and arm64 — the release publishes none — and the build refuses any other file);
+  `library._kepub_from_epub` converts on DOWNLOAD, one at a time, into a mtime-keyed cache capped
+  at KEPUB_CACHE_MB; KEPUB is a preferred format again. Verified: the served file carries
+  kepubify's koboSpan markup. Kobo SYNC stays EPUB on purpose — enabling CWA's own conversion
+  makes sync convert inline, which broke syncing permanently when measured (DECISIONS-PENDING).
 
 ### L12 — Kobo card: prerequisites, pitfalls, last-sync indicator; Magic Shelves / shelves-only sync / Hardcover token
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: Devices Kobo card gets a "before you start" list (store/Libby stop working while
   linked because `config_kobo_proxy=0`; sign-in/factory reset rewrites `api_endpoint`; only
   EPUB/KEPUB sync; first sync takes minutes) and "Last sync: <time>, <n> books" from
@@ -286,6 +339,13 @@ Checked against the files; no action needed beyond the residuals named.
   (`config_kobo_sync_magic_shelves=1`, `config_hardcover_sync=1` in defaults). All columns
   exist in `librarian/tests/fixtures/cwa_app_schema.sql`.
 - **Effort**: small. **Priority**: low (later).
+- **Resolution (2026-09-26, v5)**: Devices' Kobo card: "before you start" (store/Libby, config
+  rewrite on sign-in, EPUB/KEPUB only, first-sync time), "N books handed to your Kobo · last reading
+  position received …" from kobo_synced_books / kobo_reading_state (read-only), "Test my link"
+  (the same /kobo/<token>/v1/initialization call a device makes), shelves-only sync and a
+  reader's own Hardcover token (NULL when blank: the column is UNIQUE). CWA defaults gain
+  config_kobo_sync_magic_shelves=1 and config_hardcover_sync=1; the library-wide Hardcover
+  auto-ID task stays off.
 
 ### L13 — CWA auto-metadata fetch on ingest (with tag rewriting disabled)
 - **Status**: dropped   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
@@ -306,7 +366,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium (later).
 
 ### L16 — Shelfmark request policies and a unified approval queue
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: the portal enforces `APPROVALS_REQUIRED`; Shelfmark downloads straight into the
   dropbox with no approval. Upstream ships per-source request policies (download directly /
   must request / blocked) and an admin approve/decline flow with a static API key.
@@ -315,9 +375,17 @@ Checked against the files; no action needed beyond the residuals named.
   pull `GET /api/requests` into the portal's Pending card. Verify the feature exists in the
   Shelfmark version pinned by N14 before wiring the API.
 - **Effort**: small (docs) / medium (API). **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: Shelfmark's own policies follow the portal's APPROVALS_REQUIRED
+  (`REQUESTS_ENABLED`, `REQUEST_POLICY_DEFAULT_*=request_release` in compose), and its pending
+  requests appear on the portal's Pending card (`librarian/shelfmark_api.py`, signing in as the
+  `svc-portal` CWA admin account the installer creates; the Secure session cookie is carried by
+  hand). Approving calls Shelfmark's fulfil, which queues the READER's chosen release under the
+  READER's name (requests_service.fulfil_request) — it lands in their dropbox and is
+  owner-tagged. Proven on the real stack: alice's request pending, shown on the portal, denied
+  there, rejected with the reason in alice's Shelfmark.
 
 ### L18 — Large uploads over the tailnet
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: N10 caps browser uploads at 95 MB because of Cloudflare; audiobook zips are bigger.
 - **How**: `upload.<domain> { bind @@TAILSCALE_IP@@; import private_tls; import hardening;
   request_body { max_size 2GB }; reverse_proxy 127.0.0.1:8090 }`, grey-cloud DNS record in
@@ -328,6 +396,11 @@ Checked against the files; no action needed beyond the residuals named.
 ---
 
 ## 5. Security
+- **Resolution (2026-09-26, v5)**: `upload.<domain>` — the portal again, Tailscale-only
+  (tailnet_only, grey-cloud DNS to the tailnet IP), 2 GB body limit; Caddy sets
+  `X-Bookstack-Upload: tailnet` there and strips that header from every client everywhere, and the
+  portal raises its limit (MAX_UPLOAD_TAILNET_MB) only on that marker — never on Host. The 413 page
+  through Cloudflare now points readers at it.
 
 ### N01 — Deploy publishes books./audio. before credentials exist
 - **What**: `step_deploy` starts `caddy` in the first `compose up` (`bookstack.sh:274`) and
@@ -455,7 +528,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: medium.
 
 ### L01 — Container isolation: portal off the host network, per-service networks, `cap_drop`, `read_only`, Shelfmark sees only `app.db`
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: librarian is on the host network only to reach qBittorrent/aria2 on 127.0.0.1;
   everything else shares one bridge, so Shelfmark (third-party, internet-facing) can talk to
   qbittorrent:8080, authelia:9091, etc.; no `cap_drop`/`read_only`; caddy/kuma run as root;
@@ -471,9 +544,29 @@ Checked against the files; no action needed beyond the residuals named.
   `/etc/docker/daemon.json` with `icc:false`, `live-restore:true`; `useradd --shell
   /usr/sbin/nologin` and drop `usermod -aG docker`. Depends on N11's limits.
 - **Effort**: large. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**:
+  - **Networks.** Every bridge service has a network of its own: `cwa`, `abs`, `dl`, `fetch`
+    (Shelfmark + FlareSolverr), `auth` (Authelia) and `eph` (Ephemera + FlareSolverr). Shelfmark
+    and Ephemera share FlareSolverr but never a network with each other.
+  - **Capabilities.** Calibre-Web, Shelfmark and qBittorrent (s6/gosu start as root) keep only
+    CHOWN, SETUID, SETGID, DAC_OVERRIDE and FOWNER. Audiobookshelf and FlareSolverr keep none.
+  - **Stack account.** A newly created uid-1000 account gets no login shell; it was already
+    out of the docker group.
+  - **Proven live.** Shelfmark cannot open a connection to Calibre-Web, Audiobookshelf,
+    Authelia or the mail server, and every journey passes with the capabilities dropped.
+    qBittorrent 5.2.3 and FlareSolverr 3.5.2 were started the same way and worked (a real
+    Chromium solve).
+  - **Not done, on purpose:**
+    - The portal stays on the host network. It reaches the services on 127.0.0.1, and no bridge
+      network can reach the host's loopback.
+    - No `read_only`: the s6/gosu images write to /run and /etc at start.
+    - Shelfmark still mounts the config directory. app.db alone already holds the hashes, Kobo
+      tokens and SMTP password, and a single-file bind of a WAL database hides new users from
+      Shelfmark.
+    - No `icc:false`: it only affects the default bridge, which nothing uses now.
 
 ### L14 — The origin lock trusts Cloudflare's *shared* origin-pull CA
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: the CA in `cf-origin-pull-ca.pem` signs the same client cert for every Cloudflare
   tenant, so mTLS proves "some Cloudflare edge", not "my zone". Caddy's per-hostname certs
   blunt the classic bypass (the attacker needs an Enterprise Host/SNI override), but the
@@ -482,25 +575,61 @@ Checked against the files; no action needed beyond the residuals named.
   web ports; cheaper — a per-zone custom AOP certificate uploaded via the API and trusted
   instead of the shared PEM. Reword README/DEPLOYMENT-CHECKLIST either way.
 - **Effort**: medium. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: the cheaper option, fully automated. Install -> Cloudflare
+  offers it and Security -> Origin lock runs, finishes or renews it: the server issues a private
+  CA and an RSA-4096 client leaf (CA:FALSE, clientAuth; keys in `/etc/bookstack/aop`, 0600,
+  never in a snapshot), uploads the leaf to `POST /zones/{id}/origin_tls_client_auth`, waits for
+  `active`, enables zone-level AOP (`PUT .../origin_tls_client_auth/settings`, read back), and
+  only then narrows Caddy's trust. The switch is proven: Caddy trusts both CAs, then ours alone,
+  restarts (Cloudflare reuses origin connections, so a reload could pass on the old trust), and a
+  request through Cloudflare must succeed or it goes back to both (`AOP_MODE=both`, finished by
+  the next Deploy). Renewal keeps the CA and deletes the previous upload after the proof;
+  cert-watch alerts 60 days before the leaf expires. Needs the token permission Zone -> SSL and
+  Certificates -> Edit; without it nothing changes and the step says which permission is
+  missing. Cloudflare Tunnel stays documented as the stronger alternative (no public web ports);
+  README wording corrected. Not run against a real zone here: the API calls follow Cloudflare's
+  reference and are exercised against a stateful stub.
 
 ### L15 — Backups deletable from the host they protect
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `backup.sh:13` runs `restic forget --prune` nightly with the same key as the
   backup, so root on the VPS (or the leaked B2 key) can wipe every snapshot.
 - **How**: an append-only B2 application key (no `deleteFiles`) or `rest-server
   --append-only` for the nightly job; prune monthly from a separate `/etc/bookstack/
   restic-prune.env` or from the laptop. Pair with N12.
 - **Effort**: small. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: a free target first: Install -> Backups -> "A computer at home"
+  sets up restic's `rest-server --append-only --private-repos` on a machine the admin owns, over
+  Tailscale (bcrypt login from Caddy's `hash-password`, checked before anything is stored; the
+  login is redacted from snapshots). Measured with rest-server 0.14.0 / restic 0.19: a forget from
+  the server gets 403, another repository 401, and the prune runs on that computer against the
+  folder itself. For a bucket, Install -> Backups asks whether the key is append-only (B2: a
+  key without `deleteFiles` over the S3 API, where restic's deletes become recoverable "hides",
+  plus a lifecycle rule keeping hidden files 30 days; or rest-server `--append-only`) and stores
+  `RESTIC_APPEND_ONLY=1`. The nightly `backup.sh` then never forgets, prunes or re-tags;
+  retention moved to `scripts/prune.sh`, run either by a monthly `bookstack-prune` timer with a
+  SEPARATE key in `/etc/bookstack/restic-prune.env` (never in a snapshot) or from the admin's own
+  computer. Detection: every run records the snapshot it wrote and alerts (high) if the previous
+  one has vanished, which no retention policy can cause. The self-test says which mode is in
+  force, warns when a deleting key is used, and warns when snapshots outlive the policy (a
+  forgotten laptop prune). Not verified against a real B2 bucket here: check `b2 key create`
+  capabilities and the lifecycle rule when setting it up (DEPLOYMENT-CHECKLIST).
 
 ### L17 — Bot friction on the portal login and a default nudge towards 2FA
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: Cloudflare Turnstile (free) on `login.html` with server-side siteverify; Quick
   install asks "Enable SSO + 2FA now? (recommended)"; `selftest.sh` warns when
   `forward_auth` is absent.
 - **Effort**: small. **Priority**: low (later).
+- **Resolution (2026-09-26, v5)**: optional Cloudflare Turnstile (Security -> Login bot check; the
+  secret is checked with Cloudflare before it is saved). Only the login page may then load
+  Cloudflare's challenge script — every other page keeps `script-src 'none'` — and the token is
+  verified server-side: an explicit failure refuses the login; Cloudflare unreachable lets it
+  through and is audited (the lockout and fail2ban stay the hard limits). Quick install offers
+  Authelia SSO + 2FA; the self-test warns while no second factor is in front of the public sites.
 
 ### L19 — Host hardening extras
-- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: sshd drop-in adds `AllowUsers root books`, `LoginGraceTime 20`,
   `ClientAliveInterval 300`, `AllowTcpForwarding no`, `AllowAgentForwarding no`,
   `PermitEmptyPasswords no`, `sshd -t` before reload; sysctl adds `kernel.kptr_restrict=2`,
@@ -514,6 +643,13 @@ Checked against the files; no action needed beyond the residuals named.
 ---
 
 ## 6. Operations
+- **Resolution (2026-09-26, v5)**: sshd drop-in adds PermitEmptyPasswords no, LoginGraceTime 20,
+  ClientAliveInterval 300/CountMax 2, AllowAgentForwarding no, AllowTcpForwarding no (still
+  `sshd -t`-validated before any reload); `AllowUsers` deliberately NOT set — it would lock out a
+  provider's default login account. sysctl adds kptr_restrict, dmesg_restrict, ptrace_scope,
+  unprivileged_bpf_disabled and the fs.protected_* set. Tailscale installs from its signed apt
+  repository. cf-ips opens 443 only and removes existing port-80 rules (Full-strict SSL + Always
+  Use HTTPS mean nothing reaches the origin on 80). Persistent journald, capped at 200 MB.
 
 ### N02 — bookstack.sh: `askpw2` corrupts passwords; errexit is off inside `step || true`; Cancel clears settings
 - **What**: whiptail draws its UI on stdout and returns results on stderr, which is why
@@ -683,10 +819,15 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: small. **Priority**: high.
 
 ### L06 — Update notices (Diun) and in-app CWA update banner
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: `crazymax/diun` service (docker socket read-only, watch-by-default, notify via
   the alert channel from L07 or e-mail), `cwa_update_notifications=1` in defaults.
 - **Effort**: small. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: not Diun (another container holding the Docker socket) but
+  `scripts/update-check.sh`, weekly cron: each IMG_* pin in .env against its registry's newest
+  version tag, one alert per new version, nothing pulled or restarted (Operations -> Update does
+  that, with a backup and rollback). CWA's own update banner (`cwa_update_notifications`) is
+  already 1 by default and nothing here turns it off.
 
 ### L07 — Alert channel and Uptime Kuma bootstrap
 - **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
@@ -712,7 +853,7 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L08 — Scheduled synthetic user journey on the VPS (canary user)
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: `scripts/synthetic.py` reusing `tests/e2e_driver.py` helpers, as user `_canary`
   (hidden from user lists): login → upload a generated EPUB through Cloudflare → wait for
   import with the owner tag → download → second canary gets 404 → OPDS + Kobo init through
@@ -721,18 +862,36 @@ Checked against the files; no action needed beyond the residuals named.
   `librarian.db` and shown on `/admin` (import latency is the earliest CWA-degradation
   signal).
 - **Effort**: medium. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: `scripts/synthetic.py` (stdlib, host, root) on
+  `bookstack-canary.timer` at 06:20/18:20, set up by Operations -> Canary journey. Accounts
+  `canary-a`/`canary-b` (CWA `_valid_name` forbids a leading underscore) are ordinary isolated
+  readers without an ABS account, hidden from every user list via `CANARY_USERS`; passwords in
+  `/etc/bookstack/canary.env` (0600, never `.env`). Journey: portal login (or, while Turnstile
+  guards the form, a session the portal mints for a canary name only), upload through Cloudflare
+  (loopback when the Authelia gate is on), import with the owner tag (import latency recorded),
+  owner download, second canary refused, OPDS through Cloudflare showing the book to its owner
+  only, Kobo init through Cloudflare, Shelfmark login, weekly opt-in Send-to-Kindle to
+  `CANARY_KINDLE_TO`, then `calibredb remove` (plus leftovers older than an hour). Runs land in
+  `canary_runs` and on /admin; failures alert with the failing step and push DOWN to Kuma's
+  "Canary journey" monitor. Proven live by tests/stack-test.sh on the real containers: passes on
+  a healthy stack (import 20 s, book removed), and an unreachable Shelfmark fails the run, names
+  the step in the alert and on /admin.
 
 ### L09 — Certificate and token expiry watch
-- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **How**: daily `cert-watch.sh`: `openssl x509 -checkend` on every origin cert under
   `caddy/data/caddy/certificates` (alert < 14 days = renewal is failing), on
   `cf-origin-pull-ca.pem` (< 60 days), grep Caddy logs for `could not get certificate`;
   `cf-ips.sh` re-downloads the origin-pull CA and reloads Caddy if it changed; `selftest.sh`
   verifies the Cloudflare token with `/user/tokens/verify`.
 - **Effort**: small. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: `scripts/cert-watch.sh`, daily cron: every certificate under
+  caddy/data (alert < 14 days = renewal failing), Cloudflare's origin-pull CA (< 60 days), and the
+  Cloudflare API token via /user/tokens/verify (not active, or expiring within 14 days). One alert
+  listing every problem; silent when fine. (Tailscale key expiry was already N18.)
 
 ### L20 — Restart unhealthy containers (autoheal)
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `restart: unless-stopped` only reacts to PID 1 exiting; Docker never acts on a
   failing healthcheck, so a wedged CWA stays "unhealthy" forever.
 - **How**: `willfarrell/autoheal` with the docker socket read-only and the `autoheal` label
@@ -741,9 +900,14 @@ Checked against the files; no action needed beyond the residuals named.
   healthcheck honest first. The socket mount is root-equivalent for that container — accept
   it consciously or skip.
 - **Effort**: small. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: not the autoheal container (it needs the Docker socket — root
+  on the host inside a third-party image) but `scripts/heal.sh`, a root cron job every 2 minutes:
+  only listed services (never caddy or qbittorrent), two unhealthy readings in a row before
+  acting, at most one restart per container per 30 minutes, an alert for every restart and one
+  alert (not a loop) when a restart did not help. Audiobookshelf already has its healthcheck.
 
 ### L02 — Make the P2P path actually work (qBittorrent auth, temp path, ingest mounts)
-- **Status**: partial   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `config.py:114-118` assumes "bypass auth for localhost"; the librarian's
   connection to the published port arrives from the Docker bridge gateway, not 127.0.0.1, so
   even that setting would not match and `Qbit().add()` gets 403. The LSIO image prints a new
@@ -759,6 +923,12 @@ Checked against the files; no action needed beyond the residuals named.
   calls `torrents/info` with the stored credentials. `IA_USE_TORRENT` is off by default, so
   this is not a go-live blocker.
 - **Effort**: medium. **Priority**: medium (later).
+- **Resolution (2026-09-26, v5)**: the portal no longer drives qBittorrent at all (the P2P path was
+  removed; qBittorrent is an admin tool that saves into the admin's dropbox), so the librarian needs
+  no credentials. What remained: a real Web UI password — `qbt_seed_config` generates QBIT_PASS and
+  writes its PBKDF2-SHA512 hash in qBittorrent's own `@ByteArray(salt:key)` format before first
+  start (proven on the pinned 5.2.3: the password logs in, no temporary one is printed); temp path
+  and dropbox-only mounts were already in place; the self-test now logs in with QBIT_PASS.
 
 ### L03 — Torrent watcher: match by hash, not by substring or "oldest pending"
 - **Status**: obsolete   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
@@ -773,11 +943,16 @@ Checked against the files; no action needed beyond the residuals named.
 - **Effort**: medium. **Priority**: medium (later).
 
 ### L21 — Asynchronous Send-to-Kindle
-- **Status**: not_done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
+- **Status**: done   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->
 - **What**: `send_kindle` is synchronous; a slow relay with a 45 MB attachment can hit
   Cloudflare's 100 s proxy timeout (524) even though the mail is sent.
 - **How**: enqueue a `kindle` job row processed by the worker; flash "Sending… see Status".
 - **Effort**: small. **Priority**: low (later).
+- **Resolution (2026-09-26, v5)**: `kindle_jobs` table; the route checks visibility, format,
+  address and the daily limit (counted at the click), queues, and answers at once; the worker's
+  housekeeping mails it (`worker.kindle_once`), resolving the file again under the same
+  visibility rule, retrying 1 / 5 / 30 minutes, then reporting the failure to the reader. Status
+  shows "Sent to Kindle" with each result.
 
 ### L22 — aria2 downloads should enter through a dropbox
 - **Status**: obsolete   <!-- checked by tests/tui-test.sh; update BOTH this line and the code -->

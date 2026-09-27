@@ -216,10 +216,13 @@ ensure_stack_user(){ # the host account behind uid 1000, which every container r
   elif [ -n "$by_name" ]; then
     # a 'books' account exists with another uid: leave it alone, give uid 1000 its own account
     STACK_USER="books1000"
-    getent passwd "$STACK_USER" >/dev/null || useradd -m -u 1000 -s /bin/bash "$STACK_USER" \
+    getent passwd "$STACK_USER" >/dev/null || useradd -m -u 1000 -s /usr/sbin/nologin "$STACK_USER" \
       || { msg "Could not create a user with uid 1000 ('$STACK_USER'). Create one by hand and run System again."; return 1; }
   else
-    useradd -m -u 1000 -s /bin/bash "$STACK_USER" \
+    # L01: nothing logs in as this account (root runs compose, cron and the TUI): no shell.
+    # An account that already owns uid 1000 (the image's default user) keeps its shell — it may
+    # be how the admin logs in.
+    useradd -m -u 1000 -s /usr/sbin/nologin "$STACK_USER" \
       || { msg "Could not create the '$STACK_USER' user (uid 1000). Run System again after checking 'getent passwd 1000'."; return 1; }
   fi
   STACK_HOME=$(getent passwd "$STACK_USER" | cut -d: -f6)
@@ -248,7 +251,7 @@ copy_code_trees(){ # repo -> $STACK_DIR: code, templates and scripts (never live
   rm -f "$STACK_DIR/authelia/inject-gate.py" "$STACK_DIR/authelia/caddy-gate.snippet"
   [ -f "$STACK_DIR/authelia/users_database.yml" ] || cp -f "$SRC_DIR/authelia/users_database.yml" "$STACK_DIR/authelia/"
   cp -f "$SRC_DIR/caddy/Dockerfile" "$SRC_DIR/caddy/Caddyfile.template" "$STACK_DIR/caddy/"
-  cp -f "$SRC_DIR/scripts/"*.sh "$SRC_DIR/authelia/inject-gate.py" "$SRC_DIR/authelia/caddy-gate.snippet" "$STACK_DIR/scripts/"
+  cp -f "$SRC_DIR/scripts/"*.sh "$SRC_DIR/scripts/"*.py "$SRC_DIR/authelia/inject-gate.py" "$SRC_DIR/authelia/caddy-gate.snippet" "$STACK_DIR/scripts/"
   rsync -a --delete --exclude state --exclude tests --exclude __pycache__ "$SRC_DIR/librarian/" "$STACK_DIR/librarian/"
   rsync -a --delete --exclude __pycache__ "$SRC_DIR/monitoring/" "$STACK_DIR/monitoring/"   # kuma-bootstrap build context
   rm -rf "$STACK_DIR/configs"; cp -R "$SRC_DIR/configs" "$STACK_DIR/configs"
@@ -348,6 +351,29 @@ setup_swap(){ # swapfile sized to RAM; fstab only gets the line once, and only w
     rm -f /swapfile; echo "(could not create a swapfile; continuing without swap)"
   fi
 }
+# L19: Tailscale from its SIGNED apt repository, not `curl | sh` — the same packages, but apt
+# verifies every future update against the repository key instead of trusting one download.
+install_tailscale_apt() {
+  local id codename
+  id=$(. /etc/os-release 2>/dev/null; echo "${ID:-debian}"); codename=$(. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME:-bookworm}")
+  case "$id" in debian|ubuntu) ;; *) id=debian;; esac
+  mkdir -p /usr/share/keyrings
+  curl -fsSL "https://pkgs.tailscale.com/stable/$id/$codename.noarmor.gpg" -o /usr/share/keyrings/tailscale-archive-keyring.gpg \
+    && curl -fsSL "https://pkgs.tailscale.com/stable/$id/$codename.tailscale-keyring.list" -o /etc/apt/sources.list.d/tailscale.list \
+    && apt-get update -qq && apt-get install -y -qq tailscale
+}
+# L19: keep the journal across reboots (the 04:30 reboot otherwise erases the evidence of what
+# went wrong before it), capped: disk is this plan's binding constraint.
+write_journald(){
+  mkdir -p "$ETC/systemd/journald.conf.d"
+  [ "$ETC" = /etc ] && mkdir -p /var/log/journal
+  cat > "$ETC/systemd/journald.conf.d/90-bookstack.conf" << 'JRN'
+[Journal]
+Storage=persistent
+SystemMaxUse=200M
+JRN
+  systemctl restart systemd-journald 2>/dev/null || true
+}
 write_sysctl(){
   mkdir -p "$ETC/sysctl.d"
   cat > "$ETC/sysctl.d/90-bookstack.conf" << 'SYS'
@@ -364,6 +390,15 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 # which is temporarily absent, e.g. an interface flap on a NAT'd VPS, cannot stop Caddy starting.
 net.ipv4.ip_nonlocal_bind = 1
 net.ipv6.ip_nonlocal_bind = 1
+# L19: kernel hardening that costs a single-purpose box nothing
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+kernel.unprivileged_bpf_disabled = 1
+fs.protected_symlinks = 1
+fs.protected_hardlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
 # small-host tuning: prefer RAM over the swapfile; large libraries need many inotify watches (ABS)
 vm.swappiness = 10
 fs.inotify.max_user_watches = 524288
@@ -400,6 +435,14 @@ KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 X11Forwarding no
 MaxAuthTries 3
+# L19: the rest of the checklist. No AllowUsers on purpose: a provider's default login account
+# (debian, ubuntu, admin...) would be locked out by a list that does not name it.
+PermitEmptyPasswords no
+LoginGraceTime 20
+ClientAliveInterval 300
+ClientAliveCountMax 2
+AllowAgentForwarding no
+AllowTcpForwarding no
 SSH
   if ! sshd -t 2>/dev/null; then
     rm -f "$d/$SSH_DROPIN"
@@ -435,6 +478,7 @@ step_system() {
   ensure_stack_user || return 1
   setup_swap
   write_sysctl
+  write_journald
   setup_firewall
 
   dpkg-reconfigure -f noninteractive unattended-upgrades
@@ -455,7 +499,7 @@ make_dirs() {
 
 # ---------- 2. tailscale ----------
 step_tailscale() {
-  command -v tailscale >/dev/null || curl -fsSL https://tailscale.com/install.sh | sh
+  command -v tailscale >/dev/null || install_tailscale_apt || { msg "Could not install Tailscale from its signed package repository (see the output above)."; return 1; }
   clear
   echo "Tailscale will print a login URL. Open it in your browser and approve this machine."
   echo
@@ -579,7 +623,7 @@ step_configure() {
   if [ -z "$cur_bind" ] || ! ip_on_host "$cur_bind"; then envset BIND_IP "${rsrc:-$(envget PUBLIC_IP)}"; fi
   envdefault LIBRARIAN_SECRET "$(openssl rand -hex 32)"
   # INTAKE_TOKEN stays empty (webhook off) until Library -> Intake enables it
-  for kv in SRC_GUTENBERG:true SRC_STANDARD:false SRC_ARCHIVE:true SRC_LIBRIVOX:true SRC_MYCATALOG:false TORRENTS_ENABLED:false \
+  for kv in SRC_GUTENBERG:true SRC_STANDARD:true SRC_ARCHIVE:true SRC_LIBRIVOX:true SRC_MYCATALOG:false TORRENTS_ENABLED:false \
             APPROVALS_REQUIRED:false SHELFMARK_LANGUAGE:en SHELFMARK_CONCURRENCY:1 EPHEMERA_ENABLED:false AUTHELIA_ENABLED:false \
             FLARESOLVERR_ENABLED:false; do
     envdefault "${kv%%:*}" "${kv##*:}"; done
@@ -689,7 +733,7 @@ step_cloudflare() {
   cf_zone || { msg "Zone $(envget DOMAIN) not found with this token."; return 1; }
   CF_FAILS=""
   local h pub ts; pub=$(envget PUBLIC_IP); ts=$(envget TAILSCALE_IP)
-  local public="books audio request shelf" private="monitor" privnote=""
+  local public="books audio request shelf" private="monitor upload" privnote=""
   # auth. only exists while Authelia runs; published unconditionally it is a public hostname that
   # 502s and renews a certificate forever for a service nothing listens on.
   [ "$(envget AUTHELIA_ENABLED)" = "true" ] && public="$public auth"
@@ -724,9 +768,12 @@ step_cloudflare() {
   if cf_cache_rule "$DOMAIN"; then cachenote="- Cache Rule: never cache books/audio/request/shelf responses at the edge"
   else cachenote="- Cache Rule could NOT be created (token needs Cache Rules:Edit). In the dashboard: Rules -> Cache Rules -> add\n  'bookstack no-cache': hostname is books./audio./request./shelf.$DOMAIN -> Bypass cache"; fi
 
+  # Cloudflare's SHARED origin-pull CA: kept beside the trust file, which aop_write_trust fills
+  # with it, with the zone's own CA (L14), or with both while a switch is being proven.
   curl -fsS https://developers.cloudflare.com/ssl/static/authenticated_origin_pull_ca.pem \
-       -o "$STACK_DIR/caddy/cf-origin-pull-ca.pem" || { msg "Could not download Cloudflare's origin-pull CA. Check the network and run this step again."; return 1; }
-  chown root:root "$STACK_DIR/caddy/cf-origin-pull-ca.pem"; chmod 644 "$STACK_DIR/caddy/cf-origin-pull-ca.pem"
+       -o "$STACK_DIR/caddy/cf-shared-ca.pem" || { msg "Could not download Cloudflare's origin-pull CA. Check the network and run this step again."; return 1; }
+  chown root:root "$STACK_DIR/caddy/cf-shared-ca.pem"; chmod 644 "$STACK_DIR/caddy/cf-shared-ca.pem"
+  aop_write_trust "$(aop_mode)" || { msg "Could not write $STACK_DIR/caddy/cf-origin-pull-ca.pem. Run this step again."; return 1; }
 
   "$STACK_DIR/scripts/cf-ips.sh" >/dev/null || cf_fail "firewall allowlist (scripts/cf-ips.sh) could not be applied"
   # STACK_DIR= like the disk-watch cron: cf-ips.sh reads $STACK_DIR/.env for the alert channel, so
@@ -747,7 +794,123 @@ Cache Rules:Edit, Firewall Services:Edit) or set them in the dashboard, then run
 The public sites will not work while SSL is not 'Full (strict)' or Authenticated Origin Pulls is off."
     return 1
   fi
-  msg "Cloudflare configured (read back and verified):\n- DNS: $(printf '%s' "$public" | tr ' ' '/') -> proxied (orange)$([ -n "$private" ] && printf '; %s -> tailnet IP only' "$private")$privnote\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n\nIn the dashboard: Security > WAF > Managed rules: ON.\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
+  local aopnote="- Origin lock: Cloudflare's SHARED client certificate (proves 'a Cloudflare edge', not 'your zone')"
+  case "$(aop_mode)" in
+    zone) aopnote="- Origin lock: this zone's OWN client certificate (Security -> Origin lock rotates it)";;
+    both) aopnote="- Origin lock: switching to this zone's own certificate (finished after Deploy)";;
+    *) if yesno "Lock the origin to THIS zone only?\n\nRight now Caddy accepts Cloudflare's shared client certificate, which every Cloudflare customer's traffic carries. A certificate of your own, uploaded to this zone, proves the request came through YOUR zone.\n\nNeeds the token permission Zone -> SSL and Certificates -> Edit.\n\nSet it up now?"; then
+         step_origin_cert && aopnote="- Origin lock: this zone's OWN client certificate$([ "$(aop_mode)" = both ] && printf ' (Caddy trusts both until Deploy proves it)')"
+       fi;;
+  esac
+  msg "Cloudflare configured (read back and verified):\n- DNS: $(printf '%s' "$public" | tr ' ' '/') -> proxied (orange)$([ -n "$private" ] && printf '; %s -> tailnet IP only' "$private")$privnote\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n$aopnote\n\nIn the dashboard: Security > WAF > Managed rules: ON.\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
+}
+
+# ---------- L14: this zone's own origin-pull certificate ----------
+# Authenticated Origin Pulls with Cloudflare's shared CA proves "some Cloudflare edge": the same
+# client certificate is presented for every Cloudflare customer. Zone-level AOP presents a
+# certificate the admin issued, so Caddy can require "came through THIS zone". The CA and the
+# client key live in /etc/bookstack/aop (root, 0600; never in a snapshot: a rebuilt server
+# issues new ones). The switch is proven before it is final: Caddy first trusts both CAs, then
+# ours only, and a request through Cloudflare must still succeed or it goes back to both.
+AOP_DIR_REL=bookstack/aop
+aop_dir(){ printf '%s' "$ETC/$AOP_DIR_REL"; }
+aop_mode(){ local m; m=$(envget AOP_MODE); case "$m" in zone|both) printf '%s' "$m";; *) printf shared;; esac; }
+aop_write_trust(){ # shared | both | zone -> caddy/cf-origin-pull-ca.pem (what Caddy's client_auth trusts)
+  local t="$STACK_DIR/caddy/cf-origin-pull-ca.pem" sh="$STACK_DIR/caddy/cf-shared-ca.pem" own; own="$(aop_dir)/ca.pem"
+  case "$1" in
+    shared) [ -s "$sh" ] && cp -f "$sh" "$t.new";;
+    both) [ -s "$own" ] && [ -s "$sh" ] && cat "$own" "$sh" > "$t.new";;
+    zone) [ -s "$own" ] && cp -f "$own" "$t.new";;
+    *) false;;
+  esac || { rm -f "$t.new"; return 1; }
+  mv -f "$t.new" "$t" && chmod 644 "$t"
+}
+aop_make_certs(){ # a private CA and one client leaf (RSA 4096, CA:FALSE, clientAuth), as Cloudflare requires
+  local d; d=$(aop_dir); mkdir -p "$d"; chmod 700 "$d"
+  rm -f "$d/client.pem.new" "$d/client.key.new"
+  ( umask 077; cd "$d" || exit 1; dom=$(envget DOMAIN)
+    if [ ! -s ca.key ] || ! openssl x509 -checkend $((400*86400)) -noout -in ca.pem >/dev/null 2>&1; then
+      openssl req -x509 -newkey rsa:4096 -nodes -sha256 -days 3650 -subj "/CN=bookstack origin-pull CA ($dom)" \
+        -keyout ca.key -out ca.pem -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" || exit 1
+    fi
+    openssl req -newkey rsa:4096 -nodes -sha256 -subj "/CN=cloudflare-origin-pull.$dom" -keyout client.key.new -out client.csr || exit 1
+    printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' > client.ext
+    openssl x509 -req -sha256 -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1095 -extfile client.ext -out client.pem.new || exit 1
+    rm -f client.csr client.ext ca.srl ) >/dev/null 2>&1 || return 1
+  openssl verify -CAfile "$d/ca.pem" "$d/client.pem.new" >/dev/null 2>&1 || return 1
+  chmod 644 "$d/ca.pem"; chmod 600 "$d/ca.key" "$d/client.key.new" "$d/client.pem.new"
+}
+step_origin_cert(){
+  need DOMAIN CF_API_TOKEN || return 1
+  cf_zone || { msg "Zone $(envget DOMAIN) not found with this token."; return 1; }
+  [ -s "$STACK_DIR/caddy/cf-shared-ca.pem" ] || { msg "Run Install -> Cloudflare first."; return 1; }
+  local d body ans id st i old
+  d=$(aop_dir)
+  aop_make_certs || { msg "Could not generate the origin-pull certificate (openssl). Nothing was changed."; return 1; }
+  body=$(jq -nc --rawfile c "$d/client.pem.new" --rawfile k "$d/client.key.new" '{certificate:$c, private_key:$k}')
+  ans=$(cf POST "/zones/$ZONE/origin_tls_client_auth" --data "$body" 2>/dev/null) || ans=""
+  id=$(printf '%s' "$ans" | jq -r '.result.id // empty' 2>/dev/null)
+  if [ -z "$id" ]; then
+    rm -f "$d/client.pem.new" "$d/client.key.new"
+    msg "Cloudflare did not accept the certificate upload. The usual cause: the API token lacks Zone -> SSL and Certificates -> Edit (add it in the Cloudflare dashboard, then run Security -> Origin lock).\n\nNothing changed: the origin stays locked with Cloudflare's shared certificate."
+    return 1
+  fi
+  mv -f "$d/client.pem.new" "$d/client.pem"; mv -f "$d/client.key.new" "$d/client.key"
+  for i in $(seq 1 30); do
+    st=$(cf GET "/zones/$ZONE/origin_tls_client_auth/$id" 2>/dev/null | jq -r '.result.status // empty' 2>/dev/null)
+    [ "$st" = active ] && break; sleep 10
+  done
+  old=$(envget AOP_CERT_ID); [ "$old" = "$id" ] && old=""
+  envset AOP_CERT_ID "$id"; [ -n "$old" ] && envset AOP_OLD_CERT_ID "$old"
+  if [ "$st" != active ]; then
+    msg "The certificate was uploaded but Cloudflare has not deployed it yet (status: ${st:-unknown}).\n\nNothing else changed. Run Security -> Origin lock again in a few minutes."
+    return 1
+  fi
+  # trust both BEFORE Cloudflare switches, so no request fails in between
+  aop_write_trust both || { msg "Could not write the trust file. Nothing else changed."; return 1; }
+  caddy_up && reload_caddy
+  cf PUT "/zones/$ZONE/origin_tls_client_auth/settings" --data '{"enabled":true}' >/dev/null 2>&1 || true
+  if [ "$(cf GET "/zones/$ZONE/origin_tls_client_auth/settings" 2>/dev/null | jq -r '.result.enabled // empty' 2>/dev/null)" != true ]; then
+    aop_write_trust "$([ "$(envget AOP_MODE)" = zone ] && echo zone || echo shared)"; caddy_up && reload_caddy
+    msg "Cloudflare did not switch zone-level origin pulls on (read back: not enabled). Caddy was put back as it was."
+    return 1
+  fi
+  envset AOP_MODE both
+  aop_tighten
+}
+step_origin_lock(){ # Security menu: set up, finish, or renew the zone's own certificate
+  case "$(aop_mode)" in
+    both) cf_zone >/dev/null 2>&1; aop_tighten;;
+    zone) yesno "The origin already accepts only this zone's own certificate (valid until $(openssl x509 -enddate -noout -in "$(aop_dir)/client.pem" 2>/dev/null | cut -d= -f2)).\n\nIssue and upload a NEW one now (renewal)? Caddy keeps trusting the same CA, so nothing breaks while Cloudflare rolls it out." && step_origin_cert;;
+    *) step_origin_cert;;
+  esac
+}
+caddy_up(){ [ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null)" = true ]; }
+# A request through Cloudflare, from here: any answer below 500 means the TLS handshake between
+# the edge and Caddy succeeded (the gate's login page or a 404 are fine); 525/526 mean it failed.
+aop_probe(){ local c i d; d=$(envget DOMAIN)
+  for i in 1 2 3; do
+    c=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "https://request.$d/healthz?aop=$i$RANDOM" 2>/dev/null || echo 000)
+    [ "${c:-000}" -ge 200 ] 2>/dev/null && [ "$c" -lt 500 ] && return 0
+    sleep 5
+  done; return 1; }
+aop_tighten(){ # both -> zone, proven; called by step_origin_cert and at the end of Deploy
+  [ "$(aop_mode)" = both ] || return 0
+  caddy_up || { msg "This zone's certificate is active at Cloudflare. Caddy trusts both certificates for now; Deploy finishes the switch."; return 0; }
+  aop_write_trust zone || return 1
+  # a restart, not a reload: Cloudflare keeps connections to the origin open, and a reused one
+  # would pass the probe on the OLD trust
+  compose restart caddy >/dev/null 2>&1; sleep 5
+  if aop_probe; then
+    envset AOP_MODE zone
+    local old; old=$(envget AOP_OLD_CERT_ID)
+    if [ -n "$old" ]; then [ -n "${ZONE:-}" ] || cf_zone >/dev/null 2>&1; cf DELETE "/zones/$ZONE/origin_tls_client_auth/$old" >/dev/null 2>&1 || true; envset AOP_OLD_CERT_ID ""; fi
+    msg "Origin locked to THIS zone: Caddy now accepts only the client certificate this server issued and uploaded to $(envget DOMAIN). A request through Cloudflare was made to prove it.\n\nThe certificate is valid 3 years; the daily cert-watch warns 60 days ahead (Security -> Origin lock renews it)."
+    return 0
+  fi
+  aop_write_trust both; compose restart caddy >/dev/null 2>&1
+  msg "Cloudflare did not present this zone's certificate yet (a request through it failed with only that certificate trusted), so Caddy was put back to trusting both. Nothing is broken.\n\nRun Security -> Origin lock again later; Cloudflare can take several minutes to roll a new certificate out."
+  return 1
 }
 
 # ---------- 5. deploy ----------
@@ -773,6 +936,9 @@ apply_library_defaults() {
   # deleting another reader's copy. Auto-resolve is off above; this silences the prompt too
   # (column exists in CWA v4.0.6's cwa_schema.sql). Own statement: older schemas lack it.
   cwa_sql "UPDATE cwa_settings SET duplicate_notifications_enabled=0;" >/dev/null 2>&1 || true
+  # CWA's Hardcover auto-ID task writes identifiers across the WHOLE library (the CWA source read
+  # for v5 found it); per-reader Hardcover progress sync (Devices) does not need it. Kept off.
+  cwa_sql "UPDATE cwa_settings SET hardcover_auto_fetch_enabled=0;" >/dev/null 2>&1 || true
   # CWA reads its settings table at start-up: restart it when something actually changed.
   if printf '%s' "$out" | grep -q '"changed": true'; then
     echo "Restarting Calibre-Web to apply security defaults..."
@@ -784,6 +950,18 @@ install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 9
   mkdir -p "$ETC/bookstack"
   write_cron bookstack-disk "17 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/disk-watch.sh >/dev/null 2>&1"
   install_metadata_push
+  install_heal
+  install_cert_watch
+  install_update_check
+}
+install_update_check() { # L06: weekly "a newer release exists" notice (never updates by itself)
+  write_cron bookstack-updatecheck "20 7 * * 1" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/update-check.sh 2>&1 | logger -t bookstack-updatecheck"
+}
+install_cert_watch() { # L09: daily certificate / origin CA / Cloudflare token expiry watch
+  write_cron bookstack-certwatch "40 6 * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/cert-watch.sh 2>&1 | logger -t bookstack-certwatch"
+}
+install_heal() { # L20: restart a container Docker reports unhealthy (scripts/heal.sh; no socket-mounted container)
+  write_cron bookstack-heal "*/2 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/heal.sh 2>&1 | logger -t bookstack-heal"
 }
 install_metadata_push() { # every 15 min: the portal's queued metadata -> Calibre, so devices show it
   # A host job because the portal cannot do it: it mounts the library read-only and has no Docker
@@ -828,6 +1006,7 @@ step_deploy() {
   make_dirs; copy_code_trees
   render_caddy_all || return 1
   own_data_dirs
+  write_shelfmark_metadata_env || true
   clear; echo "Building images and starting containers (first run takes a few minutes)..."
   # BUILD_VERSION is baked into the images (compose build arg, default "dev"); the portal
   # reports it on /healthz and Self-test compares it with $STACK_DIR/.version (J03).
@@ -856,6 +1035,9 @@ step_deploy() {
     msg "Audiobookshelf has no root user yet. Whoever opened https://audio.$d first would become its administrator, so it is set up now, before the site goes public."
     step_abs_setup || yesno "Audiobookshelf is still uninitialised: the first visitor of audio.$d would become root. Start Caddy anyway (NOT recommended)?" || { msg "Caddy was not started. Run Library -> Audiobookshelf, then Deploy again."; return 1; }
   fi
+  # L16: the portal's Shelfmark service login (recreate the portal so it sees the credentials)
+  if ensure_shelfmark_service; then compose up -d librarian >/dev/null 2>&1 || true
+  else echo "(could not create the Shelfmark service account; Shelfmark approvals stay in Shelfmark's own UI)"; fi
   compose up -d caddy || { msg "Caddy failed to start. Operations -> Logs -> caddy."; return 1; }
   apply_caddy || true     # an already-running Caddy is not recreated by `up`: validate + reload the new file
   install_disk_watch
@@ -865,10 +1047,12 @@ step_deploy() {
   # admin account, notification channels and monitors without anyone opening its web UI.
   # Never fatal: a stack that is up must not be reported as a failed Deploy because Kuma lagged.
   echo "Configuring Uptime Kuma (monitors, alert channels, reboot window)..."
+  # L14: a switch to this zone's own origin-pull certificate is proven once Caddy runs
+  [ "$(aop_mode)" = both ] && { aop_tighten || true; }
   local monline; setup_monitoring || true; monline="$MON_NOTE"
   local privline="https://monitor.$d  (Uptime Kuma)" qline=""
   if torrents_on; then
-    qpw=$(docker logs qbittorrent 2>&1 | grep -oE 'temporary password.*: *[A-Za-z0-9]+' | tail -1 | awk '{print $NF}')
+    qpw=$(envget QBIT_PASS)
     privline="https://dl.$d  (qBittorrent)   $privline"; qline="  qBittorrent: admin / ${qpw:-<see: docker logs qbittorrent>}"
   fi
   adminline="the password you just set"; [ -n "${ADMIN_PW_GENERATED:-}" ] && adminline="GENERATED password: $ADMIN_PW_GENERATED  (change it under Users -> Reset password)"
@@ -903,10 +1087,19 @@ RESTIC_ENV_FILE_REL=bookstack/restic.env   # under $ETC; the scripts read /etc/b
 # it replaces the live one (that file is the only on-host copy of the repository key).
 restic_env(){ printf '%s' "${RESTIC_ENV_PATH:-$ETC/$RESTIC_ENV_FILE_REL}"; }
 write_restic_env() { # prompts for repository / password / S3 keys; writes restic.env.new (0600 root)
-  local repo rpw k1="" k2="" cur new="$(restic_env).new"
+  local repo rpw k1="" k2="" cur new="$(restic_env).new" kind
   command -v restic >/dev/null || apt-get -y -qq install restic
   cur=$(grep -E '^RESTIC_REPOSITORY=' "$(restic_env)" 2>/dev/null | cut -d= -f2- || true)
-  repo=$(ask "restic repository (e.g. s3:s3.eu-central-003.backblazeb2.com/my-bucket, sftp:user@host:/path, or /mnt/backup):" "$cur") || return 1
+  HOME_BACKUP=0
+  kind=$(whiptail --title "Backups" --menu "Where should the encrypted backups go?" 15 84 3 \
+    H "A computer at home, over Tailscale (free; this server cannot delete them)" \
+    S "A storage bucket (Backblaze B2, Wasabi, Cloudflare R2 ...)" \
+    O "Other: an SFTP host, a local path, or a repository address you already have" 3>&1 1>&2 2>&3) || return 1
+  case "$kind" in
+    H) home_backup_target "$cur" || return 1; repo="$HOME_REPO"; HOME_BACKUP=1;;
+    S) repo=$(ask "Bucket address for restic (e.g. s3:s3.eu-central-003.backblazeb2.com/my-bucket):" "$cur") || return 1;;
+    *) repo=$(ask "restic repository (e.g. sftp:user@host:/path, /mnt/backup, or the rest:http://... address from your notes):" "$cur") || return 1;;
+  esac
   [ -n "$repo" ] || return 1
   rpw=$(askpw2 "Encryption password for the backup repository (STORE THIS SAFELY — without it backups are unreadable):") || return 1
   if [[ "$repo" == s3:* ]]; then
@@ -927,6 +1120,64 @@ write_restic_env() { # prompts for repository / password / S3 keys; writes resti
   # prove it reads back exactly before anyone relies on it
   local back; back=$(bash -c 'set -a; . "$1"; printf "%s" "$RESTIC_PASSWORD"' _ "$new")
   [ "$back" = "$rpw" ] || { rm -f "$new"; msg "Internal error: the backup password did not round-trip through restic.env. Nothing saved."; return 1; }
+}
+# The free, append-only target: restic's rest-server on a computer the admin already owns,
+# reached over Tailscale. Started with --append-only it refuses every DELETE from this server
+# (measured: 403 on forget), --private-repos confines this server to its own repository, and
+# retention runs on that computer against the folder itself (scripts/prune.sh's job, done there).
+REST_SERVER_IMG="restic/rest-server:0.14.0"
+RESTIC_IMG="restic/restic:0.19.1"
+home_backup_target(){ # [current repository] -> HOME_REPO (rest:http://bookstack:<pw>@<ip>:<port>/bookstack/)
+  local cur="$1" ip port pw="" h code d
+  d=$(printf '%s' "$cur" | sed -nE 's#^rest:http://bookstack:([A-Za-z0-9]+)@([0-9.]+):([0-9]+)/bookstack/?$#\1 \2 \3#p')
+  ip=$(ask "The home computer's Tailscale address (100.x.y.z; it must be on the same Tailscale account and switched on at night — the backup runs at 01:00):" "$(printf '%s' "$d" | cut -d' ' -f2)") || return 1
+  [[ "$ip" =~ ^100\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && [ "${BASH_REMATCH[1]}" -ge 64 ] && [ "${BASH_REMATCH[1]}" -le 127 ] \
+    || { msg "'$ip' is not a Tailscale address (100.64.0.0 - 100.127.255.255). Find it in the Tailscale app on that computer."; return 1; }
+  port=$(ask "Port for the backup server on that computer:" "$(printf '%s' "$d" | cut -d' ' -f3 | grep . || echo 8000)") || return 1
+  [[ "$port" =~ ^[0-9]{2,5}$ ]] || { msg "'$port' is not a port number."; return 1; }
+  # keep the login a working home server already has; a new one needs a new .htpasswd line
+  if [ -n "$d" ] && yesno "Keep the backup server login this server already uses?\n\n(No = make a new one; you then replace the line in .htpasswd on the home computer.)"; then
+    pw=$(printf '%s' "$d" | cut -d' ' -f1)
+  fi
+  if [ -z "$pw" ]; then
+    pw=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+    h=$(printf '%s\n' "$pw" | docker run --rm -i "$CADDY_BASE" caddy hash-password 2>/dev/null) || h=""
+    [[ "$h" == '$2'* ]] || { msg "Could not make the password hash for the home server (docker run $CADDY_BASE caddy hash-password failed). Nothing was changed."; return 1; }
+    big "Set up the backup server at home (once)" "On the computer at home. It needs Docker and Tailscale (same account as this server).
+
+1. Make a folder for the backups, e.g. /srv/restic, on a disk with room for the library.
+   Put exactly this ONE line in /srv/restic/.htpasswd:
+
+   bookstack:$h
+
+2. Start the backup server, listening on the Tailscale address only:
+
+   docker run -d --name restic-rest --restart unless-stopped \\
+     -p $ip:$port:8000 -v /srv/restic:/data \\
+     -e OPTIONS=\"--append-only --private-repos\" $REST_SERVER_IMG
+
+   --append-only: this server can add backups but never delete one.
+
+3. Tailscale admin console -> Access controls. Tag that computer tag:backup and let THIS
+   server reach that one port (and nothing else):
+     {\"action\": \"accept\", \"src\": [\"tag:bookstack\"], \"dst\": [\"tag:backup:$port\"]}
+
+4. Once a month, ON THAT COMPUTER, drop old backups (this server is not allowed to):
+   docker run --rm -v /srv/restic:/data -e RESTIC_PASSWORD='<the backup password>' \\
+     $RESTIC_IMG -r /data/bookstack forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune
+   The self-test here warns when old backups pile up.
+
+Next screen: this server checks it can reach the backup server."
+  fi
+  while true; do
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -u "bookstack:$pw" "http://$ip:$port/bookstack/config" 2>/dev/null || echo 000)
+    case "$code" in
+      200|404) break;;                  # 404 = logged in, repository not created yet
+      401) yesno "The home backup server answered but refused the login (HTTP 401): the .htpasswd line is missing or different.\n\nFix it (step 1), then Yes to check again." || return 1;;
+      *) yesno "Could not reach the backup server at http://$ip:$port (HTTP ${code:-000}).\n\nIs the home computer on, on Tailscale, the container running (step 2), and the Tailscale rule in place (step 3)?\n\nYes = check again." || return 1;;
+    esac
+  done
+  HOME_REPO="rest:http://bookstack:$pw@$ip:$port/bookstack/"
 }
 POSTBOOT_LOG_REL=.postboot-selftest.log   # written by the post-boot unit; read by postboot_last
 # The OnFailure= target of every bookstack unit. Written by each installer that references it:
@@ -1201,6 +1452,81 @@ Rebuild on a new VPS: install Debian, run bookstack.sh -> System, Tailscale, Con
 (same domain), then Operations -> 'Restore from backup'. Kobo links, ABS accounts and
 Authelia users come back from the snapshot; only the Tailscale IP changes."
 }
+# L15: retention with an append-only nightly key. The prune key either lives on this server
+# (monthly timer; protects against the nightly key leaking on its own, NOT against root) or on
+# the admin's computer (nothing here can delete a snapshot).
+PRUNE_ENV_FILE_REL=bookstack/restic-prune.env
+remove_prune_units(){
+  local u="$ETC/systemd/system"
+  if [ -f "$u/bookstack-prune.timer" ]; then
+    systemctl disable --now bookstack-prune.timer >/dev/null 2>&1 || true
+    rm -f "$u/bookstack-prune.timer" "$u/bookstack-prune.service"; systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+  rm -f "$ETC/$PRUNE_ENV_FILE_REL"
+}
+install_prune_units(){
+  local u="$ETC/systemd/system"; mkdir -p "$u"
+  write_alert_template
+  cat > "$u/bookstack-prune.service" << UNIT
+[Unit]
+Description=Bookstack backup retention (separate prune key)
+OnFailure=bookstack-alert@prune.service
+[Service]
+Type=oneshot
+Environment=RESTIC_PRUNE_ENV=$ETC/$PRUNE_ENV_FILE_REL
+ExecStart=$STACK_DIR/scripts/prune.sh
+UNIT
+  cat > "$u/bookstack-prune.timer" << 'UNIT'
+[Unit]
+Description=Monthly bookstack backup retention
+[Timer]
+OnCalendar=*-*-15 03:00:00
+RandomizedDelaySec=30m
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload && systemctl enable --now bookstack-prune.timer
+}
+step_prune_key(){
+  local live pf repo k1="" k2="" rpw
+  live="$(restic_env)"; pf="$ETC/$PRUNE_ENV_FILE_REL"
+  repo=$(grep -E '^RESTIC_REPOSITORY=' "$live" | cut -d= -f2-)
+  if ! yesno "Retention (forget + prune) needs a key that CAN delete. Where should it live?\n\nYes = on THIS server, in $pf, used by a monthly timer. It stops a leaked nightly key from wiping the backups, but root on this server can read it too.\n\nNo  = on your own computer only (stronger: nothing on this server can delete a snapshot). You run scripts/prune.sh there once a month; the self-test warns when old snapshots pile up."; then
+    remove_prune_units
+    big "Prune from your own computer" "Once a month, on a computer that is NOT this server:
+
+  1. install restic
+  2. create prune.env (chmod 600):
+       RESTIC_REPOSITORY=$repo
+       RESTIC_PASSWORD=<the backup password>
+       AWS_ACCESS_KEY_ID=<a key that CAN delete>        (s3:/B2 only)
+       AWS_SECRET_ACCESS_KEY=<its secret>
+  3. copy scripts/prune.sh from this repository and run:
+       RESTIC_PRUNE_ENV=./prune.env bash prune.sh
+
+Keep 7 daily / 4 weekly / 6 monthly unless you set RESTIC_KEEP_* in the same shell.
+The server's self-test warns when snapshots older than the policy pile up."
+    return 0
+  fi
+  if [[ "$repo" == s3:* ]]; then
+    k1=$(ask "Prune key ID (a B2/S3 key that CAN delete — NOT the nightly one):") || return 1
+    k2=$(askpw "Prune application key:") || return 1
+    [ -n "$k1" ] && [ -n "$k2" ] || { msg "No prune key entered: retention will not run. Run Install -> Backups again to add one."; return 1; }
+  else
+    repo=$(ask "Repository address for pruning (rest-server: a user that is NOT append-only, e.g. rest:https://prune:PASS@host/repo):" "$repo") || return 1
+  fi
+  rpw=$(bash -c 'set -a; . "$1"; printf "%s" "$RESTIC_PASSWORD"' _ "$live")
+  ( umask 077
+    { printf 'RESTIC_REPOSITORY=%q\nRESTIC_PASSWORD=%q\nSTACK_DIR=%q\n' "$repo" "$rpw" "$STACK_DIR"
+      [ -n "$k1" ] && printf 'AWS_ACCESS_KEY_ID=%q\nAWS_SECRET_ACCESS_KEY=%q\n' "$k1" "$k2"; true; } > "$pf.new" ) \
+    || { msg "Could not write $pf.new. Nothing was changed."; return 1; }
+  if ! RESTIC_ENV_PATH="$pf.new" restic_run cat config >/dev/null 2>&1; then
+    rm -f "$pf.new"; msg "That prune key did not open the repository. Nothing was stored; retention will not run until you add a working one (Install -> Backups)."; return 1
+  fi
+  mv "$pf.new" "$pf"; chmod 600 "$pf"; chown root:root "$pf" 2>/dev/null || true
+  install_prune_units
+}
 # Debian 12 ships restic 0.14, which has no --retry-lock: passing it unconditionally makes every
 # call fail with "unknown flag". Probe it the way the restore path already probes --overwrite.
 restic_run(){ ( set -a; . "$(restic_env)"; set +a
@@ -1223,8 +1549,18 @@ step_backup() {
       return 1
     fi
   fi
+  # L15: the nightly job runs as root with this key. A key that can delete lets whoever takes the
+  # server (or just the key) wipe every snapshot along with it.
+  local ao=0
+  if [ "${HOME_BACKUP:-0}" = 1 ]; then
+    ao=1; printf 'RESTIC_APPEND_ONLY=1\nRESTIC_PRUNE_WHERE=home\n' >> "$new"      # rest-server --append-only; pruned at home
+  elif yesno "Is this key APPEND-ONLY — can it add snapshots but NOT delete them?\n\n  - Backblaze B2 (s3: address): an application key WITHOUT deleteFiles:\n      b2 key create --bucket BUCKET bookstack-nightly listBuckets,listFiles,readFiles,writeFiles\n    and a bucket lifecycle rule that keeps hidden files 30 days. restic's deletes become 'hides', recoverable for those 30 days.\n  - rest-server started with --append-only\n\nYes = the nightly job never forgets or prunes; retention runs with a SEPARATE key (next question).\nNo  = this key prunes nightly, and can delete every snapshot."; then
+    ao=1; printf 'RESTIC_APPEND_ONLY=1\n' >> "$new"
+  fi
   mv "$new" "$live" || { rm -f "$new"; msg "The repository opened, but $live could not be replaced (disk full or read-only?). Nothing was changed."; return 1; }
   chmod 600 "$live"; chown root:root "$live"
+  if [ "${HOME_BACKUP:-0}" = 1 ]; then remove_prune_units
+  elif [ "$ao" = 1 ]; then step_prune_key || true; else remove_prune_units; fi
   local ping; ping=$(ask "Optional: a dead-man's-switch ping URL (e.g. a free healthchecks.io check). backup.sh calls it after every good backup and URL/fail after a failed one, so you also hear about it when the server is gone. Blank = none." "$(envget BACKUP_PING_URL)") || ping="$(envget BACKUP_PING_URL)"
   envset BACKUP_PING_URL "$ping"
   install_backup_units
@@ -1385,7 +1721,7 @@ restore_fits(){ # snapshot-id: in-place restore needs (restore size - what is al
 }
 step_restore() {
   need DOMAIN || return 1
-  [ -f "$(restic_env)" ] || { msg "No backup repository is configured on this machine yet: enter the SAME repository and password as the old server."; write_restic_env || return 1; }
+  [ -f "$(restic_env)" ] || { msg "No backup repository is configured on this machine yet: enter the SAME repository and password as the old server (for a home backup server choose Other and paste the rest:http://... address from your notes)."; write_restic_env || return 1; }
   pick_snapshot || return 1
   local mode
   mode=$(whiptail --title "Restore: what" --menu "Snapshot $SNAP_DESC" 14 80 2 \
@@ -1431,7 +1767,7 @@ step_restore() {
   [ -n "$bind" ] && envset BIND_IP "$bind"
   # The snapshot carried the OLD server's copy of the code and templates; this checkout is the
   # version being deployed, so the code trees come from here (data and secrets stay restored).
-  make_dirs; copy_code_trees; own_data_dirs
+  make_dirs; copy_code_trees; own_data_dirs; write_shelfmark_metadata_env || true
   # host files first: sshd/sysctl/daemon.json are regenerated by NOTHING below this line
   restore_host_files "$STACK_DIR/.backup-snap/host"
   render_caddy_all || { msg "Restored, but the Caddyfile could not be rendered; Caddy was NOT started. Fix it (Install -> Configure) then Install -> Deploy."; return 1; }
@@ -1535,6 +1871,10 @@ Start?" || return 0
   if yesno "Configure encrypted nightly backups now?"; then step_backup || true; fi
   if yesno "Set up alerts now (phone notification when a backup fails or the disk fills)? Strongly recommended."; then step_alerts || true; fi
   step_fail2ban || true
+  # L17: the strongest single protection for internet-facing logins, offered while it is cheap
+  if [ "$(envget AUTHELIA_ENABLED)" != true ] && yesno "Put single sign-on with two-factor authentication (Authelia) in front of the public sites now? Recommended: a leaked family password alone then opens nothing.\n\n(Kobo, OPDS and KOReader keep working: devices bypass the gate.)"; then
+    step_authelia || true
+  fi
   while yesno "Add a user now? (creates an isolated library account + Kobo link)"; do step_user_add || break; done
   # only offered when Tailscale actually works; step_lock_ssh still asks for proof of access
   if tailscale status >/dev/null 2>&1 && ip_on_host "$(envget TAILSCALE_IP)" \
@@ -1880,7 +2220,7 @@ step_sources() {
   sel=$(whiptail --title "Curated sources in the portal" --checklist \
 "Space toggles. These are the catalogs users can request from in the portal — all free to\nredistribute. (Shelfmark's own sources are configured inside Shelfmark.)" 18 78 6 \
     GUTENBERG "Project Gutenberg (public domain ebooks)"      "$(cur SRC_GUTENBERG)" \
-    STANDARD  "Standard Ebooks (public domain, polished)"     "$(cur SRC_STANDARD)" \
+    STANDARD  "Standard Ebooks (polished; found via book pages)" "$(cur SRC_STANDARD)" \
     ARCHIVE   "Internet Archive (filtered collections)"       "$(cur SRC_ARCHIVE)" \
     LIBRIVOX  "LibriVox (public-domain audiobooks)"           "$(cur SRC_LIBRIVOX)" \
     3>&1 1>&2 2>&3) || return 1
@@ -1889,25 +2229,65 @@ step_sources() {
   done
   cols=$(ask "Internet Archive collections to search (comma-separated):" "$(envget IA_COLLECTIONS)")
   [ -n "$cols" ] && envset IA_COLLECTIONS "$cols"
-  if yesno "Require admin approval for non-admin requests?\n\nNo (recommended for a family) = every request is fulfilled immediately.\nYes = you approve each one in the portal first."; then envset APPROVALS_REQUIRED true; else envset APPROVALS_REQUIRED false; fi
+  if yesno "Require admin approval for non-admin requests?\n\nNo (recommended for a family) = every request is fulfilled immediately.\nYes = you approve each one first — portal requests AND Shelfmark downloads, both on the portal's Pending card."; then envset APPROVALS_REQUIRED true; else envset APPROVALS_REQUIRED false; fi
   local dq; dq=$(envget MAX_REQUESTS_PER_DAY)
   q=$(ask "Maximum requests per user per day (0 = unlimited; admins are never limited):" "${dq:-30}") || q="${dq:-30}"
   q=$(printf '%s' "$q" | tr -cd '0-9'); envset MAX_REQUESTS_PER_DAY "${q:-30}"
-  if yesno "Add your OWN self-hosted catalog as a source?\n\nThis connects to an OPDS feed you host (Calibre content server, Calibre-Web, Kavita, Komga, BookLore...) with one username/password."; then
-    url=$(ask "OPDS feed URL. Put {q} where the search term goes if your server supports it,\ne.g. https://books.mine.tld/opds/search/{q} — otherwise give the catalog feed URL:" "$(envget MYCATALOG_URL)")
-    if [ -n "$url" ]; then
-      nm=$(ask "Name to show users for this source:" "$(envget MYCATALOG_NAME)")
-      us=$(ask "Username for the catalog (blank if none):" "$(envget MYCATALOG_USER)")
-      ps=$(askpw "Password for the catalog (blank if none / keep):")
-      envset MYCATALOG_URL "$url"; envset MYCATALOG_NAME "${nm:-My catalog}"
-      envset MYCATALOG_USER "$us"; [ -n "$ps" ] && envset MYCATALOG_PASS "$ps"
-      envset SRC_MYCATALOG true
-    fi
-  else
-    envset SRC_MYCATALOG false
-  fi
+  yesno "Manage your OWN catalogs now (any number of OPDS feeds: Calibre, Calibre-Web, COPS, Kavita, Komga, BookLore, a library's feed)?\n\nThe portal's admin page can do the same." && { step_catalogs || true; }
+  # Shelfmark reads the approval rule from its environment (REQUESTS_ENABLED): recreate it too
+  ensure_shelfmark_service >/dev/null 2>&1 || true
+  compose up -d shelfmark >/dev/null 2>&1 || true
+  prune_shelfmark_placeholder
   if restart_portal; then msg "Sources updated and the portal restarted."
   else msg "Sources written to $ENV_FILE, but the portal could NOT be restarted, so it is still offering the OLD set of sources (Operations -> Logs -> librarian)."; return 1; fi
+}
+
+# ---------- your own OPDS catalogs (librarian/catalogs.py via admin_cli) ----------
+step_catalogs() {
+  local out rows ch id nm url us pw res
+  while true; do
+    out=$(admin_cli catalogs list 2>/dev/null) || { msg "The portal did not answer (is it running? Operations -> Logs -> librarian): $(cli_err "$out")"; return 1; }
+    rows=$(printf '%s' "$out" | json '"\n".join("%-12s %-3s %-22s %s%s" % (r["id"], "on" if r["enabled"] else "off", r["name"][:22], r["url"][:60], " (.env)" if r["legacy"] else "") for r in d["rows"]) or "(none yet)"')
+    ch=$(whiptail --title "Your catalogs" --menu "OPDS catalogs searched by the portal (search page, book pages, keep-looking):\n\n$rows" 24 96 5 \
+      A "Add a catalog (it is tested first)" T "Test an address without saving" E "Turn one on / off" R "Remove one" 0 "Back" 3>&1 1>&2 2>&3) || return 0
+    case "$ch" in
+      A) id=$(ask "Short id (lowercase letters, digits, dashes; e.g. home):" "") || continue
+         nm=$(ask "Name readers will see:" "") || continue
+         url=$(ask "OPDS feed address. Put {q} where the search term goes if the server supports it,\ne.g. https://books.mine.tld/opds/search/{q}:" "") || continue
+         us=$(ask "Login (blank if none):" "") || continue
+         pw=""; [ -n "$us" ] && { pw=$(askpw "Password for $us:") || continue; }
+         res=$(printf '%s\n' "$pw" | admin_cli catalogs add "$id" "$nm" "$url" --user "$us" --password-stdin 2>/dev/null)
+         if printf '%s' "$res" | json 'd.get("ok")' | grep -q True; then msg "Catalog '$nm' added: $(printf '%s' "$res" | json 'd.get("detail","")')"
+         elif yesno "Not added: $(cli_err "$res")\n\nSave it anyway (for a catalog that is down right now)?"; then
+           res=$(printf '%s\n' "$pw" | admin_cli catalogs add "$id" "$nm" "$url" --user "$us" --password-stdin --force 2>/dev/null)
+           msg "$(printf '%s' "$res" | json 'd.get("ok")' | grep -q True && echo "Saved." || echo "Still not saved: $(cli_err "$res")")"; fi;;
+      T) url=$(ask "OPDS feed address to test:" "") || continue
+         us=$(ask "Login (blank if none):" "") || continue
+         pw=""; [ -n "$us" ] && { pw=$(askpw "Password:") || continue; }
+         res=$(printf '%s\n' "$pw" | admin_cli catalogs test "$url" --user "$us" --password-stdin 2>/dev/null)
+         msg "$(printf '%s' "$res" | json 'd.get("detail") or d.get("error")')";;
+      E) id=$(ask "Id of the catalog to turn on/off:" "") || continue
+         [[ "$id" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || { msg "'$id' is not a catalog id."; continue; }
+         if printf '%s' "$out" | json "[r for r in d['rows'] if r['id']=='$id'][0]['enabled']" | grep -q True; then res=$(admin_cli catalogs disable "$id" 2>/dev/null); else res=$(admin_cli catalogs enable "$id" 2>/dev/null); fi
+         printf '%s' "$res" | json 'd.get("ok")' | grep -q True || msg "$(cli_err "$res")";;
+      R) id=$(ask "Id of the catalog to remove:" "") || continue
+         yesno "Remove catalog '$id'? Books already imported from it stay in the library." || continue
+         res=$(admin_cli catalogs remove "$id" 2>/dev/null)
+         printf '%s' "$res" | json 'd.get("ok")' | grep -q True && msg "Removed." || msg "$(cli_err "$res")";;
+      0) return 0;;
+    esac
+  done
+}
+# ---------- keep looking: every reader's list ----------
+step_wanted() {
+  local out id
+  out=$(admin_cli wanted list 2>/dev/null) || { msg "The portal did not answer: $(cli_err "$out")"; return 1; }
+  printf '%s' "$out" | json '"\n".join("#%-4s %-12s %-10s %-34s %-18s %s" % (r["id"], r["owner"][:12], r["status"], (r["title"] or "")[:34], (r["author"] or "")[:18], (r["detail"] or "")[:70]) for r in d["rows"]) or "Nobody is waiting for a book."' \
+    | whiptail --title "Keep looking (all readers)" --scrolltext --textbox /dev/stdin 24 120 || true
+  id=$(ask "Cancel an entry? Its number (blank = no):" "") || return 0
+  [ -n "$id" ] || return 0
+  out=$(admin_cli wanted cancel "${id#\#}" 2>/dev/null)
+  printf '%s' "$out" | json 'd.get("ok")' | grep -q True && msg "Entry $id cancelled." || msg "$(cli_err "$out")"
 }
 
 # ---------- 13. mail auth (SPF/DMARC) ----------
@@ -2024,7 +2404,7 @@ Releasing an address below clears it in every jail AND deletes its Cloudflare ru
 # it: admin account, the alert channels scripts/alert.sh already uses, a monitor per service and
 # per enabled feature, push (dead-man's switch) monitors for the scheduled jobs, and a
 # maintenance window over the nightly reboot. Re-run after every Deploy and feature toggle.
-KUMA_JOBS="selftest disk metapush cfips backup"   # push monitors; each job has KUMA_PUSH_<JOB>
+KUMA_JOBS="selftest disk metapush cfips backup canary"   # push monitors; each job has KUMA_PUSH_<JOB>
 ensure_kuma_secrets() {
   envdefault KUMA_USER "$(admin_user)" || return 1
   # alphanumeric: it goes through .env, JSON and a whiptail box, and 24 random characters from
@@ -2043,16 +2423,17 @@ kuma_config() { # the bootstrap's JSON input on stdout — secrets included, so 
   local bind; bind=$(envget BIND_IP); bind="${bind:-$(envget PUBLIC_IP)}"
   # a push monitor only for a job that is actually scheduled here: an unscheduled job would
   # read as "missed its heartbeat" forever
-  local ps="" pd="" pm="" pc="" pb=""
+  local ps="" pd="" pm="" pc="" pb="" pk=""
   [ -f "$ETC/systemd/system/bookstack-selftest.timer" ] && ps=$(envget KUMA_PUSH_SELFTEST)
   [ -f "$ETC/cron.d/bookstack-disk" ] && pd=$(envget KUMA_PUSH_DISK)
   [ -f "$ETC/cron.d/bookstack-metapush" ] && pm=$(envget KUMA_PUSH_METAPUSH)
   [ -f "$ETC/cron.d/bookstack-cfips" ] && pc=$(envget KUMA_PUSH_CFIPS)
   [ -f "$(restic_env)" ] && pb=$(envget KUMA_PUSH_BACKUP)
+  [ -f "$ETC/systemd/system/bookstack-canary.timer" ] && pk=$(envget KUMA_PUSH_CANARY)
   KC_USER="$(envget KUMA_USER)" KC_PASS="$(envget KUMA_PASS)" KC_DOMAIN="$(envget DOMAIN)" KC_BIND="$bind" \
   KC_TOR="$(envget TORRENTS_ENABLED)" KC_EPH="$(envget EPHEMERA_ENABLED)" KC_AUTH="$(envget AUTHELIA_ENABLED)" \
-  KC_FS="$(solver_on && echo true)" KC_REBOOT="$(kuma_reboot_time)" \
-  KC_PS="$ps" KC_PD="$pd" KC_PM="$pm" KC_PC="$pc" KC_PB="$pb" \
+  KC_FS="$(solver_on && echo true)" KC_REBOOT="$(kuma_reboot_time)" KC_SMA="$(envget SHELFMARK_AUTH_METHOD)" \
+  KC_PS="$ps" KC_PD="$pd" KC_PM="$pm" KC_PC="$pc" KC_PB="$pb" KC_PK="$pk" \
   KC_HOOK="$(envget NOTIFY_WEBHOOK)" KC_FMT="$(envget NOTIFY_WEBHOOK_FORMAT)" KC_TO="$(envget ADMIN_EMAIL)" \
   KC_SH="$(envget SMTP_HOST)" KC_SP="$(envget SMTP_PORT)" KC_SS="$(envget SMTP_SECURITY)" \
   KC_SU="$(envget SMTP_USER)" KC_SW="$(envget SMTP_PASS)" KC_SF="$(envget SMTP_FROM)" \
@@ -2064,9 +2445,10 @@ smtp = {"host": e("KC_SH"), "port": e("KC_SP") or "587", "security": e("KC_SS") 
         "user": e("KC_SU"), "password": e("KC_SW"), "from": e("KC_SF")} if e("KC_SH") else None
 print(json.dumps({"url": "http://127.0.0.1:3001", "user": e("KC_USER"), "password": e("KC_PASS"),
   "domain": e("KC_DOMAIN"), "bind_ip": e("KC_BIND"), "reboot_time": e("KC_REBOOT"),
+  "shelfmark_auth": e("KC_SMA") or "cwa",
   "features": {"torrents": on("KC_TOR"), "ephemera": on("KC_EPH"), "authelia": on("KC_AUTH"), "flaresolverr": on("KC_FS")},
   "push": {k: e(v) for k, v in (("selftest", "KC_PS"), ("disk", "KC_PD"), ("metapush", "KC_PM"),
-                                ("cfips", "KC_PC"), ("backup", "KC_PB")) if e(v)},
+                                ("cfips", "KC_PC"), ("backup", "KC_PB"), ("canary", "KC_PK")) if e(v)},
   "notify": {"webhook": e("KC_HOOK"), "format": e("KC_FMT") or "auto", "to": e("KC_TO"), "smtp": smtp}}))'
 }
 # setup_monitoring -> 0 configured | 1 failed | 2 Kuma has an account that is not ours.
@@ -2200,6 +2582,46 @@ if host and "@" in sender and b in s and e in s:
     s = s[:start] + "\n".join(block) + "\n" + s[stop:]
 open(f, "w").write(s)
 PYN
+  # L05: the OpenID Connect provider for Audiobookshelf, once its secrets exist (gate_sso_on)
+  if [ -n "$(envget ABS_OIDC_SECRET)" ] && [ -s "$STACK_DIR/authelia/oidc-jwks.pem" ]; then
+    python3 - "$out.new" "$(envget DOMAIN)" "$(envget ABS_OIDC_SECRET)" <<'PYO' || { rm -f "$out.new"; return 1; }
+import sys, base64, hashlib, os
+f, dom, secret = sys.argv[1:4]
+ab64 = lambda b: base64.b64encode(b).decode().rstrip("=").replace("+", ".")
+salt = os.urandom(16)
+digest = "$pbkdf2-sha512$310000$%s$%s" % (ab64(salt), ab64(hashlib.pbkdf2_hmac("sha512", secret.encode(), salt, 310000, 64)))
+s = open(f).read()
+b, e = "# @OIDC_BEGIN@", "# @OIDC_END@"
+block = f"""identity_providers:
+  oidc:
+    hmac_secret: {{{{ env "BOOKSTACK_OIDC_HMAC" | quote }}}}
+    jwks:
+      - key_id: 'bookstack'
+        algorithm: 'RS256'
+        use: 'sig'
+        key: {{{{ secret "/config/oidc-jwks.pem" | mindent 10 "|" | msquote }}}}
+    clients:
+      - client_id: 'audiobookshelf'
+        client_name: 'Audiobookshelf'
+        client_secret: '{digest}'
+        public: false
+        authorization_policy: 'two_factor'
+        consent_mode: 'implicit'
+        redirect_uris:
+          - 'https://audio.{dom}/auth/openid/callback'
+          - 'https://audio.{dom}/auth/openid/mobile-redirect'
+        scopes: ['openid', 'profile', 'email', 'groups']
+        response_types: ['code']
+        grant_types: ['authorization_code']
+        token_endpoint_auth_method: 'client_secret_basic'
+        id_token_signed_response_alg: 'RS256'
+        userinfo_signed_response_alg: 'none'
+"""
+i = s.index(b); j = s.index(e, i)
+s = s[:s.index("\n", i) + 1] + block + s[s.rfind("\n", 0, j) + 1:]
+open(f, "w").write(s)
+PYO
+  fi
   mv "$out.new" "$out"; chown 1000:1000 "$out"
 }
 authelia_user_count(){ grep -cE '^  [A-Za-z0-9._-]+:[[:space:]]*$' "$STACK_DIR/authelia/users_database.yml" 2>/dev/null || true; }
@@ -2210,6 +2632,7 @@ step_authelia() {
   envdefault AUTHELIA_SESSION_SECRET "$(openssl rand -hex 32)"
   envdefault AUTHELIA_STORAGE_ENCRYPTION_KEY "$(openssl rand -hex 32)"
   envdefault AUTHELIA_JWT_SECRET "$(openssl rand -hex 32)"
+  envdefault GATE_SECRET "$(openssl rand -hex 32)"      # L05: Caddy vouches for gated requests with it
   render_authelia_config || { msg "Could not render Authelia's configuration."; return 1; }
   [ -f "$STACK_DIR/authelia/users_database.yml" ] || echo "users: {}" > "$STACK_DIR/authelia/users_database.yml"
   chown -R 1000:1000 "$STACK_DIR/authelia"
@@ -2245,7 +2668,10 @@ step_authelia() {
   # "Add a user" — an account created there would have no Authelia login and could sign in
   # nowhere. Without this restart the guard written for exactly this case stays inert.
   local pnote=""
-  restart_portal || pnote="\n\nNOTE: the portal could not be restarted, so its /admin page still offers 'Add a user'. A user added there would have NO Authelia login and could not sign in anywhere — add users from Users -> Add here until the portal is back (Operations -> Logs -> librarian)."
+  restart_portal || pnote="\n\nNOTE: the portal could not be restarted, so it still asks for its own login behind the gate (Operations -> Logs -> librarian)."
+  # L05: one login. Caddy needs BOOKSTACK_GATE_SECRET in its environment (a recreate, once),
+  # Calibre-Web trusts Remote-User, and portal password changes reach Authelia's file.
+  gate_sso_on || pnote="$pnote\n\nNOTE: single sign-on could not be switched on everywhere (see Operations -> Self-test); the apps still ask for their own login behind the gate."
   local mailnote="Enrolment and reset codes are e-mailed through your SMTP server (Library -> Mail)."
   [ -n "$(envget SMTP_HOST)" ] || mailnote="No SMTP is configured, so enrolment/reset codes are NOT e-mailed: they are written to $STACK_DIR/authelia/notification.txt on this server (read it with: cat $STACK_DIR/authelia/notification.txt). Set up Library -> Mail to e-mail them instead."
   monitoring_refresh
@@ -2253,6 +2679,7 @@ step_authelia() {
 }
 step_authelia_off() {
   envset AUTHELIA_ENABLED false
+  gate_sso_off
   render_caddy_all || return 1
   apply_caddy || return 1
   composeA stop authelia >/dev/null 2>&1 || true
@@ -2261,6 +2688,101 @@ step_authelia_off() {
   restart_portal || pnote="\nThe portal could not be restarted, so its /admin page still links to the (now stopped) Authelia — Operations -> Logs -> librarian."
   monitoring_refresh
   msg "Gate removed — apps are back to their own logins. Authelia container stopped.$pnote\nRe-enable any time (your users and secrets are kept)."
+}
+# ---------- L05: one login behind the gate ----------
+caddy_has_gate_secret(){ [ -n "$(envget GATE_SECRET)" ] && docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' caddy 2>/dev/null | grep -qxF "BOOKSTACK_GATE_SECRET=$(envget GATE_SECRET)"; }
+install_gate_sync_units(){
+  local u="$ETC/systemd/system"; mkdir -p "$u"
+  write_alert_template
+  cat > "$u/bookstack-gate-sync.service" << UNIT
+[Unit]
+Description=Bookstack: portal password changes into the Authelia gate
+OnFailure=bookstack-alert@gate-sync.service
+[Service]
+Type=oneshot
+Environment=STACK_DIR=$STACK_DIR
+ExecStart=/usr/bin/python3 $STACK_DIR/scripts/gate-sync.py
+UNIT
+  cat > "$u/bookstack-gate-sync.path" << UNIT
+[Unit]
+Description=Bookstack: run gate-sync when the portal queues a password
+[Path]
+PathModified=$STACK_DIR/librarian/state/gate-sync.flag
+[Install]
+WantedBy=paths.target
+UNIT
+  cat > "$u/bookstack-gate-sync.timer" << 'UNIT'
+[Unit]
+Description=Bookstack: gate-sync safety net
+[Timer]
+OnCalendar=*:0/10
+[Install]
+WantedBy=timers.target
+UNIT
+  install -o "$(envget PUID || echo 1000)" -g "$(envget PGID || echo 1000)" -m 644 /dev/null "$STACK_DIR/librarian/state/gate-sync.flag" 2>/dev/null \
+    || touch "$STACK_DIR/librarian/state/gate-sync.flag"
+  systemctl daemon-reload && systemctl enable --now bookstack-gate-sync.path bookstack-gate-sync.timer
+}
+remove_gate_sync_units(){
+  local u="$ETC/systemd/system"
+  [ -f "$u/bookstack-gate-sync.path" ] || return 0
+  systemctl disable --now bookstack-gate-sync.path bookstack-gate-sync.timer >/dev/null 2>&1 || true
+  rm -f "$u/bookstack-gate-sync.path" "$u/bookstack-gate-sync.timer" "$u/bookstack-gate-sync.service"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+# Authelia's "admins" group mirrors who is an admin in Calibre-Web: Shelfmark (proxy mode) takes
+# admin rights from that group and from nothing else.
+authelia_sync_admin_groups(){
+  local f="$STACK_DIR/authelia/users_database.yml" admins
+  [ -f "$f" ] || return 0
+  admins=$(users_json | json '" ".join(x["name"] for x in d if x.get("is_admin"))' 2>/dev/null) || return 1
+  python3 - "$f" "$admins" <<'PYG' || return 1
+import sys, re
+f, admins = sys.argv[1], set(sys.argv[2].split())
+s = open(f).read()
+def fix(m):
+    name, body = m.group(1), m.group(2)
+    groups = re.findall(r"(?m)^      - (\S+)\s*$", body)
+    want = [g for g in groups if g != "admins"] + (["admins"] if name in admins else [])
+    if "users" not in want:
+        want.insert(0, "users")
+    body = re.sub(r"(?ms)^    groups:\n(?:      - .*\n?)*", "", body)
+    return "  %s:\n%s    groups:\n%s" % (name, body if body.endswith("\n") or not body else body + "\n", "".join("      - %s\n" % g for g in want))
+# anchored at line starts: a "\n  name:" pattern let one entry swallow the newline the next needed
+s2 = re.sub(r"(?m)^  ([A-Za-z0-9._-]+):\n((?:    .*\n?)*)", fix, s)
+if s2 != s:
+    open(f, "w").write(s2)
+PYG
+  chown 1000:1000 "$f" 2>/dev/null || true
+}
+gate_sso_on(){
+  local rc=0
+  if running caddy && ! caddy_has_gate_secret; then compose up -d caddy >/dev/null 2>&1 || rc=1; fi
+  docker exec librarian python -m cwa proxy-login on >/dev/null 2>&1 && compose restart calibre-web >/dev/null 2>&1 || rc=1
+  # Shelfmark: header login; Authelia's admins group decides who administers it
+  authelia_sync_admin_groups || rc=1
+  envset SHELFMARK_AUTH_METHOD proxy
+  # Audiobookshelf: OpenID Connect through Authelia (its only single sign-on)
+  envdefault ABS_OIDC_SECRET "$(openssl rand -hex 32)"
+  envdefault AUTHELIA_OIDC_HMAC "$(openssl rand -hex 32)"
+  if [ ! -s "$STACK_DIR/authelia/oidc-jwks.pem" ]; then
+    ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$STACK_DIR/authelia/oidc-jwks.pem" 2>/dev/null ) || rc=1
+    chown 1000:1000 "$STACK_DIR/authelia/oidc-jwks.pem" 2>/dev/null || true
+  fi
+  render_authelia_config && composeA up -d authelia >/dev/null 2>&1 && authelia_healthy 30 || rc=1
+  compose up -d shelfmark librarian >/dev/null 2>&1 || rc=1        # new env: auth mode, OIDC secret
+  wait_for http://127.0.0.1:8090/healthz 30 >/dev/null 2>&1 || true
+  if [ -n "$(envget ABS_TOKEN)" ]; then absctl oidc on >/dev/null 2>&1 || rc=1; fi
+  install_gate_sync_units || rc=1
+  env STACK_DIR="$STACK_DIR" python3 "$STACK_DIR/scripts/gate-sync.py" >/dev/null 2>&1 || true
+  return $rc
+}
+gate_sso_off(){
+  docker exec librarian python -m cwa proxy-login off >/dev/null 2>&1 && compose restart calibre-web >/dev/null 2>&1 || true
+  [ -n "$(envget ABS_TOKEN)" ] && { absctl oidc off >/dev/null 2>&1 || true; }
+  envset SHELFMARK_AUTH_METHOD cwa
+  compose up -d shelfmark librarian >/dev/null 2>&1 || true
+  remove_gate_sync_units
 }
 authelia_add_user() { # name displayname email password (blank displayname/email = keep the stored ones; a NEW user needs an e-mail)
   local hash f
@@ -2303,6 +2825,7 @@ with open(f, "w") as out:
     out.write(s)
 PYU
   chown 1000:1000 "$f"
+  authelia_sync_admin_groups >/dev/null 2>&1 || true     # admins group = Calibre-Web admins (L05)
   composeA restart authelia >/dev/null 2>&1 || true
 }
 # Renaming the key is the only way to carry an Authelia login across a rename: the argon2 hash
@@ -2509,9 +3032,18 @@ step_parked_one() { # <token>
 qbt_seed_config(){ # default save path = the admin's dropbox (tagged + imported), partials in /downloads/incomplete
   local f="$STACK_DIR/qbt/config/qBittorrent/qBittorrent.conf"
   mkdir -p "$(dirname "$f")"
-  python3 - "$f" "/dropbox/$(admin_user)" <<'PYQ' || return 1
-import sys, os, re
+  # L02: a real Web UI password, set before first start. The LSIO image otherwise prints a new
+  # temporary one on every restart until someone sets it in the UI. Stored in .env (QBIT_PASS);
+  # the config holds only its PBKDF2 hash, in qBittorrent's own format (proven on 5.2.3).
+  [ -n "$(envget QBIT_PASS)" ] || envset QBIT_PASS "$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | cut -c1-20)" || return 1
+  QBIT_PASS="$(envget QBIT_PASS)" python3 - "$f" "/dropbox/$(admin_user)" <<'PYQ' || return 1
+import sys, os, re, hashlib, base64
 f, save = sys.argv[1:3]
+pw = os.environ["QBIT_PASS"].encode()
+salt = os.urandom(16)
+pbkdf2 = '"@ByteArray(%s:%s)"' % (base64.b64encode(salt).decode(),
+                                   base64.b64encode(hashlib.pbkdf2_hmac("sha512", pw, salt, 100000, 64)).decode())
+prefs = {"WebUI\\Username": "admin", "WebUI\\Password_PBKDF2": pbkdf2}
 want = {"Session\\DefaultSavePath": save, "Session\\TempPath": "/downloads/incomplete", "Session\\TempPathEnabled": "true"}
 lines = open(f).read().splitlines() if os.path.exists(f) else []
 out, sec, done = [], None, set()
@@ -2529,7 +3061,23 @@ for ln in lines:
 if sec == "BitTorrent": flush()
 if len(done) < len(want):
     out += ["", "[BitTorrent]"]; flush()
-open(f, "w").write("\n".join(out).strip("\n") + "\n")
+# [Preferences]: the Web UI login, replaced in place or added
+text = "\n".join(out)
+body, psec, pdone = [], None, set()
+for ln in text.splitlines():
+    m = re.match(r"^\[(.+)\]\s*$", ln)
+    if m:
+        if psec == "Preferences":
+            body += ["%s=%s" % (k, v) for k, v in prefs.items() if k not in pdone]; pdone |= set(prefs)
+        psec = m.group(1)
+    elif psec == "Preferences" and "=" in ln and ln.split("=", 1)[0] in prefs:
+        k = ln.split("=", 1)[0]; ln = "%s=%s" % (k, prefs[k]); pdone.add(k)
+    body.append(ln)
+if psec == "Preferences":
+    body += ["%s=%s" % (k, v) for k, v in prefs.items() if k not in pdone]; pdone |= set(prefs)
+if len(pdone) < len(prefs):
+    body += ["", "[Preferences]"] + ["%s=%s" % (k, v) for k, v in prefs.items()]
+open(f, "w").write("\n".join(body).strip("\n") + "\n")
 PYQ
   chown -R 1000:1000 "$STACK_DIR/qbt/config"
 }
@@ -2565,9 +3113,9 @@ step_torrents() { # C5: qBittorrent runs only while enabled (compose profile), 6
 "
   sleep 5
   monitoring_refresh
-  local qpw; qpw=$(docker logs qbittorrent 2>&1 | grep -oE 'temporary password.*: *[A-Za-z0-9]+' | tail -1 | awk '{print $NF}')
+  local qpw; qpw=$(envget QBIT_PASS)
   big "qBittorrent enabled" "${cnote}Open https://dl.$d (Tailscale on; admin-gate password first).
-Web UI login: admin / ${qpw:-<see: docker logs qbittorrent>}  -> change it under Tools -> Options -> Web UI.
+Web UI login: admin / ${qpw:-<see: docker logs qbittorrent>}  (generated, kept in $ENV_FILE as QBIT_PASS; enabling torrents again resets the Web UI to it).
 
 Default save path is /dropbox/$(admin_user) (your own library). So downloads land in the right
 person's library (tagged owner:<user>), set up ONE category per family member, in qBittorrent:
@@ -2769,7 +3317,7 @@ def get(url, hdr={}):
 if img.startswith("ghcr.io/"):
     repo = img[len("ghcr.io/"):]
     tok = get(f"https://ghcr.io/token?scope=repository:{repo}:pull")["token"]
-    tags = get(f"https://ghcr.io/v2/{repo}/tags/list", {"Authorization": "Bearer " + tok})["tags"]
+    tags = get(f"https://ghcr.io/v2/{repo}/tags/list?n=10000", {"Authorization": "Bearer " + tok})["tags"]  # one page of ALL tags: the default page missed the newest
 else:
     repo = img if "/" in img else "library/" + img
     tags = [t["name"] for t in get(f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&ordering=last_updated")["results"]]
@@ -2843,7 +3391,7 @@ step_update() {
   local cf="$STACK_DIR/caddy/Caddyfile"
   [ -s "$cf" ] && cat "$cf" > "$cf.pre-update"
   [ "$keep" = 0 ] && tag_images latest prev
-  copy_code_trees; own_data_dirs
+  copy_code_trees; own_data_dirs; write_shelfmark_metadata_env || true
   # host-side units the update may be introducing: an existing install that only ever runs
   # Operations -> Update would otherwise never pick up a new one (idempotent, so it is free)
   install_postboot_unit
@@ -3046,6 +3594,72 @@ menu_install() {
       4) step_cloudflare || true;; 5) step_deploy || true;; 6) step_backup || true;; 7) step_alerts || true;; 0) return 0;; esac
   done
 }
+# ---------- L16: the portal's service login for Shelfmark's approval API ----------
+# Shelfmark has no API key, so the portal signs in as a dedicated Calibre-Web ADMIN account with
+# a generated password (kept in .env only; nobody types it). Created/reset idempotently.
+SHELFMARK_SVC_NAME=svc-portal
+ensure_shelfmark_service() {
+  local pw; pw=$(envget SHELFMARK_SVC_PASS)
+  if [ -z "$pw" ]; then pw=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32); fi
+  if lib list 2>/dev/null | json '" ".join(u["name"] for u in d)' | tr ' ' '\n' | grep -qx "$SHELFMARK_SVC_NAME"; then
+    printf '%s\n' "$pw" | lib passwd "$SHELFMARK_SVC_NAME" --password-stdin >/dev/null 2>&1 || return 1
+  else
+    printf '%s\n' "$pw" | lib add-user "$SHELFMARK_SVC_NAME" --email "svc-portal@localhost" --password-stdin --admin >/dev/null 2>&1 || return 1
+  fi
+  envset SHELFMARK_SVC_USER "$SHELFMARK_SVC_NAME" && envset SHELFMARK_SVC_PASS "$pw"
+}
+
+# ---------- metadata sources ----------
+# Open Library needs no key and is always on, in the portal and in Shelfmark (whose default
+# metadata-first search had NO provider until v5 and answered "No metadata provider configured").
+# Hardcover (best series data) and Google Books need the owner's own free key. .env is the one
+# source of truth; shelfmark/metadata.env is regenerated from it, holding only keys that EXIST —
+# Shelfmark treats an empty env var as set and would lock its key field blank.
+write_shelfmark_metadata_env() {
+  local f="$STACK_DIR/shelfmark/metadata.env" hc gb
+  hc=$(envget HARDCOVER_API_KEY); gb=$(envget GOOGLE_BOOKS_API_KEY)
+  mkdir -p "$STACK_DIR/shelfmark"
+  ( umask 077
+    { echo "# Generated by bookstack.sh from .env (Library -> Metadata sources). Do not edit."
+      [ -n "$hc" ] && printf 'HARDCOVER_ENABLED=true\nHARDCOVER_API_KEY=%s\n' "$hc"
+      [ -n "$gb" ] && printf 'GOOGLEBOOKS_ENABLED=true\nGOOGLEBOOKS_API_KEY=%s\n' "$gb"
+      true; } > "$f.new" ) || return 1
+  chown root:root "$f.new" 2>/dev/null || true
+  mv -f "$f.new" "$f"
+}
+metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it
+  case "$1" in
+    hardcover) curl -fsS -m 15 -X POST https://api.hardcover.app/v1/graphql \
+                 -H "Authorization: Bearer ${2#Bearer }" -H "Content-Type: application/json" \
+                 --data '{"query":"{ me { id } }"}' 2>/dev/null | grep -q '"me"';;
+    google) curl -fsS -m 15 "https://www.googleapis.com/books/v1/volumes?q=isbn:9780141439518&maxResults=1&key=$2" >/dev/null 2>&1;;
+  esac
+}
+step_metadata_sources() {
+  local hc gb cur note=""
+  cur=$(envget HARDCOVER_API_KEY)
+  hc=$(askpw "Hardcover API token (optional; hardcover.app -> Settings -> API; starts with hc_pat_ or 'Bearer'). The best series data there is.\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || hc=""
+  case "$hc" in
+    -) envset HARDCOVER_API_KEY ""; note="$note\nHardcover: removed.";;
+    "") ;;
+    *) if metadata_key_ok hardcover "$hc"; then envset HARDCOVER_API_KEY "$hc"; note="$note\nHardcover: accepted and saved."
+       else note="$note\nHardcover: the token was REFUSED by api.hardcover.app, not saved."; fi;;
+  esac
+  cur=$(envget GOOGLE_BOOKS_API_KEY)
+  gb=$(askpw "Google Books API key (optional; console.cloud.google.com -> APIs -> Books API -> Credentials; free, 1000 lookups a day). Without one Google Books is not used: its keyless quota is shared worldwide and is usually exhausted.\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || gb=""
+  case "$gb" in
+    -) envset GOOGLE_BOOKS_API_KEY ""; note="$note\nGoogle Books: removed.";;
+    "") ;;
+    *) if metadata_key_ok google "$gb"; then envset GOOGLE_BOOKS_API_KEY "$gb"; note="$note\nGoogle Books: accepted and saved."
+       else note="$note\nGoogle Books: the key was REFUSED by googleapis.com, not saved."; fi;;
+  esac
+  write_shelfmark_metadata_env || { msg "Could not write shelfmark/metadata.env (disk full?).$note"; return 1; }
+  local rc=0
+  compose up -d librarian shelfmark >/dev/null 2>&1 || rc=1
+  prune_shelfmark_placeholder
+  msg "Metadata sources$note\n\nAlways on: Open Library (book search, author pages, links to free copies) and the bookinfo/Hardcover mirrors for library enrichment.\nOptional now: Hardcover $([ -n "$(envget HARDCOVER_API_KEY)" ] && echo ON || echo off), Google Books $([ -n "$(envget GOOGLE_BOOKS_API_KEY)" ] && echo ON || echo off) — in the portal's enrichment AND in Shelfmark's own metadata search.$([ $rc != 0 ] && printf '\n\nWARNING: the portal or Shelfmark could not be recreated, so the change is not live yet (Operations -> Logs).')"
+  return $rc
+}
 menu_library() {
   while true; do
     ch=$(whiptail --title "Library" --menu "What the library does with books, and where they come from." 24 88 13 \
@@ -3054,6 +3668,9 @@ menu_library() {
       M "Mail: SMTP so the portal can Send-to-Kindle (and test it)" \
       S "Sources: catalogs offered in the portal, approvals, your own OPDS catalog" \
       H "Shelfmark: extended search settings + first-run checklist" \
+      K "Metadata sources: Open Library (always on) + optional Hardcover / Google Books keys" \
+      C "Your catalogs: add / test / remove your own OPDS feeds" \
+      W "Keep looking: every reader's waiting list, cancel entries" \
       I "Intake & dropboxes: webhook, Gutenberg mirror, email-to-library" \
       T "Torrents (qBittorrent): enable/disable ($(torrents_on && echo on || echo off))" \
       Q "Request queue: approvals and failures, all of them, retry / dismiss" \
@@ -3062,13 +3679,14 @@ menu_library() {
       G "How per-user isolation works (guide)" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in F) step_formats || true;; A) step_abs_setup || true;; M) step_mail || true;; S) step_sources || true;; H) step_shelfmark || true;;
+      K) step_metadata_sources || true;; C) step_catalogs || true;; W) step_wanted || true;;
       I) step_intake || true;; T) step_torrents || true;; Q) step_requests || true;; P) step_parked || true;; R) step_abs_scan || true;;
       G) step_isolation || true;; 0) return 0;; esac
   done
 }
 menu_security() {
   while true; do
-    ch=$(whiptail --title "Security" --menu "Authelia gate: $([ "$(envget AUTHELIA_ENABLED)" = true ] && echo ON || echo off)   Public SSH: $([ "$(envget SSH_LOCKED)" = true ] && echo LOCKED || echo open)" 22 84 11 \
+    ch=$(whiptail --title "Security" --menu "Authelia gate: $([ "$(envget AUTHELIA_ENABLED)" = true ] && echo ON || echo off)   Public SSH: $([ "$(envget SSH_LOCKED)" = true ] && echo LOCKED || echo open)" 23 84 12 \
       A "Authelia: enable self-hosted SSO + 2FA in front of the public apps" \
       D "Authelia: disable the gate" \
       U "Authelia: add or reset a user" \
@@ -3079,11 +3697,36 @@ menu_security() {
       M "Mail auth: SPF/DMARC records for Send-to-Kindle deliverability" \
       C "Cloudflare Access: hosted SSO + 2FA alternative (guide)" \
       R "Rotate the portal session secret (logs every portal user out)" \
+      T "Login bot check: Cloudflare Turnstile on the portal login ($([ -n "$(envget TURNSTILE_SITEKEY)" ] && echo on || echo off))" \
+      Z "Origin lock: this zone's own Cloudflare client certificate ($(aop_mode))" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in A) step_authelia || true;; D) step_authelia_off || true;; U) step_authelia_user || true;; L) step_lock_ssh || true;;
       O) step_unlock_ssh || true;; F) step_fail2ban || true;; B) step_unban || true;; M) step_mailauth || true;;
-      C) step_cfaccess || true;; R) step_rotate_secret || true;; 0) return 0;; esac
+      C) step_cfaccess || true;; R) step_rotate_secret || true;; T) step_turnstile || true;; Z) step_origin_lock || true;; 0) return 0;; esac
   done
+}
+# L17: Cloudflare Turnstile on the portal login. Off by default: it is the one page that may then
+# load Cloudflare's challenge script (every other page keeps script-src 'none').
+step_turnstile() {
+  local sk sec ans
+  if [ -n "$(envget TURNSTILE_SITEKEY)" ] && yesno "The Turnstile bot check is ON for the portal login.\n\nTurn it off?"; then
+    envset TURNSTILE_SITEKEY ""; envset TURNSTILE_SECRET ""
+    restart_portal_ok && msg "Turnstile is off; the login page is back to no scripts at all."; return 0
+  fi
+  sk=$(ask "Turnstile SITE key (Cloudflare dashboard -> Turnstile -> Add widget, domain request.$(envget DOMAIN), mode Managed):" "") || return 0
+  [ -n "$sk" ] || return 0
+  sec=$(askpw "Turnstile SECRET key:") || return 0
+  [ -n "$sec" ] || return 0
+  # a real secret answers 'invalid-input-response' for a dummy token; a wrong one 'invalid-input-secret'
+  ans=$(curl -fsS -m 15 -X POST https://challenges.cloudflare.com/turnstile/v0/siteverify \
+        --data-urlencode "secret=$sec" --data-urlencode "response=bookstack-key-check" 2>/dev/null) || ans=""
+  case "$ans" in
+    *invalid-input-secret*) msg "Cloudflare says that secret key is wrong. Nothing was changed."; return 1;;
+    "") msg "Cloudflare did not answer the key check. Nothing was changed; try again."; return 1;;
+  esac
+  envset TURNSTILE_SITEKEY "$sk"; envset TURNSTILE_SECRET "$sec"
+  restart_portal_ok || return 1
+  msg "Turnstile is on for the portal login.\n\nOpen https://request.$(envget DOMAIN)/login and check the widget appears. If Cloudflare is ever unreachable, logins still work (and are audited) — the lockout and fail2ban remain the hard limits."
 }
 step_rotate_secret() {
   yesno "Rotate the portal's session-signing secret? Every portal session (all users, all devices) is logged out immediately; Kobo/OPDS/Kindle are unaffected." || return 0
@@ -3118,13 +3761,88 @@ menu_ops() {
       G "FlareSolverr: $([ "$(envget FLARESOLVERR_ENABLED)" = true ] && echo "ON for Shelfmark — turn off" || echo "off for Shelfmark — turn on") (challenge solver)" \
       E "Ephemera: enable (Tailscale-only, unmaintained upstream — read notice)" \
       X "Ephemera: disable" \
+      J "Canary journey: a test reader's path twice a day ($([ -f "$ETC/systemd/system/bookstack-canary.timer" ] && echo on || echo off))" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in T) step_selftest || true;; S) step_status || true;; V) step_service || true;; L) step_logs || true;;
       D) step_advanced || true;; C) step_check_updates || true;; U) step_update || true;;
       B) step_backup || true;; K) step_restic_rotate || true;; A) step_alerts || true;; R) step_restore_test || true;;
       W) step_restore || true;; F) step_restore_file || true;; M) step_monitoring || true;;
-      G) step_flaresolverr || true;; E) step_ephemera || true;; X) step_ephemera_off || true;; 0) return 0;; esac
+      G) step_flaresolverr || true;; E) step_ephemera || true;; X) step_ephemera_off || true;; J) step_canary || true;; 0) return 0;; esac
   done
+}
+# ---------- L08: the canary journey ----------
+# Two hidden accounts (CANARY_USERS: left out of every user list) and scripts/synthetic.py on a
+# timer at 06:20 and 18:20. Their passwords live in /etc/bookstack/canary.env (root, 0600),
+# never in .env, which the portal container reads.
+CANARY_ENV_REL=bookstack/canary.env
+CANARY_NAMES="canary-a canary-b"
+install_canary_units(){
+  local u="$ETC/systemd/system"; mkdir -p "$u"
+  cat > "$u/bookstack-canary.service" << UNIT
+[Unit]
+Description=Bookstack canary journey (a test reader's path)
+After=docker.service
+[Service]
+Type=oneshot
+Environment=STACK_DIR=$STACK_DIR
+Environment=CANARY_ENV=$ETC/$CANARY_ENV_REL
+ExecStart=/usr/bin/python3 $STACK_DIR/scripts/synthetic.py
+TimeoutStartSec=1800
+UNIT
+  cat > "$u/bookstack-canary.timer" << 'UNIT'
+[Unit]
+Description=Bookstack canary journey, twice a day
+[Timer]
+OnCalendar=*-*-* 06,18:20:00
+RandomizedDelaySec=10m
+Persistent=false
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload && systemctl enable --now bookstack-canary.timer
+}
+step_canary(){
+  need DOMAIN || return 1
+  local cf="$ETC/$CANARY_ENV_REL" n pw out
+  if [ -f "$ETC/systemd/system/bookstack-canary.timer" ]; then
+    local ch; ch=$(whiptail --title "Canary journey" --menu "The canary journey runs at 06:20 and 18:20. /admin shows every run." 14 76 3 \
+      R "Run it now (takes a minute or two; watch the output)" \
+      D "Turn it off and remove the two canary accounts" \
+      0 "Back" 3>&1 1>&2 2>&3) || return 0
+    case "$ch" in
+      R) clear; env STACK_DIR="$STACK_DIR" CANARY_ENV="$cf" python3 "$STACK_DIR/scripts/synthetic.py"; local rc=$?
+         msg "$([ $rc = 0 ] && echo "The canary journey PASSED." || echo "The canary journey FAILED (see the output above; the alert channel was told).")\n\n/admin -> Canary journey shows the history and the import time."; return $rc;;
+      D) systemctl disable --now bookstack-canary.timer >/dev/null 2>&1 || true
+         rm -f "$ETC/systemd/system/bookstack-canary.timer" "$ETC/systemd/system/bookstack-canary.service"; systemctl daemon-reload >/dev/null 2>&1 || true
+         for n in $CANARY_NAMES; do docker exec librarian python -m cwa remove-user "$n" >/dev/null 2>&1 || true; done
+         rm -f "$cf"; envset CANARY_USERS ""; restart_portal_ok || true
+         monitoring_refresh >/dev/null 2>&1 || true
+         msg "The canary journey is off and its two accounts are removed."; return 0;;
+      *) return 0;;
+    esac
+  fi
+  yesno "Turn on the canary journey?\n\nTwice a day two hidden test accounts (canary-a, canary-b) do what a family member does: log in, upload a small generated book (through Cloudflare), wait for Calibre-Web to import it with the owner tag, download it, check the OTHER account cannot, read OPDS and the Kobo endpoint through Cloudflare, and log in to Shelfmark. The book is removed again.\n\nA failure alerts you; /admin shows every run and how long the import took (it slows down before Calibre-Web fails).\n\nThe accounts never appear in user lists. They are ordinary, isolated readers." || return 0
+  ( umask 077; mkdir -p "$(dirname "$cf")"; : > "$cf.new" ) || { msg "Could not write $cf. Nothing was changed."; return 1; }
+  for n in $CANARY_NAMES; do
+    pw=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+    docker exec librarian python -m cwa remove-user "$n" >/dev/null 2>&1 || true   # a leftover from an earlier setup
+    out=$(printf '%s\n' "$pw" | docker exec -i librarian python -m cwa add-user "$n" --password-stdin --no-abs 2>&1) \
+      || { rm -f "$cf.new"; msg "Could not create the canary account $n:\n$out"; return 1; }
+    printf '%s=%s\n%s_PW=%s\n' "CANARY_$([ "$n" = canary-a ] && echo A || echo B)" "$n" "CANARY_$([ "$n" = canary-a ] && echo A || echo B)" "$pw" >> "$cf.new"
+  done
+  mv -f "$cf.new" "$cf"; chmod 600 "$cf"; chown root:root "$cf" 2>/dev/null || true
+  envset CANARY_USERS "$(printf '%s' "$CANARY_NAMES" | tr ' ' ',')"
+  restart_portal_ok || true
+  envdefault KUMA_PUSH_CANARY "$(openssl rand -hex 16)" || true
+  install_canary_units
+  monitoring_refresh >/dev/null 2>&1 || true
+  local kto; kto=$(ask "Optional: once a week (Sunday morning run) the canary also sends its book to a Kindle address, proving Send-to-Kindle end to end. Put YOUR own Kindle address here (it must allow the sender in Amazon's approved list). Blank = skip." "$(envget CANARY_KINDLE_TO)") || kto="$(envget CANARY_KINDLE_TO)"
+  envset CANARY_KINDLE_TO "$kto"
+  if yesno "The canary journey is on (06:20 and 18:20).\n\nRun it once now?"; then
+    clear; env STACK_DIR="$STACK_DIR" CANARY_ENV="$cf" python3 "$STACK_DIR/scripts/synthetic.py" \
+      && msg "The canary journey PASSED. /admin -> Canary journey shows it." \
+      || msg "The canary journey FAILED on its first run (see the output above). Fix the cause, then Operations -> Canary journey -> Run it now."
+  fi
 }
 main_menu() {
   local banner h

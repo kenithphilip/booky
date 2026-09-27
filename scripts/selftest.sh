@@ -77,6 +77,16 @@ curl -fs -m 5 http://127.0.0.1:8084/api/health >/dev/null && ok "shelfmark /api/
 # STARTED with a readable app.db and nothing more — it does NOT re-resolve per request, and an
 # earlier comment here said it did. Measured: with app.db moved away afterwards, /api/auth/check
 # still answered "cwa" while every login answered 500 "Database configuration error".
+SM_AUTH=$(envget SHELFMARK_AUTH_METHOD); SM_AUTH=${SM_AUTH:-cwa}
+if [ "$SM_AUTH" = proxy ]; then
+  # L05, behind the Authelia gate: Remote-User from Caddy is the login. Without it, refused.
+  curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null | grep -q '"auth_mode": *"proxy"' \
+    && ok "shelfmark in auth_mode 'proxy' (one login through the Authelia gate)" \
+    || bad "shelfmark is NOT in auth_mode 'proxy' although the gate is on: check SHELFMARK_AUTH_METHOD and Operations -> Restart shelfmark"
+  smp=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8084/api/settings 2>/dev/null || echo 000)
+  [ "$smp" = 401 ] && ok "shelfmark refuses a request that carries no gate identity (401)" \
+    || bad "shelfmark answered $smp to a request with no Remote-User (expected 401): it may be open"
+else
 curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null | grep -q '"auth_mode": *"cwa"' \
   && ok "shelfmark STARTED in auth_mode 'cwa' (Calibre-Web accounts)" \
   || bad "shelfmark is NOT in auth_mode 'cwa': it is open to everyone (check ./cwa/config/app.db is readable, then Operations -> Restart shelfmark)"
@@ -103,8 +113,15 @@ case "$smc" in
   000) warn "could not probe shelfmark's login route";;
   *)   warn "shelfmark login probe answered $smc (expected 401)";;
 esac
+fi
 curl -fs -m 5 -o /dev/null http://127.0.0.1:8083/login && ok "calibre-web /login" || bad "calibre-web /login"
 curl -fs -m 5 -o /dev/null http://127.0.0.1:13378/healthcheck && ok "audiobookshelf /healthcheck" || bad "audiobookshelf /healthcheck"
+# L05: behind the gate Audiobookshelf's web login goes through Authelia (OpenID Connect)
+if [ "$(envget AUTHELIA_ENABLED)" = true ] && [ -n "$(envget ABS_OIDC_SECRET)" ]; then
+  curl -fs -m 5 http://127.0.0.1:13378/status 2>/dev/null | grep -q '"openid"' \
+    && ok "audiobookshelf signs in through Authelia (OpenID Connect)" \
+    || warn "audiobookshelf does not offer the Authelia sign-in: readers log in twice there (Security -> Authelia: enable again, or check ABS_TOKEN)"
+fi
 if [ "$SOLVER" = true ]; then
   curl -fs -m 5 http://127.0.0.1:8191/health 2>/dev/null | grep -q '"ok"' && ok "flaresolverr /health" || bad "flaresolverr /health: protection challenges cannot be solved (Operations -> Logs -> flaresolverr)"
   # what Shelfmark actually uses is the NAME on the compose network, not the loopback port
@@ -122,6 +139,17 @@ if grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" 2>/dev/null; then
     && ok "Authelia config validates (gate active)" || bad "Authelia gate is in the Caddyfile but its config does not validate"
 fi
 [ -f "$STACK_DIR/caddy/cf-origin-pull-ca.pem" ] && ok "Cloudflare origin-pull CA present" || bad "cf-origin-pull-ca.pem missing (run Cloudflare step)"
+# L08: the canary journey (a test reader's path, twice a day)
+if [ -f /etc/systemd/system/bookstack-canary.timer ]; then
+  if systemctl is-failed bookstack-canary.service >/dev/null 2>&1; then bad "the last canary journey FAILED: what a family member would hit (journalctl -u bookstack-canary -n 60; /admin -> Canary journey)"
+  else ok "canary journey scheduled (06:20 / 18:20); last run did not fail"; fi
+fi
+# L14: which certificate the origin lock accepts
+case "$(envget AOP_MODE)" in
+  zone) ok "origin lock: only this zone's own Cloudflare client certificate is accepted";;
+  both) warn "origin lock: switching to this zone's own certificate is unfinished (Caddy trusts both): Security -> Origin lock";;
+  *) warn "origin lock uses Cloudflare's SHARED client certificate (any Cloudflare zone can present it): Security -> Origin lock";;
+esac
 docker compose -f "$STACK_DIR/docker-compose.yml" config -q 2>/dev/null && ok "docker-compose.yml renders" || bad "docker-compose.yml does not render"
 if command -v timedatectl >/dev/null; then [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = yes ] && ok "clock is NTP-synchronised" || bad "clock NOT NTP-synchronised (TOTP, Kobo sync, ACME and mTLS drift): timedatectl set-ntp true"; fi
 # J03: the running portal image vs the code that was last deployed. Without this a stale
@@ -496,6 +524,25 @@ print(int((datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.from
   if [ -n "$grp" ]; then ok "backup verification rotation at group $grp of 52 (every byte re-read once a year)"
   elif [ -f "$bstate" ]; then bad "$bstate exists but holds no check_group: the weekly verification restarts at 1/52 every week and 51/52 of the repository is never read"
   else warn "no $bstate yet: the rotating weekly verification writes it after the first Sunday backup (BACKUP_CHECK_DOW)"; fi
+  # L15: who can delete the backups. With an append-only nightly key, retention runs elsewhere
+  # (the monthly prune timer or the admin's computer); snapshots older than the policy piling up
+  # is how a forgotten laptop prune shows.
+  if grep -qE '^RESTIC_APPEND_ONLY=1' /etc/bookstack/restic.env 2>/dev/null; then
+    km=$(envget RESTIC_KEEP_MONTHLY); case "$km" in ''|*[!0-9]*) km=6;; esac
+    oldest=$( (set -a; . /etc/bookstack/restic.env; set +a; restic --no-lock snapshots --json 2>/dev/null) | python3 -c '
+import sys, json, re, datetime
+now = datetime.datetime.now(datetime.timezone.utc)
+ts = [datetime.datetime.fromisoformat(re.sub(r"\.\d+", "", x["time"]).replace("Z", "+00:00"))
+      for x in (json.load(sys.stdin) or []) if "pre-update" not in (x.get("tags") or [])]
+print(max((now - t).days for t in ts) if ts else "")' 2>/dev/null)
+    where="your own computer"; [ -f /etc/bookstack/restic-prune.env ] && where="the monthly bookstack-prune timer"
+    grep -qE '^RESTIC_PRUNE_WHERE=home' /etc/bookstack/restic.env 2>/dev/null && where="the home backup computer (Install -> Backups showed the monthly command)"
+    if systemctl is-failed bookstack-prune.service >/dev/null 2>&1; then bad "the last monthly prune FAILED (journalctl -u bookstack-prune -n 50): old snapshots are piling up"
+    elif [ -n "$oldest" ] && [ "$oldest" -gt $(( (km + 2) * 31 )) ]; then warn "the oldest snapshot is $oldest days old, past the $km-month policy: retention has not run lately (it runs from $where)"
+    else ok "backup key is append-only: nothing on this server can delete a snapshot$([ -f /etc/bookstack/restic-prune.env ] && echo ' except the separate prune key in /etc/bookstack/restic-prune.env')"; fi
+  else
+    warn "the nightly backup key can DELETE snapshots: whoever takes this server can wipe the backups too (Install -> Backups: use an append-only key)"
+  fi
 elif [ -f /etc/bookstack/restic.env ] && ! command -v restic >/dev/null; then bad "restic.env exists but restic is not installed: no backup can run (apt-get install restic)"; fi
 # The staging area is INSIDE the backup root ($SNAP = $STACK_DIR/.backup-snap) with no matching
 # --exclude, so anything staged there ends up in every snapshot. scripts/backup.sh used to copy
@@ -525,6 +572,19 @@ if [ -f /etc/systemd/system/bookstack-selftest.timer ]; then
   elif [ "${hage:-9999}" -le 130 ]; then ok "hourly self-test last finished ${hage} min ago ($(grep -E '^finished=' "$hl" | tail -1 | sed 's/.* exit=/exit=/'))"
   else bad "the hourly self-test last finished ${hage} min ago: its timer is not firing (systemctl status bookstack-selftest.timer)"; fi
 else warn "hourly self-test not installed (re-run Install -> Deploy)"; fi
+
+# L02: qBittorrent's Web UI answers the password bookstack set (not a temporary one)
+if [ "$TORRENTS" = true ] && [ -n "$(envget QBIT_PASS)" ]; then
+  qcode=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -H 'Referer: http://127.0.0.1:8080' \
+          --data-urlencode "username=admin" --data-urlencode "password=$(envget QBIT_PASS)" http://127.0.0.1:8080/api/v2/auth/login 2>/dev/null || echo 000)
+  case "$qcode" in 200|204) ok "qBittorrent Web UI accepts the stored admin password (QBIT_PASS)";;
+    000) warn "could not reach qBittorrent's Web UI to check its login";;
+    *) bad "qBittorrent refused QBIT_PASS (HTTP $qcode): its password was changed in its own UI, or the seed did not apply (Library -> Torrents: disable + enable re-seeds it)";; esac
+fi
+# L17: a leaked family password is the likeliest way in; say so while there is no second factor
+if [ "$(envget AUTHELIA_ENABLED)" != true ]; then
+  warn "no second factor in front of books./audio./request./shelf. (Security -> Authelia: SSO + 2FA; devices keep working)"
+fi
 
 echo "== Monitoring (Uptime Kuma)"
 if curl -fs -m 5 -o /dev/null http://127.0.0.1:3001/; then

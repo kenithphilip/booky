@@ -1,4 +1,4 @@
-# mfdata.in private library — hardened, per-user, self-serve (v4)
+# mfdata.in private library — hardened, per-user, self-serve (v5)
 
 A private book/audiobook library on one small VPS. **Admins** install and run everything from
 one menu (`bookstack.sh`). **Users** only ever see the portal: they sign in, search, request
@@ -9,7 +9,7 @@ download — only their own books, never anyone else's. Nothing is public.
 
 | For end users (`request.<domain>`) | For the admin (`bookstack.sh`, plus `/admin` in the portal) |
 |---|---|
-| Search the curated catalogs and **Request** (with optional admin approval) | **Quick install**: system → Tailscale → Cloudflare → deploy → backups, in order |
+| **Search for any book** (metadata-first), open its page, **Request** a verified copy or **Keep looking** | **Quick install**: system → Tailscale → Cloudflare → deploy → backups, in order |
 | **Upload** a book they own | **Users & devices**: create an isolated account, Kobo link, Kindle address, passwords — one screen |
 | **My books**: download in their preferred format, or **Send to Kindle** | **Library**: target format & conversion policy, SMTP for Send-to-Kindle, sources, Shelfmark, intake |
 | **Devices**: generate their Kobo sync link, set their Kindle address, pick a format, opt into auto-send | **Security**: Authelia SSO + 2FA gate, SSH lock, fail2ban, SPF/DMARC |
@@ -18,6 +18,61 @@ download — only their own books, never anyone else's. Nothing is public.
 Everything an admin previously had to click through in three different web UIs (user
 creation, Allowed Tags, Kobo sync toggle, registration off, conversion settings, Kindle
 addresses) is now done by the menu or by users themselves in the portal.
+
+## What changed in v5 (metadata-first search, fetch and enrichment)
+Designed from how Readarr, Shelfmark, CWA and Ephemera actually do it (their source was read,
+not guessed — see `docs/PLAN-v5.md`), then built and proven on the real containers.
+- **Search finds the BOOK first** (Open Library, keyless): covers, authors, years, editions,
+  "free ebook / free audiobook" and "in library" badges. **Author pages** for any author (bio,
+  photo, works) and **series** listings from the Goodreads mirror.
+- **Each book's page lists copies we can actually fetch**, resolved through the book's own
+  catalogue links (Open Library records the same work's Gutenberg, LibriVox, Standard Ebooks and
+  Internet Archive ids) plus a Readarr-style keyword search of every enabled catalogue. Every
+  copy is **checked against the book** — title, author, ISBN, language, abridged/adapted,
+  omnibus — with a Readarr-style weighted distance, and shows why ("good match" / "check this
+  one" / refused with the reason). A copy in another language than the reader's is never
+  fetched for them (each reader sets their language on Devices).
+- **Request buttons post a token, never an address**: the download carries the source's own
+  evidence (Internet Archive's size and SHA-1 are now actually checked — the old form dropped
+  them), the work it was chosen as, and the match reasons.
+- **Keep looking**: a book no catalogue has yet is re-checked on a widening schedule (1 h, 6 h,
+  daily, for 180 days) through its catalogue links and the catalogues; an exact match is
+  requested automatically, an uncertain one waits for the reader's yes.
+- **Your own catalogs**: any number of OPDS feeds (Calibre, Calibre-Web, COPS, Kavita, Komga,
+  BookLore, a library's feed), added from the admin page or the TUI, searched everywhere.
+- **Shelfmark's own metadata search works** (it shipped with no provider switched on and
+  answered "No metadata provider configured"); Hardcover and Google Books keys are optional
+  (Library → Metadata sources). **Shelfmark obeys the portal's approval rule**, and its pending
+  downloads are approved on the portal's Pending card — one queue.
+- **Enrichment** looks books fetched from a book page up exactly (by Open Library work), adds
+  descriptions, and the host job now fills a missing **cover, description, publisher, date,
+  language and ISBN** into Calibre so the Kobo shows them — fill-only, never overwriting.
+- **Convert to any format** from a book's page (EPUB, AZW3, MOBI, PDF, TXT, DOCX, FB2, RTF) with
+  Calibre's own converter, and **real KEPUB downloads** for Kobo readers.
+- **MOBI/AZW3/FB2/TXT get their owner tag** added in Calibre by the host job (L10), and
+  **Send-to-Kindle runs in the background** (no more 524 on a slow mail relay).
+- **One login behind the gate** (Authelia on): the portal and Calibre-Web trust Authelia's
+  answer, so a family member signs in once. Caddy strips `Remote-User` on every path and adds a
+  secret only to requests Authelia let through; a portal password change reaches Authelia's
+  own user file within seconds (host job, a hash, never the password). Shelfmark keeps its own
+  login, with the same password.
+- **Containers can no longer talk to each other**: each service has its own network (Shelfmark
+  shares one with FlareSolverr only), and capabilities are dropped.
+- **The origin can be locked to your zone**: Security → Origin lock swaps Cloudflare's shared
+  client certificate for one this server issues and uploads (proven with a request through
+  Cloudflare before the old one is dropped; renewal and expiry warnings included).
+- **Backups the server cannot delete**: with an append-only B2 key the nightly job never
+  prunes; retention runs monthly with a separate key (on the server or from your own
+  computer), and a snapshot that vanishes is an alert the next night.
+- **A canary reader**: twice a day two hidden test accounts upload, import, download, check
+  isolation, OPDS, Kobo and Shelfmark; failures alert with the failing step, and /admin shows
+  the import time (it climbs before Calibre-Web fails).
+- **qBittorrent gets a real password** before its first start (no temporary one to fish out of
+  the logs).
+- Found on the way and fixed: calibredb (as the library user) printed a warning on stdout that
+  broke every JSON read of the host metadata push on the real image; Standard Ebooks serves an
+  HTML page at its plain download address; finished imports were never joined to their Calibre
+  book, so the metadata push could not reach them.
 
 ## What changed in v4.3 (fan-out audit + simulated user journeys)
 Five auditors, each checked by a skeptic, went through the installer, the service wiring, the
@@ -173,8 +228,15 @@ For your own writing you don't need a tracker: the **OPDS source** (Library → 
 | SSH | You, only on Tailscale (after locking) | Key-only |
 | Port 6881 (only with Torrents on) | Torrent peers | qB peer port only — no UI, no files |
 
-Origin locked three ways (IP not in public DNS as an origin, firewall accepts 80/443 only
-from Cloudflare, Caddy requires Cloudflare's client cert). Caddy takes the visitor's address
+Origin locked three ways (IP not in public DNS as an origin, firewall accepts 443 only
+from Cloudflare, Caddy requires a Cloudflare client certificate). What that certificate proves
+depends on which one: Cloudflare's **shared** origin-pull certificate is presented for every
+Cloudflare customer, so it proves "a Cloudflare edge", not "your zone" (an attacker would still
+need their own Cloudflare zone pointing at your IP, and Caddy's per-hostname certificates make
+that harder). **Security → Origin lock** replaces it with a certificate this server issues and
+uploads to your zone (needs the token permission SSL and Certificates → Edit); then only
+requests through *your* zone pass the handshake. The strongest option, Cloudflare Tunnel (no
+public web ports at all), is not automated. Caddy takes the visitor's address
 from Cloudflare's `CF-Connecting-IP` only, so rate limits, lockouts, fail2ban and the audit
 trail see the real client and cannot be fooled by a forged `X-Forwarded-For`. Every container binds 127.0.0.1
 with `no-new-privileges`. No anonymous browsing, no self-registration, no third-party
@@ -215,6 +277,7 @@ Create Custom Token** and add these permissions, all with type **Zone**:
 | Zone Settings | Edit | SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls, e-reader-breaking features off |
 | Cache Rules | Edit | never cache a user's book or audio response |
 | Firewall Services | Edit | fail2ban bans abusive visitors at Cloudflare |
+| SSL and Certificates | Edit | optional: this zone's own origin-pull certificate (Security → Origin lock) |
 
 Under **Zone Resources** pick *Include → Specific zone → your domain*. Leave client IP
 filtering empty (the server's IP changes if you ever rebuild) and set no expiry, or put a
@@ -261,10 +324,20 @@ page) to **Amazon → Manage Your Content and Devices → Preferences → Person
 Settings → Approved Personal Document E-mail List**. The **Send a test to my Kindle** button
 proves it works.
 
-**5. A backup repository off the server (recommended).** Any restic repository: an S3
-bucket (Backblaze B2, Wasabi, Cloudflare R2) or an SFTP host. **Quick install → Backups**
-asks for the repository URL, a password and the access keys. Keep the password somewhere
-other than the server; without it the backups cannot be restored.
+**5. A backup repository off the server (recommended).** **Quick install → Backups** offers three
+places:
+- **A computer at home, over Tailscale — free, no subscription.** It runs restic's own
+  `rest-server` in Docker with `--append-only`, so this server can add backups but never delete
+  one (measured: a delete from the server is refused with 403). The step prints everything to
+  do on that computer: one `.htpasswd` line, one `docker run`, one Tailscale rule letting this
+  server reach that single port, and the monthly command that clears out old backups there. It
+  checks the login from here before storing anything. The computer has to be on at 01:00.
+- **A storage bucket** (Backblaze B2, Wasabi, Cloudflare R2). Paid past their free tiers; B2 can
+  be made append-only with a key that lacks `deleteFiles`.
+- **Other**: an SFTP host or a local path.
+
+Keep the backup password somewhere other than the server; without it the backups cannot be
+restored.
 
 **6. Shelfmark release sources.** Nothing is enabled by default. After deploy, open
 `shelf.<domain>` as admin → **Settings** and choose the sources you are entitled to use.
@@ -317,9 +390,14 @@ tells a reader which numbers they are missing and which comes next. What it is, 
   and only list your own books. Gaps in a series are worked out from YOUR copies, never from
   what a sibling has — the metadata store is shared across the household, and it would
   otherwise say what everyone else is reading.
-- **What it does not do.** It does not find or download books. The portal's own search still
-  covers the free, redistributable catalogues (Gutenberg, Internet Archive, LibriVox, Standard
-  Ebooks); anything else comes through Shelfmark, configured by the admin.
+- **Search and fetch (v5).** Searching now finds the BOOK first (Open Library), and a book's page
+  lists the copies the stack can fetch, each checked against the book (see "What changed in v5").
+  The portal fetches from the free catalogues and your own OPDS catalogs; everything else comes
+  through Shelfmark, which the book page links to with the book's title, author and ISBN filled in.
+- **Covers and descriptions on the devices (v5).** The host job also fills a missing cover,
+  description, publisher, publication date, language and ISBN into Calibre — each only when
+  Calibre has none. A cover is fetched only from the providers' image hosts, at most 8 MB, and
+  only when the bytes really are an image.
 
 ## The request flow
 Users sign in at `https://request.<domain>` with their library credentials → search →
@@ -461,7 +539,7 @@ container, reads its settings (passwords included) on stdin, and:
   logins, Caddy's public listener; every 5 minutes, the full public path through Cloudflare;
   and each optional service that is on (qBittorrent, Authelia, Ephemera, FlareSolverr);
 - adds **dead-man's switches** for the scheduled jobs — hourly self-test, disk watchdog, metadata
-  push, Cloudflare IP refresh, nightly backup. Each job reports in when it succeeds
+  push, Cloudflare IP refresh, nightly backup, and the canary journey when it is on. Each job reports in when it succeeds
   (`scripts/kuma-push.sh`); silence past its schedule is an alert;
 - puts the nightly unattended reboot in a maintenance window, keeps 30 days of history (not
   Kuma's 180 — that is millions of rows in a database the backup snapshots every night), and
@@ -568,9 +646,27 @@ otherwise. On a failure: `journalctl -u bookstack-backup -n 50`, then
 Authelia gives login + TOTP/passkey 2FA + brute-force lockout in front of the public apps,
 self-hosted. Enabling generates secrets, starts it, injects a Caddy `forward_auth` gate and
 offers to create Authelia logins for existing users;
-new users created afterwards get one automatically. **Test in a browser right after
-enabling**; *disable* removes the gate instantly. Apps keep their own logins behind the gate
-(defence in depth); double login is the trade for that.
+new users created afterwards get one automatically — from the TUI or from the portal's /admin.
+**Test in a browser right after enabling**; *disable* removes the gate instantly.
+
+**One login (v5).** The portal and Calibre-Web sign the person in from Authelia's answer: Caddy
+strips `Remote-User`/`Remote-*` and `X-Bookstack-Gate` on every path, and adds
+`X-Bookstack-Gate: <GATE_SECRET>` only to requests Authelia let through. The portal trusts
+`Remote-User` only beside that secret; Calibre-Web (which cannot check a secret) is reachable
+only through Caddy and from the host, never from another container (each has its own network).
+Logging out of the portal ends the Authelia session too. A password changed on the portal's
+Devices page is queued as a PBKDF2-SHA512 hash, written into Authelia's user file by the host
+(`scripts/gate-sync.py`, triggered by a systemd path unit) and picked up by Authelia without a
+restart.
+
+**Shelfmark** runs in its header-login mode behind the gate: the reader Authelia names is the
+Shelfmark account of the same name (measured on v1.3.15: switching modes keeps every account),
+admin rights come only from Authelia's `admins` group, which bookstack keeps equal to Calibre-Web's
+admins, and a request without the gate's identity is refused. **Audiobookshelf** has no header
+login, so Authelia is its OpenID Connect provider: its web page goes straight to Authelia (already
+signed in, no consent screen) and back into the reader's EXISTING account, matched by username,
+never auto-created, with its tag restriction untouched. Its apps keep their local login. Turning
+the gate off puts all of them back on their own logins.
 
 Paths that cannot do SSO are bypassed: `/kobo/*`, `/opds`, `/kosync` on books.; the
 Audiobookshelf apps' own login, token refresh, API, sockets, streams and feeds on audio.,
@@ -612,8 +708,11 @@ prints peak memory per container (see the VPS section) and fails on any worker c
   `library.py` (tag-scoped reads), `kindle.py` (SMTP), templates, tests
 - `caddy/` — Caddy build + hardened template (mTLS, headers, rate limits, gate marker)
 - `authelia/` — optional SSO config (rendered on enable)
-- `scripts/` — Cloudflare-IP firewall sync, encrypted backup, restore test, disk watchdog,
-  alerting, **selftest**
+- `scripts/` — Cloudflare-IP firewall sync, encrypted backup and `prune.sh` (retention with a
+  separate key), restore test, disk watchdog, alerting, **selftest**, the host metadata push,
+  `synthetic.py` (canary journey), `gate-sync.py` (passwords into Authelia), heal, cert and
+  update watches
+- `monitoring/` — the Uptime Kuma bootstrap (monitors, channels, push tokens)
 - `configs/fail2ban/` — jails + Caddy filters (login and device-auth paths)
 - `tests/` — unit runner, installer harness, end-to-end UAT + driver
 - `docs/` — deployment checklist, research sweep (`RESEARCH-GAPS.md`), pending decisions

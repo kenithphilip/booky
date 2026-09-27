@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% block body %}
+<form method="get" action="{{ url_for('index') }}" class="row" style="margin-bottom:6px">
+<input type="text" name="q" value="{{q}}" placeholder="Search title or author…" style="flex:1">
+<button type="submit">Search</button><span class="busy">Looking it up…</span></form>
+<p class="mut">Books matching "{{ q }}". Open one to see what can be fetched for you.
+· <a href="{{ url_for('index', q=q, mode='catalogs') }}">Search the download catalogues directly</a>
+{% if shelf %}· <a href="{{ shelf }}" target="_blank" rel="noopener">Search more sources in Shelfmark</a>{% endif %}</p>
+{% set keep %}<form method="post" action="{{ url_for('wanted_add') }}" class="row" style="flex-wrap:wrap;gap:6px;margin-top:8px">{{ csrf_field() }}
+<input type="text" name="title" value="{{ q }}" maxlength="300" required placeholder="Title" style="flex:2;min-width:160px">
+<input type="text" name="author" maxlength="200" placeholder="Author (recommended)" style="flex:1;min-width:140px">
+<select name="kind"><option value="ebook">Ebook</option><option value="audio">Audiobook</option></select>
+<button type="submit">Keep looking</button></form>{% endset %}
+{% if not works %}<div class="card">No books matched. Try fewer words, or the author's surname.
+<p class="mut" style="margin:6px 0 0">Or we can keep looking and request it the moment a catalogue has it.</p>{{ keep }}</div>{% endif %}
+{% for w in works %}
+<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
+<div class="row" style="gap:12px;align-items:flex-start">
+{% if w.cover %}<a href="{{ url_for('work_page', key=w.key) }}"><img src="{{ url_for('cover', u=w.cover) }}" alt="" loading="lazy"
+ style="width:48px;height:72px;object-fit:cover;border-radius:4px;border:1px solid var(--line);flex:none"></a>{% endif %}
+<div><a href="{{ url_for('work_page', key=w.key) }}"><strong>{{ w.title }}</strong></a>{% if w.subtitle %} <span class="mut">{{ w.subtitle }}</span>{% endif %}<br>
+{% for a in w.authors %}{% if a.key %}<a class="mut" href="{{ url_for('writer_page', key=a.key) }}">{{ a.name }}</a>{% else %}<span class="mut">{{ a.name }}</span>{% endif %}{{ ', ' if not loop.last }}{% endfor %}
+{% if w.year %}<span class="mut"> · {{ w.year }}</span>{% endif %}{% if w.editions > 1 %}<span class="mut"> · {{ w.editions }} editions</span>{% endif %}</div>
+</div>
+<div class="row" style="flex:none">
+{% if w.dupe %}<span class="badge">{{ 'maybe in library' if w.dupe.how == 'title' else 'in library' }}</span>{% endif %}
+{% if w.has_ebook %}<span class="badge">free ebook</span>{% endif %}
+{% if w.has_audio %}<span class="badge">free audiobook</span>{% endif %}
+<a class="btn" href="{{ url_for('work_page', key=w.key) }}">Open</a>
+</div></div></div>
+{% endfor %}
+{% if works %}<details class="card"><summary>Not here? Keep looking for it</summary>{{ keep }}</details>{% endif %}
+<p class="mut" style="font-size:12px">Book information from Open Library.</p>
+{% endblock %}

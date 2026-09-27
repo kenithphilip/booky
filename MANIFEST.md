@@ -24,7 +24,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   address, Kobo tokens, Kobo-sync / registration toggles (+ WAL checkpoint so Shelfmark sees
   changes). Also the CLI the menu calls.
 - `abs.py` — Audiobookshelf automation: bootstrap (root, API key, library), tag-restricted
-  user accounts, scan + tag-to-owner after ingest. Also a CLI for the menu.
+  user accounts, scan + tag-to-owner after ingest, and `oidc on|off` (sign in through Authelia,
+  matched by username, local login kept). Also a CLI for the menu.
 - `notify.py` — webhook + e-mail notifications (requester on done/denied, admin on pending)
 - `library.py` — tag-scoped, path-confined reads of the Calibre library for downloads, the
   book page and covers; opens metadata.db `mode=ro` and falls back to `immutable=1` (loudly)
@@ -34,14 +35,24 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   the adapter boundary
 - `dedupe.py` — the 'in library' match: ISBN / Calibre UUID, then title + author, one scoped
   read per search page
+- `bookmeta.py` — metadata-first search (Open Library): works, work and author records, series
+  from the Goodreads mirror, and `copies()` — a book's catalogue cross-links resolved into
+  downloadable copies, plus the keyword ladder, each verified by `matching.py`
+- `matching.py` — Readarr-style weighted distance (identifier 10, language 5, format 5, author 3,
+  title 3; auto at <= 0.20), edition flags (abridged/adapted, omnibus), language codes
+- `wanted.py` — keep looking: matching and the widening recheck schedule
+- `catalogs.py` — the admin's own OPDS catalogs (any number), each a first-class source
+- `shelfmark_api.py` — Shelfmark's pending requests on the portal's Pending card (service login)
 - `kindle.py` — SMTP Send-to-Kindle (+ `python -m kindle test addr`)
 - `fetchers.py` — provider registry + adapters (Gutenberg, Standard Ebooks, IA, LibriVox)
 - `opds.py` — OPDS catalog search-and-grab (your own catalog)
 - `enrich.py`, `imap.py` (plain or TLS IMAP, sender authentication), `tagger.py`,
   `auth.py`, `db.py` (requests, prefs, lockout counters, audit trail), `config.py`
 - `requirements.txt`, `Dockerfile` (1 worker process, `BIND` env), `.dockerignore`
-- `templates/` — base, login, index, status, upload, **library**, **devices**, **admin**,
-  **book**, **author**, **series**
+- `templates/` — base, login, index (direct catalogue search), **books** (metadata search),
+  **work** (a book and its verified copies), **writer** (any author), status (incl. Still looking,
+  Sent to Kindle, Shelfmark approvals), upload, **library**, **devices**, **admin** (incl. your
+  catalogs), **book**, **author**, **series**
 - `tests/` — the portal's pytest suite, every `test_*.py` in that directory (a hand-kept list
   here went stale twice; `bash tests/run-unit.sh` runs whatever is present) + `fixtures/`
   (schemas dumped from the real CWA / Calibre DBs)
@@ -77,7 +88,7 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   inodes-used, and the alert names which tripped (the remedies are unrelated)
 - `alert.sh` — one entry point for alerts: portal (webhook/e-mail), else journal + direct ntfy/webhook post
 - `kuma-push.sh` — `kuma-push.sh <job> up|down [msg]`: a scheduled job reports to its Kuma push
-  monitor (selftest, disk, metapush, cfips, backup); a no-op until monitoring is set up
+  monitor (selftest, disk, metapush, cfips, backup, canary); a no-op until monitoring is set up
 - `selftest.sh` — non-destructive health/security check (Operations → Self-test). Includes the
   library's own isolation invariant (books with no `owner:<user>` tag, and owner tags naming
   accounts that no longer exist — both are invisible to everybody), orphan dropbox folders, and
@@ -95,12 +106,33 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   401-only filter never saw, so the jail could not fire on the one real password oracle
 
 ## scripts/ additions
-- `metadata-push.sh` — every 15 min (cron `bookstack-metapush`, output to the journal): the
-  portal's queued metadata into Calibre via CWA's own `calibredb`, as PUID:PGID, allowlisted
-  to title/sort/authors/series/series_index, owner tag checked before and after each write
+- `metadata-push.sh` — every 15 min (cron `bookstack-metapush`, output to the journal), three
+  passes, all through CWA's own tools as PUID:PGID with the owner tag checked before and after:
+  (1) fill-only metadata (title/sort/authors/series/description/publisher/date/language/ISBN
+  and a missing cover, fetched only from provider image hosts); (2) L10 owner tags for books
+  whose file cannot carry one — refused if the book already has an owner; (3) on-demand
+  format conversions with Calibre's `ebook-convert`, added to the same book
+- `prune.sh` — backup retention (forget + prune) with whichever key it is given: nightly from
+  `backup.sh` when that key may delete, monthly with `/etc/bookstack/restic-prune.env`, or from
+  the admin's own computer (`RESTIC_PRUNE_ENV=./prune.env bash prune.sh`) (L15)
+- `heal.sh` — every 2 min: restart a container Docker reports unhealthy twice, at most once per
+  30 min, alerting every time (L20)
+- `cert-watch.sh` — daily: Caddy's certificates, the origin-pull trust, this zone's own
+  origin-pull certificate and the Cloudflare token, alerting ahead of expiry (L09, L14)
+- `update-check.sh` — weekly: newer releases for every pinned image, one alert per version (L06)
+- `synthetic.py` — the canary journey, twice a day (`bookstack-canary.timer`, L08)
+- `gate-sync.py` — portal password changes into Authelia's user file (path unit + timer, L05)
 
 ## Files bookstack.sh generates on the HOST (outside $STACK_DIR, not in this repo)
-- `/etc/bookstack/restic.env` (0600 root) — repository, password, S3 keys
+- `/etc/bookstack/restic.env` (0600 root) — repository, password, S3 keys; `RESTIC_APPEND_ONLY=1`
+  when the nightly key cannot delete (then `restic-prune.env`, if the prune key lives here, and
+  `bookstack-prune.{service,timer}` on the 15th)
+- `/etc/bookstack/aop/` (0700 root) — this zone's origin-pull CA and client certificate + keys (L14)
+- `/etc/bookstack/canary.env` (0600 root) + `bookstack-canary.{service,timer}` — the canary
+  accounts' passwords and their twice-daily journey (L08)
+- `bookstack-gate-sync.{service,path,timer}` — only while the Authelia gate is on (L05)
+- `$STACK_DIR/authelia/oidc-jwks.pem` (0600, uid 1000) — Authelia's OpenID Connect signing key,
+  made when the gate is enabled; Audiobookshelf signs in through it (L05)
 - `/etc/bookstack/disk.state` — the disk watchdog's latch and last-alert stamp
 - `/etc/bookstack/postboot.sh` (0755 root, regenerated on every Deploy / Update / Backups) and
   `/etc/systemd/system/bookstack-postboot.service` — a oneshot that runs `scripts/selftest.sh`

@@ -16,6 +16,7 @@ services:
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }
+    networks: { auth: {} }         # L01: a network of its own; Caddy reaches 127.0.0.1:9091
     ports:
       - "127.0.0.1:9091:9091"
     volumes:
@@ -33,3 +34,9 @@ services:
       # variable instead; a name starting with AUTHELIA_ would be rejected as unknown.
       - X_AUTHELIA_CONFIG_FILTERS=template
       - BOOKSTACK_SMTP_PASS=${SMTP_PASS:-}
+      # L05: the OpenID Connect provider's HMAC secret, read by the rendered identity_providers
+      # block the same way (never written to configuration.yml)
+      - BOOKSTACK_OIDC_HMAC=${AUTHELIA_OIDC_HMAC:-}
+
+networks:
+  auth: {}

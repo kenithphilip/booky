@@ -148,15 +148,18 @@ def get_user(name):
     return dict(r) if r else None
 
 @_guard
-def list_users():
+def list_users(include_canary=False):
     """Real accounts only: CWA's built-in anonymous 'Guest' row (ROLE_ANONYMOUS) is not a
-    login and anonymous browsing is switched off by harden(), so it is left out."""
+    login and anonymous browsing is switched off by harden(), so it is left out. The canary
+    accounts of the synthetic journey (config.CANARY_USERS) are left out too unless asked for."""
     with _conn() as c:
         rows = c.execute("SELECT id,name,email,role,kindle_mail,allowed_tags FROM user ORDER BY name").fetchall()
     out = []
     for r in rows:
         d = dict(r)
         if (d["role"] or 0) & ROLE_ANONYMOUS:
+            continue
+        if not include_canary and d["name"] in config.CANARY_USERS:
             continue
         d["is_admin"] = bool((d["role"] or 0) & ROLE_ADMIN)
         d["isolated"] = (d.get("allowed_tags") or "") == owner_tag(d["name"])
@@ -330,6 +333,49 @@ def kobo_token(name, create=True):
     return tok
 
 @_guard
+def kobo_status(name):
+    """What CWA itself records about this reader's Kobo (L12), read-only: how many books it has
+    handed to the device (kobo_synced_books) and when a reading position last arrived
+    (kobo_reading_state). Tables CWA has not created yet read as 'never'."""
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    out = {"books_on_device": 0, "last_reading": None,
+           "shelves_only": bool(u.get("kobo_only_shelves_sync")) if "kobo_only_shelves_sync" in u else False,
+           "hardcover": False}
+    with _conn() as c:
+        try:
+            out["books_on_device"] = c.execute("SELECT COUNT(*) FROM kobo_synced_books WHERE user_id=?", (u["id"],)).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+        try:
+            r = c.execute("SELECT MAX(last_modified) FROM kobo_reading_state WHERE user_id=?", (u["id"],)).fetchone()
+            out["last_reading"] = r[0] if r else None
+        except sqlite3.OperationalError:
+            pass
+        try:
+            r = c.execute("SELECT kobo_only_shelves_sync, hardcover_token FROM user WHERE id=?", (u["id"],)).fetchone()
+            out["shelves_only"], out["hardcover"] = bool(r[0]), bool(r[1])
+        except sqlite3.OperationalError:
+            pass
+    return out
+
+@_guard
+def set_kobo_prefs(name, shelves_only=None, hardcover_token=None):
+    """The two per-reader Kobo options CWA keeps on the user row. A blank Hardcover token clears
+    it (the column is UNIQUE, so '' would collide between readers: NULL it is)."""
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    with _conn() as c:
+        if shelves_only is not None:
+            c.execute("UPDATE user SET kobo_only_shelves_sync=? WHERE id=?", (1 if shelves_only else 0, u["id"]))
+        if hardcover_token is not None:
+            tok = hardcover_token.strip().replace("Bearer ", "") or None
+            c.execute("UPDATE user SET hardcover_token=? WHERE id=?", (tok, u["id"]))
+    _checkpoint()
+
+@_guard
 def kobo_url(name, create=True):
     tok = kobo_token(name, create)
     return f"{config.BOOKS_URL}/kobo/{tok}" if tok and config.BOOKS_URL else None
@@ -367,8 +413,11 @@ def _apply_settings(wanted):
     return True
 
 def enable_kobo_sync():
-    """Turn on CWA's global Kobo sync (the 'Enable Kobo sync' checkbox), store proxy off."""
-    return _apply_settings({"config_kobo_sync": 1, "config_kobo_proxy": 0})
+    """Turn on CWA's global Kobo sync (the 'Enable Kobo sync' checkbox), store proxy off. With it
+    (L12): shelves-only sync ("magic shelves") available to readers who choose it on Devices, and
+    Hardcover progress sync — which does nothing for a reader who has not set their own token."""
+    return _apply_settings({"config_kobo_sync": 1, "config_kobo_proxy": 0,
+                            "config_kobo_sync_magic_shelves": 1, "config_hardcover_sync": 1})
 
 def disable_public_registration():
     """Pin every way into CWA that does not go through a password prompt.
@@ -382,10 +431,28 @@ def disable_public_registration():
     as whoever it names, including admin. The header NAME is itself an admin-chosen setting
     (config_reverse_proxy_login_header_name) while caddy/Caddyfile.template strips a FIXED list,
     so Caddy cannot catch a name nobody anticipated. Every other hardening step in this stack is
-    pinned rather than assumed; this one now is too."""
+    pinned rather than assumed; this one now is too.
+
+    L05: with the Authelia gate on it is pinned ON instead — to exactly Remote-User, the header
+    Caddy strips on every path and sets only after Authelia said yes, with auto-creation off
+    (see proxy_login_settings)."""
     return _apply_settings({"config_public_reg": 0, "config_anonbrowse": 0,
-                            "config_remote_login": 0,
-                            "config_allow_reverse_proxy_header_login": 0})
+                            "config_remote_login": 0, **proxy_login_settings()})
+
+def proxy_login_settings(on=None):
+    """Calibre-Web's reverse-proxy header login (L05: one login behind the gate). ON only while
+    the gate is on and has its secret: Caddy then strips Remote-User on EVERY path (the device
+    paths that bypass Authelia included) and copies it from Authelia's answer, and no bridge
+    network can reach Calibre-Web (docker-compose.yml, L01). Never auto-creates accounts."""
+    if on is None:
+        on = bool(config.AUTHELIA_ENABLED and config.GATE_SECRET)
+    s = {"config_allow_reverse_proxy_header_login": 1 if on else 0, "config_reverse_proxy_auto_create_users": 0}
+    if on:
+        s["config_reverse_proxy_login_header_name"] = "Remote-User"
+    return s
+
+def set_proxy_login(on):
+    return _apply_settings(proxy_login_settings(on))
 
 # ---- CLI (used by bookstack.sh) ---------------------------------------------------
 def _password_args(sub):
@@ -445,7 +512,8 @@ def _cli(argv=None):
     sp = p.add_subparsers(dest="cmd", required=True)
     a = sp.add_parser("add-user"); a.add_argument("name"); a.add_argument("--email", default="")
     _password_args(a); a.add_argument("--admin", action="store_true")
-    sp.add_parser("list")
+    a.add_argument("--no-abs", action="store_true", help="no Audiobookshelf account (the canary accounts)")
+    sp.add_parser("list").add_argument("--all", action="store_true", help="include the canary accounts")
     k = sp.add_parser("kindle"); k.add_argument("name"); k.add_argument("address")
     u = sp.add_parser("kobo-url"); u.add_argument("name"); u.add_argument("--reset", action="store_true")
     w = sp.add_parser("passwd"); w.add_argument("name"); _password_args(w)
@@ -453,6 +521,7 @@ def _cli(argv=None):
     i = sp.add_parser("isolate"); i.add_argument("name")
     n = sp.add_parser("rename-user"); n.add_argument("old"); n.add_argument("new")
     sp.add_parser("enable-kobo-sync"); sp.add_parser("harden")
+    sp.add_parser("proxy-login").add_argument("state", choices=("on", "off"))
     args = p.parse_args(argv)
     try:
         if args.cmd == "add-user":
@@ -462,13 +531,13 @@ def _cli(argv=None):
             out = {"ok": True, "user": u["name"], "id": u["id"], "kobo_url": kobo_url(u["name"])}
             # admins see every audiobook through ABS's own admin role; only end users get an
             # ABS account here, matching what /admin and the TUI create
-            if not (u["role"] or 0) & ROLE_ADMIN:
+            if not (u["role"] or 0) & ROLE_ADMIN and not args.no_abs:
                 a = _abs_sync("create", u["name"], pw)
                 if a:
                     out["abs"] = a
             print(json.dumps(out))
         elif args.cmd == "list":
-            print(json.dumps(list_users(), indent=1))
+            print(json.dumps(list_users(include_canary=args.all), indent=1))
         elif args.cmd == "kindle":
             addr = set_kindle_mail(args.name, args.address)
             _audit("kindle_set", args.name, addr or "(cleared)")
@@ -504,6 +573,10 @@ def _cli(argv=None):
             print(json.dumps({"ok": True, "isolated": done}))
         elif args.cmd == "enable-kobo-sync":
             print(json.dumps({"ok": True, "changed": enable_kobo_sync(), "restart_cwa": True}))
+        elif args.cmd == "proxy-login":
+            ch = set_proxy_login(args.state == "on")
+            _audit("cwa_proxy_login", "-", args.state)
+            print(json.dumps({"ok": True, "changed": ch, "restart_cwa": ch}))
         elif args.cmd == "harden":
             ch = disable_public_registration() | enable_kobo_sync()
             print(json.dumps({"ok": True, "changed": ch, "restart_cwa": ch}))

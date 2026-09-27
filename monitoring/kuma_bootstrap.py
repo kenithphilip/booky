@@ -68,9 +68,10 @@ def desired_monitors(cfg):
               "http://127.0.0.1:13378/status", "isInit", "true"),
         _http("shelfmark", "Shelfmark (shelf.) - health", "http://127.0.0.1:8084/api/health"),
         # Shelfmark silently falls back to auth mode "none" (no login, everyone admin) when it
-        # cannot read Calibre-Web's app.db: "up" is not enough, it must still say "cwa"
+        # cannot read Calibre-Web's app.db: "up" is not enough, it must still say "cwa" — or
+        # "proxy" behind the Authelia gate (L05: one login), whichever bookstack.sh set
         _json("shelfmark-auth", "Shelfmark still requires library logins",
-              "http://127.0.0.1:8084/api/auth/check", "auth_mode", "cwa"),
+              "http://127.0.0.1:8084/api/auth/check", "auth_mode", cfg.get("shelfmark_auth") or "cwa"),
     ]
     if cfg.get("bind_ip"):
         # TCP only: the public listener demands Cloudflare's client certificate, so any HTTP
@@ -109,6 +110,10 @@ def desired_monitors(cfg):
         out.append(_push("push-cfips", "Cloudflare IP allowlist refresh (nightly)", p["cfips"], 26 * 3600))
     if p.get("backup"):
         out.append(_push("push-backup", "Backup (nightly)", p["backup"], 26 * 3600))
+    if p.get("canary"):
+        # twice a day (06:20 / 18:20 + up to 10 min delay + the run): a missed run or a failed
+        # one (it pushes "down") shows here as well as through alert.sh
+        out.append(_push("push-canary", "Canary journey (twice a day)", p["canary"], 13 * 3600))
     mons = {}
     for key, spec in out:
         spec["description"] = f"{MARK}{key}. {NOTE}"
