@@ -283,7 +283,7 @@ Under **Zone Resources** pick *Include → Specific zone → your domain*. Leave
 filtering empty (the server's IP changes if you ever rebuild) and set no expiry, or put a
 reminder in your calendar. Copy the token once; Cloudflare will not show it again.
 
-Optionally create a **second token with only Zone → DNS → Edit** for the same zone. Configure
+Optionally create a **second token with only Zone → DNS → Edit and Zone → Zone → Read** for the same zone (Caddy's Cloudflare plugin looks the zone up by name). Configure
 asks for it: Caddy, the one internet-facing process, then only holds that narrow token for
 certificate renewals, and the powerful one stays on the host. Leave it blank to reuse the
 main token.
@@ -291,7 +291,7 @@ Paste it when **Quick install → Configure** asks for it. It is stored only in
 `/srv/bookstack/.env` (root-only, mode 600) and read by Caddy at runtime. To replace it later,
 re-run **Install & deploy → Configure** and paste the new one.
 
-In the Cloudflare dashboard, turn **Security → WAF → Managed rules ON**. Leave **Bot Fight
+On a paid Cloudflare plan, turn **Security → WAF → Managed rules ON** (on the Free plan the managed rules are an upgrade; Cloudflare's free baseline protection runs by itself, nothing to buy). Leave **Bot Fight
 Mode OFF**: it challenges Kobo, OPDS, KOReader and the Audiobookshelf apps, cannot be
 exempted on the Free plan, and the devices fail silently.
 

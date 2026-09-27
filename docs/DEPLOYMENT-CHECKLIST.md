@@ -212,7 +212,7 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
 - [ ] External check: a free healthchecks.io check (period 1 h, grace 1 h) entered under
       Operations → Monitoring; it turns green within the hour.
 - [ ] Tailscale: key expiry disabled for this machine (the Tailscale step checks it).
-- [ ] Cloudflare dashboard: WAF Managed rules ON; Bot Fight Mode **OFF** (it silently breaks
+- [ ] Cloudflare dashboard (inside the mfdata.in domain, not the account): WAF Managed rules ON on a paid plan only (Free shows "Upgrade plan": nothing to do); Bot Fight Mode **OFF** (it silently breaks
       Kobo, OPDS, KOReader and the Audiobookshelf apps and cannot be exempted on the Free plan).
 - [ ] (Only if enabling Ephemera) `Operations → Ephemera` builds on the VPS; its success
       screen reports that Ephemera reaches FlareSolverr.

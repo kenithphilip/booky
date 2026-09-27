@@ -102,7 +102,8 @@ CLI_ACT='{"ok": true}'
 CLI_ACT_FAIL=0
 curl(){ echo "curl: $*" >> "$LOG"; case "$*" in *ipify*) echo "${IPIFY:-203.0.113.5}";;
   *127.0.0.1:8090/healthz*) [ "${FAIL_HEALTHZ:-0}" = 1 ] && return 22; return 0;;
-  *"/healthz?aop="*) printf '%s' "${AOP_PROBE:-200}";;   # L14: a request through Cloudflare
+  *"/healthz?aop="*) if [ -n "${AOP_SEQ:-}" ] && [ -s "$AOP_SEQ" ]; then head -1 "$AOP_SEQ"; tail -n +2 "$AOP_SEQ" > "$AOP_SEQ.n"; mv "$AOP_SEQ.n" "$AOP_SEQ"
+     else printf '%s' "${AOP_PROBE:-200}"; fi;;   # L14: a request through Cloudflare (AOP_SEQ: one answer per call)
   *"/bookstack/config"*) printf '%s' "${REST_PROBE:-404}";;   # the home rest-server (404 = logged in, no repo yet)
   *authenticated_origin_pull_ca.pem*) local o=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && o="$2"; shift; done
      if [ -n "${CF_SHARED_PEM:-}" ]; then cp "$CF_SHARED_PEM" "$o"; else printf -- '-----BEGIN CERTIFICATE-----\nstub\n-----END CERTIFICATE-----\n' > "$o"; fi;;
@@ -501,8 +502,11 @@ envset SMTP_HOST ""; envset SMTP_USER ""; envset SMTP_FROM ""; envset SMTP_PORT 
 envset AUTHELIA_ENABLED false; render_caddyfile; echo "users: {}" > "$f"
 reset "yes" "<cancel>" "<cancel>" "<cancel>"; step_authelia; rc=$?
 expect '[ $rc = 1 ] && [ "$(envget AUTHELIA_ENABLED)" = false ] && ! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" && seen "stop authelia" && grep -F msgbox "$LOG" | grep -q "No Authelia user exists"' "no user created -> gate NOT enabled, Authelia stopped"
-FAIL_AUTHELIA_HEALTH=1; reset "yes"; step_authelia; rc=$?; FAIL_AUTHELIA_HEALTH=0
-expect '[ $rc = 1 ] && [ "$(envget AUTHELIA_ENABLED)" = false ] && ! seen "askpw:" && grep -F msgbox "$LOG" | grep -q "did not become healthy"' "Authelia unhealthy -> gate NOT enabled, no users asked"
+expect '! grep -F "docker: " "$LOG" | grep -q "up -d authelia"' "with no user Authelia is never even started (4.39 refuses an empty user file: 'users: non zero value required')"
+echo "users: {}" > "$f"; FAIL_AUTHELIA_HEALTH=1; reset "yes" "adminpw-123" "adminpw-123" "boss@mail.example" "<cancel>" "<cancel>"; step_authelia; rc=$?; FAIL_AUTHELIA_HEALTH=0
+expect '[ $rc = 1 ] && [ "$(envget AUTHELIA_ENABLED)" = false ] && grep -F msgbox "$LOG" | grep -q "did not become healthy" && ! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Authelia unhealthy -> gate NOT enabled"
+expect '[ "$(line_of "authelia crypto hash")" -lt "$(line_of "up -d authelia")" ]' "the first user is written BEFORE Authelia starts (it would refuse an empty user file)"
+echo "users: {}" > "$f"
 reset "yes" "adminpw-123" "adminpw-123" "boss@mail.example" "<cancel>" "<cancel>"; step_authelia; rc=$?
 expect '[ $rc = 0 ] && [ "$(envget AUTHELIA_ENABLED)" = true ] && grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" && grep -q "^  admin:" "$f" && [ "$(line_of "authelia crypto hash")" -lt "$(line_of "caddy reload")" ] && grep -F msgbox "$LOG" | grep -q "notification.txt"' "one user created -> gate injected and Caddy reloaded afterwards; no SMTP -> admin told where codes go"
 # A17: the portal reads AUTHELIA_ENABLED at start-up; that flag is what stops /admin offering
@@ -824,8 +828,11 @@ expect 'openssl verify -CAfile "$ad/ca.pem" "$ad/client.pem" >/dev/null 2>&1 && 
 expect '[ "$(stat -c %a "$ad/client.key" 2>/dev/null || stat -f %Lp "$ad/client.key")" = 600 ] && [ "$(stat -c %a "$ad/ca.key" 2>/dev/null || stat -f %Lp "$ad/ca.key")" = 600 ] && [ "$(stat -c %a "$ad" 2>/dev/null || stat -f %Lp "$ad")" = 700 ] && ! ls "$STACK_DIR/caddy" | grep -q "\.key"' "private keys stay in /etc/bookstack/aop (0700/0600); only the CA certificate reaches caddy/"
 expect 'command jq -e ".certificate | startswith(\"-----BEGIN CERTIFICATE\")" "$CFSTORE/aop_upload" >/dev/null && command jq -e ".private_key | test(\"PRIVATE KEY\")" "$CFSTORE/aop_upload" >/dev/null && ! command jq -r .certificate "$CFSTORE/aop_upload" | grep -q "$(sed -n 2p "$ad/ca.pem")"' "the upload carries the LEAF and its key, not the CA (Cloudflare: 'missing leaf certificate')"
 expect 'seen "docker: compose" && grep -F "docker: " "$LOG" | grep -q "restart caddy" && seen "curl: -s -o /dev/null -m 15 -w %{http_code} https://request.example.test/healthz?aop=" && grep -qF "Origin locked to THIS zone" "$LOG"' "the switch is proven with a real request through Cloudflare after a Caddy RESTART (no reused connection)"
+# the site does not answer through Cloudflare yet (Caddy still getting certificates): no switch at all
+envset AOP_MODE both; aop_write_trust both; cp "$tr" "$T/tr.pre"; AOP_PROBE=526 reset; AOP_PROBE=526 step_origin_lock; rc=$?
+expect '[ $rc = 1 ] && cmp -s "$tr" "$T/tr.pre" && ! grep -F "docker: " "$LOG" | grep -q "restart caddy" && grep -qF "does not answer through Cloudflare yet" "$LOG"' "no switch while the site itself is not answering yet: trust unchanged, Caddy not restarted, the admin told why"
 # the probe fails: back to trusting both, nothing broken
-envset AOP_MODE both; AOP_PROBE=526 reset; AOP_PROBE=526 step_origin_lock; rc=$?
+envset AOP_MODE both; printf '200\n526\n526\n526\n526\n526\n526\n' > "$T/aopseq"; AOP_SEQ="$T/aopseq" reset; AOP_SEQ="$T/aopseq" step_origin_lock; rc=$?
 expect '[ $rc = 1 ] && [ "$(envget AOP_MODE)" = both ] && [ "$(grep -c "BEGIN CERTIFICATE" "$tr")" = 2 ] && grep -qF "put back to trusting both" "$LOG"' "Cloudflare still presents the shared certificate: Caddy goes back to trusting both, and says so"
 reset; step_origin_lock; expect '[ "$(envget AOP_MODE)" = zone ] && cmp -s "$tr" "$ad/ca.pem"' "a later run finishes the switch"
 # renewal: a new leaf from the same CA; the old upload is deleted only after the proof
@@ -1034,6 +1041,7 @@ reset "yes" "yes"; step_lock_ssh; expect 'seen "ufw: --force delete allow 22/tcp
 reset "yes"; step_lock_ssh; expect 'seen "ufw: --force delete allow 22/tcp" && ! grep -q "yesno: IMPORTANT" "$LOG"' "KeyExpiry null -> no extra prompt"
 envset SSH_LOCKED false; IP_ADDRS=""
 reset; step_tailscale >/dev/null; expect 'grep -F "msgbox" "$LOG" | grep -q "Disable key expiry" && grep -q "advertise-tags=tag:bookstack" "$LOG" && [ "$(envget TAILSCALE_IP)" = 100.64.0.1 ]' "Tailscale step: key expiry warning + tag:bookstack ACL advice; IP stored"
+expect 'seen "systemctl: enable --now tailscaled" && [ "$(line_of "systemctl: enable --now tailscaled")" -lt "$(line_of "tailscale: up")" ]' "the step starts tailscaled before logging in (a Debian 13 minimal image leaves it stopped)"
 TS_EXPIRY='"2027-03-01T00:00:00Z"'; reset "no"; step_tailscale >/dev/null; rc=$?; TS_EXPIRY=null
 expect '[ $rc = 0 ] && seen "yesno: Key expiry is still ENABLED"' "Tailscale step checks KeyExpiry and asks the admin to disable it (C3)"
 # restore onto this server: pick a snapshot, stop, restore in place, DB copies per MANIFEST, keep fresh IPs, restart
@@ -2085,6 +2093,9 @@ expect 'declare -f copy_code_trees | grep -qF "scripts/\"*.py" && grep -q "canar
 expect 'python3 -m py_compile "$REPO/scripts/synthetic.py"' "synthetic.py compiles"
 reset "D"; step_canary
 expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
+echo "== self-test: a refused connection reads as 000, not 000000"
+expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+
 echo "== L20: restart unhealthy containers, carefully (scripts/heal.sh)"
 HL="$T/hl"; mkdir -p "$HL/bin"
 cat > "$HL/bin/docker" <<'EOS'

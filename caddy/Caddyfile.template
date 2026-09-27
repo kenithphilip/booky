@@ -107,7 +107,7 @@
 # trusted is bookstack.sh's choice (aop_write_trust): Cloudflare's SHARED origin-pull CA, which
 # any Cloudflare zone's edge can satisfy, or this zone's own CA (Security -> Origin lock, L14).
 # {env.CF_API_TOKEN} is read at runtime, so the token never appears in the adapted config.
-# (The compose file fills it from CF_DNS_TOKEN: a Zone:DNS:Edit-only token.)
+# (The compose file fills it from CF_DNS_TOKEN: a token with only Zone:DNS:Edit + Zone:Read.)
 (public_tls) {
 	tls {
 		dns cloudflare {env.CF_API_TOKEN}

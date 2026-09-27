@@ -449,7 +449,8 @@ SSH
     sshnote="WARNING: sshd rejected the configuration (sshd -t), so the hardening was NOT applied and SSH was not reloaded. Check /etc/ssh/sshd_config."; return 1
   fi
   systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-  if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+  local sshd_eff; sshd_eff=$(sshd -T 2>/dev/null || true)    # not piped: grep -q + pipefail = SIGPIPE "failure"
+  if printf '%s\n' "$sshd_eff" | grep -qi '^passwordauthentication no'; then
     sshnote="SSH is now key-only (verified with sshd -T)."
   else
     sshnote="WARNING: SSH password login is STILL ON although $SSH_DROPIN says no — another file in /etc/ssh overrides it (check: sshd -T | grep -i passwordauth)."; return 1
@@ -500,6 +501,11 @@ make_dirs() {
 # ---------- 2. tailscale ----------
 step_tailscale() {
   command -v tailscale >/dev/null || install_tailscale_apt || { msg "Could not install Tailscale from its signed package repository (see the output above)."; return 1; }
+  # The package normally starts tailscaled itself; on a Debian 13 minimal image it did not
+  # ("dial unix /var/run/tailscaled.socket: no such file"), so every tailscale command failed.
+  systemctl enable --now tailscaled >/dev/null 2>&1 || true
+  local w; for w in $(seq 1 15); do tailscale status >/dev/null 2>&1 && break; tailscale status 2>&1 | grep -q "Logged out\|NeedsLogin" && break; sleep 1; done
+  systemctl is-active --quiet tailscaled || { msg "The Tailscale service (tailscaled) does not start.\n\nSee: journalctl -u tailscaled -n 30 --no-pager"; return 1; }
   clear
   echo "Tailscale will print a login URL. Open it in your browser and approve this machine."
   echo
@@ -589,7 +595,7 @@ step_configure() {
   e=$(ask "Admin email (for Let's Encrypt notices):" "$(envget ADMIN_EMAIL)")     ; [ -n "$e" ] || return 1
   valid_email "$e" || { msg "'$e' is not an e-mail address. Let's Encrypt would refuse the ACME account and no certificate would ever issue. Nothing was changed."; return 1; }
   tz=$(ask "Timezone:" "$(envget TZ)") || tz="$(envget TZ)"                       ; [ -n "$tz" ] || tz=UTC
-  tok=$(askpw "Cloudflare API token (Zone:Read, DNS:Edit, Zone Settings:Edit, Config Rules:Edit, Cache Rules:Edit, Firewall Services:Edit). Leave blank to keep existing.") ; [ -n "$tok" ] || tok="$(envget CF_API_TOKEN)"
+  tok=$(askpw "Cloudflare API token (Zone:Read, DNS:Edit, Zone Settings:Edit, Cache Rules:Edit, Firewall Services:Edit; SSL and Certificates:Edit for Security -> Origin lock). Leave blank to keep existing.") ; [ -n "$tok" ] || tok="$(envget CF_API_TOKEN)"
   [ -n "$tok" ] || { msg "A Cloudflare API token is required."; return 1; }
   if [ -n "$(envget ADMIN_HASH)" ] && yesno "Keep the existing admin-gate password (for the Tailscale-only admin tools)?"; then pw=""; else
     pw=$(askpw2 "Password for the admin gate in front of the Tailscale-only admin tools (qBittorrent, Ephemera):") || return 1; fi
@@ -598,7 +604,7 @@ step_configure() {
   au=$(ask "Username of YOUR admin account (Calibre-Web, the portal and Shelfmark). Avoid 'admin': bots guess it, and Calibre-Web then locks that name for the day." "${cur_au:-$sugg}") || au="${cur_au:-$sugg}"
   au=$(printf '%s' "$au" | tr 'A-Z' 'a-z'); [ -n "$au" ] || au="${cur_au:-$sugg}"
   valid_username "$au" || { msg "'$au' is not a valid username (2-32 of a-z 0-9 . _ -). Nothing was changed."; return 1; }
-  dtok=$(askpw "Optional, recommended: a SECOND Cloudflare token with only Zone -> DNS -> Edit on this zone. Caddy uses it for certificates, so the powerful main token never sits in a container.\n\nBlank = keep the current one (or reuse the main token).") || dtok=""
+  dtok=$(askpw "Optional, recommended: a SECOND Cloudflare token with only Zone -> DNS -> Edit and Zone -> Zone -> Read on this zone. Caddy uses it for certificates, so the powerful main token never sits in a container.\n\nBlank = keep the current one (or reuse the main token).") || dtok=""
 
   local old_tok; old_tok=$(envget CF_API_TOKEN)
   envset DOMAIN "$d"; envset ADMIN_EMAIL "$e"; envset TZ "$tz"
@@ -789,7 +795,7 @@ step_cloudflare() {
   if [ -n "$CF_FAILS" ]; then
     big "Cloudflare: NOT fully configured" "These items failed:$CF_FAILS
 
-Fix the token permissions (Zone:Read, DNS:Edit, Zone Settings:Edit, Config Rules:Edit,
+Fix the token permissions (Zone:Read, DNS:Edit, Zone Settings:Edit,
 Cache Rules:Edit, Firewall Services:Edit) or set them in the dashboard, then run this step again.
 The public sites will not work while SSL is not 'Full (strict)' or Authenticated Origin Pulls is off."
     return 1
@@ -802,7 +808,7 @@ The public sites will not work while SSL is not 'Full (strict)' or Authenticated
          step_origin_cert && aopnote="- Origin lock: this zone's OWN client certificate$([ "$(aop_mode)" = both ] && printf ' (Caddy trusts both until Deploy proves it)')"
        fi;;
   esac
-  msg "Cloudflare configured (read back and verified):\n- DNS: $(printf '%s' "$public" | tr ' ' '/') -> proxied (orange)$([ -n "$private" ] && printf '; %s -> tailnet IP only' "$private")$privnote\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n$aopnote\n\nIn the dashboard: Security > WAF > Managed rules: ON.\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
+  msg "Cloudflare configured (read back and verified):\n- DNS: $(printf '%s' "$public" | tr ' ' '/') -> proxied (orange)$([ -n "$private" ] && printf '; %s -> tailnet IP only' "$private")$privnote\n- SSL Full (strict), TLS 1.2+, HTTPS forced, Authenticated Origin Pulls ON\n- Browser Integrity Check, e-mail obfuscation and Rocket Loader OFF (they break e-readers and the portal)\n$cachenote\n- Firewall allows web ports only from Cloudflare (auto-refreshed nightly)\n$aopnote\n\nIn the dashboard: on a paid plan turn the WAF managed rules ON (the Free plan's baseline runs by itself; nothing to buy).\nDo NOT enable Bot Fight Mode: it challenges Kobo/OPDS/KOReader/Audiobookshelf apps, cannot be exempted on the Free plan, and the devices fail silently. Leave it OFF."
 }
 
 # ---------- L14: this zone's own origin-pull certificate ----------
@@ -888,8 +894,8 @@ step_origin_lock(){ # Security menu: set up, finish, or renew the zone's own cer
 caddy_up(){ [ "$(docker inspect -f '{{.State.Running}}' caddy 2>/dev/null)" = true ]; }
 # A request through Cloudflare, from here: any answer below 500 means the TLS handshake between
 # the edge and Caddy succeeded (the gate's login page or a 404 are fine); 525/526 mean it failed.
-aop_probe(){ local c i d; d=$(envget DOMAIN)
-  for i in 1 2 3; do
+aop_probe(){ local c i d n="${1:-3}"; d=$(envget DOMAIN)
+  for i in $(seq 1 "$n"); do
     c=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "https://request.$d/healthz?aop=$i$RANDOM" 2>/dev/null || echo 000)
     [ "${c:-000}" -ge 200 ] 2>/dev/null && [ "$c" -lt 500 ] && return 0
     sleep 5
@@ -897,11 +903,18 @@ aop_probe(){ local c i d; d=$(envget DOMAIN)
 aop_tighten(){ # both -> zone, proven; called by step_origin_cert and at the end of Deploy
   [ "$(aop_mode)" = both ] || return 0
   caddy_up || { msg "This zone's certificate is active at Cloudflare. Caddy trusts both certificates for now; Deploy finishes the switch."; return 0; }
+  # The site must answer through Cloudflare BEFORE the switch: right after Deploy starts Caddy
+  # its own certificates are still being issued (DNS-01, about a minute), and a probe then fails
+  # for that reason — which the switch below would blame on the origin certificate.
+  if ! aop_probe 12; then
+    msg "The site does not answer through Cloudflare yet (Caddy may still be getting its certificates; that takes a minute or two after it starts).\n\nNothing was changed: Caddy trusts both certificates. When https://request.$(envget DOMAIN) opens in a browser, run Security -> Origin lock."
+    return 1
+  fi
   aop_write_trust zone || return 1
   # a restart, not a reload: Cloudflare keeps connections to the origin open, and a reused one
   # would pass the probe on the OLD trust
   compose restart caddy >/dev/null 2>&1; sleep 5
-  if aop_probe; then
+  if aop_probe 6; then
     envset AOP_MODE zone
     local old; old=$(envget AOP_OLD_CERT_ID)
     if [ -n "$old" ]; then [ -n "${ZONE:-}" ] || cf_zone >/dev/null 2>&1; cf DELETE "/zones/$ZONE/origin_tls_client_auth/$old" >/dev/null 2>&1 || true; envset AOP_OLD_CERT_ID ""; fi
@@ -1860,7 +1873,7 @@ step_quick() {
   yesno "Quick install runs, in order: System -> Tailscale -> Configure -> Cloudflare -> Deploy -> Backups -> Alerts -> fail2ban,
 then helps you add the first user and offers to lock SSH to Tailscale. Each step still asks what it needs. You can stop at any prompt and resume from the Install menu later.
 
-Before starting you need: a Cloudflare zone for your domain + an API token (Zone:Read, DNS:Edit, Zone Settings:Edit, Config Rules:Edit, Cache Rules:Edit, Firewall Services:Edit), and a Tailscale account.
+Before starting you need: a Cloudflare zone for your domain + an API token (Zone:Read, DNS:Edit, Zone Settings:Edit, Cache Rules:Edit, Firewall Services:Edit, SSL and Certificates:Edit), and a Tailscale account.
 
 Start?" || return 0
   step_system || { msg "System step did not finish."; return 1; }
@@ -2639,13 +2652,9 @@ step_authelia() {
   [ -f "$STACK_DIR/authelia/users_database.yml" ] || echo "users: {}" > "$STACK_DIR/authelia/users_database.yml"
   chown -R 1000:1000 "$STACK_DIR/authelia"
   if [ -n "$(envget CF_API_TOKEN)" ] && cf_zone; then cf_dns auth "$(envget PUBLIC_IP)" true || true; fi
-  clear; echo "Starting Authelia..."
-  composeA up -d authelia || { msg "Authelia did not start (Operations -> Logs -> authelia). The gate was NOT enabled."; return 1; }
-  if ! authelia_healthy 30; then
-    composeA stop authelia >/dev/null 2>&1 || true
-    msg "Authelia did not become healthy within 60 s (Operations -> Logs -> authelia). The gate was NOT enabled; the apps keep their own logins."; return 1
-  fi
-  # users BEFORE the gate: without one, every visitor meets a login nobody can pass
+  # users FIRST: Authelia 4.39 refuses to start with an empty user file ("users: non zero value
+  # required", measured on the real server), and without one every visitor would meet a login
+  # nobody can pass. Hashing runs in a throwaway container, so Authelia need not be up for it.
   local u pw em
   if [ "$(authelia_user_count)" = 0 ] || yesno "Create or refresh Authelia logins for the existing library users? (each gets a password you type; usernames stay identical)"; then
     for u in $(users_json | json '" ".join(x["name"] for x in d)'); do
@@ -2657,9 +2666,14 @@ step_authelia() {
   fi
   if [ "$(authelia_user_count)" = 0 ]; then
     composeA stop authelia >/dev/null 2>&1 || true
-    msg "No Authelia user exists, so the gate was NOT enabled (nobody could log in). Add one with Security -> 'Authelia: add or reset a user', then enable again."; return 1
+    msg "No Authelia user exists, so the gate was NOT enabled (nobody could log in, and Authelia refuses to start without one). Run Security -> Authelia again and give at least one user a password and an e-mail address."; return 1
   fi
-  authelia_healthy 30 || { composeA stop authelia >/dev/null 2>&1 || true; msg "Authelia is not healthy after adding users (Operations -> Logs -> authelia). The gate was NOT enabled."; return 1; }
+  clear; echo "Starting Authelia..."
+  composeA up -d authelia || { msg "Authelia did not start (Operations -> Logs -> authelia). The gate was NOT enabled."; return 1; }
+  if ! authelia_healthy 30; then
+    composeA stop authelia >/dev/null 2>&1 || true
+    msg "Authelia did not become healthy within 60 s (Operations -> Logs -> authelia). The gate was NOT enabled; the apps keep their own logins."; return 1
+  fi
   envset AUTHELIA_ENABLED true
   if ! render_caddy_all || ! apply_caddy; then
     envset AUTHELIA_ENABLED false; render_caddyfile >/dev/null 2>&1 && apply_caddy >/dev/null 2>&1

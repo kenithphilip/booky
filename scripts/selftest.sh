@@ -28,7 +28,9 @@ guards=0
 envget(){ local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
 compose(){ (cd "$STACK_DIR" && docker compose "$@"); }
-code(){ curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null || echo 000; }
+# curl already prints 000 when it cannot connect, and then exits non-zero: "|| echo 000" made that
+# "000000", so the one check that WANTS a refused connection (the origin lock) reported a failure
+code(){ local c; c=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true; printf '%s' "${c:-000}"; }
 D=$(envget DOMAIN)
 ADMIN_USER=$(envget ADMIN_USER); ADMIN_USER="${ADMIN_USER:-admin}"
 TORRENTS=$(envget TORRENTS_ENABLED)
@@ -181,7 +183,10 @@ pub=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | while IFS=$'\t' 
 if [ "$TORRENTS" != true ] && command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qE '^6881'; then warn "port 6881 open in ufw but torrents are off (re-run Install -> System)"; fi
 # the EFFECTIVE sshd configuration: a provider drop-in (50-cloud-init.conf) can override ours
 if command -v sshd >/dev/null; then
-  if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then ok "SSH password login disabled (effective sshd -T)"
+  # captured first: under pipefail, grep -q quitting at the match kills sshd -T with SIGPIPE mid-way
+  # through its long output and the pipeline "fails" although the setting is right (seen on Debian 13)
+  sshd_eff=$(sshd -T 2>/dev/null || true)
+  if printf '%s\n' "$sshd_eff" | grep -qi '^passwordauthentication no'; then ok "SSH password login disabled (effective sshd -T)"
   elif [ -f /etc/ssh/sshd_config.d/01-bookstack.conf ]; then bad "SSH password login is still ON although 01-bookstack.conf disables it: another sshd drop-in overrides it (sshd -T | grep -i passwordauth)"
   else warn "SSH password login not disabled (add a key, re-run System step)"; fi
 fi
