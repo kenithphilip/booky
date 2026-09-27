@@ -20,6 +20,10 @@ USER_EVENTS = {"done": "is in your library", "denied": "was denied", "error": "c
 EVENTS = set(USER_EVENTS) | {"requested", "approved"}
 
 def send(event, req):
+    # the canary journey's hidden accounts (L08) report through their own run, never as a
+    # "library: done" on the family's phones twice a day
+    if req.get("owner") in config.CANARY_USERS:
+        return
     _webhook(event, req)
     threading.Thread(target=_mail, args=(event, req), daemon=True).start()
 

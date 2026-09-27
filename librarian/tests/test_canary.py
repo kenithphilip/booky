@@ -127,3 +127,45 @@ def test_the_library_lookup_needs_the_owner_tag(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "METADATA_DB", str(p)); monkeypatch.setattr(m, "A", "canary-a")
     assert [r[0] for r in m.library_books("Canary %", "canary-a")] == [1]
     assert m.library_books("Canary Y", "canary-a") == [], "a book without MY owner tag is not an import"
+
+
+def test_canary_accounts_never_notify(monkeypatch):
+    import notify
+    monkeypatch.setattr(config, "CANARY_USERS", ("canary-a", "canary-b"))
+    sent = []
+    monkeypatch.setattr(notify, "_webhook", lambda e, r: sent.append((e, r.get("owner"))))
+    monkeypatch.setattr(notify, "_mail", lambda e, r: sent.append(("mail", r.get("owner"))))
+    notify.send("done", {"owner": "canary-a", "title": "Canary 20260927"})
+    assert sent == [], "the canary's test book must not buzz the family's phones twice a day"
+    notify.send("done", {"owner": "alice", "title": "Emma"})
+    assert ("done", "alice") in sent
+
+
+def _shelf_env(monkeypatch, method, answers):
+    m = _synthetic()
+    monkeypatch.setattr(m, "E", {"SHELFMARK_AUTH_METHOD": method})
+    monkeypatch.setattr(m, "A", "canary-a"); monkeypatch.setattr(m, "A_PW", "pw")
+    calls = []
+    def fake(self, url, **kw):
+        calls.append((url, kw))
+        return answers[len(calls) - 1]
+    monkeypatch.setattr(m.Client, "req", fake)
+    return m, calls
+
+
+def test_behind_the_gate_the_canary_checks_shelfmarks_header_login(monkeypatch):
+    ok = json.dumps({"authenticated": True, "username": "canary-a", "is_admin": False}).encode()
+    m, calls = _shelf_env(monkeypatch, "proxy", [(200, {}, ok), (401, {}, b"")])
+    assert m.shelfmark_ok()[0] is True
+    assert calls[0][0].endswith("/api/auth/check") and calls[0][1]["headers"]["Remote-User"] == "canary-a"
+    assert "json_body" not in calls[0][1], "no password login: Shelfmark has none in proxy mode"
+    m, _ = _shelf_env(monkeypatch, "proxy", [(200, {}, ok), (200, {}, b"{}")])
+    assert m.shelfmark_ok()[0] is False, "a Shelfmark that answers without an identity is a failure"
+    admin = json.dumps({"authenticated": True, "username": "canary-a", "is_admin": True}).encode()
+    m, _ = _shelf_env(monkeypatch, "proxy", [(200, {}, admin), (401, {}, b"")])
+    assert m.shelfmark_ok()[0] is False, "the canary must never be an admin"
+
+
+def test_without_the_gate_the_canary_uses_the_password_login(monkeypatch):
+    m, calls = _shelf_env(monkeypatch, "cwa", [(200, {}, b"{}")])
+    assert m.shelfmark_ok()[0] is True and calls[0][0].endswith("/api/auth/login")

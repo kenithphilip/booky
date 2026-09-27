@@ -209,6 +209,24 @@ def login(cl, user, pw):
     return False, f"login answered {st}"
 
 
+def shelfmark_ok():
+    if E.get("SHELFMARK_AUTH_METHOD") == "proxy":
+        # behind the Authelia gate Shelfmark takes the identity Caddy passes on and has no
+        # password login: check it maps the canary to its own account, never an admin, and
+        # that a request without an identity is refused
+        st, _, b = Client().req(SHELF + "/api/auth/check", headers={"Remote-User": A, "Remote-Groups": "users"})
+        try:
+            j = json.loads(b or b"{}")
+        except ValueError:
+            j = {}
+        if not (st == 200 and j.get("authenticated") and j.get("username") == A and not j.get("is_admin")):
+            return False, f"header login: HTTP {st} {str(j)[:120]}"
+        st2, _, _ = Client().req(SHELF + "/api/settings")
+        return st2 == 401, "" if st2 == 401 else f"a request with no identity got HTTP {st2} (expected 401)"
+    st, _, b = Client().req(SHELF + "/api/auth/login", json_body={"username": A, "password": A_PW})
+    return st == 200, f"HTTP {st}"
+
+
 def page_csrf(cl, base, path="/upload"):
     st, _, b = cl.req(base + path)
     return csrf(b) if st == 200 else ""
@@ -287,10 +305,7 @@ def main():
         return st == 200, f"HTTP {st}"
     step("Kobo endpoint through Cloudflare", kobo)
 
-    def shelfmark():
-        st, _, b = Client().req(SHELF + "/api/auth/login", json_body={"username": A, "password": A_PW})
-        return st == 200, f"HTTP {st}"
-    step("Shelfmark login", shelfmark)
+    step("Shelfmark login", shelfmark_ok)
 
     kto = E.get("CANARY_KINDLE_TO", "")
     if kto and bid and datetime.date.today().weekday() == 6 and datetime.datetime.now().hour < 12:
