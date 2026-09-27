@@ -286,7 +286,17 @@ fi
 # config_anonbrowse and config_remote_login only — so an admin who ticks "Allow Reverse Proxy
 # Authentication" in CWA's own UI, or a future CWA default change, would turn header login on
 # with nothing anywhere to notice. Read it here, alongside the other two.
-docker exec calibre-web sqlite3 /config/app.db "select config_public_reg, config_kobo_sync, IFNULL(config_allow_reverse_proxy_header_login,0) from settings" 2>/dev/null | { IFS='|' read -r reg kobo rph; [ "${reg:-1}" = 0 ] && guard "config_public_reg=0 (no public registration)" || bad "CWA public registration is ON"; [ "${kobo:-0}" = 1 ] && ok "CWA Kobo sync on" || warn "CWA Kobo sync off (Users menu → enable)"; [ "${rph:-1}" = 0 ] && guard "config_allow_reverse_proxy_header_login=0" || bad "CWA config_allow_reverse_proxy_header_login=1: anything that can reach 127.0.0.1:8083 with a Remote-User header becomes that user. Caddy strips the header at the edge, so this is not remotely exploitable today, but it is one Caddyfile mistake away — turn 'Allow Reverse Proxy Authentication' off in Calibre-Web -> Admin -> Basic Configuration"; }
+# L05: with the Authelia gate on (and its secret), header login is ON by design — one login —
+# and must name exactly Remote-User, the header Caddy strips on every path; with the gate off
+# it must be OFF.
+GATE_ON=false; [ "$(envget AUTHELIA_ENABLED)" = true ] && [ -n "$(envget GATE_SECRET)" ] && GATE_ON=true
+docker exec calibre-web sqlite3 /config/app.db "select config_public_reg, config_kobo_sync, IFNULL(config_allow_reverse_proxy_header_login,0), IFNULL(config_reverse_proxy_login_header_name,''), IFNULL(config_reverse_proxy_auto_create_users,0) from settings" 2>/dev/null | { IFS='|' read -r reg kobo rph rpn rpa; [ "${reg:-1}" = 0 ] && guard "config_public_reg=0 (no public registration)" || bad "CWA public registration is ON"; [ "${kobo:-0}" = 1 ] && ok "CWA Kobo sync on" || warn "CWA Kobo sync off (Users menu → enable)"
+  if [ "$GATE_ON" = true ]; then
+    if [ "${rph:-0}" = 1 ] && [ "$rpn" = Remote-User ] && [ "${rpa:-0}" = 0 ]; then ok "CWA header login ON for the Authelia gate (Remote-User, which Caddy strips on every path; no auto-created accounts)"
+    else bad "CWA header login is not set up for the gate (on=${rph:-?} header='${rpn}' auto-create=${rpa:-?}): readers log in twice at books. — run Security -> Authelia again"; fi
+  else
+    [ "${rph:-1}" = 0 ] && guard "config_allow_reverse_proxy_header_login=0" || bad "CWA config_allow_reverse_proxy_header_login=1 while the Authelia gate is OFF: anything that can reach 127.0.0.1:8083 with a Remote-User header becomes that user. Deploy turns it off again (cwa harden), or untick 'Allow Reverse Proxy Authentication' in Calibre-Web -> Admin -> Basic Configuration"
+  fi; }
 if [ -n "$(envget ABS_TOKEN)" ]; then
   alist=$(docker exec librarian python -m abs list-users 2>/dev/null || true)
   if [ -z "$alist" ]; then bad "Audiobookshelf API not reachable with ABS_TOKEN (Library → Audiobookshelf to re-run setup)"
@@ -448,7 +458,12 @@ sys.exit(1)' 2>/dev/null; then ok "Caddy resolves the real client IP behind Clou
   c=$(code -H 'Remote-User: admin' "https://books.$D/me"); [ "$c" = 200 ] && bad "a client-supplied Remote-User header reached Calibre-Web and logged in: the (hardening) request_header strip is not in the running Caddyfile (re-run Configure)" || ok "Caddy strips client-supplied Remote-* headers ($c at the edge)"
   if grep -q forward_auth "$STACK_DIR/caddy/Caddyfile" 2>/dev/null; then
     c=$(code "https://audio.$D/ping"); [ "$c" = 200 ] && ok "gate lets the Audiobookshelf app through (/ping 200)" || bad "audio./ping -> $c (Authelia gate blocks the ABS apps)"
-    c=$(code -u x:y "https://books.$D/kosync/users/auth"); [ "$c" = 401 ] && ok "gate lets KOReader sync through (/kosync 401)" || bad "books./kosync -> $c (Authelia gate blocks KOReader)"
+    c=$(code -u x:y "https://books.$D/kosync/users/auth")
+    case "$c" in
+      401) ok "gate lets KOReader sync through (/kosync 401)";;
+      503) warn "KOReader sync is off in Calibre-Web (it answers 503), so the gate's /kosync bypass is untested; turn it on under Library -> Formats if anyone uses KOReader";;
+      *) bad "books./kosync -> $c (Authelia gate blocks KOReader)";;
+    esac
   fi
   # /kosync/users/auth is the ONE kosync endpoint that answers a wrong password with 401. The
   # progress endpoints answer 400 (cps/progress_syncing/protocols/kosync.py:532 raises
