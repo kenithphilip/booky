@@ -12,8 +12,8 @@ STACK_USER=books
 CF_API=https://api.cloudflare.com/client/v4
 BOOKSTACK_VERSION=4
 # Image pins (looked up 2026-09-22). Seeded into .env by Configure; changed by Operations -> Update.
-IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.6 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
-IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.3.15 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
+IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.7 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
+IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.4.0 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
 IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2
 IMG_SYNCTHING=syncthing/syncthing:2.1.5"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
@@ -973,6 +973,7 @@ install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 9
   write_cron bookstack-disk "17 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/disk-watch.sh >/dev/null 2>&1"
   install_metadata_push
   install_heal
+  install_mem_tidy
   install_cert_watch
   install_update_check
 }
@@ -984,6 +985,9 @@ install_cert_watch() { # L09: daily certificate / origin CA / Cloudflare token e
 }
 install_heal() { # L20: restart a container Docker reports unhealthy (scripts/heal.sh; no socket-mounted container)
   write_cron bookstack-heal "*/2 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/heal.sh 2>&1 | logger -t bookstack-heal"
+}
+install_mem_tidy() { # nightly 03:45: restart a service whose own memory grew past 70 % of its limit, only when idle
+  write_cron bookstack-memtidy "45 3 * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/mem-tidy.sh 2>&1 | logger -t bookstack-memtidy"
 }
 install_metadata_push() { # every 2 min: the portal's queued metadata and owner tags -> Calibre
   # A host job because the portal cannot do it: it mounts the library read-only and has no Docker
@@ -2118,7 +2122,7 @@ step_formats() {
   cur=$(cwa_sql "SELECT auto_convert||'|'||auto_convert_target_format||'|'||auto_ingest_automerge||'|'||kindle_epub_fixer||'|'||IFNULL(auto_convert_retained_formats,'')||'|'||IFNULL(koreader_sync_enabled,0) FROM cwa_settings;" 2>/dev/null) || { msg "Could not read CWA settings."; return 1; }
   IFS='|' read -r _ _ c_merge _ c_keep c_ko <<< "$cur"
   # The conversion target is always EPUB: the one format every reader handles. Kobo devices get
-  # EPUB too, not KEPUB: CWA v4.0.6 autodetects kepubify only at /opt/kepubify/kepubify-linux-
+  # EPUB too, not KEPUB: CWA v4.0.6 (and v4.0.7, re-checked 2026-09-28) autodetects kepubify only at /opt/kepubify/kepubify-linux-
   # {64,32}bit (cps/config_sql.py) while the image installs it at /usr/bin/kepubify, so
   # config_kepubifypath is permanently empty and the conversion in cps/kobo.py never fires.
   # EPUB syncs to a Kobo and reads fine; the only loss is that the device records reading

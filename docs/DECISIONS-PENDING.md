@@ -2,8 +2,8 @@
 
 ## 2026-09-23 — Kobo has never received KEPUB, and the real enablement path is a trap
 
-Kobo devices sync **EPUB** from this stack, not KEPUB, and always have. CWA v4.0.6
-autodetects `kepubify` only at `/opt/kepubify/kepubify-linux-{64,32}bit`
+Kobo devices sync **EPUB** from this stack, not KEPUB, and always have. CWA v4.0.6 (and
+v4.0.7, re-checked 2026-09-28: same list, kepubify still at /usr/bin) autodetects `kepubify` only at `/opt/kepubify/kepubify-linux-{64,32}bit`
 (`cps/config_sql.py:568-579`), while the image installs it at `/usr/bin/kepubify`. So
 `config_kepubifypath` is permanently empty and the conversion at `cps/kobo.py:281` never
 fires. EPUB syncs and reads perfectly well on a Kobo; the only loss is that reading position

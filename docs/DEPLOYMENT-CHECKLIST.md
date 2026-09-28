@@ -235,6 +235,10 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
 - [ ] Remove from my library (v5.5): a reader removes a shared book; it leaves their My books at
       once and their shelf in Calibre within minutes; the other reader keeps it. A book nobody
       has any more is deleted from the server after LIBRARY_RELEASE_DAYS (7).
+- [ ] v5.5.1: `/etc/cron.d/bookstack-memtidy` exists (03:45); the next morning
+      `journalctl -t bookstack-memtidy` shows one line per service. A day after an Update,
+      `docker images` no longer lists the replaced Shelfmark/CWA versions (after the 7-day
+      rollback window).
 - [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
       runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
       check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on

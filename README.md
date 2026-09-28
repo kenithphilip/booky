@@ -446,7 +446,7 @@ CWA's import-time Kindle fixer (keep off), originals to keep alongside, and
 the duplicate policy (`new_record` required for isolation). Deploy applies the secure
 defaults; users choose their own *download* format on Devices.
 
-**Kobo receives EPUB, not KEPUB.** CWA v4.0.6 looks for `kepubify` only under
+**Kobo receives EPUB, not KEPUB.** CWA v4.0.6 and v4.0.7 look for `kepubify` only under
 `/opt/kepubify/` while its image installs it at `/usr/bin/kepubify`, so KEPUB conversion is
 never enabled and never has been here. EPUB syncs and reads fine on a Kobo; the one
 difference is that reading position is recorded at chapter boundaries rather than
@@ -511,7 +511,7 @@ again (`librarian/share.py`):
   else keeps the book. The page first says how to delete the copies already on their devices
   (Kobo: *Remove → Remove from My Books*; Kindle: *Remove from Device*, plus Amazon's *Manage
   Your Content and Devices* for mailed books), because Calibre-Web's Kobo sync never removes a
-  book it no longer shows (measured in the CWA v4.0.6 source).
+  book it no longer shows (measured in the CWA v4.0.6 source, unchanged in v4.0.7).
 
 ## Keeping the VPS small (it has 80 GB; the seedbox has the space)
 - **Books no reader has any more** are deleted from the server `LIBRARY_RELEASE_DAYS` (7) after
@@ -527,9 +527,21 @@ again (`librarian/share.py`):
   cache (7 days), dangling image layers left by rebuilds (never tagged images: Update keeps
   `:prev` for its rollback), apt's package cache, restic's cache. CWA's own copies of every
   imported/converted file are off by default (Library → Formats).
-- **Memory** is not a cleanup job: every container has a hard `mem_limit`, the idle services are
-  small (measured peak for the whole stack ~2.2 GB of 4 GB), FlareSolverr's browser and Calibre
-  conversions give their memory back when done, and the kernel reclaims what is unused.
+- **Daily**: old versions of the stack's own images (the Shelfmark or CWA an Update replaced,
+  0.5-2 GB each). Kept: anything a container uses, the pinned tags, the `bookstack/*:prev`
+  rollback images, and the versions Update would roll back to, for 7 days after an update and
+  while one is unfinished. Other images on the box are never touched.
+- **Weekly**: `apt-get autoremove --purge` (old kernels and orphaned libraries only, never a
+  package installed on purpose), Audiobookshelf's daily log files after 14 days, and a failed
+  better copy's staged EPUB after 14 days.
+- **Memory, nightly at 03:45** (scripts/mem-tidy.sh): Calibre-Web, Shelfmark, Audiobookshelf and
+  Syncthing keep the memory they once needed, and only a restart returns it. A service at or
+  above `MEM_TIDY_PCT` (70) % of its own `mem_limit` is restarted, one at a time and back to
+  healthy before the next, and only when idle: nothing waiting to import and the host job not
+  writing (Calibre-Web), nothing queued or downloading (Shelfmark), nobody online
+  (Audiobookshelf). A service that does not come back is an alert. The page cache is not
+  "freed": the kernel already gives it back on demand, and dropping it only slows the next
+  minutes. Measured peak for the whole stack ~2.2 GB of 4 GB.
 
 ## Seedbox — Shelfmark downloads on your seedbox, brought home by Syncthing (Library → Seedbox)
 Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or
@@ -558,7 +570,7 @@ fingerprinting the whole seedbox tree after every run and every destructive act 
    are handed over only once rTorrent reports them complete, at least 90 seconds earlier (the
    seedbox's file watcher must catch the last pieces), and keep seeding.
 
-Timing: Shelfmark (v1.3.15, and upstream as of 2026-09-28) cancels a download after 5 minutes
+Timing: Shelfmark (v1.3.15 and v1.4.0, the latest as of 2026-09-28) cancels a download after 5 minutes
 without progress, and its "Waiting for completed files" loop does not count, whatever Completed
 Path Wait says. So the job runs every 20 seconds and hands an item over within ~2–3 minutes of
 the seedbox finishing it. One that misses the window (a big audiobook) still arrives: press

@@ -63,7 +63,7 @@ services:
 
   calibre-web:
     <<: *common
-    image: ${IMG_CWA:-crocodilestick/calibre-web-automated:v4.0.6}
+    image: ${IMG_CWA:-crocodilestick/calibre-web-automated:v4.0.7}
     container_name: calibre-web
     # Calibre conversions fork several processes and peak high; the largest fence in the stack.
     pids_limit: 1024
@@ -317,7 +317,7 @@ services:
     # the pinned v1.3.15 image (Python 3.14.7): 169.254.169.254 and 172.17.0.1 are BLOCKED,
     # but 100.64.1.5 is private=False loopback=False link_local=False reserved=False, i.e.
     # ALLOWED — the whole Tailscale CGNAT range 100.64.0.0/10 is not fenced. Redirects ARE
-    # re-checked, so the hole is the range, not the redirect handling. v1.3.15 did not fix it
+    # re-checked, so the hole is the range, not the redirect handling. v1.3.15 did not fix it, nor v1.4.0 (2026-09-28)
     # (re-verified this round); re-check whenever IMG_SHELFMARK is bumped.
     # The portal's own fence does block it — see librarian/worker.py::_check_target,
     # `CGNAT = ipaddress.ip_network("100.64.0.0/10")  # Tailscale addresses live here` — so
@@ -329,7 +329,7 @@ services:
     # The alternative, if the ACL cannot be relied on, is to turn the cover cache off
     # entirely (COVERS_CACHE_ENABLED in Shelfmark's Settings) at the cost of cover latency —
     # recorded in docs/DECISIONS-PENDING.md.
-    image: ${IMG_SHELFMARK:-ghcr.io/calibrain/shelfmark:v1.3.15}
+    image: ${IMG_SHELFMARK:-ghcr.io/calibrain/shelfmark:v1.4.0}
     container_name: shelfmark
     # Fail closed: Shelfmark silently falls back to auth mode "none" (no login at all, everyone
     # admin) when CWA's app.db is missing or unreadable at start. Refuse to start unless the

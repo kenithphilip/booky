@@ -183,7 +183,7 @@ touch "$T/notadir"
 ( STACK_DIR="$T/notadir/sub"; ENV_FILE="$STACK_DIR/.env"; envset X y ) 2>/dev/null; rc=$?
 expect '[ $rc != 0 ]' "envset returns non-zero when .env cannot be written (full disk / read-only root) (A11)"
 envdefault K1 'ignored'; envdefault KNEW 'set'; expect '[ "$(envget K1)" = changed ] && [ "$(envget KNEW)" = set ]' "envdefault only fills blanks"
-expect '[ "$(img IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.6 ]' "img() falls back to the pinned default"
+expect '[ "$(img IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.7 ]' "img() falls back to the pinned default"
 envset IMG_CWA x/y:1; expect '[ "$(img IMG_CWA)" = x/y:1 ]' "img() prefers .env"; envset IMG_CWA ""
 if command docker info >/dev/null 2>&1; then
   printf 'services:\n  t:\n    image: alpine\n    environment:\n' > "$STACK_DIR/docker-compose.yml"
@@ -2199,6 +2199,65 @@ reset "D"; step_canary
 expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
 echo "== self-test: a refused connection reads as 000, not 000000"
 expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+
+echo "== Old image versions: removed once a day, the rollback point kept"
+MT="$T/mt"; mkdir -p "$MT/bin" "$MT/stack"
+cat > "$MT/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MT/log"
+case "$1" in
+  ps) printf '%s\n' "ghcr.io/calibrain/shelfmark:v1.4.0" "someone/else:1";;
+  images) printf '%s\n' "ghcr.io/calibrain/shelfmark:v1.4.0" "ghcr.io/calibrain/shelfmark:v1.3.15" \
+      "crocodilestick/calibre-web-automated:v4.0.7" "crocodilestick/calibre-web-automated:v4.0.6" \
+      "bookstack/librarian:latest" "bookstack/librarian:prev" "bookstack/librarian:old" "other/thing:9" "<none>:<none>";;
+esac
+exit 0
+EOS
+chmod +x "$MT/bin/docker"
+printf "IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.4.0\nIMG_CWA=crocodilestick/calibre-web-automated:v4.0.7\n" > "$MT/stack/.env"
+mtdw(){ : > "$MT/log"; MT="$MT" PATH="$MT/bin:$PATH" DF_PCT=40 STACK_DIR="$MT/stack" DISK_STATE="$MT/disk.state" DISK_PAUSE_FLAG="$MT/pause" bash "$REPO/scripts/disk-watch.sh" >/dev/null 2>&1; }
+rm -f "$MT/disk.state"; mtdw
+expect 'grep -q "docker rmi ghcr.io/calibrain/shelfmark:v1.3.15" "$MT/log" && grep -q "docker rmi crocodilestick/calibre-web-automated:v4.0.6" "$MT/log" && grep -q "docker rmi bookstack/librarian:old" "$MT/log"' \
+  "old versions of the stack's own images are removed (a replaced Shelfmark, CWA, an old portal build)"
+expect '! grep -qE "docker rmi (ghcr.io/calibrain/shelfmark:v1.4.0|crocodilestick/calibre-web-automated:v4.0.7|bookstack/librarian:(latest|prev)|other/thing|someone/else)" "$MT/log"' \
+  "the pinned versions, the :prev rollback images and other people's images are never touched"
+mtdw
+expect '! grep -q "docker rmi" "$MT/log"' "once a day, not every hour"
+rm -f "$MT/disk.state"; printf "IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.3.15\n" > "$MT/stack/.env.images.prev"; mtdw
+expect '! grep -q "docker rmi ghcr.io/calibrain/shelfmark:v1.3.15" "$MT/log" && grep -q "docker rmi crocodilestick/calibre-web-automated:v4.0.6" "$MT/log"' \
+  "for 7 days after an Update, the versions it would roll back to stay"
+rm -f "$MT/disk.state"; touch -d "10 days ago" "$MT/stack/.env.images.prev" 2>/dev/null || touch -t 202001010000 "$MT/stack/.env.images.prev"; mtdw
+expect 'grep -q "docker rmi ghcr.io/calibrain/shelfmark:v1.3.15" "$MT/log"' "after that, they go too"
+rm -f "$MT/disk.state"; touch "$MT/stack/.update-in-progress"; mtdw; rm -f "$MT/stack/.update-in-progress"
+expect '! grep -q "docker rmi ghcr.io/calibrain/shelfmark:v1.3.15" "$MT/log"' "never while an update is unfinished"
+
+echo "== Nightly memory tidy: only a grown, idle service is restarted"
+cat > "$MT/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MT/log"
+case "$*" in
+  "inspect -f {{.State.Running}} "*) echo true;;
+  "stats --no-stream --format {{.MemPerc}} "*) n="${*: -1}"; v="MEM_${n//-/_}"; echo "${!v:-5}.25%";;
+  "exec -i librarian python -m admin_cli busy shelfmark") echo "{\"ok\": true, \"busy\": ${SM_BUSY:-false}}";;
+  "exec -i librarian python -m admin_cli busy audiobookshelf") echo '{"ok": true, "busy": false}';;
+  "inspect -f {{if .State.Health}}"*) echo healthy;;
+esac
+exit 0
+EOS
+printf '#!/usr/bin/env bash\nexit "${FLOCK_HELD:-0}"\n' > "$MT/bin/flock"; chmod +x "$MT/bin/docker" "$MT/bin/flock"
+mkdir -p "$MT/stack/library/ingest"; printf "X=1\n" > "$MT/stack/.env"
+mtt(){ : > "$MT/log"; MT="$MT" PATH="$MT/bin:$PATH" STACK_DIR="$MT/stack" MEMTIDY_METAPUSH_LOCK="$MT/lock" \
+  MEM_calibre_web=85 MEM_shelfmark=80 MEM_audiobookshelf=30 MEM_syncthing=10 bash "$REPO/scripts/mem-tidy.sh" > "$MT/out" 2>&1; }
+mtt
+expect 'grep -q "docker restart calibre-web" "$MT/log" && grep -q "docker restart shelfmark" "$MT/log"' "a service past 70 % of its limit and idle is restarted (Calibre-Web, Shelfmark)"
+expect '! grep -q "docker restart audiobookshelf" "$MT/log" && ! grep -q "docker restart syncthing" "$MT/log" && grep -q "audiobookshelf at 30% of its limit: fine" "$MT/out"' "one well under its limit is left alone"
+SM_BUSY=true mtt
+expect '! grep -q "docker restart shelfmark" "$MT/log" && grep -q "shelfmark at 80% but in use" "$MT/out"' "Shelfmark with a download under way is never restarted"
+touch "$MT/stack/library/ingest/new book.epub"; mtt; rm -f "$MT/stack/library/ingest/new book.epub"
+expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "books are waiting to be imported" "$MT/out"' "Calibre-Web with a book waiting to import is never restarted"
+FLOCK_HELD=1 mtt
+expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "the host job is writing to it" "$MT/out"' "...nor while the host job is writing through it"
+expect 'grep -q "write_cron bookstack-memtidy \"45 3 \* \* \*\"" "$REPO/bookstack.sh" && declare -f install_disk_watch | grep -q install_mem_tidy' "installed nightly at 03:45 by Deploy (before the 04:30 reboot window)"
 
 echo "== Family sharing: Shelfmark's request step follows the portal's ability to answer it"
 envset APPROVALS_REQUIRED false; envset FAMILY_SHARING true; envset SHELFMARK_SVC_USER ""; envset SHELFMARK_SVC_PASS ""; envset SHELFMARK_REQUESTS ""

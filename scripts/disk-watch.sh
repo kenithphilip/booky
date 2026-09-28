@@ -148,6 +148,48 @@ docker builder prune -f --filter until=168h >/dev/null 2>&1
 docker image prune -f >/dev/null 2>&1
 apt-get clean >/dev/null 2>&1
 if [ -f /etc/bookstack/restic.env ]; then ( set -a; . /etc/bookstack/restic.env; set +a; restic cache --cleanup >/dev/null 2>&1 ); fi
+
+# ---- once a day: old versions of this stack's images ----------------------------------------
+# After an Update, the previous version of each image stays on disk (tagged, so the dangling
+# prune above never takes it): a Shelfmark or CWA image is 0.5-2 GB. Removed here: images of a
+# repository this stack pins (IMG_* in .env, bookstack/caddy and bookstack/librarian) whose tag
+# is not the pinned one. Kept: anything a container uses (running or stopped), the pinned tags,
+# the bookstack/*:prev rollback images, and, while an update is unfinished or for 7 days after
+# one, the previous tags in .env.images.prev (Operations -> Update's rollback point). Images of
+# anything else on the box are never touched.
+due(){ local last; last=$(state_get "$1"); case "$last" in ''|*[!0-9]*) return 0;; esac; [ $(( $(date +%s) - last )) -ge "$2" ]; }
+prune_old_images(){
+  local keep repos img k v prev="$STACK_DIR/.env.images.prev"
+  keep=$(docker ps -a --format '{{.Image}}' 2>/dev/null)
+  repos="bookstack/caddy"$'\n'"bookstack/librarian"
+  keep="$keep"$'\n'"bookstack/caddy:latest"$'\n'"bookstack/caddy:prev"$'\n'"bookstack/librarian:latest"$'\n'"bookstack/librarian:prev"
+  for k in $(grep -oE '^IMG_[A-Z_]+' "$ENV_FILE" 2>/dev/null); do
+    v=$(envget "$k"); [ -n "$v" ] || continue
+    keep="$keep"$'\n'"$v"; repos="$repos"$'\n'"${v%:*}"
+  done
+  if [ -f "$prev" ] && { [ -e "$STACK_DIR/.update-in-progress" ] || [ $(( $(date +%s) - $(stat -c %Y "$prev" 2>/dev/null || echo 0) )) -lt 604800 ]; }; then
+    keep="$keep"$'\n'"$(cut -d= -f2- "$prev")"
+  fi
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | while read -r img; do
+    case "$img" in *'<none>'*) continue;; esac
+    printf '%s\n' "$repos" | grep -qxF "${img%:*}" || continue      # not one of ours
+    printf '%s\n' "$keep" | grep -qxF "$img" && continue
+    docker rmi "$img" >/dev/null 2>&1 && echo "disk-watch: removed the old image $img"
+  done
+}
+if due image_sweep 86400; then prune_old_images; state_set image_sweep "$(date +%s)"; fi
+
+# ---- once a week: packages and leftovers nothing needs ---------------------------------------
+# apt's autoremove takes only packages installed as dependencies that nothing depends on any
+# more (old kernels, orphaned libraries), never one installed on purpose. Audiobookshelf writes
+# a log file a day and keeps them all. A better copy (Find a better copy) whose swap failed
+# leaves its staged EPUB behind.
+if due weekly_sweep 604800; then
+  DEBIAN_FRONTEND=noninteractive apt-get -y -qq autoremove --purge >/dev/null 2>&1
+  find "$STACK_DIR/abs/metadata/logs" -type f -name '*.txt' -mtime +14 -delete 2>/dev/null
+  find "$STACK_DIR/library/staging/replace" -type f -mtime +14 -delete 2>/dev/null
+  state_set weekly_sweep "$(date +%s)"
+fi
 # dead-man's switch: Kuma's "Disk watchdog" monitor goes red if this hourly run stops happening.
 # Always "up": the disk level itself is alerted above, through alert.sh, with its own latch.
 "${KUMA_PUSH:-$STACK_DIR/scripts/kuma-push.sh}" disk up "ran: blocks ${bpct}%${ipct:+, inodes ${ipct}%}$([ -e "$PAUSE_FLAG" ] && printf ', downloaders PAUSED')" >/dev/null 2>&1 || true

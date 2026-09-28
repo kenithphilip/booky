@@ -228,6 +228,29 @@ def _replaces(args):
     db.audit("replace_result", row.get("owner"), "host", f"#{args.job_id} book {row['calibre_id']} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 
+def _busy(args):
+    """For scripts/mem-tidy.sh: is anyone using this service right now? A restart that frees
+    memory must never cut a download or someone's listening short."""
+    if args.what == "shelfmark":
+        import shelfmark_api
+        if not shelfmark_api.configured():
+            return {"ok": True, "busy": False, "why": "not configured"}
+        r = shelfmark_api._call("GET", "/api/status")
+        if r.status_code != 200:
+            raise ValueError(f"Shelfmark answered HTTP {r.status_code}")
+        st = r.json() or {}
+        n = sum(len(st.get(k) or {}) for k in ("queued", "resolving", "locating", "downloading"))
+        return {"ok": True, "busy": n > 0, "active": n}
+    import abs as absapi
+    if not absapi.configured():
+        return {"ok": True, "busy": False, "why": "not configured"}
+    r = absapi._req("GET", "/api/users/online")
+    if r.status_code != 200:
+        raise ValueError(f"Audiobookshelf answered HTTP {r.status_code}")
+    d = absapi._json(r)
+    n = len(d.get("openSessions") or []) + len(d.get("usersOnline") or [])
+    return {"ok": True, "busy": n > 0, "active": n}
+
 def _catalogs(args):
     """The admin's own OPDS catalogs (catalogs.py). The password arrives on stdin, never argv."""
     import catalogs
@@ -350,6 +373,8 @@ def _parser():
     cr.add_argument("outcome", choices=("ok", "fail"))
     cr.add_argument("--reason", default="")
 
+    sp.add_parser("busy").add_argument("what", choices=("shelfmark", "audiobookshelf"))
+
     rl = sp.add_parser("releases").add_subparsers(dest="what", required=True)
     rl.add_parser("due")
     rlr = rl.add_parser("result")
@@ -394,7 +419,7 @@ def _parser():
     return p
 
 ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
-        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "releases": _releases,
+        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "releases": _releases, "busy": _busy,
         "canary": _canary, "gate": _gate}
 
 def main(argv=None):

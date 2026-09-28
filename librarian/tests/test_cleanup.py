@@ -124,3 +124,42 @@ def test_the_waiting_list_is_written_for_the_host(users, monkeypatch, tmp_path):
     worker._export_waiting(S, now=5000.0)
     d = json.load(open(tmp_path / "seedbox-wanted.json"))
     assert d == {"at": 5000, "waiting": [{"title": "The Kite Runner", "author": "Khaled Hosseini"}]}
+
+
+# ---- is anyone using it? (scripts/mem-tidy.sh asks before a nightly restart) --------------------
+def _cli(capsys, *argv):
+    rc = admin_cli.main(list(argv))
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_shelfmark_is_busy_while_anything_is_queued_or_downloading(users, monkeypatch, capsys):
+    import shelfmark_api
+    class R:
+        status_code = 200
+        def __init__(self, st): self.st = st
+        def json(self): return self.st
+    monkeypatch.setattr(shelfmark_api, "configured", lambda: True)
+    monkeypatch.setattr(shelfmark_api, "_call", lambda *a, **k: R({"complete": {"a": {}}, "error": {"b": {}}}))
+    assert _cli(capsys, "busy", "shelfmark")[1]["busy"] is False, "finished and failed tasks do not count"
+    monkeypatch.setattr(shelfmark_api, "_call", lambda *a, **k: R({"downloading": {"a": {}}}))
+    assert _cli(capsys, "busy", "shelfmark")[1] == {"ok": True, "busy": True, "active": 1}
+
+
+def test_audiobookshelf_is_busy_while_anyone_listens(users, monkeypatch, capsys):
+    import abs as absapi
+    class R:
+        status_code = 200
+    monkeypatch.setattr(absapi, "configured", lambda: True)
+    monkeypatch.setattr(absapi, "_req", lambda *a, **k: R())
+    monkeypatch.setattr(absapi, "_json", lambda r: {"usersOnline": [], "openSessions": [{"id": "s1"}]})
+    assert _cli(capsys, "busy", "audiobookshelf")[1]["busy"] is True
+    monkeypatch.setattr(absapi, "_json", lambda r: {"usersOnline": [], "openSessions": []})
+    assert _cli(capsys, "busy", "audiobookshelf")[1]["busy"] is False
+
+
+def test_an_unreachable_service_is_never_reported_idle(users, monkeypatch, capsys):
+    import shelfmark_api
+    monkeypatch.setattr(shelfmark_api, "configured", lambda: True)
+    monkeypatch.setattr(shelfmark_api, "_call", lambda *a, **k: (_ for _ in ()).throw(shelfmark_api.ShelfmarkError("down")))
+    rc, out = _cli(capsys, "busy", "shelfmark")
+    assert rc == 1 and out["ok"] is False and "busy" not in out, "mem-tidy reads anything but busy:false as busy"

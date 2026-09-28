@@ -32,7 +32,7 @@ An item is handed over when:
   * torrents only: rTorrent reports it complete, at least RT_SETTLE (90 s) ago. rTorrent writes
     into full-size files in place, so a copy the seedbox's Syncthing scanned mid-download looks
     whole; the wait lets its file watcher (10 s) catch the last pieces first.
-  The whole hand-over has to fit in Shelfmark's FIVE minutes: v1.3.15 (and upstream main,
+  The whole hand-over has to fit in Shelfmark's FIVE minutes: v1.3.15 and v1.4.0 (and upstream main,
   2026-09-28) cancels a download after STALL_TIMEOUT = 300 s without progress, and its "Waiting
   for completed files" loop does not count as progress, whatever Completed Path Wait says. A
   hand-over that misses it (a big audiobook) still arrives; the reader presses Retry in Shelfmark,
