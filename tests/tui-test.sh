@@ -2208,7 +2208,8 @@ expect 'python3 -m py_compile "$REPO/scripts/synthetic.py"' "synthetic.py compil
 reset "D"; step_canary
 expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
 echo "== self-test: a refused connection reads as 000, not 000000"
-expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); CODE_RETRY_SLEEP=0; curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); CODE_RETRY_SLEEP=0; f=\$(mktemp); curl(){ [ -s \$f ] || { echo 1 > \$f; printf 000; return 28; }; printf 403; }; [ \"\$(code https://x)\" = 403 ]; r=\$?; rm -f \$f; exit \$r"' "code() asks once more when nothing answered: one request Cloudflare dropped is not a FAIL (live, 2026-09-28)"
 
 echo "== Caddy and Cloudflare's address list (scripts/caddy-clientip.sh, heal.sh, Deploy/Update)"
 CI="$T/ci"; mkdir -p "$CI"
@@ -2318,6 +2319,16 @@ expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "books are w
 FLOCK_HELD=1 mtt
 expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "the host job is writing to it" "$MT/out"' "...nor while the host job is writing through it"
 expect 'grep -q "write_cron bookstack-memtidy \"45 3 \* \* \*\"" "$REPO/bookstack.sh" && declare -f install_disk_watch | grep -q install_mem_tidy' "installed nightly at 03:45 by Deploy (before the 04:30 reboot window)"
+
+echo "== pipefail + early-exiting grep (the SIGPIPE false alarm, three times on the real server)"
+# grep -q stops reading at its first match; a producer with more to write then dies of SIGPIPE and,
+# under pipefail, the whole test reads as "not found". Harmless on tiny output, wrong on real output.
+expect '[ "$(set -o pipefail; seq 1 200000 | grep -q "^5$"; echo $?)" != 0 ]' "the trap is real: with pipefail, a match found early still 'fails' (so the guard below matters)"
+risky=$(grep -nE '(ip -o addr|ss -ltn|ufw status|restic [a-z]+ --help|sshd -T|find .*|journalctl .*|tail -n? ?[0-9]+ .*|docker logs .*|curl .*) *(2>[^|]*)?\| *grep -[a-zA-Z]*q' \
+          "$REPO"/scripts/*.sh "$REPO/bookstack.sh" | grep -vE '^[^:]+:[0-9]+: *#' || true)
+expect '[ -z "$risky" ]' "no script pipes a long-output command into grep -q (take the output first: grep -q ... <<< \"\$(cmd)\")"
+[ -n "$risky" ] && printf '       %s\n' "$risky"
+unset risky
 
 echo "== Daily disk summary for the admin (scripts/disk-report.sh, v5.6)"
 DR="$T/dr"; mkdir -p "$DR/bin" "$DR/stack/library/books" "$DR/stack/library/audiobooks" "$DR/stack/library/seedbox-sync" "$DR/etc"

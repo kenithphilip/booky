@@ -349,7 +349,7 @@ inject_authelia_gate(){ # per-host bypass lists live in inject-gate.py (reads fi
 reload_caddy(){ compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile --address unix//run/caddy-admin.sock 2>/dev/null || compose restart caddy; }
 route_src_ip(){ ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="src"){print $(i+1); exit}}'; }
 public_ip(){ curl -4 -fsS -m 10 https://api.ipify.org 2>/dev/null || route_src_ip; }
-ip_on_host(){ ip -o addr show 2>/dev/null | grep -qF " $1/"; }
+ip_on_host(){ grep -qF " $1/" <<< "$(ip -o addr show 2>/dev/null)"; }   # never `ip | grep -q` under pipefail (SIGPIPE)
 # Shape check only (fail2ban and Cloudflare do the real validation): enough to keep a typo out
 # of an API URL and out of `fail2ban-client set <jail> unbanip`.
 valid_ip(){ [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { [[ "$1" == *:* ]] && [[ "$1" =~ ^[0-9A-Fa-f:.]+$ ]]; }; }
@@ -557,7 +557,7 @@ step_tailscale() {
   # The package normally starts tailscaled itself; on a Debian 13 minimal image it did not
   # ("dial unix /var/run/tailscaled.socket: no such file"), so every tailscale command failed.
   systemctl enable --now tailscaled >/dev/null 2>&1 || true
-  local w; for w in $(seq 1 15); do tailscale status >/dev/null 2>&1 && break; tailscale status 2>&1 | grep -q "Logged out\|NeedsLogin" && break; sleep 1; done
+  local w; for w in $(seq 1 15); do tailscale status >/dev/null 2>&1 && break; grep -q "Logged out\|NeedsLogin" <<< "$(tailscale status 2>&1)" && break; sleep 1; done
   systemctl is-active --quiet tailscaled || { msg "The Tailscale service (tailscaled) does not start.\n\nSee: journalctl -u tailscaled -n 30 --no-pager"; return 1; }
   clear
   echo "Tailscale will print a login URL. Open it in your browser and approve this machine."
@@ -1615,7 +1615,7 @@ The server's self-test warns when snapshots older than the policy pile up."
 # Debian 12 ships restic 0.14, which has no --retry-lock: passing it unconditionally makes every
 # call fail with "unknown flag". Probe it the way the restore path already probes --overwrite.
 restic_run(){ ( set -a; . "$(restic_env)"; set +a
-  local R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
+  local R=(); grep -q -- '--retry-lock' <<< "$(restic backup --help 2>/dev/null)" && R=(--retry-lock 30m)
   restic ${R[@]+"${R[@]}"} "$@" ); }
 step_backup() {
   local live new
@@ -1824,7 +1824,7 @@ step_restore() {
   if [ "$mode" = full ]; then incl=(--include "$STACK_DIR")
   else for p in $RESTORE_CONFIG_PATHS; do incl+=(--include "$STACK_DIR/$p"); done; fi
   # restic >= 0.17 skips files that are already identical (a mostly intact library restores fast)
-  restic restore --help 2>/dev/null | grep -q -- '--overwrite' && ow=(--overwrite if-changed)
+  grep -q -- '--overwrite' <<< "$(restic restore --help 2>/dev/null)" && ow=(--overwrite if-changed)
   # in place, straight into the stopped $STACK_DIR: no temporary copy, so the disk never needs
   # room for the library twice
   echo "Restoring $SNAP_DESC into $STACK_DIR (this can take a while)..."
@@ -2779,7 +2779,7 @@ step_authelia_off() {
   msg "Gate removed — apps are back to their own logins. Authelia container stopped.$pnote\nRe-enable any time (your users and secrets are kept)."
 }
 # ---------- L05: one login behind the gate ----------
-caddy_has_gate_secret(){ [ -n "$(envget GATE_SECRET)" ] && docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' caddy 2>/dev/null | grep -qxF "BOOKSTACK_GATE_SECRET=$(envget GATE_SECRET)"; }
+caddy_has_gate_secret(){ [ -n "$(envget GATE_SECRET)" ] && grep -qxF "BOOKSTACK_GATE_SECRET=$(envget GATE_SECRET)" <<< "$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' caddy 2>/dev/null)"; }
 install_gate_sync_units(){
   local u="$ETC/systemd/system"; mkdir -p "$u"
   write_alert_template
@@ -3713,7 +3713,7 @@ SHELFMARK_SVC_NAME=svc-portal
 ensure_shelfmark_service() {
   local pw; pw=$(envget SHELFMARK_SVC_PASS)
   if [ -z "$pw" ]; then pw=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32); fi
-  if lib list 2>/dev/null | json '" ".join(u["name"] for u in d)' | tr ' ' '\n' | grep -qx "$SHELFMARK_SVC_NAME"; then
+  if grep -qx "$SHELFMARK_SVC_NAME" <<< "$(lib list 2>/dev/null | json '" ".join(u["name"] for u in d)' | tr ' ' '\n')"; then
     printf '%s\n' "$pw" | lib passwd "$SHELFMARK_SVC_NAME" --password-stdin >/dev/null 2>&1 || return 1
   else
     printf '%s\n' "$pw" | lib add-user "$SHELFMARK_SVC_NAME" --email "svc-portal@localhost" --password-stdin --admin >/dev/null 2>&1 || return 1
@@ -3743,7 +3743,7 @@ metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it
   case "$1" in
     hardcover) curl -fsS -m 15 -X POST https://api.hardcover.app/v1/graphql \
                  -H "Authorization: Bearer ${2#Bearer }" -H "Content-Type: application/json" \
-                 --data '{"query":"{ me { id } }"}' 2>/dev/null | grep -q '"me"';;
+                 --data '{"query":"{ me { id } }"}' 2>/dev/null | grep '"me"' >/dev/null;;   # grep reads it all: no SIGPIPE
     google) curl -fsS -m 15 "https://www.googleapis.com/books/v1/volumes?q=isbn:9780141439518&maxResults=1&key=$2" >/dev/null 2>&1;;
   esac
 }

@@ -32,7 +32,13 @@ envget(){ local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } |
 compose(){ (cd "$STACK_DIR" && docker compose "$@"); }
 # curl already prints 000 when it cannot connect, and then exits non-zero: "|| echo 000" made that
 # "000000", so the one check that WANTS a refused connection (the origin lock) reported a failure
-code(){ local c; c=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true; printf '%s' "${c:-000}"; }
+# One retry when nothing answered at all (000): a single request Cloudflare dropped on the way is
+# not a finding, and it was the only thing a live FAIL on 2026-09-28 turned out to be.
+code(){ local c t; for t in 1 2; do c=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true; [ "${c:-000}" != 000 ] && break; [ "$t" = 1 ] && sleep "${CODE_RETRY_SLEEP:-3}"; done; printf '%s' "${c:-000}"; }
+# NEVER `producer | grep -q`: with pipefail on, grep -q quits at its first match, the producer dies
+# of SIGPIPE writing the rest, and the pipeline "fails" although the match was found (sshd -T,
+# Caddy's access log, `ip -o addr` on a box with dozens of Docker interfaces: all false alarms on
+# the real server). Take the output first, then search it: has "<pattern>" <<< "$(producer)".
 D=$(envget DOMAIN)
 ADMIN_USER=$(envget ADMIN_USER); ADMIN_USER="${ADMIN_USER:-admin}"
 TORRENTS=$(envget TORRENTS_ENABLED)
@@ -85,14 +91,14 @@ curl -fs -m 5 http://127.0.0.1:8084/api/health >/dev/null && ok "shelfmark /api/
 SM_AUTH=$(envget SHELFMARK_AUTH_METHOD); SM_AUTH=${SM_AUTH:-cwa}
 if [ "$SM_AUTH" = proxy ]; then
   # L05, behind the Authelia gate: Remote-User from Caddy is the login. Without it, refused.
-  curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null | grep -q '"auth_mode": *"proxy"' \
+  grep -q '"auth_mode": *"proxy"' <<< "$(curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null)" \
     && ok "shelfmark in auth_mode 'proxy' (one login through the Authelia gate)" \
     || bad "shelfmark is NOT in auth_mode 'proxy' although the gate is on: check SHELFMARK_AUTH_METHOD and Operations -> Restart shelfmark"
   smp=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8084/api/settings 2>/dev/null || echo 000)
   [ "$smp" = 401 ] && ok "shelfmark refuses a request that carries no gate identity (401)" \
     || bad "shelfmark answered $smp to a request with no Remote-User (expected 401): it may be open"
 else
-curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null | grep -q '"auth_mode": *"cwa"' \
+grep -q '"auth_mode": *"cwa"' <<< "$(curl -fs -m 5 http://127.0.0.1:8084/api/auth/check 2>/dev/null)" \
   && ok "shelfmark STARTED in auth_mode 'cwa' (Calibre-Web accounts)" \
   || bad "shelfmark is NOT in auth_mode 'cwa': it is open to everyone (check ./cwa/config/app.db is readable, then Operations -> Restart shelfmark)"
 # The assertion that does NOT depend on the cached path: can Shelfmark still reach app.db RIGHT
@@ -123,12 +129,12 @@ curl -fs -m 5 -o /dev/null http://127.0.0.1:8083/login && ok "calibre-web /login
 curl -fs -m 5 -o /dev/null http://127.0.0.1:13378/healthcheck && ok "audiobookshelf /healthcheck" || bad "audiobookshelf /healthcheck"
 # L05: behind the gate Audiobookshelf's web login goes through Authelia (OpenID Connect)
 if [ "$(envget AUTHELIA_ENABLED)" = true ] && [ -n "$(envget ABS_OIDC_SECRET)" ]; then
-  curl -fs -m 5 http://127.0.0.1:13378/status 2>/dev/null | grep -q '"openid"' \
+  grep -q '"openid"' <<< "$(curl -fs -m 5 http://127.0.0.1:13378/status 2>/dev/null)" \
     && ok "audiobookshelf signs in through Authelia (OpenID Connect)" \
     || warn "audiobookshelf does not offer the Authelia sign-in: readers log in twice there (Security -> Authelia: enable again, or check ABS_TOKEN)"
 fi
 if [ "$SOLVER" = true ]; then
-  curl -fs -m 5 http://127.0.0.1:8191/health 2>/dev/null | grep -q '"ok"' && ok "flaresolverr /health" || bad "flaresolverr /health: protection challenges cannot be solved (Operations -> Logs -> flaresolverr)"
+  grep -q '"ok"' <<< "$(curl -fs -m 5 http://127.0.0.1:8191/health 2>/dev/null)" && ok "flaresolverr /health" || bad "flaresolverr /health: protection challenges cannot be solved (Operations -> Logs -> flaresolverr)"
   # what Shelfmark actually uses is the NAME on the compose network, not the loopback port
   if [ "$(envget FLARESOLVERR_ENABLED)" = true ]; then
     docker exec shelfmark curl -fs -m 5 http://flaresolverr:8191/health >/dev/null 2>&1 \
@@ -187,20 +193,22 @@ else warn "STALE PORTAL IMAGE: running '$got_ver', deployed code is '$want_ver' 
 
 echo "== Security posture"
 if command -v ufw >/dev/null; then
-  ufw status | grep -q "Status: active" && ok "ufw active" || bad "ufw inactive"
-  ufw status | grep -qE "^443/tcp.*Anywhere" && bad "443 open to Anywhere (should be Cloudflare ranges only)" || ok "443 not open to the world"
-  ufw status | grep -qE "^22/tcp.*ALLOW.*Anywhere" && warn "SSH still public (Security → Lock SSH once Tailscale works)" || ok "SSH not public"
+  ufws=$(ufw status 2>/dev/null)
+  grep -q "Status: active" <<< "$ufws" && ok "ufw active" || bad "ufw inactive"
+  grep -qE "^443/tcp.*Anywhere" <<< "$ufws" && bad "443 open to Anywhere (should be Cloudflare ranges only)" || ok "443 not open to the world"
+  grep -qE "^22/tcp.*ALLOW.*Anywhere" <<< "$ufws" && warn "SSH still public (Security → Lock SSH once Tailscale works)" || ok "SSH not public"
 fi
+listen=$(ss -ltn 2>/dev/null | awk '{print $4}')
 for p in 8083 13378 8080 8090 8084 3001 9091 8286; do
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "(^|:)$p\$" ; then
-    ss -ltn | awk '{print $4}' | grep -E ":$p\$" | grep -qvE '^(127\.0\.0\.1|\[::1\]):' && bad "port $p bound to a non-loopback address" || ok "port $p loopback-only"
+  if grep -qE "(^|:)$p\$" <<< "$listen"; then
+    grep -E ":$p\$" <<< "$listen" | grep -vE '^(127\.0\.0\.1|\[::1\]):' | grep -q . && bad "port $p bound to a non-loopback address" || ok "port $p loopback-only"
   fi
 done
-ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ':2019$' && bad "Caddy admin API listens on TCP :2019 (must be the unix socket)" || ok "Caddy admin API not on TCP"
+grep -qE ':2019$' <<< "$listen" && bad "Caddy admin API listens on TCP :2019 (must be the unix socket)" || ok "Caddy admin API not on TCP"
 pub=$(docker ps --format '{{.Names}}\t{{.Ports}}' 2>/dev/null | while IFS=$'\t' read -r n p; do
         printf '%s' "$p" | tr ',' '\n' | grep -E '(0\.0\.0\.0|\[::\]|:::)[0-9]+->' | grep -qv ':6881->' && printf '%s ' "$n"; done)
 [ -z "$pub" ] && ok "no container port published on a public address (except the torrent peer port)" || bad "published on a public address: $pub (Docker bypasses ufw)"
-if [ "$TORRENTS" != true ] && command -v ufw >/dev/null && ufw status 2>/dev/null | grep -qE '^6881'; then warn "port 6881 open in ufw but torrents are off (re-run Install -> System)"; fi
+if [ "$TORRENTS" != true ] && command -v ufw >/dev/null && grep -qE '^6881' <<< "$(ufw status 2>/dev/null)"; then warn "port 6881 open in ufw but torrents are off (re-run Install -> System)"; fi
 # the EFFECTIVE sshd configuration: a provider drop-in (50-cloud-init.conf) can override ours
 if command -v sshd >/dev/null; then
   # captured first: under pipefail, grep -q quitting at the match kills sshd -T with SIGPIPE mid-way
@@ -210,15 +218,15 @@ if command -v sshd >/dev/null; then
   elif [ -f /etc/ssh/sshd_config.d/01-bookstack.conf ]; then bad "SSH password login is still ON although 01-bookstack.conf disables it: another sshd drop-in overrides it (sshd -T | grep -i passwordauth)"
   else warn "SSH password login not disabled (add a key, re-run System step)"; fi
 fi
-if [ "$(envget SSH_LOCKED)" = true ] && ufw status 2>/dev/null | grep -qE "^22/tcp.*ALLOW.*Anywhere"; then bad "Lock SSH was chosen but port 22 is open to the world again (ufw delete allow 22/tcp)"; fi
+if [ "$(envget SSH_LOCKED)" = true ] && grep -qE "^22/tcp.*ALLOW.*Anywhere" <<< "$(ufw status 2>/dev/null)"; then bad "Lock SSH was chosen but port 22 is open to the world again (ufw delete allow 22/tcp)"; fi
 [ "$(stat -c %a "$ENV_FILE" 2>/dev/null)" = "600" ] && ok ".env is 0600" || bad ".env permissions are not 0600"
 [ "$(stat -c %U "$ENV_FILE" 2>/dev/null)" = root ] && ok ".env owned by root" || bad ".env is owned by $(stat -c %U "$ENV_FILE" 2>/dev/null) (containers run as uid 1000; run Configure)"
 tsip=$(envget TAILSCALE_IP)
 if [ -n "$tsip" ] && [ "$tsip" != 127.0.0.1 ] && command -v ip >/dev/null; then
-  ip -o addr show 2>/dev/null | grep -qF " $tsip/" && ok "Tailscale IP $tsip is on an interface" \
+  grep -qF " $tsip/" <<< "$(ip -o addr show 2>/dev/null)" && ok "Tailscale IP $tsip is on an interface" \
     || warn "Tailscale IP $tsip is not on any interface (tailscaled down or IP changed): monitor./dl. unreachable; run Install -> Tailscale, then Configure"
 fi
-if command -v tailscale >/dev/null && ! ufw status 2>/dev/null | grep -qE '^22/tcp.*ALLOW.*Anywhere'; then
+if command -v tailscale >/dev/null && ! grep -qE '^22/tcp.*ALLOW.*Anywhere' <<< "$(ufw status 2>/dev/null)"; then
   exp=$(tailscale status --json 2>/dev/null | jq -r '.Self.KeyExpiry // "null"' 2>/dev/null)
   if [ "$exp" = null ] || [ -z "$exp" ]; then ok "Tailscale key expiry disabled"
   else days=$(( ($(date -d "$exp" +%s 2>/dev/null || echo 0) - $(date +%s)) / 86400 ))
@@ -281,7 +289,7 @@ for fu in $fus; do
 done; rm -f "$cj"
 case "$lc" in 302|303) bad "Calibre-Web still accepts admin/admin123 (Users -> Reset password NOW)";; 000) warn "could not test the factory admin password";; *) ok "factory admin password rejected";; esac
 fi
-curl -s -m 5 http://127.0.0.1:13378/status 2>/dev/null | grep -q '"isInit":false' && bad "Audiobookshelf has NO root user: the first visitor becomes admin (Library -> Audiobookshelf)" || ok "Audiobookshelf initialised"
+grep -q '"isInit":false' <<< "$(curl -s -m 5 http://127.0.0.1:13378/status 2>/dev/null)" && bad "Audiobookshelf has NO root user: the first visitor becomes admin (Library -> Audiobookshelf)" || ok "Audiobookshelf initialised"
 # Per-check scratch files: mktemp, never a fixed name under a shared $TMPDIR. These two carry
 # the ONLY per-user isolation FAIL text this script produces — including in the unattended
 # post-reboot run, whose whole point is to speak up when nobody is watching — and this script
@@ -528,7 +536,12 @@ iavail=""; [ -n "$ipct" ] && iavail=$(df -i --output=iavail "$STACK_DIR" 2>/dev/
 # max(blocks, inodes) so the one threshold below keeps its meaning; the message names which.
 worst="${pct:-0}"; [ -n "$ipct" ] && [ "$ipct" -gt "$worst" ] && worst="$ipct"
 if [ -n "$availk" ]; then [ "$availk" -lt 5242880 ] || [ "${pct:-0}" -ge 90 ] && bad "low disk BLOCKS: $((availk/1048576)) GB free, ${pct}% used (< 10 % or < 5 GB)" || ok "disk blocks: $((availk/1048576)) GB free, ${pct}% used"; fi
-if [ -z "$ipct" ]; then warn "inode use not reported for $STACK_DIR (a filesystem with no fixed inode table, e.g. btrfs/zfs): the disk watchdog cannot see an inode shortage either"
+fstype=$(df --output=fstype "$STACK_DIR" 2>/dev/null | tail -1 | tr -d ' ')
+if [ -z "$ipct" ]; then
+  case "$fstype" in
+    btrfs|zfs) ok "disk inodes: $fstype creates them as it needs them (no fixed table that could run out)";;
+    *) warn "inode use not reported for $STACK_DIR (${fstype:-unknown} filesystem): the disk watchdog cannot see an inode shortage either";;
+  esac
 elif [ "$ipct" -ge 90 ]; then bad "low disk INODES: ${ipct}% of inodes used${iavail:+, only $iavail left}. This is NOT a byte shortage: freeing gigabytes will not help and df -h will keep showing free space. Delete many small files (cwa/config/processed_books, abs/metadata/cache, thumbnails); ext4 fixes its inode count at mkfs time"
 else ok "disk inodes: ${ipct}% used${iavail:+, $iavail free}"; fi
 # The watchdog latches on max(blocks, inodes); say what it is seeing so the two agree.

@@ -11,7 +11,7 @@ tmp="$(mktemp -d "$(dirname "$STACK_DIR")/.bs-restore-test.XXXXXX")"; trap 'rm -
 fail=0
 # --retry-lock (the nightly backup may hold the repository lock) needs restic >= 0.16; Debian 12
 # ships 0.14, which fails every call with "unknown flag". Probe, exactly as scripts/backup.sh does.
-R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
+R=(); grep -q -- '--retry-lock' <<< "$(restic backup --help 2>/dev/null)" && R=(--retry-lock 30m)
 ok(){ echo "  [ OK ] $1"; }
 bad(){ echo "  [FAIL] $1"; fail=$((fail+1)); }
 
@@ -38,7 +38,7 @@ done
 # a restore falls back to the raw file without its WAL (recent users, Kobo tokens lost)
 for core in cwa/config/app.db cwa/config/cwa.db library/books/metadata.db librarian/state/librarian.db abs/config/absdatabase.sqlite; do
   [ -f "$STACK_DIR/$core" ] || continue
-  if [ -f "$r/.backup-snap/MANIFEST" ] && cut -f2 "$r/.backup-snap/MANIFEST" | grep -qxF "$core"; then ok "consistent copy of $core in the snapshot"
+  if [ -f "$r/.backup-snap/MANIFEST" ] && grep -qxF "$core" <<< "$(cut -f2 "$r/.backup-snap/MANIFEST")"; then ok "consistent copy of $core in the snapshot"
   else bad "no consistent copy of $core in the snapshot (backup.sh could not snapshot it)"; fi
 done
 

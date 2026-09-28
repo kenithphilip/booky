@@ -21,7 +21,7 @@ extra_tag=""; [ "${1:-}" = "--tag" ] && extra_tag="${2:-}"
 # --retry-lock (wait for a concurrent restore test instead of failing) landed in restic 0.16.
 # Debian 12 ships 0.14, which dies with "unknown flag" on EVERY call — i.e. every nightly backup.
 # Probe for it the way bookstack.sh probes `restic restore --overwrite`.
-R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
+R=(); grep -q -- '--retry-lock' <<< "$(restic backup --help 2>/dev/null)" && R=(--retry-lock 30m)
 envget(){ local raw; raw=$({ grep -E "^$1=" "$STACK_DIR/.env" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
 PING_URL=$(envget BACKUP_PING_URL)

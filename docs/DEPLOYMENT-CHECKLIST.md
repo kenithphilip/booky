@@ -200,6 +200,14 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.6.1 (self-test false alarms seen on the live server)
+- Live 2026-09-28: "Tailscale IP not on any interface" while `ip -o addr show tailscale0` showed
+  it: `ip -o addr | grep -q` under pipefail (SIGPIPE). Every long-output `| grep -q` in the
+  scripts now searches captured output instead; tests/tui-test.sh fails if one comes back (779
+  passed). Same fix in mem-tidy.sh, where it could have restarted Calibre-Web mid-import.
+- One edge probe answered 000 (no reply in 12 s) while its neighbours answered 403: edge probes
+  retry once on 000. btrfs/zfs report no inode table: an OK now, not a warning.
+
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,

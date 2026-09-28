@@ -59,7 +59,9 @@ for c in calibre-web shelfmark audiobookshelf syncthing; do
   if [ "$p" -lt "$PCT" ]; then echo "mem-tidy: $c at ${p}% of its limit: fine"; continue; fi
   case "$c" in
     calibre-web)
-      if find "$STACK_DIR/library/ingest" -maxdepth 1 -type f ! -name '*.part' ! -name '*.tmp' 2>/dev/null | grep -q .; then
+      # find's own -quit, not `find | grep -q .`: under pipefail grep -q quitting would SIGPIPE a
+      # find with more to print, read as "nothing waiting", and restart Calibre-Web mid-import
+      if [ -n "$(find "$STACK_DIR/library/ingest" -maxdepth 1 -type f ! -name '*.part' ! -name '*.tmp' -print -quit 2>/dev/null)" ]; then
         echo "mem-tidy: calibre-web at ${p}% but books are waiting to be imported: next night"; continue
       fi
       exec 9>"$LOCK"

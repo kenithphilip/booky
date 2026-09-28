@@ -20,7 +20,7 @@ PENV="${RESTIC_PRUNE_ENV:-/etc/bookstack/restic-prune.env}"
 # shellcheck source=/dev/null
 set -a; . "$PENV"; set +a
 STACK_DIR="${STACK_DIR:-/srv/bookstack}"
-R=(); restic backup --help 2>/dev/null | grep -q -- '--retry-lock' && R=(--retry-lock 30m)
+R=(); grep -q -- '--retry-lock' <<< "$(restic backup --help 2>/dev/null)" && R=(--retry-lock 30m)
 envget(){ local raw; raw=$({ grep -E "^$1=" "$STACK_DIR/.env" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
 num(){ local v="${!1:-}"; [ -n "$v" ] || v=$(envget "$1"); case "$v" in ''|*[!0-9]*) v="$2";; esac; printf '%s' "$v"; }
