@@ -291,6 +291,16 @@ def init():
             provider TEXT PRIMARY KEY,
             failures INTEGER DEFAULT 0, opened_at REAL, retry_after REAL,
             last_error TEXT, last_ok REAL)""")
+        # admin notifications about things polled every few seconds (Shelfmark's queue): told once
+        c.execute("""CREATE TABLE IF NOT EXISTS notified(key TEXT PRIMARY KEY, at REAL NOT NULL)""")
+
+def first_notice(key, now=None, keep_days=30):
+    """True the first time `key` is seen (and remembers it), False after that. Survives a
+    restart, so a portal restart does not repeat every notice. Keys older than keep_days go."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM notified WHERE at < ?", (now - keep_days * 86400,))
+        return c.execute("INSERT OR IGNORE INTO notified(key, at) VALUES(?, ?)", (key, now)).rowcount == 1
 
 def get_prefs(owner):
     with _conn() as c:

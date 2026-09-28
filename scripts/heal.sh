@@ -36,7 +36,7 @@ for c in $HEAL; do
   if [ $(( now - last )) -lt "$COOLDOWN" ]; then
     # already restarted recently and still unhealthy: a person has to look; say so once
     if [ "$(get "told_$c")" != "$last" ]; then
-      "$ALERT" "Bookstack: $c is still unhealthy after a restart" \
+      ALERT_SEQ="heal-$c" "$ALERT" "Bookstack: $c is still unhealthy after a restart" \
         "It was restarted $(( (now - last) / 60 )) min ago and is unhealthy again; not restarting it again for now. Operations -> Logs -> $c." high >/dev/null 2>&1 || true
       put "told_$c" "$last"
     fi
@@ -45,11 +45,11 @@ for c in $HEAL; do
   why=$(docker inspect -f '{{range .State.Health.Log}}{{.Output}}{{end}}' "$c" 2>/dev/null | tail -c 300 | tr '\n' ' ')
   if docker restart "$c" >/dev/null 2>&1; then
     put "restart_$c" "$now"; put "seen_$c" 0
-    "$ALERT" "Bookstack: restarted $c (unhealthy)" \
+    ALERT_SEQ="heal-$c" "$ALERT" "Bookstack: restarted $c (unhealthy)" \
       "Docker reported $c unhealthy for two checks in a row, so it was restarted. Last healthcheck output: ${why:-none}" >/dev/null 2>&1 || true
     logger -t bookstack-heal "restarted $c (unhealthy): ${why:0:200}" 2>/dev/null || true
   else
-    "$ALERT" "Bookstack: could not restart unhealthy $c" "docker restart $c failed. Operations -> Logs -> $c." high >/dev/null 2>&1 || true
+    ALERT_SEQ="heal-$c" "$ALERT" "Bookstack: could not restart unhealthy $c" "docker restart $c failed. Operations -> Logs -> $c." high >/dev/null 2>&1 || true
   fi
 done
 

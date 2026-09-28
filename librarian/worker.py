@@ -477,7 +477,13 @@ def shelfmark_gate_once(now=None):
     import shelfmark_api
     if not shelfmark_api.configured():
         return 0, 0
-    _export_waiting(shelfmark_api)
+    try:
+        queue = shelfmark_api.queue_status()     # one read of the queue for both uses below
+    except Exception as e:
+        log.debug("could not read Shelfmark's queue: %s", e)
+        queue = None
+    _export_waiting(shelfmark_api, status=queue)
+    _report_failed_downloads(shelfmark_api, queue)
     try:
         rows = shelfmark_api.pending(cache=False)
     except shelfmark_api.ShelfmarkError as e:
@@ -486,8 +492,14 @@ def shelfmark_gate_once(now=None):
     shared = approved = 0
     for x in rows:
         owner = x.get("requester") or ""
+        told = {"owner": owner, "title": x.get("title"), "author": x.get("author"), "source": "shelfmark",
+                "seq": notify.seq_id("shelf", x.get("id"))}
+        def waiting():                           # left for the admin: say so once
+            if db.first_notice(f"shelfmark-pending-{x.get('id')}"):
+                notify.admin("requested", dict(told, status="pending"))
         try:
             if not owner or cwa.get_user(owner) is None:
+                waiting()
                 continue                         # not a library account: the admin decides
         except cwa.CwaError:
             continue
@@ -506,6 +518,9 @@ def shelfmark_gate_once(now=None):
                         if not config.APPROVALS_REQUIRED:
                             shelfmark_api.decide(x["id"], True, "")
                             approved += 1
+                            notify.admin("requested", dict(told, status="queued", detail="a better copy of a book already in the library"))
+                        else:
+                            waiting()
                     else:
                         shelfmark_api.decide(x["id"], False, SHELF_PICK_EPUB)
                     continue
@@ -516,12 +531,18 @@ def shelfmark_gate_once(now=None):
                                                   f"nothing downloaded; {AUTO_TAG_NOTE}: {_owner_tag(owner)}")
                     share.give_ebook(m, owner, rid, now)
             if m:
-                shelfmark_api.decide(x["id"], False, SHELF_OWNED if owner in m["owners"] else SHELF_SHARED)
+                note = SHELF_OWNED if owner in m["owners"] else SHELF_SHARED
+                shelfmark_api.decide(x["id"], False, note)
                 db.audit("family_share", owner, "shelfmark", f"#{x['id']} {x['title'][:80]} ({m['how']})")
                 shared += 1
+                if note == SHELF_SHARED:
+                    notify.admin("shared", dict(told, status="shared", detail=f"matched by {m['how']}"))
             elif not config.APPROVALS_REQUIRED:
                 shelfmark_api.decide(x["id"], True, "")
                 approved += 1
+                notify.admin("requested", dict(told, status="queued"))
+            else:
+                waiting()
         except Exception as e:                   # one bad row never blocks the others
             log.warning("Shelfmark gate: request #%s: %s", x.get("id"), e)
     return shared, approved
@@ -529,14 +550,30 @@ def shelfmark_gate_once(now=None):
 WAITING_FILE = os.path.join(os.path.dirname(config.STATE_DB), "seedbox-wanted.json")
 _WAITING = {"last": None, "at": 0.0}
 
-def _export_waiting(shelfmark_api, now=None):
+def _report_failed_downloads(shelfmark_api, queue):
+    """A Shelfmark download that failed (a source that broke, a stall it cancelled) is otherwise
+    only on the reader's own Shelfmark page: tell the admin, once per download."""
+    n = 0
+    try:
+        for f in (shelfmark_api.failed(queue) if queue else []):
+            if db.first_notice(f"shelfmark-error-{f['task_id']}"):
+                notify.admin("error", {"owner": f["user"] or "?", "title": f["title"], "author": f["author"],
+                                       "source": "shelfmark", "status": "error",
+                                       "detail": f["message"] or "the download failed in Shelfmark",
+                                       "seq": notify.seq_id("shelf-task", f["task_id"])})
+                n += 1
+    except Exception as e:                       # never let this block the gate
+        log.warning("could not report Shelfmark's failed downloads: %s", e)
+    return n
+
+def _export_waiting(shelfmark_api, now=None, status=None):
     """The seedbox job (scripts/seedbox-fetch.py) drops its synced copy of a download after a
     week and tells Syncthing to ignore it. Asked for again, the torrent is already complete on
     the seedbox, so Shelfmark just waits for the file: this list (librarian/state, which the host
     reads) is what makes the job bring that copy back through Syncthing."""
     now = now or time.time()
     try:
-        titles = shelfmark_api.waiting_for_files()
+        titles = shelfmark_api.waiting_for_files() if status is None else shelfmark_api.waiting_for_files(status)
     except Exception as e:                       # never let this block the gate
         log.debug("could not read Shelfmark's queue: %s", e)
         return

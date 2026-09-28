@@ -94,7 +94,13 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   `library/staging/.disk-paused` (the portal's own imports honour it) at `DISK_STOP_PCT`,
   start them again below `DISK_RESUME_PCT`. The percentage is the worse of blocks-used and
   inodes-used, and the alert names which tripped (the remedies are unrelated)
-- `alert.sh` — one entry point for alerts: portal (webhook/e-mail), else journal + direct ntfy/webhook post
+- `alert.sh` — one entry point for alerts: portal (webhook/e-mail), else journal + direct ntfy/webhook post.
+  `ALERT_SEQ` gives a problem and its all-clear one ntfy Sequence-ID (the all-clear replaces it on
+  the phone); `ALERT_TAGS` / `ALERT_CLICK` set the emoji and what tapping it opens
+- `disk-report.sh` — daily at `DISK_REPORT_HOUR` (09:05, cron `bookstack-diskreport`): the admin's
+  disk summary on the alert channel: how full, growth since yesterday and over the week, days
+  until `DISK_WARN_PCT`, where the space went (ebooks, audiobooks, seedbox copies, Docker),
+  memory. One Sequence-ID, so today's replaces yesterday's. `DISK_REPORT=false` turns it off
 - `kuma-push.sh` — `kuma-push.sh <job> up|down [msg]`: a scheduled job reports to its Kuma push
   monitor (selftest, disk, metapush, cfips, backup, canary); a no-op until monitoring is set up
 - `selftest.sh` — non-destructive health/security check (Operations → Self-test). Includes the
@@ -173,6 +179,9 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   containers
 - `monitoring-test.sh` — `kuma_bootstrap.py` against the real pinned Uptime Kuma, a webhook
   receiver and GreenMail (setup, idempotence, drift repair, push, /metrics, both alert channels)
+- `caddy-build-test.sh` — builds `caddy/Dockerfile`, checks `caddy version` is the release it asks
+  for (v2.10.2 while GHSA-6365-7ppr-5r92 is open) and its three plugins, and validates the full
+  production Caddyfile (every optional site, the Authelia gate injected) on it
 
 ## docs/
 - `DEPLOYMENT-CHECKLIST.md` — what is verified locally per version and what to check on the VPS

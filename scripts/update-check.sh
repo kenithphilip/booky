@@ -57,7 +57,7 @@ print("\n".join(out))
 PY
 )
 if [ -n "$news" ]; then
-  "$ALERT" "Bookstack: newer releases are available" "$news
+  ALERT_SEQ=updates ALERT_TAGS=package "$ALERT" "Bookstack: newer releases are available" "$news
 
 Read each project's release notes, then Operations -> Update (it backs up first and can roll back)." >/dev/null 2>&1 || true
   echo "update-check: new releases:"; echo "$news"

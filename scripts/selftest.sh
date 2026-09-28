@@ -611,6 +611,9 @@ if [ -d "$STACK_DIR/.backup-snap/host" ]; then
     || bad "the backup staging area carries repository secrets: $leak — every snapshot then contains the key that decrypts it and the credentials that can delete it. Update scripts/scripts (copy_code_trees) and rotate: restic key add + a NEW B2/S3 application key"
 fi
 [ -f /etc/cron.d/bookstack-disk ] && ok "disk watchdog installed" || warn "disk watchdog not installed (re-run Deploy)"
+if [ "$(envget DISK_REPORT)" != false ]; then
+  [ -f /etc/cron.d/bookstack-diskreport ] && ok "daily disk summary scheduled" || warn "daily disk summary not scheduled (re-run Deploy)"
+fi
 [ -e "$STACK_DIR/library/staging/.disk-paused" ] && warn "the disk watchdog has PAUSED the downloaders AND the portal's own imports (library/staging/.disk-paused); it clears itself below DISK_RESUME_PCT"
 if [ -f /etc/cron.d/bookstack-disk ] || [ -f /etc/cron.d/bookstack-cfips ]; then
   systemctl is-active cron >/dev/null 2>&1 && ok "cron daemon running (disk watchdog, Cloudflare IP refresh)" || bad "cron is not running: the disk watchdog and the Cloudflare IP refresh never run (apt-get install cron; systemctl enable --now cron)"

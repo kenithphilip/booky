@@ -224,6 +224,11 @@ for _ in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:23378/healthchec
 absout=$(compose run --rm --no-deps -T librarian python -m abs init --user root --password rootpass-e2e1 2>&1 | tail -1)
 abskey=$(printf '%s' "$absout" | python3 -c 'import sys,json; print(json.load(sys.stdin)["api_key"])' 2>/dev/null || true)
 if [ -n "$abskey" ]; then envset ABS_TOKEN "$abskey"; echo "   [ OK ] python -m abs init: root + API key + library"; else echo "   [FAIL] abs init: $absout"; fi
+# v5.6: Audiobookshelf's own nightly database copy, switched on the way Deploy does it
+bout=$(compose run --rm --no-deps -T -e ABS_TOKEN="$abskey" librarian python -m abs backups 2>&1 | tail -1)
+printf '%s' "$bout" | grep -q '"backupSchedule": "30 2 \* \* \*", "backupsToKeep": 3, "maxBackupSize": 1' \
+  && echo "   [ OK ] python -m abs backups: Audiobookshelf keeps 3 nightly copies of its database (read back from it)" \
+  || { echo "   [FAIL] abs backups: $bout"; pre_fail=$(( ${pre_fail:-0} + 1 )); }
 echo "== starting the rest"; compose up -d greenmail filesrv authelia librarian shelfmark gate
 # memory sampler (every 5 s) for the sizing table
 ( while true; do docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null | sed 's|/.*||'; sleep 5; done ) > stats.log 2>/dev/null &
@@ -244,6 +249,7 @@ docker exec audiobookshelf ffmpeg -loglevel error -f lavfi -i anullsrc=r=22050:c
 sleep 3
 echo "== driving the user journeys"
 python3 "$REPO/tests/e2e_driver.py" "$STACK"; rc=$?
+rc=$(( rc + ${pre_fail:-0} ))           # set-up checks that failed before the driver ran
 echo "== L08: the canary journey (scripts/synthetic.py) against this stack"
 CE="$STACK/canary.env"; : > "$CE"; cok=1
 for n in canary-a canary-b; do

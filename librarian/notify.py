@@ -1,12 +1,20 @@
 """Notifications. Two channels, both best-effort and never blocking a request:
-  - NOTIFY_WEBHOOK: a POST on every event. Generic hooks get JSON; ntfy (the free default the
-    installer suggests) gets a plain-text body with Title/Priority headers so the phone shows
-    a readable message (NOTIFY_WEBHOOK_FORMAT=auto|json|ntfy).
+  - NOTIFY_WEBHOOK: the ADMIN's channel (readers never see it): a POST on every event for every
+    reader. Generic hooks get JSON; ntfy (the free default the installer suggests) gets a
+    plain-text body with Title/Priority headers so the phone shows a readable message
+    (NOTIFY_WEBHOOK_FORMAT=auto|json|ntfy). On ntfy each message also carries:
+      Tags         an emoji per kind of event, so the phone says what happened at a glance
+      Click        the portal page to open when the notification is tapped
+      Actions      a "Review" button on anything waiting for the admin
+      Sequence-ID  one notification per request / per problem: a request's later events and a
+                   problem's all-clear REPLACE the earlier notification instead of piling up
+    Routine successes are Priority low (silent, in the drawer); anything waiting for the admin
+    or failed is high.
   - e-mail (the same SMTP as Send-to-Kindle): the requester gets a note when their request is
     done, denied or failed (if they opted in on Devices; own uploads only on failure); the
     admin gets a note when a request waits for approval or imported without an owner tag
     (if ADMIN_EMAIL is set)."""
-import json, urllib.request, threading, sys
+import json, re, urllib.request, threading, sys
 from urllib.parse import urlsplit
 from email.message import EmailMessage
 import config, db
@@ -19,6 +27,21 @@ USER_EVENTS = {"done": "is in your library", "denied": "was denied", "error": "c
                "wanted-expired": "did not turn up in any catalog, so we have stopped looking"}
 EVENTS = set(USER_EVENTS) | {"requested", "approved"}
 
+# The admin's view of the same events (webhook only; the reader's mail keeps USER_EVENTS).
+ADMIN_EVENTS = {"requested": "requested", "pending": "requested: waiting for your approval",
+                "approved": "approved", "done": "added to their library", "denied": "denied",
+                "error": "could not be added", "needs-tag": "imported, but needs an owner tag",
+                "shared": "given from the family library (nothing downloaded)",
+                "wanted-found": "found by Keep looking and requested",
+                "wanted-candidate": "possibly found by Keep looking (the reader confirms it)",
+                "wanted-expired": "not found by Keep looking; it has stopped looking"}
+# ntfy turns a tag that is an emoji short code into that emoji in front of the title
+TAGS = {"requested": "inbox_tray", "pending": "raised_hand", "approved": "+1", "done": "books",
+        "denied": "no_entry", "error": "x", "needs-tag": "label", "shared": "busts_in_silhouette",
+        "wanted-found": "mag", "wanted-candidate": "question", "wanted-expired": "hourglass"}
+PRIORITY = {"pending": "high", "error": "high", "needs-tag": "default", "wanted-candidate": "default"}  # else low
+ALERT_TAGS = {"urgent": "rotating_light", "high": "rotating_light", "low": "information_source"}   # else warning
+
 def send(event, req):
     # the canary journey's hidden accounts (L08) report through their own run, never as a
     # "library: done" on the family's phones twice a day
@@ -27,20 +50,49 @@ def send(event, req):
     _webhook(event, req)
     threading.Thread(target=_mail, args=(event, req), daemon=True).start()
 
+def admin(event, req):
+    """The admin's notification only (the webhook): for what the portal sees happen elsewhere,
+    Shelfmark's requests and failed downloads. The reader is never mailed about these."""
+    if req.get("owner") in config.CANARY_USERS:
+        return
+    _webhook(event, req)
+
 def _ntfy(url):
     fmt = config.NOTIFY_WEBHOOK_FORMAT
     return fmt == "ntfy" or (fmt == "auto" and "ntfy" in (urlsplit(url).hostname or ""))
 
-def _post(url, title, text, priority, payload):
-    """One webhook POST in the configured shape. Raises on failure."""
+def portal_url(path="/admin"):
+    return f"https://request.{config.DOMAIN}{path}" if config.DOMAIN else ""
+
+def seq_id(*parts):
+    """An ntfy Sequence-ID: letters, digits, - and _, at most 64 characters."""
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", "-".join(str(p) for p in parts if p not in (None, ""))).strip("-")[:64]
+
+def _latin1(s, n=None):
+    # HTTP headers must be latin-1: keep them ASCII-safe, the body carries the details
+    s = str(s).replace("\r", " ").replace("\n", " ").encode("ascii", "replace").decode()
+    return s[:n] if n else s
+
+def _post(url, title, text, priority, payload, tags=None, click=None, seq=None, actions=None):
+    """One webhook POST in the configured shape. Raises on failure. tags/click/seq/actions are
+    ntfy's (a generic JSON hook gets them as fields, only when set)."""
     if _ntfy(url):
-        prio = {"high": "high", "urgent": "urgent", "low": "low"}.get(priority, "default")
-        # HTTP headers must be latin-1: keep the title ASCII-safe, the body carries the details
-        hdr = {"Title": title.encode("ascii", "replace").decode()[:200], "Priority": prio,
-               "Content-Type": "text/plain; charset=utf-8"}
+        prio = {"high": "high", "urgent": "urgent", "low": "low", "min": "min"}.get(priority, "default")
+        hdr = {"Title": _latin1(title, 200), "Priority": prio, "Content-Type": "text/plain; charset=utf-8"}
+        if tags:
+            hdr["Tags"] = _latin1(tags)
+        if click:
+            hdr["Click"] = _latin1(click)
+        if seq:
+            hdr["Sequence-ID"] = seq_id(seq)
+        if actions:
+            # "view, <label>, <url>" per action, at most three, separated by ;
+            hdr["Actions"] = _latin1("; ".join(f"view, {label}, {u}" for label, u in actions[:3]))
         r = urllib.request.Request(url, data=text.encode("utf-8"), headers=hdr)
     else:
-        r = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
+        extra = {k: v for k, v in (("tags", tags), ("click", click), ("seq", seq and seq_id(seq))) if v}
+        r = urllib.request.Request(url, data=json.dumps({**payload, **extra}).encode(),
+                                   headers={"Content-Type": "application/json"})
     urllib.request.urlopen(r, timeout=8)
 
 def _webhook(event, req):
@@ -49,10 +101,18 @@ def _webhook(event, req):
         return
     body = {"event": event, "title": req.get("title"), "author": req.get("author"), "owner": req.get("owner"),
             "source": req.get("source"), "status": req.get("status"), "detail": req.get("detail")}
-    text = f"{req.get('owner')}: \"{req.get('title')}\" {USER_EVENTS.get(event, event)}" \
+    kind = "pending" if event == "requested" and req.get("status") == "pending" else event
+    by = f" by {req['author']}" if req.get("author") else ""
+    via = f" (via {req['source']})" if req.get("source") else ""
+    text = f"\"{req.get('title')}\"{by}\n{req.get('owner')}: {ADMIN_EVENTS.get(kind, kind)}{via}" \
         + (f"\n{req.get('detail')}" if req.get("detail") and event != "done" else "")
+    click = portal_url("/status" if kind == "pending" else "/admin")    # Pending card / audit trail
+    actions = [("Review", click)] if kind == "pending" and click else None
+    # one notification per request: its later events replace the earlier ones on the phone
+    seq = req.get("seq") or (seq_id("req", req["id"]) if req.get("id") else None)
     try:
-        _post(url, f"library: {event}", text, "high" if event == "error" else "default", body)
+        _post(url, f"{req.get('owner')}: {req.get('title')}", text, PRIORITY.get(kind, "low"), body,
+              tags=TAGS.get(kind), click=click or None, seq=seq, actions=actions)
     except Exception:
         pass
 
@@ -95,16 +155,18 @@ def _deliver(to, subject, text):
     msg.set_content(text)
     kindle._deliver(msg)
 
-def alert(title, text, priority="default"):
+def alert(title, text, priority="default", seq=None, tags=None, click=None):
     """Operational alert (backup failed, disk full, container unhealthy, audiobook left
     untagged): webhook + admin mail. Best-effort; returns a list of the channels that took it
-    (empty = nobody was told; the reason is printed to stderr)."""
+    (empty = nobody was told; the reason is printed to stderr). seq: the same value on the
+    problem and on its all-clear, so the all-clear replaces the problem on the phone."""
     import kindle
     took = []
     if config.NOTIFY_WEBHOOK:
         try:
             _post(config.NOTIFY_WEBHOOK, f"[bookstack] {title}", text, priority,
-                  {"event": "alert", "title": title, "text": text, "priority": priority})
+                  {"event": "alert", "title": title, "text": text, "priority": priority},
+                  tags=tags or ALERT_TAGS.get(priority, "warning"), click=click or portal_url() or None, seq=seq)
             took.append("webhook")
         except Exception as e:
             print(f"alert: webhook failed: {e}", file=sys.stderr)
@@ -128,11 +190,18 @@ def why_undelivered():
     return "; ".join(missing) or "every configured channel failed (see the errors above)"
 
 def _cli(argv):
-    """python -m notify alert "<title>" "<text>" [priority]   (scripts/alert.sh, systemd OnFailure=)
-    Exit 0 when at least one channel took the alert, 3 when nothing was delivered (so the host
-    side logs it to the journal and tries its own webhook), 2 on usage errors."""
-    if len(argv) >= 3 and argv[0] == "alert":
-        sent = alert(argv[1], argv[2], argv[3] if len(argv) > 3 else "default")
+    """python -m notify alert "<title>" "<text>" [priority] [--seq ID] [--tags T] [--click URL]
+    (scripts/alert.sh, systemd OnFailure=). Exit 0 when at least one channel took the alert, 3
+    when nothing was delivered (so the host side logs it to the journal and tries its own
+    webhook), 2 on usage errors."""
+    opts, pos, it = {}, [], iter(argv)
+    for a in it:
+        if a in ("--seq", "--tags", "--click"):
+            opts[a[2:]] = next(it, "") or None
+        else:
+            pos.append(a)
+    if len(pos) >= 3 and pos[0] == "alert":
+        sent = alert(pos[1], pos[2], pos[3] if len(pos) > 3 and pos[3] else "default", **opts)
         if sent:
             print(json.dumps({"ok": True, "sent": sent}))
             return 0

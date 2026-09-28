@@ -106,18 +106,42 @@ def pending(force=False, cache=True):
     return rows
 
 
-def waiting_for_files():
-    """[{title, author}] of Shelfmark downloads a client reports done but whose file has not
-    appeared yet ("Waiting for completed files"): what the seedbox job should bring back."""
+def queue_status():
+    """Shelfmark's download queue, {status: {task_id: task}} (queued, resolving, locating,
+    downloading, complete, error, cancelled). The service account is an admin, so this is every
+    user's queue. Finished and failed tasks stay listed for STATUS_TIMEOUT (1 h)."""
     if not configured():
-        return []
+        return {}
     r = _call("GET", "/api/status")
     if r.status_code != 200:
         raise ShelfmarkError(f"Shelfmark answered HTTP {r.status_code} for its queue")
+    st = r.json() or {}
+    return st if isinstance(st, dict) else {}
+
+
+def waiting_for_files(status=None):
+    """[{title, author}] of Shelfmark downloads a client reports done but whose file has not
+    appeared yet ("Waiting for completed files"): what the seedbox job should bring back."""
+    st = queue_status() if status is None else status
     out = []
-    for task in ((r.json() or {}).get("locating") or {}).values():
+    for task in (st.get("locating") or {}).values():
         if isinstance(task, dict) and "completed files" in (task.get("status_message") or "").lower():
             out.append({"title": task.get("title") or "", "author": task.get("author") or ""})
+    return out
+
+
+def failed(status=None):
+    """[{task_id, title, author, user, message}] of downloads that ended in an error (a source
+    that failed, a stall Shelfmark cancelled): nobody but the reader would otherwise know.
+    Task fields as v1.4.0's orchestrator._task_to_dict writes them: id, title, author, username,
+    status_message (which carries the error text; last_error_message is not serialized)."""
+    st = queue_status() if status is None else status
+    out = []
+    for tid, task in (st.get("error") or {}).items():
+        if isinstance(task, dict):
+            out.append({"task_id": str(task.get("id") or tid), "title": task.get("title") or "Unknown title",
+                        "author": task.get("author") or "", "user": task.get("username") or "",
+                        "message": task.get("status_message") or ""})
     return out
 
 

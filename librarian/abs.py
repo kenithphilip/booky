@@ -266,6 +266,26 @@ def set_oidc(on, token=None):
         raise AbsError(f"Audiobookshelf did not switch its sign-in methods (now: {', '.join(methods) or 'none'})")
     return {"methods": methods}
 
+# ---- Audiobookshelf's own backups (database + covers and metadata, never the audio) ----------
+# Off in a fresh Audiobookshelf (backupSchedule false). A few nightly copies in
+# abs/metadata/backups are a cheap guard against a corrupted absdatabase.sqlite, the one file that
+# holds every listener's progress, while restic backups are not set up. It does not protect
+# against losing the disk: that is what Install -> Backups is for.
+BACKUP_SCHEDULE = "30 2 * * *"     # 02:30: after the 01:00 restic run, before the 03:45 memory tidy
+BACKUPS_TO_KEEP = 3
+BACKUP_MAX_GB = 1                  # a bigger backup is skipped rather than filling the disk
+
+def set_backups(token=None):
+    want = {"backupSchedule": BACKUP_SCHEDULE, "backupsToKeep": BACKUPS_TO_KEEP, "maxBackupSize": BACKUP_MAX_GB}
+    r = _req("PATCH", "/api/settings", token=token, json=want)
+    if r.status_code != 200:
+        raise AbsError(f"Audiobookshelf refused the backup settings (HTTP {r.status_code}: {r.text[:120]})")
+    got = (_json(r) or {}).get("serverSettings") or {}
+    if any(got.get(k) != v for k, v in want.items()):
+        raise AbsError(f"Audiobookshelf did not keep the backup settings (now: {got.get('backupSchedule')!r}, "
+                       f"keep {got.get('backupsToKeep')!r})")
+    return {k: got[k] for k in want}
+
 def _password_args(sub, required=True):
     """--password <pw> or --password-stdin (keeps the secret out of argv / `ps` / docker inspect)."""
     g = sub.add_mutually_exclusive_group(required=required)
@@ -286,6 +306,7 @@ def _cli(argv=None):
     sp.add_parser("list-users"); sp.add_parser("scan"); sp.add_parser("status")
     t = sp.add_parser("tag"); t.add_argument("folder"); t.add_argument("owner"); t.add_argument("--attempts", type=int, default=1)
     sp.add_parser("oidc").add_argument("state", choices=("on", "off"))
+    sp.add_parser("backups")
     args = p.parse_args(argv)
     try:
         if args.cmd == "init":
@@ -308,6 +329,8 @@ def _cli(argv=None):
             print(json.dumps({"ok": True, "note": tag_folder(args.folder, args.owner, attempts=args.attempts)}))
         elif args.cmd == "oidc":
             print(json.dumps({"ok": True, **set_oidc(args.state == "on")}))
+        elif args.cmd == "backups":
+            print(json.dumps({"ok": True, **set_backups()}))
         return 0
     except (AbsError, requests.RequestException) as e:
         print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)

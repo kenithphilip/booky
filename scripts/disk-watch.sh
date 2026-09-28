@@ -75,12 +75,12 @@ if [ "$pct" -ge "$STOP_PCT" ]; then
       if compose stop qbittorrent >/dev/null 2>&1; then stopped="${stopped:+$stopped, }qbittorrent"; else nostop="${nostop:+$nostop, }qbittorrent"; fi
     fi
     state_set paused 1
-    "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$STOP_PCT") under $STACK_DIR; only $free_txt. Downloaders stopped (${stopped:-none})${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too.$(inode_hint "$STOP_PCT") Free space, then they restart automatically below ${RESUME_PCT}%." high
+    ALERT_SEQ=disk-level "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$STOP_PCT") under $STACK_DIR; only $free_txt. Downloaders stopped (${stopped:-none})${nostop:+; COULD NOT stop: $nostop}. The portal's own imports are paused too.$(inode_hint "$STOP_PCT") Free space, then they restart automatically below ${RESUME_PCT}%." high
     state_set last_alert "$now"
   fi
 elif [ "$pct" -ge "$WARN_PCT" ]; then
   if [ $((now - last)) -ge 86400 ]; then
-    "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$WARN_PCT") under $STACK_DIR; $free_txt. At ${STOP_PCT}% the downloaders are stopped.$(inode_hint "$WARN_PCT") Check Operations -> Self-test and library/audiobooks."
+    ALERT_SEQ=disk-level "$ALERT" "Disk ${pct}% full on $(hostname)" "$(trip "$WARN_PCT") under $STACK_DIR; $free_txt. At ${STOP_PCT}% the downloaders are stopped.$(inode_hint "$WARN_PCT") Check Operations -> Self-test and library/audiobooks."
     state_set last_alert "$now"
   fi
 elif [ "$pct" -lt "$RESUME_PCT" ] && [ "$(state_get paused)" = 1 ]; then
@@ -94,11 +94,11 @@ elif [ "$pct" -lt "$RESUME_PCT" ] && [ "$(state_get paused)" = 1 ]; then
   fi
   if [ -z "$nostart" ]; then
     state_set paused 0; state_set resume_failed 0
-    "$ALERT" "Disk back to ${pct}% on $(hostname)" "Now at blocks ${bpct}%${ipct:+, inodes ${ipct}%}; $free_txt. Downloaders started again ($started)."
+    ALERT_SEQ=disk-level ALERT_TAGS=white_check_mark "$ALERT" "Disk back to ${pct}% on $(hostname)" "Now at blocks ${bpct}%${ipct:+, inodes ${ipct}%}; $free_txt. Downloaders started again ($started)."
   else
     # paused stays 1: the next hourly run tries again instead of leaving a dead container behind.
     if [ "$(state_get resume_failed)" != 1 ] || [ $((now - last)) -ge 86400 ]; then
-      "$ALERT" "Disk back to ${pct}% on $(hostname) but a downloader did NOT start" "Could not start: $nostart${started:+ (started: $started)}. Still paused; the watchdog retries hourly. Operations -> Logs, then Operations -> Restart a service." high
+      ALERT_SEQ=disk-level "$ALERT" "Disk back to ${pct}% on $(hostname) but a downloader did NOT start" "Could not start: $nostart${started:+ (started: $started)}. Still paused; the watchdog retries hourly. Operations -> Logs, then Operations -> Restart a service." high
       state_set last_alert "$now"
     fi
     state_set resume_failed 1

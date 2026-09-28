@@ -323,6 +323,22 @@ a long random topic name and subscribe to it in the ntfy phone app) or any webho
 a test. For a dead-man check on backups, optionally add a free healthchecks.io URL in the
 Backups step.
 
+This channel is **yours alone**: readers never see it (they get e-mail, if they opt in on
+Devices). It carries every reader's activity and every server problem:
+
+| What | Priority | Tapping it opens |
+|---|---|---|
+| A request waiting for your approval (portal or Shelfmark), with a **Review** button | high | the Pending card |
+| A failed request, a failed Shelfmark download, a book that needs an owner tag | high / default | /admin |
+| Requested, approved, added, given from the family library, Keep looking results | low (silent) | /admin |
+| Server problems (disk, self-test, seedbox, certificates, restarts) and their all-clear | by severity | /admin |
+| **Daily disk summary** (09:05; `DISK_REPORT_HOUR`, `DISK_REPORT=false` in Advanced) | low; default at `DISK_WARN_PCT` | /admin |
+
+On ntfy each one has an emoji for its kind, and **one notification per request or problem**:
+a request's later steps (approved, added) and a problem's all-clear ("Disk back to 70 %",
+"self-test passes again", "seedbox connected again") *replace* the earlier notification
+instead of adding another, and today's disk summary replaces yesterday's.
+
 **4. Outgoing mail (optional, for Send-to-Kindle and notifications).** An SMTP account the
 server sends from, set once by you in **Library → Mail**. Any provider that gives SMTP
 credentials works (a Gmail or Fastmail app password, Brevo, Mailgun, your domain's mail host).
@@ -598,8 +614,9 @@ its code); a Usenet job it added and that is cancelled or fails is deleted by Sh
 Usenet (no seeding) does not mind.
 
 ## Ephemera — optional, Tailscale-only (Operations → Ephemera)
-Adds a "request it and auto-download when it appears" queue and a newznab indexer mode —
-the one thing neither the portal nor Shelfmark does (they search when asked, once).
+Adds a "request it and auto-download when it appears" queue over Anna's Archive and a
+newznab indexer mode. The portal's **Keep looking** does the same over the portal's own
+catalogues; Shelfmark searches only when asked.
 **Status (Sept 2026):** the upstream repo `OrwellianEpilogue/ephemera` and its image were
 removed from GitHub. The overlay *builds* the last release (v1.3.1, Nov 2025) from a
 community re-upload pinned to commit `e98e9944…`; treat it as unmaintained. It is reachable
@@ -806,6 +823,7 @@ bash tests/run-unit.sh      # portal unit/integration tests inside the shipping 
 bash tests/tui-test.sh      # installer logic: .env quoting, configure, gate, users, ABS, formats, mail
 bash tests/stack-test.sh    # end-to-end with the REAL containers (~8-10 min); KEEP=1 to inspect
 bash tests/monitoring-test.sh  # the Kuma bootstrap against the REAL pinned Uptime Kuma (~2 min)
+bash tests/caddy-build-test.sh # caddy/Dockerfile: the Caddy release, its plugins, the full Caddyfile validates
 ```
 `run-unit.sh` needs Docker; it also runs `pip-audit` against the locked requirements, which
 needs network (`SKIP_AUDIT=1` for an offline run). Lint the Python with an isolated ruff:

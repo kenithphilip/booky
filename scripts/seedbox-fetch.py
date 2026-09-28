@@ -120,9 +120,12 @@ def save_state(st):
     os.replace(tmp, STATE)
 
 
-def alert(title, body, prio="high"):
+def alert(title, body, prio="high", seq="seedbox", tags=None):
+    """scripts/alert.sh. seq: a problem and its all-clear share one, so on the admin's phone the
+    all-clear replaces the problem."""
+    env = dict(os.environ, ALERT_SEQ=seq, **({"ALERT_TAGS": tags} if tags else {}))
     try:
-        subprocess.run([ALERT, title, body, prio], capture_output=True, timeout=60)
+        subprocess.run([ALERT, title, body, prio], capture_output=True, timeout=60, env=env)
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -457,7 +460,7 @@ def run():
         if not up:
             raise RuntimeError("the seedbox's Syncthing is not connected")
         if st.get("fails", 0) >= FAILS_BEFORE_ALERT:
-            alert("Bookstack: seedbox connected again", "Finished downloads are arriving again.", "default")
+            alert("Bookstack: seedbox connected again", "Finished downloads are arriving again.", "default", tags="white_check_mark")
         st["fails"], st["last_ok"], st["unsafe_alerted"] = 0, int(now), False
         save_state(st)
         for n in notes:
@@ -467,7 +470,8 @@ def run():
     except Unsafe as e:
         st["last_error"] = f"REFUSED: {e}"[:400]
         if not st.get("unsafe_alerted"):
-            alert("Bookstack: seedbox sync REFUSED (safety)", f"{e}\n\nNothing is handed over until this is fixed (Library -> Seedbox).")
+            alert("Bookstack: seedbox sync REFUSED (safety)",
+                  f"{e}\n\nNothing is handed over until this is fixed (Library -> Seedbox).", seq="seedbox-safety")
             st["unsafe_alerted"] = True
         save_state(st)
         print(f"seedbox: REFUSED ({e})", file=sys.stderr)

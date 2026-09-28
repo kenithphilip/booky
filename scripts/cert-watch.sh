@@ -60,7 +60,7 @@ fi
 
 if [ "${#problems[@]}" -gt 0 ]; then
   msg=$(printf -- '- %s\n' "${problems[@]}")
-  "$ALERT" "Bookstack: certificate/token expiry" "$msg" high >/dev/null 2>&1 || true
+  ALERT_SEQ=certs "$ALERT" "Bookstack: certificate/token expiry" "$msg" high >/dev/null 2>&1 || true
   echo "cert-watch: ${#problems[@]} problem(s) in $checked item(s)"; printf '%s\n' "$msg"
   exit 1
 fi

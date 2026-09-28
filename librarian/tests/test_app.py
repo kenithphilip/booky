@@ -539,7 +539,8 @@ def test_alert_helper_posts_webhook_and_mails_admin_best_effort(monkeypatch, cap
     monkeypatch.setattr(config, "SMTP_HOST", "smtp"); monkeypatch.setattr(config, "SMTP_FROM", "lib@example.test")
     monkeypatch.setattr(config, "ADMIN_EMAIL", "admin@example.test")
     assert notify.alert("backup failed", "restic exit 1", "high") == ["webhook", "mail"]
-    assert hooks == [("https://hook.example.test/x", {"event": "alert", "title": "backup failed", "text": "restic exit 1", "priority": "high"})]
+    assert hooks == [("https://hook.example.test/x", {"event": "alert", "title": "backup failed", "text": "restic exit 1", "priority": "high",
+                                                      "tags": "rotating_light", "click": "https://request.example.test/admin"})]
     assert mails[0][0] == "admin@example.test" and mails[0][1] == "[bookstack] backup failed" and "restic exit 1" in mails[0][2]
     def boom(*a, **k): raise OSError("smtp down")
     monkeypatch.setattr(notify, "_deliver", boom)

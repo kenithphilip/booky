@@ -185,6 +185,21 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
 - L14/L15: exercised against stubs only (Cloudflare API, restic/B2) — the VPS checks below
   are the real proof.
 
+## Verified locally in v5.6 (admin alerts, daily disk summary, Caddy 2.10.2)
+- Unit 557 passed, installer 776 passed, seedbox 47 passed, end-to-end 278 checks / 0 failed
+  (the Authelia gate on caddy:2.10.2, `python -m abs backups` read back from the real
+  Audiobookshelf 2.36.1), tests/caddy-build-test.sh 8 passed: caddy/Dockerfile builds Caddy
+  v2.10.2 with its three plugins on the 2.11.4 builder's Go, and the full production Caddyfile
+  (every optional site, gate injected) validates on it.
+- Shelfmark v1.4.0's queue payload read from its source (orchestrator._task_to_dict): `id`,
+  `username`, `status_message` carries the error. The failed-download notice parses exactly that.
+- Uptime Kuma `:1` checked: still 1.23.17 inside, rebuilt 2026-09-16 on a newer base than the
+  `1.23.17` tag, so it stays `:1` (2.x is v5.8). CWA's archived-book cleanup is already on by
+  default in v4.0.7 (daily 03:00): nothing to set.
+- On the VPS after Deploy: the ntfy app shows the next request with an emoji and, if it waits
+  for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
+  report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
+
 ## Do on the VPS after Quick install
 - [ ] `Operations → Self-test` is all green (it checks: containers, endpoints, Caddy +
       Authelia config, origin-pull CA, ufw posture, loopback-only binds, SSH key-only,

@@ -10,7 +10,7 @@ ENV_FILE="$STACK_DIR/.env"
 ETC="${BOOKSTACK_ETC:-/etc}"          # host config root (tests point it at a temp dir)
 STACK_USER=books
 CF_API=https://api.cloudflare.com/client/v4
-BOOKSTACK_VERSION=4
+BOOKSTACK_VERSION=5.6
 # Image pins (looked up 2026-09-22). Seeded into .env by Configure; changed by Operations -> Update.
 IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.7 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
 IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.4.0 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
@@ -1020,6 +1020,12 @@ install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 9
   install_mem_tidy
   install_cert_watch
   install_update_check
+  install_disk_report
+}
+disk_report_hour(){ local h; h=$(adv_value DISK_REPORT_HOUR 9); case "$h" in ''|*[!0-9]*) h=9;; esac; [ "$h" -le 23 ] || h=9; printf '%s' "$((10#$h))"; }
+install_disk_report() { # daily disk summary for the admin (scripts/disk-report.sh); DISK_REPORT=false removes it
+  if [ "$(adv_value DISK_REPORT true)" = false ]; then rm -f "$ETC/cron.d/bookstack-diskreport"; return 0; fi
+  write_cron bookstack-diskreport "5 $(disk_report_hour) * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/disk-report.sh 2>&1 | logger -t bookstack-diskreport"
 }
 install_update_check() { # L06: weekly "a newer release exists" notice (never updates by itself)
   write_cron bookstack-updatecheck "20 7 * * 1" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/update-check.sh 2>&1 | logger -t bookstack-updatecheck"
@@ -1108,6 +1114,8 @@ step_deploy() {
     msg "Audiobookshelf has no root user yet. Whoever opened https://audio.$d first would become its administrator, so it is set up now, before the site goes public."
     step_abs_setup || yesno "Audiobookshelf is still uninitialised: the first visitor of audio.$d would become root. Start Caddy anyway (NOT recommended)?" || { msg "Caddy was not started. Run Library -> Audiobookshelf, then Deploy again."; return 1; }
   fi
+  # Audiobookshelf's own nightly copy of its database (off in a fresh Audiobookshelf; librarian/abs.py)
+  if [ -n "$(envget ABS_TOKEN)" ]; then absctl backups >/dev/null 2>&1 || echo "(could not turn on Audiobookshelf's own nightly backups; Library -> Audiobookshelf, then Deploy again)"; fi
   # L16: the portal's Shelfmark service login (recreate the portal so it sees the credentials)
   if ensure_shelfmark_service; then compose up -d librarian >/dev/null 2>&1 || true
   else echo "(could not create the Shelfmark service account; Shelfmark approvals stay in Shelfmark's own UI)"; fi
@@ -1151,7 +1159,8 @@ Monitoring: $monline
 
 Already applied for you: public registration OFF, Kobo sync ON, convert-to-EPUB on import,
 per-user copies kept separate, CWA's Kindle EPUB fixer OFF (the portal applies the Kindle fixes when it mails a book; on import the fixer would strip the owner tag from comics), CWA's duplicate file copies OFF,
-hourly disk watchdog (alerts at 85 %, stops downloaders at 95 %), hourly self-test (pushed to Kuma).
+hourly disk watchdog (alerts at 85 %, stops downloaders at 95 %), hourly self-test (pushed to Kuma),
+a daily disk summary on your alert channel, Audiobookshelf's own nightly database copy (3 kept).
 
 Next: Users & devices -> Add user (isolated account + Kobo link + ABS login in one go),
 Library -> Mail for Send-to-Kindle from the portal, Install -> Backups, Install -> Alerts, Operations -> Self-test."
@@ -1451,13 +1460,13 @@ printf '%s\n' "$now" > "$STATE" 2>/dev/null || true
 if ! "$STACK_DIR/scripts/kuma-push.sh" selftest "$st" "$m"; then
   if [ "$now" != "$prev" ]; then
     if [ "$now" = fail ]; then
-      "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test FAILED" "$rc check(s) failed:
+      ALERT_SEQ=selftest "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test FAILED" "$rc check(s) failed:
 
 $(grep -F '[FAIL]' "$LOG" 2>/dev/null | head -12)
 
 (Uptime Kuma could not be told, so this came directly.) Full result: $LOG" high
     else
-      "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test passes again" "All checks pass. Full result: $LOG"
+      ALERT_SEQ=selftest ALERT_TAGS=white_check_mark "$STACK_DIR/scripts/alert.sh" "Bookstack: hourly self-test passes again" "All checks pass. Full result: $LOG"
     fi
   fi
 fi
@@ -3236,8 +3245,9 @@ DO THIS ONCE, AS ADMIN, IN https://shelf.$d -> Settings:
 2. Metadata provider: Open Library (default) or Hardcover/Google Books.
 3. Formats: allow only epub, pdf and cbz for ebooks (everything else is converted or
    rejected on import anyway). Leave 'Destination' as set by compose (per-user dropbox).
-4. Optional torrent sources (only with Library -> Torrents on): qBittorrent client URL http://qbittorrent:8080 with the
-   Web UI credentials (127.0.0.1 is not reachable from inside the container).
+4. Torrents: give Shelfmark the SEEDBOX's rTorrent or SABnzbd (Library -> Seedbox). The local
+   qBittorrent (Library -> Torrents) is kept on a network of its own, so Shelfmark cannot reach it:
+   add torrents to it in its own web page (https://dl.<domain>, Tailscale only).
 
 Updates with Operations -> Update. Logs: Operations -> Logs -> shelfmark."
 }
@@ -3605,6 +3615,8 @@ mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files au
 disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
 disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
 disk|DISK_RESUME_PCT|80|pct|Disk use they are started again below
+disk|DISK_REPORT|true|bool|Send the daily disk summary on the alert channel (true or false)
+disk|DISK_REPORT_HOUR|9|int|Hour of the day (0-23, server time) the daily disk summary is sent
 backup|RESTIC_KEEP_DAILY|7|int|Daily snapshots the nightly forget --prune keeps
 backup|RESTIC_KEEP_WEEKLY|4|int|Weekly snapshots kept
 backup|RESTIC_KEEP_MONTHLY|6|int|Monthly snapshots kept'
@@ -3617,7 +3629,7 @@ step_advanced() {
       lockout "Login lockout thresholds and session length" \
       uploads "Size ceilings for uploads, imports and Send-to-Kindle" \
       mail    "IMAP intake, alert format, Audiobookshelf library name" \
-      disk    "Disk watchdog thresholds" \
+      disk    "Disk watchdog thresholds and the daily disk summary" \
       backup  "restic snapshot retention" \
       0       "Back" 3>&1 1>&2 2>&3) || return 0
     [ "$g" = 0 ] && return 0
@@ -3645,7 +3657,13 @@ step_advanced() {
       envset "$key" "$new" || { msg "Could not write $ENV_FILE, so $key was NOT changed."; continue; }
       case "$g" in
         backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;
-        disk)   w=$(adv_value DISK_WARN_PCT 85); s=$(adv_value DISK_STOP_PCT 95); r=$(adv_value DISK_RESUME_PCT 80)
+        disk)   if [ "${key#DISK_REPORT}" != "$key" ]; then
+                  install_disk_report
+                  if [ "$(adv_value DISK_REPORT true)" = false ]; then msg "$key is now $new. The daily disk summary is off."
+                  else msg "$key is now $new. The daily disk summary is sent at $(printf '%02d' "$(disk_report_hour)"):00 server time."; fi
+                  continue
+                fi
+                w=$(adv_value DISK_WARN_PCT 85); s=$(adv_value DISK_STOP_PCT 95); r=$(adv_value DISK_RESUME_PCT 80)
                 { [ "$r" -lt "$s" ] && [ "$w" -le "$s" ]; } \
                   || msg "WARNING: the thresholds now read warn=$w stop=$s resume=$r. They only work as resume < stop and warn <= stop — otherwise the watchdog either stops the downloaders before it ever warns you, or never starts them again."
                 if restart_portal; then msg "$key is now $new.\n\nThe hourly watchdog reads $ENV_FILE when it runs, and the portal was recreated so its own copy of the thresholds matches."

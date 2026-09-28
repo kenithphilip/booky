@@ -1296,11 +1296,12 @@ touch -t 202001010000 "$fs/downloads/incomplete/old.part" "$fs/library/staging/o
 printf "TORRENTS_ENABLED='false'\n" > "$fs/.env"
 dw(){ DF_PCT=$1 DF_IPCT="${2-NONE}" STACK_DIR="$fs" DISK_STATE="$T/disk.state" bash "$REPO/scripts/disk-watch.sh"; }
 : > "$DLOG"; dw 96 && ok "disk-watch.sh runs" || bad "disk-watch.sh failed"
-expect 'grep -q "docker: compose stop shelfmark" "$DLOG" && ! grep -q "aria2" "$DLOG" && ! grep -q "stop qbittorrent" "$DLOG" && grep -q "^paused=1" "$T/disk.state" && grep -q "python -m notify alert Disk 96% full" "$DLOG" && grep -q " high$" "$DLOG"' "96 %: shelfmark stopped (no aria2; qBittorrent not running), high-priority alert, state recorded"
+expect 'grep -q "docker: compose stop shelfmark" "$DLOG" && ! grep -q "aria2" "$DLOG" && ! grep -q "stop qbittorrent" "$DLOG" && grep -q "^paused=1" "$T/disk.state" && grep -q "python -m notify alert Disk 96% full" "$DLOG" && grep -q " high --seq disk-level$" "$DLOG"' "96 %: shelfmark stopped (no aria2; qBittorrent not running), high-priority alert, state recorded"
 expect '[ ! -f "$fs/downloads/incomplete/old.part" ] && [ ! -f "$fs/library/staging/old.bin" ] && [ ! -f "$fs/library/ingest/old.part" ] && [ -f "$fs/downloads/incomplete/new.part" ] && [ -f "$fs/library/ingest/stuck.epub" ]' "stale partials/staging deleted; fresh files and real ingest files kept"
 expect 'grep -q "journalctl: --vacuum-size=200M" "$DLOG" && grep -q "docker: builder prune -f --filter until=168h" "$DLOG"' "journal and build cache trimmed"
 : > "$DLOG"; dw 96; expect '! grep -q "notify alert" "$DLOG"' "still 96 %: no repeated alert"
 : > "$DLOG"; dw 50; expect 'grep -q "docker: compose up -d shelfmark" "$DLOG" && ! grep -q qbittorrent "$DLOG" && grep -q "^paused=0" "$T/disk.state"' "back under 80 %: shelfmark recreated with up -d (start cannot revive a removed container); qBittorrent left alone while torrents are off"
+expect 'grep -q "notify alert Disk back to 50% .* --seq disk-level --tags white_check_mark" "$DLOG"' "the all-clear carries the problem's id, so on the phone it replaces the 'Disk full' alert (v5.6)"
 printf "TORRENTS_ENABLED='true'\n" > "$fs/.env"
 : > "$DLOG"; QBIT_RUNNING=1 dw 97; expect 'grep -q "docker: compose --profile torrents stop qbittorrent" "$DLOG" && grep -q "qbittorrent" "$DLOG"' "96 %+ with torrents running: qBittorrent container stopped (F32)"
 : > "$DLOG"; dw 40; expect 'grep -q "docker: compose --profile torrents up -d qbittorrent" "$DLOG"' "below 80 % with torrents enabled: qBittorrent started again"
@@ -1331,6 +1332,10 @@ printf "NOTIFY_WEBHOOK='https://ntfy.example/secret-topic'\n" > "$fs/.env"
 : > "$DLOG"; STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "T" "body" high; expect 'grep -q "docker: exec -i librarian python -m notify alert T body high" "$DLOG" && ! grep -q "^curl:" "$DLOG" && ! grep -q "^logger:" "$DLOG"' "alert.sh hands off to the portal's notify CLI (delivered -> nothing else)"
 : > "$DLOG"; NOTIFY_RC=3 STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "Disk full" "body text" high; rc=$?
 expect '[ $rc = 0 ] && grep -q "logger: -t bookstack -p user.warning ALERT Disk full: body text" "$DLOG" && grep -qF "curl: -fsS -m 20 --retry 2 -X POST -H Title: Disk full --data-binary body text -H Priority: high https://ntfy.example/secret-topic" "$DLOG"' "portal says 'not delivered' (exit 3): journal + direct ntfy POST from the host with Title/Priority (C1)"
+: > "$DLOG"; ALERT_SEQ=selftest ALERT_TAGS=white_check_mark STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "T" "body"
+expect 'grep -q "docker: exec -i librarian python -m notify alert T body --seq selftest --tags white_check_mark$" "$DLOG"' "alert.sh passes a problem id and tags to the portal (v5.6)"
+: > "$DLOG"; NOTIFY_RC=3 ALERT_SEQ="disk level" ALERT_TAGS=warning STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "Disk full" "body text" high
+expect 'grep -qF "curl: -fsS -m 20 --retry 2 -X POST -H Title: Disk full --data-binary body text -H Priority: high -H Sequence-ID: disk-level -H Tags: warning https://ntfy.example/secret-topic" "$DLOG"' "the host's own fallback POST carries them too, the id made header-safe (v5.6)"
 printf '#!/usr/bin/env bash\necho "docker: $*" >> "$DLOG"; exit 1\n' > "$bin/docker"; : > "$DLOG"; printf "X=1\n" > "$fs/.env"
 STACK_DIR="$fs" bash "$REPO/scripts/alert.sh" "T" "body"; rc=$?; expect '[ $rc = 0 ] && grep -q "logger: -t bookstack -p user.warning ALERT T: body" "$DLOG" && ! grep -q "^curl:" "$DLOG"' "portal down, no webhook: journal only, never fails"
 printf '#!/usr/bin/env bash\necho "docker: $*" >> "$DLOG"; exit 0\n' > "$bin/docker"
@@ -2313,6 +2318,55 @@ expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "books are w
 FLOCK_HELD=1 mtt
 expect '! grep -q "docker restart calibre-web" "$MT/log" && grep -q "the host job is writing to it" "$MT/out"' "...nor while the host job is writing through it"
 expect 'grep -q "write_cron bookstack-memtidy \"45 3 \* \* \*\"" "$REPO/bookstack.sh" && declare -f install_disk_watch | grep -q install_mem_tidy' "installed nightly at 03:45 by Deploy (before the 04:30 reboot window)"
+
+echo "== Daily disk summary for the admin (scripts/disk-report.sh, v5.6)"
+DR="$T/dr"; mkdir -p "$DR/bin" "$DR/stack/library/books" "$DR/stack/library/audiobooks" "$DR/stack/library/seedbox-sync" "$DR/etc"
+cat > "$DR/bin/df" <<'EOS'
+#!/usr/bin/env bash
+S=85899345920                                      # 80 GiB
+case "$*" in
+  *-i*--output=ipcent*) printf 'IUse%%\n %s%%\n' "${DR_IPCT:-9}";;
+  *--output=size*)  printf '1B-blocks\n%s\n' "$S";;
+  *--output=used*)  printf 'Used\n%s\n' "$DR_USED";;
+  *--output=avail*) printf 'Avail\n%s\n' "$((S - DR_USED))";;
+  *--output=pcent*) printf 'Use%%\n %s%%\n' "$((DR_USED * 100 / S))";;
+esac
+EOS
+printf '#!/usr/bin/env bash\nprintf "%%s\\ttotal\\n" 1073741824\n' > "$DR/bin/du"
+cat > "$DR/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+case "$*" in "system df --format "*) printf 'Images=7.9GB\nContainers=12MB\nLocal Volumes=0B\nBuild Cache=400MB\n';; esac
+EOS
+printf '#!/usr/bin/env bash\nprintf "              total  used  free\\nMem:   4294967296 2147483648 0\\nSwap:  2147483648 107374182 0\\n"\n' > "$DR/bin/free"
+cat > "$DR/alert" <<'EOS'
+#!/usr/bin/env bash
+printf 'ALERT seq=%s tags=%s prio=%s title=%s\n%s\n' "$ALERT_SEQ" "$ALERT_TAGS" "$3" "$1" "$2" >> "$DR_LOG"
+EOS
+chmod +x "$DR"/bin/* "$DR/alert"; printf 'X=1\n' > "$DR/stack/.env"
+dr(){ : > "$DR/log"; DR_LOG="$DR/log" PATH="$DR/bin:$PATH" STACK_DIR="$DR/stack" DISK_HISTORY="$DR/etc/hist" DISK_REPORT_ALERT="$DR/alert" \
+  DR_USED="$1" bash "$REPO/scripts/disk-report.sh" > "$DR/out" 2>&1; }
+GiB=1073741824
+rm -f "$DR/etc/hist"; dr $((40 * GiB))
+expect 'grep -q "^ALERT seq=disk-daily tags=floppy_disk prio=low title=Disk 50% used, 40.0 GB free$" "$DR/log"' "a quiet (low) notification with the same id every day, so today's replaces yesterday's"
+expect 'grep -q "Used 40.0 GB of 80.0 GB (50%), 40.0 GB free · inodes 9%" "$DR/log" && grep -q "First report" "$DR/log"' "says how full, in bytes and inodes; the trend starts tomorrow"
+expect 'grep -q "Ebooks 1.0 GB · Audiobooks 1.0 GB · Seedbox copies 1.0 GB" "$DR/log" && grep -q "Docker images 7.9GB, build cache 400MB" "$DR/log" && grep -q "Memory: 2.0 of 4.0 GB in use, swap 0.1 GB" "$DR/log"' "where the space went, Docker's share and memory"
+expect 'grep -q "^$(date +%F) $((40 * GiB))$" "$DR/etc/hist"' "today's figure is kept for tomorrow's comparison"
+{ echo "$(date -d '-7 day' +%F) $((33 * GiB))"; echo "$(date -d '-1 day' +%F) $((39 * GiB))"; } > "$DR/etc/hist"
+dr $((40 * GiB))
+expect 'grep -q "+1.0 GB since yesterday · 7-day average +1.0 GB a day · 85% in about 28 days" "$DR/log"' "the growth since yesterday, the weekly rate and when it reaches the warning level"
+dr $((40 * GiB)); expect '[ "$(grep -c "^$(date +%F) " "$DR/etc/hist")" = 1 ]' "a second run the same day replaces today's figure instead of adding one"
+dr $((70 * GiB))
+expect 'grep -q "^ALERT seq=disk-daily tags=warning prio=default title=Disk 87% used" "$DR/log"' "at or over DISK_WARN_PCT it makes a sound and shows a warning sign"
+printf 'DISK_REPORT=false\n' > "$DR/stack/.env"; dr $((40 * GiB)); printf 'X=1\n' > "$DR/stack/.env"
+expect '[ ! -s "$DR/log" ]' "DISK_REPORT=false: nothing is sent"
+envset DISK_REPORT ""; envset DISK_REPORT_HOUR ""; install_disk_report
+expect 'grep -q "^5 9 \* \* \* root STACK_DIR=.*scripts/disk-report.sh" "$T/etc/cron.d/bookstack-diskreport"' "installed at 09:05 by default"
+envset DISK_REPORT_HOUR 21; install_disk_report; expect 'grep -q "^5 21 \* \* \* root" "$T/etc/cron.d/bookstack-diskreport"' "DISK_REPORT_HOUR moves it"
+envset DISK_REPORT_HOUR 31; install_disk_report; expect 'grep -q "^5 9 \* \* \* root" "$T/etc/cron.d/bookstack-diskreport"' "an hour that does not exist falls back to 09"
+envset DISK_REPORT false; install_disk_report; expect '[ ! -e "$T/etc/cron.d/bookstack-diskreport" ]' "DISK_REPORT=false removes it"
+envset DISK_REPORT ""; envset DISK_REPORT_HOUR ""
+expect 'declare -f install_disk_watch | grep -q install_disk_report' "Deploy installs it with the other scheduled jobs"
+expect 'declare -f step_deploy | grep -q "absctl backups"' "Deploy switches on Audiobookshelf's own nightly database copy"
 
 echo "== Family sharing: Shelfmark's request step follows the portal's ability to answer it"
 envset APPROVALS_REQUIRED false; envset FAMILY_SHARING true; envset SHELFMARK_SVC_USER ""; envset SHELFMARK_SVC_PASS ""; envset SHELFMARK_REQUESTS ""

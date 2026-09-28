@@ -149,9 +149,10 @@ def test_a_portal_request_for_a_family_book_downloads_nothing(users, quiet, monk
 @pytest.fixture
 def shelf(monkeypatch, users):
     import shelfmark_api
-    st = {"rows": [], "decided": []}
+    st = {"rows": [], "decided": [], "queue": {}}
     monkeypatch.setattr(config, "APPROVALS_REQUIRED", False)      # the family default
     monkeypatch.setattr(shelfmark_api, "configured", lambda: True)
+    monkeypatch.setattr(shelfmark_api, "queue_status", lambda: st["queue"])
     monkeypatch.setattr(shelfmark_api, "pending", lambda force=False, cache=True: list(st["rows"]))
     monkeypatch.setattr(shelfmark_api, "decide", lambda i, ok, note="": st["decided"].append((i, ok, note)))
     return st
