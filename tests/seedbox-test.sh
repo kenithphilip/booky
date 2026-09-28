@@ -81,7 +81,7 @@ SEEDBOX_SOURCES=bookstack-sab-ebooks|sabnzbd/bookstack-ebooks|sab;bookstack-sab-
 EOF
 printf '#!/usr/bin/env bash\necho "ALERT $1" >> "%s"\n' "$T/alerts.log" > "$T/alert.sh"; chmod +x "$T/alert.sh"; : > "$T/alerts.log"
 SF(){ STACK_DIR="$STACK" SEEDBOX_ENV="$T/etc/seedbox.env" SEEDBOX_STATE="$T/etc/seedbox.state" SEEDBOX_ALERT="$T/alert.sh" \
-  SEEDBOX_ST_URL=http://127.0.0.1:18384 SEEDBOX_MIN_AGE=1 SEEDBOX_RT_SETTLE="${SETTLE:-4}" SEEDBOX_KEEP_DAYS="${KEEP:-7}" \
+  SEEDBOX_ST_URL=http://127.0.0.1:18384 SEEDBOX_FAILS_BEFORE_ALERT=15 SEEDBOX_MIN_AGE=1 SEEDBOX_RT_SETTLE="${SETTLE:-4}" SEEDBOX_KEEP_DAYS="${KEEP:-7}" \
   python3 "$REPO/scripts/seedbox-fetch.py" "$@"; }
 
 echo "== Library -> Seedbox: this server's Syncthing is set up by --setup"
@@ -158,6 +158,7 @@ sleep 4; runs r1b
 expect '[ -f "$M/rtorrent/Recent.epub" ]' "...and is handed over once that wait has passed"
 expect '[ ! -e "$M/rtorrent/Elsewhere" ]' "a complete torrent outside the bookstack folder is ignored"
 expect '[ -z "$(ls -A "$M/.incoming" 2>/dev/null)" ]' "nothing is left in the staging folder"
+expect '[ "$(stat -c %u "$M/rtorrent" 2>/dev/null || stat -f %u "$M/rtorrent")" = "$(id -u)" ] && [ "$(stat -c %u "$M/sabnzbd/bookstack-ebooks" 2>/dev/null || stat -f %u "$M/sabnzbd/bookstack-ebooks")" = "$(id -u)" ]' "the hand-over folders belong to PUID (Shelfmark's user), not root"
 
 echo "== nothing twice; a change is handed over again"
 rm -rf "$M/rtorrent/Middlemarch" "$M/sabnzbd/bookstack-ebooks/Emma (1815)"     # Shelfmark took them into dropboxes

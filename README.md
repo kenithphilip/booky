@@ -479,7 +479,7 @@ Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the see
 rTorrent. Those download on the **seedbox**. The seedbox's own Syncthing sends the bookstack
 folders (SABnzbd's bookstack categories, rTorrent's bookstack folder) to this server's Syncthing
 container (compose profile `seedbox`, into `library/seedbox-sync`), and `scripts/seedbox-fetch.py`
-(every minute) hands each finished, fully arrived item to `library/seedbox` (Shelfmark's
+(every 20 seconds) hands each finished, fully arrived item to `library/seedbox` (Shelfmark's
 `/seedbox`) as hard links, where Shelfmark's remote path mappings file it into the reader's
 dropbox. After a week this server drops its own copy (Syncthing is told to ignore the item
 first), so its disk holds about a week of seedbox downloads.
@@ -498,8 +498,14 @@ fingerprinting the whole seedbox tree after every run and every destructive act 
    over, and every request it sends to Syncthing goes through one allowlist (no revert, no
    override, no config change beyond pausing a folder);
 4. rTorrent is asked one read-only question (name / complete / directory / finished). Torrents
-   are handed over only once rTorrent reports them complete, at least 10 minutes earlier (the
-   seedbox's rescan, every 5 minutes, must catch the last pieces), and keep seeding.
+   are handed over only once rTorrent reports them complete, at least 90 seconds earlier (the
+   seedbox's file watcher must catch the last pieces), and keep seeding.
+
+Timing: Shelfmark (v1.3.15, and upstream as of 2026-09-28) cancels a download after 5 minutes
+without progress, and its "Waiting for completed files" loop does not count, whatever Completed
+Path Wait says. So the job runs every 20 seconds and hands an item over within ~2–3 minutes of
+the seedbox finishing it. One that misses the window (a big audiobook) still arrives: press
+Retry on it in Shelfmark and it imports at once (the torrent/job is already complete).
 
 Shelfmark itself fetches only the small .torrent / .nzb file, from the seedbox's Prowlarr, to
 hand it to rTorrent / SABnzbd. Those links sit behind the seedbox's login, so Library → Seedbox

@@ -121,7 +121,7 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   origin-pull certificate and the Cloudflare token, alerting ahead of expiry (L09, L14)
 - `update-check.sh` — weekly: newer releases for every pinned image, one alert per version (L06)
 - `synthetic.py` — the canary journey, twice a day (`bookstack-canary.timer`, L08)
-- `seedbox-fetch.py` — every minute: hands finished seedbox downloads (SABnzbd jobs, torrents
+- `seedbox-fetch.py` — every 20 seconds: hands finished seedbox downloads (SABnzbd jobs, torrents
   rTorrent reports complete) from the Syncthing copy (`library/seedbox-sync`) to `library/seedbox`
   for Shelfmark; checks every folder here is Receive Only (pauses one that is not), allowlisted
   Syncthing requests, never changes the seedbox. `--setup` / `--check` for Library → Seedbox

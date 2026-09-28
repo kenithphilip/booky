@@ -6,7 +6,7 @@ download it on the SEEDBOX's disk. Syncthing carries it to this server:
 
   seedbox Syncthing (SEND ONLY) --> this server's Syncthing (container "syncthing", RECEIVE ONLY)
                                     into $STACK_DIR/library/seedbox-sync/<sub>/
-  this job, every minute: each item that is finished AND fully arrived is hard-linked (copied
+  this job, every 20 seconds: each item that is finished AND fully arrived is hard-linked (copied
   when it cannot be) into $STACK_DIR/library/seedbox/<sub>/, which Shelfmark sees as /seedbox;
   Shelfmark's remote path mappings find it there and file it into that reader's dropbox.
 
@@ -28,11 +28,15 @@ Shelfmark's own clean-up is pinned in docker-compose.yml (torrents: keep; Usenet
 
 An item is handed over when:
   * the seedbox is connected and Syncthing needs nothing more under that item;
-  * nothing in it has changed for MIN_AGE (2 minutes);
-  * torrents only: rTorrent reports it complete, at least RT_SETTLE (10 minutes) ago. rTorrent
-    writes into full-size files in place, so a copy the seedbox's Syncthing scanned mid-download
-    looks whole; the wait lets its rescan (every 5 minutes, see Library -> Seedbox) catch the
-    last pieces first.
+  * nothing in it has changed for MIN_AGE (1 minute);
+  * torrents only: rTorrent reports it complete, at least RT_SETTLE (90 s) ago. rTorrent writes
+    into full-size files in place, so a copy the seedbox's Syncthing scanned mid-download looks
+    whole; the wait lets its file watcher (10 s) catch the last pieces first.
+  The whole hand-over has to fit in Shelfmark's FIVE minutes: v1.3.15 (and upstream main,
+  2026-09-28) cancels a download after STALL_TIMEOUT = 300 s without progress, and its "Waiting
+  for completed files" loop does not count as progress, whatever Completed Path Wait says. A
+  hand-over that misses it (a big audiobook) still arrives; the reader presses Retry in Shelfmark,
+  which finds the torrent/job already complete and imports it.
 Each item is remembered by its names, sizes and times: handed over once, again only if it
 changes. It appears under library/seedbox/ only whole (built in .incoming/, renamed into place).
 After KEEP_DAYS both the hand-over and the synced copy go (the latter ignored in Syncthing
@@ -54,11 +58,11 @@ SYNC = os.environ.get("SEEDBOX_SYNC", os.path.join(STACK, "library/seedbox-sync"
 ST_SYNC = os.environ.get("SEEDBOX_ST_SYNC", "/sync")            # the same folder inside the container
 ST_URL = os.environ.get("SEEDBOX_ST_URL", "http://127.0.0.1:8384")
 ALERT = os.environ.get("SEEDBOX_ALERT", os.path.join(STACK, "scripts/alert.sh"))
-MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "120"))           # seconds an item must be unchanged
-RT_SETTLE = int(os.environ.get("SEEDBOX_RT_SETTLE", "600"))       # seconds after rTorrent finished it
+MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "60"))           # seconds an item must be unchanged
+RT_SETTLE = int(os.environ.get("SEEDBOX_RT_SETTLE", "90"))       # seconds after rTorrent finished it
 KEEP_DAYS = float(os.environ.get("SEEDBOX_KEEP_DAYS", "7"))       # hand-overs and synced copies here
 FREE_MARGIN = int(os.environ.get("SEEDBOX_FREE_MARGIN_GB", "5")) * 2**30
-FAILS_BEFORE_ALERT = 15                                            # a quarter of an hour of minutes
+FAILS_BEFORE_ALERT = int(os.environ.get("SEEDBOX_FAILS_BEFORE_ALERT", "45"))   # 15 minutes of 20 s runs
 SKIP_PREFIX = ("_UNPACK_", "_FAILED_", "_ADMIN_", ".")
 SAB_IGNORES = ["/_UNPACK_*", "/_FAILED_*", "/_ADMIN_*"]            # SABnzbd's work in progress
 DEVICE_RE = re.compile(r"^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$")
@@ -224,6 +228,13 @@ def hand_over(src, dest_dir, files, sig, uid, gid):
     """Hard-link (or copy) one item whole into dest_dir; bytes. The synced copy is only read."""
     total = sum(sz for _, sz, _ in files)
     os.makedirs(dest_dir, exist_ok=True)
+    d = dest_dir                                    # library/seedbox/<sub>: Shelfmark's, not root's
+    while os.path.realpath(d).startswith(os.path.realpath(MIRROR) + os.sep):
+        try:
+            os.chown(d, uid, gid)
+        except OSError:
+            pass
+        d = os.path.dirname(d)
     stage = os.path.join(MIRROR, ".incoming", uuid.uuid4().hex)
     os.makedirs(stage)
     try:
@@ -425,7 +436,7 @@ def run():
         st["last_error"] = f"{type(e).__name__}: {e}"[:300]
         if st["fails"] == FAILS_BEFORE_ALERT:
             alert("Bookstack: seedbox downloads are not arriving",
-                  f"For {FAILS_BEFORE_ALERT} minutes in a row: {st['last_error']}\n\n"
+                  f"For about {FAILS_BEFORE_ALERT // 3} minutes in a row: {st['last_error']}\n\n"
                   "Downloads keep finishing on the seedbox and arrive once it connects again. Check the "
                   "seedbox's Syncthing, or Library -> Seedbox -> Check the connection.")
         save_state(st)

@@ -3689,7 +3689,7 @@ step_metadata_sources() {
 # Shelfmark sends a reader's pick to the seedbox's SABnzbd / rTorrent; they download on the
 # SEEDBOX's disk. The seedbox's own Syncthing (SEND ONLY) sends the bookstack folders to this
 # server's Syncthing container (RECEIVE ONLY) in library/seedbox-sync, and
-# scripts/seedbox-fetch.py (every minute) hands each finished, fully arrived item to
+# scripts/seedbox-fetch.py (every 20 s) hands each finished, fully arrived item to
 # library/seedbox (Shelfmark's /seedbox), where Shelfmark's remote path mappings find it and file
 # it into the right reader's dropbox. Nothing on the seedbox is ever changed. Addresses and
 # passwords live in /etc/bookstack/seedbox.env (0600); only Syncthing's API key is in .env,
@@ -3710,10 +3710,10 @@ TimeoutStartSec=6h
 UNIT
   cat > "$u/bookstack-seedbox.timer" << 'UNIT'
 [Unit]
-Description=Bookstack: hand finished seedbox downloads to Shelfmark every minute
+Description=Bookstack: hand finished seedbox downloads to Shelfmark every 20 seconds
 [Timer]
-OnCalendar=*:*:00
-AccuracySec=10s
+OnCalendar=*:*:00/20
+AccuracySec=2s
 [Install]
 WantedBy=timers.target
 UNIT
@@ -3730,7 +3730,7 @@ seedbox_mappings(){ # the rows the admin types into Shelfmark
   local sab_own rt_dir
   sab_own=$(seedbox_get SEEDBOX_SAB_OWN); rt_dir=$(seedbox_get SEEDBOX_RT_DIR)
   printf 'In Shelfmark (https://shelf.%s) -> Settings -> Advanced, under "Remote Path Mappings":\n\n' "$(envget DOMAIN)"
-  printf '1. Completed Path Wait (seconds):  3600\n   (the default 60 s is too short: files arrive some minutes after the seedbox finishes)\n\n'
+  printf '1. Completed Path Wait (seconds):  3600\n   (Shelfmark itself still gives up after 5 minutes; files are handed over within ~2-3.\n   If a big audiobook misses that, press Retry on it in Shelfmark once it has arrived.)\n\n'
   printf '   (Settings -> Download Clients: set NZB Completion Action to Copy there too. This server\n   already pins torrents: keep, Usenet: copy, and that pin wins, but the page shows its own\n   saved value, Move by default, until you change it.)\n\n'
   printf '2. Path Mappings -> Add Mapping:\n'
   [ -n "$sab_own" ] && printf '   Client SABnzbd:  Remote Path  %s\n                    Local Path   /seedbox/sabnzbd\n' "$sab_own"
@@ -3780,7 +3780,7 @@ seedbox_wait(){ local i; for i in $(seq 1 45); do curl -fsS -m 3 http://127.0.0.
 step_seedbox(){
   local cf="$ETC/$SEEDBOX_ENV_REL" ch out me
   if [ -f "$ETC/systemd/system/bookstack-seedbox.timer" ]; then
-    ch=$(whiptail --title "Seedbox" --menu "Finished seedbox downloads arrive through Syncthing and are handed to Shelfmark every minute." 16 86 6 \
+    ch=$(whiptail --title "Seedbox" --menu "Finished seedbox downloads arrive through Syncthing and are handed to Shelfmark every 20 seconds." 16 86 6 \
       C "Check the connection now" \
       S "Show what to set up on the seedbox (this server's Syncthing ID)" \
       M "Show the Shelfmark path mappings to enter" \
@@ -3805,7 +3805,7 @@ which download on the SEEDBOX. Syncthing then brings the finished files here:
 
   seedbox Syncthing (Send Only)  -->  this server's Syncthing (Receive Only)
 
-and every minute each finished, fully arrived item is handed to Shelfmark (/seedbox), which
+and every 20 seconds each finished, fully arrived item is handed to Shelfmark (/seedbox), which
 files it into that reader's dropbox; the library imports it.
 
 NOTHING ON THE SEEDBOX IS EVER MOVED, DELETED OR CHANGED:
