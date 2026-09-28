@@ -224,6 +224,16 @@ def init():
             c.execute("ALTER TABLE tag_push ADD COLUMN share INTEGER DEFAULT 0")
         c.execute("DROP INDEX IF EXISTS tag_push_open")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open_owner ON tag_push(calibre_id, owner) WHERE status = 'pending'")
+        # "Find a better copy" (the book page): for REPLACE_DAYS the next EPUB of this book that
+        # arrives replaces the FILE inside the same Calibre book (owners, cover, corrected metadata
+        # and the Kobo's identity of the book kept); the host job swaps it (metadata-push.sh).
+        c.execute("""CREATE TABLE IF NOT EXISTS replace_job(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, calibre_id INTEGER NOT NULL, opened_by TEXT,
+            status TEXT NOT NULL DEFAULT 'open',   -- open | staged | done | failed | cancelled | expired
+            staged TEXT, fmt TEXT, rid INTEGER, owner TEXT, attempts INTEGER DEFAULT 0,
+            last_error TEXT, created REAL, updated REAL)""")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS replace_job_live ON replace_job(calibre_id) "
+                  "WHERE status IN ('open','staged')")
         # L21: Send-to-Kindle runs in the worker, not inside the web request (a slow relay with a
         # 45 MB attachment could outlast Cloudflare's 100 s and show a 524 for a mail that went out)
         c.execute("""CREATE TABLE IF NOT EXISTS kindle_jobs(
@@ -1228,6 +1238,68 @@ def queue_tag_push(calibre_id, rid, owner, now=None, share=False):
 def tag_push_open_for(rid):
     with _conn() as c:
         return c.execute("SELECT 1 FROM tag_push WHERE rid=? AND status IN ('pending','done')", (rid,)).fetchone() is not None
+
+REPLACE_DAYS = 7
+
+def open_replace(calibre_id, user, now=None):
+    """Start looking for a better copy of a book; the live job's id (an existing one is kept)."""
+    now = now or time.time()
+    replace_live(calibre_id, now)                 # lets an expired window go first
+    with _lock, _conn() as c:
+        try:
+            return c.execute("INSERT INTO replace_job(calibre_id, opened_by, created, updated) VALUES(?,?,?,?)",
+                             (int(calibre_id), user, now, now)).lastrowid
+        except sqlite3.IntegrityError:
+            return c.execute("SELECT id FROM replace_job WHERE calibre_id=? AND status IN ('open','staged')",
+                             (int(calibre_id),)).fetchone()[0]
+
+def replace_live(calibre_id, now=None):
+    """The open or staged job for this book, or None. An open window older than REPLACE_DAYS
+    expires here."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("UPDATE replace_job SET status='expired', updated=? WHERE calibre_id=? AND status='open' "
+                  "AND created < ?", (now, int(calibre_id), now - REPLACE_DAYS * 86400))
+        r = c.execute("SELECT * FROM replace_job WHERE calibre_id=? AND status IN ('open','staged')",
+                      (int(calibre_id),)).fetchone()
+    return dict(r) if r else None
+
+def replace_for_book(calibre_id):
+    """The newest job of any status (the book page shows it)."""
+    replace_live(calibre_id)
+    with _conn() as c:
+        r = c.execute("SELECT * FROM replace_job WHERE calibre_id=? ORDER BY id DESC LIMIT 1",
+                      (int(calibre_id),)).fetchone()
+    return dict(r) if r else None
+
+def stage_replace(job_id, path, fmt, rid, owner, now=None):
+    """A better copy arrived for an open job: hand it to the host. False if no longer open."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        return c.execute("UPDATE replace_job SET status='staged', staged=?, fmt=?, rid=?, owner=?, updated=? "
+                         "WHERE id=? AND status='open'", (path, fmt, rid, owner, now, job_id)).rowcount == 1
+
+def cancel_replace(calibre_id, now=None):
+    with _lock, _conn() as c:
+        return c.execute("UPDATE replace_job SET status='cancelled', updated=? WHERE calibre_id=? AND status='open'",
+                         (now or time.time(), int(calibre_id))).rowcount == 1
+
+def pending_replaces(limit=10):
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id, calibre_id, fmt, rid, owner FROM replace_job WHERE status='staged' ORDER BY id LIMIT ?", (limit,))]
+
+def replace_result(job_id, ok, error=None, max_attempts=3):
+    now = time.time()
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM replace_job WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise ValueError(f"no replace job {job_id}")
+        attempts = (row["attempts"] or 0) + 1
+        st = "done" if ok else ("failed" if attempts >= max_attempts or (error or "").startswith("refused:") else "staged")
+        c.execute("UPDATE replace_job SET status=?, attempts=?, last_error=?, updated=? WHERE id=?",
+                  (st, attempts, None if ok else (error or "")[:300], now, job_id))
+        return dict(row, status=st)
 
 def pending_tag_pushes(limit=50):
     with _conn() as c:

@@ -229,6 +229,9 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
       seconds it closes with "Already in the family library", nothing reaches rTorrent/SABnzbd,
       and within a few minutes it is under that reader's My books. A MOBI-only book lands in
       the reader's library by itself (no needs-tag alert).
+- [ ] Find a better copy (v5.4): on a badly converted book's page press *Find a better copy*,
+      request it again in Shelfmark choosing an EPUB result; within minutes the page says it
+      was replaced, the book keeps its owners, and the Kobo gets the new file at its next sync.
 - [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
       runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
       check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on

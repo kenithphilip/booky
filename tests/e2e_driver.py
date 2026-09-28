@@ -748,5 +748,28 @@ if len(fam) >= 2:
     check(calibre("SELECT count(*) FROM books")[0][0] == before, "and no second copy was imported")
     st, h, b = pb.get(PORTAL + "/library"); check(t1.encode() in b and t2.encode() in b, "both appear under bob's My books")
 
+    print("== 16b. Find a better copy: the next EPUB replaces the file inside the same book")
+    import hashlib
+    def book_file(bid):
+        rows = calibre("SELECT b.path, d.name, d.format FROM books b JOIN data d ON d.book=b.id WHERE b.id=?", bid)
+        return {fmt: f"{STACK}/library/books/{path}/{name}.{fmt.lower()}" for path, name, fmt in rows}
+    owners_before = sorted(t for (t,) in calibre("SELECT t.name FROM tags t JOIN books_tags_link l ON l.tag=t.id WHERE l.book=? AND t.name LIKE 'owner:%'", b2))
+    old = hashlib.sha256(open(book_file(b2)["EPUB"], "rb").read()).hexdigest() if "EPUB" in book_file(b2) else None
+    portal_post(p, f"/book/{b2}/replace", f"/book/{b2}", {"action": "open"})
+    st, h, b = p.get(f"{PORTAL}/book/{b2}"); check(b"Looking for a better copy" in b, "alice asks for a better copy on the book's page")
+    before = calibre("SELECT count(*) FROM books")[0][0]
+    better = make_epub(t2, a2)                         # the same book, a different file
+    st, h, b = upload_as(p, f"{t2} (better).epub", better); check(st == 302, "alice uploads an EPUB of it", str(st))
+    def swapped():
+        host_job()
+        f = book_file(b2).get("EPUB")
+        return f if f and os.path.exists(f) and hashlib.sha256(open(f, "rb").read()).hexdigest() != old else None
+    check(wait(swapped, 300, 20) is not None, "the host job swapped the new file into THE SAME Calibre book")
+    check(calibre("SELECT count(*) FROM books")[0][0] == before, "no new book was created")
+    check(sorted(t for (t,) in calibre("SELECT t.name FROM tags t JOIN books_tags_link l ON l.tag=t.id WHERE l.book=? AND t.name LIKE 'owner:%'", b2)) == owners_before,
+          f"its owners are exactly as they were ({owners_before})")
+    check(sorted(book_file(b2)) == ["EPUB"], "only the new EPUB is left (formats made from the old file are gone)")
+    st, h, b = p.get(f"{PORTAL}/book/{b2}"); check(b"replaced with a better copy" in b, "the book's page says so")
+
 print(f"\nE2E RESULT: {fails} failed")
 sys.exit(fails)

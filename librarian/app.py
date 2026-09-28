@@ -973,7 +973,29 @@ def book_page(book_id):
         kindle_mail=_cwa_user(user).get("kindle_mail") or "",
         convert_to=[f for f in config.CONVERT_TARGETS if f not in b["formats"]]
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
-        converting=db.convert_for_book(book_id))
+        converting=db.convert_for_book(book_id),
+        replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS)
+
+@app.route("/book/<int:book_id>/replace", methods=["POST"])
+@login_required
+def book_replace(book_id):
+    """'Find a better copy': for REPLACE_DAYS the next EPUB of this book that arrives (Shelfmark,
+    a dropbox, an upload) replaces the library's file of it — for every reader who has it — while
+    the book itself (owners, cover, corrected metadata) stays. Any reader who has the book may
+    ask; the admin may for any book."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not library.book_detail(user, book_id, is_admin):
+        abort(404)
+    if request.form.get("action") == "cancel":
+        if db.cancel_replace(book_id):
+            _audit("replace_cancel", f"book {book_id}")
+            flash("Stopped looking for a better copy.")
+        return redirect(url_for("book_page", book_id=book_id))
+    db.open_replace(book_id, user)
+    _audit("replace_open", f"book {book_id}")
+    flash(f"Looking for a better copy for {db.REPLACE_DAYS} days: request this book again in Shelfmark and "
+          "choose an EPUB result, or upload an EPUB of it. The first one that arrives replaces this file.")
+    return redirect(url_for("book_page", book_id=book_id))
 
 @app.route("/book/<int:book_id>/convert", methods=["POST"])
 @login_required
@@ -1001,7 +1023,7 @@ def book_convert(book_id):
     jid = db.convert_queue(book_id, user, src, dst, rel)
     _audit("convert", f"book {book_id} {src} -> {dst}" + ("" if jid else " (already queued)"))
     flash(f"Converting to {dst.upper()} — it appears on this page, on your devices and in downloads "
-          f"within about 15 minutes." if jid else f"A {dst.upper()} copy is already being made.")
+          f"within a few minutes." if jid else f"A {dst.upper()} copy is already being made.")
     return redirect(url_for("book_page", book_id=book_id))
 
 @app.route("/book/<int:book_id>/cover")

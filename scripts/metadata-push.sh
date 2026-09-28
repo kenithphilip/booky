@@ -282,7 +282,73 @@ for job in (conv.get("rows") or []) if conv.get("ok") else []:
         convert_failed += 1
 failed += convert_failed
 
+# ---- fourth pass: 'Find a better copy' ---------------------------------------------------
+# A reader (or the admin) asked for a better file of a book, and an EPUB of it arrived: the
+# portal staged it in library/staging/replace/<job>.epub. It goes into THE SAME Calibre book
+# (calibredb add_format replaces the EPUB), so its owners, cover, corrected metadata and the
+# Kobo's identity of the book all stay; every other format was made from the old file (the
+# KEPUB for the Kobo, a MOBI kept from the import, a conversion) and is removed, to be made again
+# from the new one. Tags read before and after, like every write here.
+REPLACE_DIR = os.path.join(STACK, "library", "staging", "replace")
+
+def book_formats(book_id):
+    r = calibredb("list", "--fields", "formats", "--search", f"id:{book_id}", "--for-machine")
+    if r.returncode != 0:
+        return None
+    try:
+        rows = machine_json(r.stdout)
+    except ValueError:
+        return None
+    if not rows:
+        return None
+    return sorted({os.path.splitext(f)[1].lstrip(".").upper() for f in rows[0].get("formats", [])})
+
+replaced = replace_failed = 0
+reps = admin("replaces", "pending")
+for job in (reps.get("rows") or []) if reps.get("ok") else []:
+    jid, bid = int(job["id"]), int(job["calibre_id"])
+    host = os.path.join(REPLACE_DIR, f"{jid}.epub")
+    if job.get("fmt") != "epub" or not os.path.isfile(host) or os.path.islink(host):
+        admin("replaces", "result", str(jid), "fail", "--reason", "refused: the staged EPUB is missing")
+        replace_failed += 1
+        continue
+    before, fmts = all_tags(bid), book_formats(bid)
+    if before is None or fmts is None:
+        admin("replaces", "result", str(jid), "fail", "--reason", "could not read the book (tags or formats)")
+        replace_failed += 1
+        continue
+    inside = f"/tmp/bookstack-replace-{jid}.epub"
+    ok = run(["docker", "cp", host, f"calibre-web:{inside}"], timeout=120).returncode == 0
+    why = "could not hand the file to the library container"
+    if ok:
+        run(["docker", "exec", "calibre-web", "chown", f"{UID}:{GID}", inside], timeout=30)
+        r = calibredb("add_format", str(bid), inside)          # replaces the book's EPUB
+        ok, why = r.returncode == 0, (r.stderr or r.stdout or "add_format failed")[-250:]
+    if ok:
+        for f in fmts:
+            if f != "EPUB":
+                calibredb("remove_format", str(bid), f)       # made from the old file
+    run(["docker", "exec", "calibre-web", "rm", "-f", inside], timeout=30)
+    after, fmts_after = all_tags(bid), book_formats(bid)
+    if after != before:
+        owner_moved = True
+        alert("Bookstack: replacing a book's file CHANGED its tags",
+              f"Calibre book {bid}: tags were {before}, are now {after}. Check it in Calibre-Web.")
+        ok, why = False, f"tags changed unexpectedly: {after}"
+    elif ok and fmts_after != ["EPUB"]:
+        ok, why = False, f"formats after the swap: {fmts_after}"
+    if ok:
+        admin("replaces", "result", str(jid), "ok")
+        os.remove(host)
+        replaced += 1
+    else:
+        admin("replaces", "result", str(jid), "fail", "--reason", why)
+        replace_failed += 1
+failed += replace_failed
+
 print(f"metadata push: {applied} applied, {failed} failed")
+if replaced or replace_failed:
+    print(f"better copies: {replaced} swapped in, {replace_failed} failed")
 if converted or convert_failed:
     print(f"conversions: {converted} made, {convert_failed} failed")
 if tagged or tag_failed:

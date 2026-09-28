@@ -194,6 +194,21 @@ def _converts(args):
     db.audit("convert_result", None, "host", f"#{args.job_id} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 
+def _replaces(args):
+    """'Find a better copy': the host job swaps a staged EPUB into the same Calibre book."""
+    if args.what == "pending":
+        return {"ok": True, "rows": db.pending_replaces(args.limit)}
+    row = db.replace_result(args.job_id, args.outcome == "ok", error=args.reason)
+    if row.get("rid"):
+        rec = db.get(row["rid"])
+        if rec and args.outcome == "ok" and rec["status"] == "done":
+            db.set_status(row["rid"], "done", "a better copy: it replaced the library's file of this book")
+        elif rec and row["status"] == "failed":
+            db.set_status(row["rid"], rec["status"], f"{rec.get('detail') or ''}; the better copy could not "
+                                                     f"replace the library's file ({args.reason[:120]})".lstrip("; "))
+    db.audit("replace_result", row.get("owner"), "host", f"#{args.job_id} book {row['calibre_id']} {args.outcome} {args.reason[:120]}")
+    return {"ok": True, "status": row["status"]}
+
 def _catalogs(args):
     """The admin's own OPDS catalogs (catalogs.py). The password arrives on stdin, never argv."""
     import catalogs
@@ -316,6 +331,13 @@ def _parser():
     cr.add_argument("outcome", choices=("ok", "fail"))
     cr.add_argument("--reason", default="")
 
+    rp = sp.add_parser("replaces").add_subparsers(dest="what", required=True)
+    rp.add_parser("pending").add_argument("--limit", type=int, default=5)
+    rr = rp.add_parser("result")
+    rr.add_argument("job_id", type=int)
+    rr.add_argument("outcome", choices=("ok", "fail"))
+    rr.add_argument("--reason", default="")
+
     ca = sp.add_parser("catalogs").add_subparsers(dest="what", required=True)
     ca.add_parser("list")
     for name in ("add", "test"):
@@ -346,7 +368,7 @@ def _parser():
     return p
 
 ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
-        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts,
+        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces,
         "canary": _canary, "gate": _gate}
 
 def main(argv=None):

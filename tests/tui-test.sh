@@ -1783,6 +1783,44 @@ expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 9 f
 MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["owner:alice"]}]' MP_AFTER='[{"id":50,"tags":["owner:bob"]}]' mprun
 expect 'grep -q "ALERT Bookstack: adding an owner tag changed other tags" "$MP/log" && grep -q "tags result 8 fail" "$MP/log"' \
   "a share that would REMOVE alice (read-back differs) raises the alert and fails"
+# 'Find a better copy': a staged EPUB swapped into the SAME Calibre book
+cat > "$MP/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MP/log"
+case "$*" in
+  *"admin_cli pushes pending"*|*"admin_cli converts pending"*|*"admin_cli tags pending"*) echo '{"ok":true,"rows":[]}';;
+  *"admin_cli replaces pending"*) echo "$MP_REPROWS";;
+  *"admin_cli replaces result"*) echo '{"ok":true,"status":"done"}';;
+  *"--fields tags"*) n=$(cat "$MP/tc" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/tc"
+    if [ "$n" -ge 2 ]; then echo "$MP_AFTER"; else echo "$MP_BEFORE"; fi;;
+  *"--fields formats"*) n=$(cat "$MP/fc" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/fc"
+    if [ "$n" -ge 2 ]; then echo "$MP_FAFTER"; else echo "$MP_FBEFORE"; fi;;
+esac
+EOS
+chmod +x "$MP/bin/docker"
+rpdir="$MP/stack/library/staging/replace"; mkdir -p "$rpdir"
+rprun(){ rm -f "$MP/tc" "$MP/fc"; mprun; }
+export MP_REPROWS='{"ok":true,"rows":[{"id":8,"calibre_id":50,"fmt":"epub","rid":3,"owner":"alice"}]}'
+export MP_BEFORE='[{"id":50,"tags":["Fiction","owner:alice","owner:bob"]}]' MP_AFTER='[{"id":50,"tags":["Fiction","owner:alice","owner:bob"]}]'
+export MP_FBEFORE='[{"id":50,"formats":["/calibre-library/A/B (50)/B - A.epub","/calibre-library/A/B (50)/B - A.kepub","/calibre-library/A/B (50)/B - A.mobi"]}]'
+export MP_FAFTER='[{"id":50,"formats":["/calibre-library/A/B (50)/B - A.epub"]}]'
+echo better > "$rpdir/8.epub"; rprun
+expect 'grep -q "docker cp $rpdir/8.epub calibre-web:/tmp/bookstack-replace-8.epub" "$MP/log" && grep "calibredb add_format" "$MP/log" | grep -q "add_format 50 /tmp/bookstack-replace-8.epub" && ! grep -q "dont-replace" "$MP/log"' \
+  "the better copy goes into the SAME book (add_format replaces its EPUB)"
+expect 'grep -q "remove_format 50 KEPUB" "$MP/log" && grep -q "remove_format 50 MOBI" "$MP/log" && ! grep -q "remove_format 50 EPUB" "$MP/log"' \
+  "formats made from the old file (the Kobo's KEPUB, a kept MOBI) are removed, to be made again from the new one"
+expect 'grep -q "replaces result 8 ok" "$MP/log" && [ ! -e "$rpdir/8.epub" ] && [ "$(grep -c "fields tags" "$MP/log")" = 2 ]' \
+  "owners read before and after, the job reported done, the staged copy removed"
+rprun
+expect 'grep -q "replaces result 8 fail --reason refused: the staged EPUB is missing" "$MP/log" && ! grep -q "add_format" "$MP/log"' \
+  "no staged file: refused, nothing written"
+echo better > "$rpdir/8.epub"; MP_AFTER='[{"id":50,"tags":["Fiction","owner:alice"]}]' rprun
+expect 'grep -q "ALERT Bookstack: replacing a book.s file CHANGED its tags" "$MP/log" && grep -q "replaces result 8 fail" "$MP/log" && [ -e "$rpdir/8.epub" ]' \
+  "a swap that changed the owners raises the alert and fails (the staged copy is kept)"
+MP_FAFTER="$MP_FBEFORE" rprun
+expect 'grep -q "replaces result 8 fail --reason formats after the swap" "$MP/log"' \
+  "old formats that would not go away: reported, not called done"
+unset MP_REPROWS MP_BEFORE MP_AFTER MP_FBEFORE MP_FAFTER
 
 # ---------------------------------------------------------------------------------------------
 echo "== FlareSolverr: one shared solver for Shelfmark and Ephemera"

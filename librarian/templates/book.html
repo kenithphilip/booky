@@ -22,7 +22,23 @@
 <span class="mut">Need another format?</span>
 <select name="format">{% for f in convert_to %}<option value="{{ f }}">{{ f|upper }}</option>{% endfor %}</select>
 <button type="submit" class="sec">Convert</button></form>{% endif %}
-{% for j in converting if j.status != 'done' %}<p class="mut" style="margin:4px 0 0">{{ j.dst_fmt|upper }}: {{ 'being made (within about 15 minutes)' if j.status == 'pending' else 'could not be made — ' ~ (j.detail or 'see the admin') }}</p>{% endfor %}
+{% for j in converting if j.status != 'done' %}<p class="mut" style="margin:4px 0 0">{{ j.dst_fmt|upper }}: {{ 'being made (within a few minutes)' if j.status == 'pending' else 'could not be made — ' ~ (j.detail or 'see the admin') }}</p>{% endfor %}
+{# 'Find a better copy': the next EPUB of this book that arrives replaces this file, for everyone who has it #}
+{% set r = replacing %}
+{% if r and r.status == 'open' %}
+<form method="post" action="{{ url_for('book_replace', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
+<span class="mut">Looking for a better copy: request this book again in Shelfmark and choose an <b>EPUB</b> result, or upload an EPUB of it. The first one that arrives replaces this file (for {{ replace_days }} days from when it was asked).</span>
+<input type="hidden" name="action" value="cancel"><button type="submit" class="sec">Stop looking</button></form>
+{% elif r and r.status == 'staged' %}
+<p class="mut" style="margin:8px 0 0">A better copy has arrived: it replaces this file within a few minutes.</p>
+{% else %}
+{% if r and r.status == 'done' %}<p class="mut" style="margin:8px 0 0">This file was replaced with a better copy.</p>{% endif %}
+{% if r and r.status == 'failed' %}<p class="mut" style="margin:8px 0 0">The better copy could not replace this file — {{ r.last_error or 'see the admin' }}.</p>{% endif %}
+<form method="post" action="{{ url_for('book_replace', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
+<input type="hidden" name="action" value="open">
+<button type="submit" class="sec">Find a better copy</button>
+<span class="mut">Badly formatted or no cover? The next EPUB of this book replaces this file, for everyone who has it.</span></form>
+{% endif %}
 </div></div></div>
 {% if description %}<div class="card"><h3 style="margin-top:0">About this book</h3><p style="white-space:pre-line">{{ description }}</p></div>{% endif %}
 {% endblock %}

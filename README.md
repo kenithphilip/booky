@@ -500,6 +500,13 @@ again (`librarian/share.py`):
   **Audiobooks:** the portal tags the Audiobookshelf item directly.
 - **Matching:** ISBN or Calibre UUID, or the same title AND an overlapping author. Title alone
   never shares, and two candidates are never guessed between. Audiobooks match on the name.
+- **Find a better copy** (a book's page, for any reader who has it, or the admin): a badly
+  converted MOBI, a missing cover. For 7 days the next EPUB of that book that arrives (Shelfmark
+  lets an EPUB release through instead of closing it, and asks for an EPUB otherwise; a dropbox
+  or portal upload counts too) replaces the FILE inside the same Calibre book: owners, cover,
+  corrected metadata and the Kobo's identity of the book stay, every reader who has it gets the
+  new file, and formats made from the old one (the Kobo's KEPUB, a kept MOBI, conversions) are
+  removed to be made again. The host job does the swap, reading the owner tags before and after.
 
 ## Seedbox — Shelfmark downloads on your seedbox, brought home by Syncthing (Library → Seedbox)
 Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or

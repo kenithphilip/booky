@@ -235,3 +235,96 @@ def test_the_gate_never_stales_the_admins_pending_card(monkeypatch):
     page = shelfmark_api.pending()                      # the page fills its cache
     gate = shelfmark_api.pending(cache=False)           # the gate fetches fresh, writes nothing
     assert shelfmark_api.pending() == page and gate != page and len(calls) == 2
+
+
+# ---- 'Find a better copy' ----------------------------------------------------------------------
+from conftest import login, post
+
+
+def test_a_replace_window_opens_expires_and_cancels(users):
+    now = time.time()
+    jid = db.open_replace(7, "alice", now=now)
+    assert db.open_replace(7, "alice", now=now) == jid, "one live window per book"
+    assert db.replace_live(7, now=now)["status"] == "open"
+    assert db.replace_live(7, now=now + db.REPLACE_DAYS * 86400 + 1) is None, "it expires"
+    jid2 = db.open_replace(7, "bob", now=now + db.REPLACE_DAYS * 86400 + 2)
+    assert jid2 != jid and db.cancel_replace(7) and db.replace_live(7) is None
+
+
+def test_only_a_reader_who_has_the_book_can_ask(client):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    login(client, "bob", "bobpass1")
+    assert post(client, "/book/7/replace", action="open").status_code == 404
+    assert db.replace_live(7) is None
+    import app as appmod
+    alice = appmod.app.test_client(); login(alice, "alice", "alicepass1")
+    page = post(alice, "/book/7/replace", action="open").get_data(as_text=True)
+    assert "Looking for a better copy" in page and db.replace_live(7)["opened_by"] == "alice"
+    page = post(alice, "/book/7/replace", action="cancel").get_data(as_text=True)
+    assert "Find a better copy" in page and db.replace_live(7) is None
+
+
+def test_an_epub_arrival_replaces_the_file_of_the_same_book(users, tmp_path):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    jid = db.open_replace(7, "alice")
+    src = make_epub(str(tmp_path / "Emma.epub"), "Emma", "Jane Austen")
+    rid = db.add("alice", {"kind": "ebook", "source": "dropbox", "title": "Emma.epub", "download_url": "local"})
+    note = worker.ingest_local_file(str(src), "alice", rid)
+    assert note == worker.REPLACE_NOTE and worker._status_for(note) == "done"
+    staged = os.path.join(config.STAGING_DIR, "replace", f"{jid}.epub")
+    assert open(staged, "rb").read() == open(src, "rb").read(), "the file exactly as it came, not our tagged copy"
+    assert os.listdir(config.INGEST_DIR) == [], "not imported as a new book"
+    job = db.replace_live(7)
+    assert job["status"] == "staged" and job["rid"] == rid and not db.pending_tag_pushes()
+
+
+def test_a_better_copy_from_another_reader_also_gives_them_the_book(users, tmp_path):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    db.open_replace(7, "alice")
+    src = make_epub(str(tmp_path / "Emma.epub"), "Emma", "Jane Austen")
+    note = worker.ingest_local_file(str(src), "bob", 9)
+    assert worker.REPLACE_NOTE in note and worker._status_for(note) == worker.NEEDS_TAG
+    assert db.replace_live(7)["status"] == "staged" and db.pending_tag_pushes()[0]["owner"] == "bob"
+
+
+def test_a_mobi_is_not_a_better_copy(users):
+    add_calibre_book(7, "The Kite Runner", "Khaled Hosseini", tags=["owner:alice"])
+    db.open_replace(7, "alice")
+    src = os.path.join(os.path.dirname(__file__), "fixtures", "untaggable", "kite-runner.mobi")
+    note = worker.ingest_local_file(src, "alice", 3)
+    assert note.startswith("already in your library") and db.replace_live(7)["status"] == "open", "still waiting for an EPUB"
+
+
+def test_the_gate_lets_an_epub_through_and_asks_for_one_otherwise(shelf):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    db.open_replace(7, "alice")
+    epub, mobi = _req(1, "alice", "Emma", "Jane Austen"), _req(2, "alice", "Emma", "Jane Austen")
+    mobi["format"] = "mobi"
+    shelf["rows"] = [epub, mobi]
+    worker.shelfmark_gate_once()
+    assert shelf["decided"] == [(1, True, ""), (2, False, worker.SHELF_PICK_EPUB)]
+
+
+def test_a_portal_request_downloads_while_a_better_copy_is_wanted(users, monkeypatch):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    db.open_replace(7, "alice")
+    fetched = []
+    monkeypatch.setattr(worker, "_place_ebook_http", lambda req: fetched.append(req["id"]))
+    rid = db.add("alice", {"kind": "ebook", "source": "gutenberg", "title": "Emma", "author": "Jane Austen",
+                           "download_url": "https://www.gutenberg.org/x.epub"})
+    worker._process(db.get(rid))
+    assert fetched == [rid]
+
+
+def test_the_host_reports_the_swap(users, tmp_path, capsys):
+    add_calibre_book(7, "Emma", "Jane Austen", tags=["owner:alice"])
+    jid = db.open_replace(7, "alice")
+    src = make_epub(str(tmp_path / "Emma.epub"), "Emma", "Jane Austen")
+    rid = db.add("alice", {"kind": "ebook", "source": "dropbox", "title": "Emma.epub", "download_url": "local"})
+    note = worker.ingest_local_file(str(src), "alice", rid); worker._finish(rid, "done", note)
+    admin_cli.main(["replaces", "pending"])
+    (row,) = json.loads(capsys.readouterr().out)["rows"]
+    assert (row["id"], row["calibre_id"], row["fmt"]) == (jid, 7, "epub")
+    assert admin_cli.main(["replaces", "result", str(jid), "ok"]) == 0
+    capsys.readouterr()
+    assert db.replace_for_book(7)["status"] == "done" and "replaced" in db.get(rid)["detail"]

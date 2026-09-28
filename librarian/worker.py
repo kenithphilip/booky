@@ -342,7 +342,7 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
             # the file's own title/author/identifiers, recorded against the request. For a
             # dropbox or Shelfmark arrival this replaces "the filename" as the only evidence.
             db.set_file_meta(rid, seen)
-            fam = _family_copy(owner, rid, seen)
+            fam = _family_copy(owner, rid, seen, src, ext)
             if fam:                            # before anything is mailed or imported
                 os.remove(part)
                 return fam
@@ -360,7 +360,7 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
             # also when CWA converted it to EPUB and named it from its own metadata
             meta = filemeta.read(part, ext)
             db.set_file_meta(rid, meta)
-            fam = _family_copy(owner, rid, meta)
+            fam = _family_copy(owner, rid, meta, src, ext)
             if fam:
                 os.remove(part)
                 return fam
@@ -375,15 +375,44 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
 
 FAMILY_NOTE = "already in the family library"
 
-def _family_copy(owner, rid, meta):
+REPLACE_NOTE = "a better copy: it replaces the library's file of this book, for everyone who has it, within a few minutes"
+SHELF_PICK_EPUB = ("A better copy of this book is being looked for: request it again and choose an EPUB "
+                   "result (that is the copy that replaces the one in the library).")
+
+def _stage_better_copy(job, src, ext, rid, owner):
+    """'Find a better copy' is open for this book and an EPUB arrived: hand the file, exactly
+    as it came (not our owner-tagged copy: the book's tags live in Calibre), to the host job,
+    which swaps it into the SAME Calibre book. True if staged."""
+    if ext != "epub" or not src:
+        return False
+    d = os.path.join(config.STAGING_DIR, "replace")
+    os.makedirs(d, exist_ok=True)
+    dest = os.path.join(d, f"{job['id']}.epub")
+    shutil.copyfile(src, dest + ".tmp")
+    os.replace(dest + ".tmp", dest)
+    if db.stage_replace(job["id"], dest, "epub", rid, owner):
+        db.audit("replace_staged", owner, None, f"book {job['calibre_id']} job {job['id']}")
+        return True
+    os.remove(dest)
+    return False
+
+def _family_copy(owner, rid, meta, src=None, ext=None):
     """Family sharing (share.py): an arrival that is a book already in the library is not
     imported a second time. The reader gets the existing copy (their owner tag is added by the
-    host job); a book they already have is simply not duplicated. None = import it as usual."""
+    host job); a book they already have is simply not duplicated. While 'Find a better copy' is
+    open for that book, an EPUB arrival replaces the library's file instead. None = import it
+    as usual."""
     if not meta or not (meta.get("title") or meta.get("identifiers")):
         return None
     m = share.find_ebook(meta.get("title"), meta.get("author") or "", meta.get("identifiers") or ())
     if not m:
         return None
+    job = db.replace_live(m["book_id"])
+    if job and job["status"] == "open" and _stage_better_copy(job, src, ext, rid, owner):
+        if owner in m["owners"]:
+            return REPLACE_NOTE
+        share.give_ebook(m, owner, rid)
+        return f"{NEEDS_TAG}: {FAMILY_NOTE}, {REPLACE_NOTE}; {AUTO_TAG_NOTE}: {_owner_tag(owner)}"
     if owner in m["owners"]:
         return f"already in your library (matched by {m['how']}); this copy was not imported again"
     share.give_ebook(m, owner, rid)
@@ -424,8 +453,8 @@ def _family_request(req):
             return None
         return f"{FAMILY_NOTE}: added to your audiobooks, nothing downloaded"
     m = share.find_ebook(req.get("title"), req.get("author") or "")
-    if not m:
-        return None
+    if not m or db.replace_live(m["book_id"]):
+        return None                              # new, or a better copy is wanted: download it
     if owner in m["owners"]:
         return f"already in your library (matched by {m['how']}); nothing downloaded"
     share.give_ebook(m, owner, req["id"])
@@ -468,6 +497,17 @@ def shelfmark_gate_once(now=None):
                     share.give_audiobook(m, owner)
             else:
                 m = share.find_ebook(x["title"], x["author"], share.isbn_ids(*x.get("isbns", ())))
+                job = db.replace_live(m["book_id"]) if m else None
+                if job and job["status"] == "open":
+                    # 'Find a better copy': an EPUB release goes through (and replaces the file on
+                    # arrival); anything else is sent back asking for an EPUB
+                    if (x.get("format") or "").lower() == "epub":
+                        if not config.APPROVALS_REQUIRED:
+                            shelfmark_api.decide(x["id"], True, "")
+                            approved += 1
+                    else:
+                        shelfmark_api.decide(x["id"], False, SHELF_PICK_EPUB)
+                    continue
                 if m and owner not in m["owners"]:
                     rid = db.add(owner, {"kind": "ebook", "source": "shelfmark", "title": x["title"],
                                          "author": x["author"], "download_url": "local"}, status=NEEDS_TAG)
