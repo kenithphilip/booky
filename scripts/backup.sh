@@ -138,6 +138,7 @@ restic "${R[@]}" backup "$STACK_DIR" \
   --exclude "$STACK_DIR/cwa/config/processed_books" \
   --exclude "$STACK_DIR/library/staging" \
   --exclude "$STACK_DIR/library/seedbox" \
+  --exclude "$STACK_DIR/library/seedbox-sync" \
   --exclude "$STACK_DIR/ephemera/downloads" \
   --exclude "$STACK_DIR/abs/metadata/cache" \
   --exclude "$STACK_DIR/abs/metadata/logs" \

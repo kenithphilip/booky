@@ -1,36 +1,48 @@
 #!/usr/bin/env python3
-"""seedbox-fetch.py — bring finished downloads back from the seedbox (Library -> Seedbox).
+"""seedbox-fetch.py — hand finished seedbox downloads to Shelfmark (Library -> Seedbox).
 
 Shelfmark sends a reader's pick to the seedbox's SABnzbd (Usenet) or rTorrent (torrents), which
-download it on the SEEDBOX's disk. This job, every minute on the host, COPIES each finished item
-to $STACK_DIR/library/seedbox/, which Shelfmark sees as /seedbox; Shelfmark's remote path mapping
-then finds it there and files it into that reader's dropbox, and the portal tags and imports it.
+download it on the SEEDBOX's disk. Syncthing carries it to this server:
 
-COPY ONLY. The seedbox belongs to private trackers with strict seeding rules: nothing here may
-move, delete, rename or change anything on it. Enforced three ways, each on its own enough:
-  1. the Filebrowser account must be DOWNLOAD-ONLY: its permissions ride in the login token, and
-     this refuses to run (and alerts) if it could create, rename, modify, delete, share, execute
-     or administer anything. Filebrowser itself then refuses any write (measured: DELETE -> 403);
-  2. every request goes through one allowlist: POST /api/login, GET /api/resources/..., GET
-     /api/raw/... Anything else raises before a byte is sent. There is no delete code at all;
-  3. rTorrent is asked one fixed, read-only question (d.multicall2 of d.name / d.complete /
-     d.directory) and nothing else.
+  seedbox Syncthing (SEND ONLY) --> this server's Syncthing (container "syncthing", RECEIVE ONLY)
+                                    into $STACK_DIR/library/seedbox-sync/<sub>/
+  this job, every minute: each item that is finished AND fully arrived is hard-linked (copied
+  when it cannot be) into $STACK_DIR/library/seedbox/<sub>/, which Shelfmark sees as /seedbox;
+  Shelfmark's remote path mappings find it there and file it into that reader's dropbox.
+
+NOTHING ON THE SEEDBOX IS EVER MOVED, DELETED OR CHANGED (private trackers: strict seeding
+rules). Enforced in layers, each on its own enough:
+  1. this server's side of every folder is RECEIVE ONLY: Syncthing never sends a change made here
+     (measured in tests/seedbox-test.sh: files deleted, edited and added here leave the seedbox
+     byte-identical even with the seedbox side wrongly set to Send & Receive). Checked every run;
+     a folder found otherwise is PAUSED at once and nothing runs until it is fixed;
+  2. the seedbox's side is SEND ONLY (Library -> Seedbox says where): it ignores all changes
+     from other devices;
+  3. this job never writes into the synced copy, except to drop an item it handed over a week
+     ago, and only after Syncthing has been told to ignore that item. Every request to this
+     server's Syncthing goes through one allowlist (no revert, no override, no config writes
+     outside --setup);
+  4. rTorrent is asked one fixed, read-only question (d.multicall2 of d.name / d.complete /
+     d.directory / d.timestamp.finished) and nothing else.
 Shelfmark's own clean-up is pinned in docker-compose.yml (torrents: keep; Usenet: copy).
 
-What is fetched, and when:
-  * sab (SABnzbd): a job folder appears in completed/<category> only once SABnzbd is done with it
-    (it unpacks in _UNPACK_* and renames at the end); fetched once every file is 2 minutes old.
-  * rt (rTorrent): rTorrent downloads IN PLACE, so only names rTorrent itself reports complete
-    (XML-RPC d.complete) are fetched. They keep seeding untouched.
-Each item is remembered by its file list (names and sizes) and never fetched twice; if it changes
-on the seedbox it is fetched again. An item appears under library/seedbox/ only whole: it is
-downloaded into .incoming/, every file's size checked, re-listed on the seedbox, then renamed into
-place. Standard library only, runs as root.
+An item is handed over when:
+  * the seedbox is connected and Syncthing needs nothing more under that item;
+  * nothing in it has changed for MIN_AGE (2 minutes);
+  * torrents only: rTorrent reports it complete, at least RT_SETTLE (10 minutes) ago. rTorrent
+    writes into full-size files in place, so a copy the seedbox's Syncthing scanned mid-download
+    looks whole; the wait lets its rescan (every 5 minutes, see Library -> Seedbox) catch the
+    last pieces first.
+Each item is remembered by its names, sizes and times: handed over once, again only if it
+changes. It appears under library/seedbox/ only whole (built in .incoming/, renamed into place).
+After KEEP_DAYS both the hand-over and the synced copy go (the latter ignored in Syncthing
+first), so this server keeps about a week of seedbox downloads. Standard library only; root.
 
-Config: /etc/bookstack/seedbox.env (0600; Library -> Seedbox writes it). State and the failure
-latch: /etc/bookstack/seedbox.state (JSON).
+Config: /etc/bookstack/seedbox.env (0600; Library -> Seedbox writes it). Syncthing's API key:
+SYNCTHING_API_KEY in $STACK_DIR/.env (the container reads it). State and the failure latch:
+/etc/bookstack/seedbox.state (JSON).
 """
-import base64, datetime, fcntl, hashlib, json, os, re, shutil, subprocess, sys, time, uuid
+import base64, fcntl, hashlib, http.client, json, os, re, shutil, subprocess, sys, time, uuid
 import urllib.error, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
 
@@ -38,22 +50,36 @@ STACK = os.environ.get("STACK_DIR", "/srv/bookstack")
 CONF = os.environ.get("SEEDBOX_ENV", "/etc/bookstack/seedbox.env")
 STATE = os.environ.get("SEEDBOX_STATE", "/etc/bookstack/seedbox.state")
 MIRROR = os.environ.get("SEEDBOX_MIRROR", os.path.join(STACK, "library/seedbox"))
+SYNC = os.environ.get("SEEDBOX_SYNC", os.path.join(STACK, "library/seedbox-sync"))
+ST_SYNC = os.environ.get("SEEDBOX_ST_SYNC", "/sync")            # the same folder inside the container
+ST_URL = os.environ.get("SEEDBOX_ST_URL", "http://127.0.0.1:8384")
 ALERT = os.environ.get("SEEDBOX_ALERT", os.path.join(STACK, "scripts/alert.sh"))
-MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "120"))            # seconds a SABnzbd job must be settled
-KEEP_DAYS = int(os.environ.get("SEEDBOX_KEEP_DAYS", "7"))           # unclaimed items on the VPS
+MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "120"))           # seconds an item must be unchanged
+RT_SETTLE = int(os.environ.get("SEEDBOX_RT_SETTLE", "600"))       # seconds after rTorrent finished it
+KEEP_DAYS = float(os.environ.get("SEEDBOX_KEEP_DAYS", "7"))       # hand-overs and synced copies here
 FREE_MARGIN = int(os.environ.get("SEEDBOX_FREE_MARGIN_GB", "5")) * 2**30
-FAILS_BEFORE_ALERT = 15                                             # a quarter of an hour of minutes
+FAILS_BEFORE_ALERT = 15                                            # a quarter of an hour of minutes
 SKIP_PREFIX = ("_UNPACK_", "_FAILED_", "_ADMIN_", ".")
-# guardrail 1: permissions a Filebrowser account must NOT have
-WRITE_PERMS = ("admin", "create", "rename", "modify", "delete", "share", "execute")
-# guardrail 2: the only requests this job may make to the seedbox (method, path prefix)
-ALLOWED = (("POST", "/api/login"), ("GET", "/api/resources/"), ("GET", "/api/raw/"))
-# guardrail 3: the one, read-only rTorrent question
-RT_COMMANDS = ("d.name=", "d.complete=", "d.directory=")
+SAB_IGNORES = ["/_UNPACK_*", "/_FAILED_*", "/_ADMIN_*"]            # SABnzbd's work in progress
+DEVICE_RE = re.compile(r"^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$")
+# guardrail 3: the only requests this job may send to THIS server's Syncthing. (method, path);
+# a path ending in "/" is a prefix. PATCH of a folder is further limited to {"paused": true}.
+ST_RUN = {("GET", "/rest/system/status"), ("GET", "/rest/system/connections"),
+          ("GET", "/rest/config/folders/"), ("GET", "/rest/db/status"), ("GET", "/rest/db/need"),
+          ("GET", "/rest/db/browse"), ("GET", "/rest/db/completion"),
+          ("GET", "/rest/db/ignores"), ("POST", "/rest/db/ignores"),
+          ("PATCH", "/rest/config/folders/")}
+ST_SETUP = ST_RUN | {("GET", "/rest/config/folders"), ("GET", "/rest/config/devices"), ("GET", "/rest/config/gui"),
+                     ("PATCH", "/rest/config/options"), ("PATCH", "/rest/config/gui"),
+                     ("POST", "/rest/config/devices"), ("PATCH", "/rest/config/devices/"),
+                     ("DELETE", "/rest/config/devices/"), ("POST", "/rest/config/folders"),
+                     ("DELETE", "/rest/config/folders/")}
+# guardrail 4: the one, read-only rTorrent question
+RT_COMMANDS = ("d.name=", "d.complete=", "d.directory=", "d.timestamp.finished=")
 
 
 class Unsafe(RuntimeError):
-    """A guardrail refused: nothing is fetched until it is fixed."""
+    """A guardrail refused: nothing is handed over until it is fixed."""
 
 
 def envfile(path):
@@ -79,7 +105,7 @@ def load_state():
 
 def save_state(st):
     tmp = STATE + ".tmp"
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(st, f, indent=1, sort_keys=True)
     os.replace(tmp, STATE)
@@ -92,196 +118,197 @@ def alert(title, body, prio="high"):
         pass
 
 
-def parse_time(s):
-    """Filebrowser: 2026-09-27T17:12:31.780402342Z (nanoseconds, Z or an offset)."""
-    s = re.sub(r"(\.\d{6})\d+", r"\1", s or "").replace("Z", "+00:00")
-    try:
-        return datetime.datetime.fromisoformat(s).timestamp()
-    except ValueError:
-        return 0.0
+class Syncthing:
+    """This server's Syncthing, through the allowlist."""
 
+    def __init__(self, key, allowed=ST_RUN):
+        if not key:
+            raise RuntimeError("SYNCTHING_API_KEY is not set in .env (Library -> Seedbox -> Change the settings)")
+        self.key, self.allowed = key, allowed
 
-class Seedbox:
-    def __init__(self, c):
-        self.base = c["SEEDBOX_FB_URL"].rstrip("/")
-        self.basic = None
-        if c.get("SEEDBOX_BASIC_USER"):
-            raw = f'{c["SEEDBOX_BASIC_USER"]}:{c.get("SEEDBOX_BASIC_PASS", "")}'.encode()
-            self.basic = "Basic " + base64.b64encode(raw).decode()
-        self.user, self.pw = c["SEEDBOX_FB_USER"], c.get("SEEDBOX_FB_PASS", "")
-        self.token = None
+    def req(self, method, path, query=None, body=None, timeout=30):
+        if not any(method == m and (path.startswith(p) if p.endswith("/") else path == p) for m, p in self.allowed):
+            raise Unsafe(f"refused to send {method} {path} to Syncthing: not on this job's list")
+        if self.allowed is ST_RUN and method == "PATCH" and body != {"paused": True}:
+            raise Unsafe(f"refused PATCH {path} {body}: this job may only pause a folder")
+        url = ST_URL.rstrip("/") + urllib.parse.quote(path, safe="/") + ("?" + urllib.parse.urlencode(query) if query else "")
+        data = None if body is None else json.dumps(body).encode()
+        h = {"X-API-Key": self.key, "Content-Type": "application/json", "User-Agent": "bookstack-seedbox/2"}
+        raw = urllib.request.urlopen(urllib.request.Request(url, data=data, headers=h, method=method), timeout=timeout).read()
+        try:
+            return json.loads(raw) if raw else None
+        except ValueError:
+            return raw.decode(errors="replace")
 
-    def _req(self, method, path, data=None, raw=False, timeout=60, stream_to=None):
-        if not any(method == m and (path == p if m == "POST" else path.startswith(p)) for m, p in ALLOWED):
-            raise Unsafe(f"refused to send {method} {path}: this job only reads from the seedbox")
-        h = {"User-Agent": "bookstack-seedbox/1"}
-        if self.basic:
-            h["Authorization"] = self.basic
-        if self.token:
-            h["X-Auth"] = self.token
-        if data is not None:
-            h["Content-Type"] = "application/json"
-            data = json.dumps(data).encode()
-        url = self.base + urllib.parse.quote(path, safe="/")
-        r = urllib.request.urlopen(urllib.request.Request(url, data=data, headers=h, method=method), timeout=timeout)
-        if stream_to:
-            n = 0
-            with open(stream_to, "wb") as f:
-                while True:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk); n += len(chunk)
-            return n
-        body = r.read()
-        return body if raw else (json.loads(body) if body else None)
-
-    def login(self):
-        self.token = None
-        self.token = self._req("POST", "/api/login", {"username": self.user, "password": self.pw, "recaptcha": ""},
-                               raw=True).decode().strip()
-        if not self.token.startswith("ey"):
-            raise RuntimeError("Filebrowser login answered without a token")
-        self.perm = token_perms(self.token)
-        risky = sorted(k for k in WRITE_PERMS if self.perm.get(k))
-        if risky or not self.perm.get("download"):
-            raise Unsafe("the Filebrowser account '%s' %s. Use a DOWNLOAD-ONLY account (Filebrowser -> Settings -> "
-                         "User Management: only 'Download' ticked) so nothing on the seedbox can ever be changed"
-                         % (self.user, ("can " + ", ".join(risky)) if risky else "cannot download"))
-
-    def listdir(self, path):
-        return (self._req("GET", "/api/resources" + path.rstrip("/") + "/") or {}).get("items") or []
-
-    def walk(self, item):
-        """[(relative path, size, mtime)] for every file under an item (the item itself when a
-        file), sorted, so two walks compare equal only when nothing changed in between."""
-        if not item.get("isDir"):
-            return [(item["name"], int(item.get("size") or 0), parse_time(item.get("modified")))]
-        out, todo = [], [(item["path"], item["name"])]
-        while todo:
-            path, rel = todo.pop()
-            for it in self.listdir(path):
-                r = rel + "/" + it["name"]
-                if it.get("isSymlink"):
-                    continue
-                if it.get("isDir"):
-                    todo.append((it["path"], r))
-                else:
-                    out.append((r, int(it.get("size") or 0), parse_time(it.get("modified"))))
-        return sorted(out)
-
-    def download(self, remote_file, local):
-        return self._req("GET", "/api/raw" + remote_file, stream_to=local, timeout=300)
-
-
-def token_perms(token):
-    """The account's permissions, from the JWT Filebrowser signs (its payload's user.perm)."""
-    try:
-        part = token.split(".")[1]
-        payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
-        return dict((payload.get("user") or {}).get("perm") or {})
-    except (IndexError, ValueError):
-        raise RuntimeError("could not read the Filebrowser account's permissions from its login token")
-
-
-def signature(files):
-    """Names and sizes: equal only for the same content on the seedbox (mtimes can be touched)."""
-    return hashlib.sha256(json.dumps([(r, sz) for r, sz, _ in files]).encode()).hexdigest()[:24]
-
-
-def _scalar(v):
-    kids = list(v)
-    return (kids[0].text if kids else v.text) or ""
+    def folder(self, fid):
+        try:
+            return self.req("GET", "/rest/config/folders/" + fid)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            raise
 
 
 def rtorrent_complete(c):
-    """Names of the torrents rTorrent reports COMPLETE whose folder is under the watched one."""
+    """{name: finished time (0 = unknown)} of the torrents rTorrent reports COMPLETE whose data
+    sits directly in the watched folder."""
     url = c.get("SEEDBOX_RT_URL", "")
     params = "".join(f"<param><value><string>{x}</string></value></param>" for x in ("", "main") + RT_COMMANDS)
     body = f'<?xml version="1.0"?><methodCall><methodName>d.multicall2</methodName><params>{params}</params></methodCall>'.encode()
-    h = {"Content-Type": "text/xml", "User-Agent": "bookstack-seedbox/1"}
-    user = c.get("SEEDBOX_RT_USER") or c.get("SEEDBOX_BASIC_USER")
-    if user:
-        pw = c.get("SEEDBOX_RT_PASS") or c.get("SEEDBOX_BASIC_PASS", "")
-        h["Authorization"] = "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()
-    xml = urllib.request.urlopen(urllib.request.Request(url, data=body, headers=h), timeout=60).read()
-    root = ET.fromstring(xml)
+    h = {"Content-Type": "text/xml", "User-Agent": "bookstack-seedbox/2"}
+    if c.get("SEEDBOX_RT_USER"):
+        raw = f'{c["SEEDBOX_RT_USER"]}:{c.get("SEEDBOX_RT_PASS", "")}'.encode()
+        h["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+    root = ET.fromstring(urllib.request.urlopen(urllib.request.Request(url, data=body, headers=h), timeout=60).read())
     if root.find("fault") is not None:
         raise RuntimeError("rTorrent XML-RPC fault")
     base = c.get("SEEDBOX_RT_DIR", "").rstrip("/")
-    done = set()
+    done = {}
     outer = root.find("./params/param/value/array/data")
     for v in (outer.findall("value") if outer is not None else []):
         row = v.find("array/data")
-        vals = [_scalar(x) for x in row.findall("value")] if row is not None else []
-        if len(vals) < 3:
+        vals = [((list(x)[0].text if list(x) else x.text) or "") for x in row.findall("value")] if row is not None else []
+        if len(vals) < 4:
             continue
         name, complete, directory = vals[0], vals[1].strip(), vals[2].rstrip("/")
-        if complete != "1":
-            continue
         # a multi-file torrent's d.directory is <base>/<name>, a single file's is <base>
-        if directory in (base, base + "/" + name):
-            done.add(name)
+        if complete == "1" and directory in (base, base + "/" + name):
+            try:
+                done[name] = int(vals[3].strip() or 0)
+            except ValueError:
+                done[name] = 0
     return done
 
 
 def sources(c):
-    """[(fb path, local subdir, kind)] from SEEDBOX_SOURCES: 'fb path|local subdir|sab or rt' per ';'."""
+    """[(Syncthing folder ID, subdir, 'sab' or 'rt')] from SEEDBOX_SOURCES ('id|sub|kind;...')."""
     out = []
     for part in (c.get("SEEDBOX_SOURCES") or "").split(";"):
         bits = [b.strip() for b in part.split("|")]
-        if len(bits) == 3 and bits[0].startswith("/") and bits[2] in ("sab", "rt") \
-                and bits[1] and ".." not in bits[1].split("/") and not bits[1].startswith("/"):
+        if len(bits) == 3 and re.fullmatch(r"bookstack-[A-Za-z0-9._-]+", bits[0]) and bits[2] in ("sab", "rt") \
+                and bits[1] and not bits[1].startswith("/") and ".." not in bits[1].split("/"):
             out.append(tuple(bits))
     return out
 
 
-def chown_tree(path, uid, gid):
+def walk(path):
+    """[(relative path, size, mtime)] for every file under an item (the item itself when a file),
+    sorted, so two walks compare equal only when nothing changed in between. Symlinks skipped."""
+    name = os.path.basename(path)
+    if os.path.islink(path):
+        return []
+    if not os.path.isdir(path):
+        s = os.stat(path)
+        return [(name, s.st_size, int(s.st_mtime))]
+    out = []
     for root, dirs, files in os.walk(path):
-        for n in [root] + [os.path.join(root, x) for x in dirs + files]:
-            try:
-                os.chown(n, uid, gid)
-            except OSError:
-                pass
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for f in files:
+            p = os.path.join(root, f)
+            if not os.path.islink(p):
+                s = os.lstat(p)
+                out.append((os.path.join(name, os.path.relpath(p, path)), s.st_size, int(s.st_mtime)))
+    return sorted(out)
 
 
-def fetch_item(sb, item, dest_dir, uid, gid, files):
-    """Download one item (file or folder, already walked) whole into dest_dir; bytes, or raises."""
+def signature(files):
+    return hashlib.sha256(json.dumps(files).encode()).hexdigest()[:24]
+
+
+def inside(path, root):
+    rp, rr = os.path.realpath(path), os.path.realpath(root)
+    return rp != rr and rp.startswith(rr + os.sep)
+
+
+def hand_over(src, dest_dir, files, sig, uid, gid):
+    """Hard-link (or copy) one item whole into dest_dir; bytes. The synced copy is only read."""
     total = sum(sz for _, sz, _ in files)
     os.makedirs(dest_dir, exist_ok=True)
-    if shutil.disk_usage(dest_dir).free < total + FREE_MARGIN:
-        raise OSError(f"not enough free space on the VPS for {item['name']} ({total // 2**20} MiB)")
     stage = os.path.join(MIRROR, ".incoming", uuid.uuid4().hex)
     os.makedirs(stage)
     try:
+        base = os.path.dirname(src)
+        same_fs = os.stat(base).st_dev == os.stat(stage).st_dev
+        if not same_fs and shutil.disk_usage(stage).free < total + FREE_MARGIN:
+            raise OSError(f"not enough free space for {os.path.basename(src)} ({total // 2**20} MiB)")
         for rel, size, _ in files:
-            local = os.path.join(stage, rel)
-            os.makedirs(os.path.dirname(local), exist_ok=True)
-            remote = item["path"] if not item.get("isDir") else item["path"].rstrip("/") + "/" + rel.split("/", 1)[1]
-            got = sb.download(remote, local)
-            if got != size or os.path.getsize(local) != size:
-                raise OSError(f"{rel}: got {got} bytes, the seedbox lists {size}")
-        final = os.path.join(dest_dir, item["name"])
-        if os.path.exists(final):
-            shutil.rmtree(final) if os.path.isdir(final) else os.unlink(final)
-        chown_tree(stage, uid, gid)
-        os.replace(os.path.join(stage, item["name"]), final)      # whole, in one step
-        os.utime(final, None)                                      # the week of grace starts now
+            s, d = os.path.join(base, rel), os.path.join(stage, rel)
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            try:
+                os.link(s, d)                       # the same bytes, no second copy on disk
+            except OSError:
+                shutil.copyfile(s, d)
+            if os.path.getsize(d) != size:
+                raise OSError(f"{rel}: {os.path.getsize(d)} bytes, expected {size}")
+        if signature(walk(src)) != sig:
+            raise OSError(f"{os.path.basename(src)} changed while it was handed over; again next minute")
+        for root, dirs, _ in os.walk(stage):         # only the new folders: never chown a linked file
+            for n in [root] + [os.path.join(root, x) for x in dirs]:
+                try:
+                    os.chown(n, uid, gid)
+                except OSError:
+                    pass
+        final = os.path.join(dest_dir, os.path.basename(src))
+        if os.path.lexists(final):
+            shutil.rmtree(final) if os.path.isdir(final) and not os.path.islink(final) else os.unlink(final)
+        os.replace(os.path.join(stage, os.path.basename(src)), final)      # whole, in one step
         return total
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 
 
-def prune(now, subs):
-    """Items Shelfmark never claimed (the reader cancelled, a mapping was wrong) go after a week;
-    a staging leftover from a run that died mid-download goes after a day."""
+def ignore_line(name):
+    """A Syncthing ignore pattern matching exactly one top-level item; None when unsafe to express."""
+    if not name or "\n" in name or "\r" in name or name != name.strip():
+        return None
+    return "/" + re.sub(r"([\\*?\[\]{}])", r"\\\1", name)
+
+
+def set_ignores(stc, fid, add=(), drop=()):
+    cur = (stc.req("GET", "/rest/db/ignores", {"folder": fid}) or {}).get("ignore") or []
+    new = [x for x in cur if x not in drop] + [x for x in add if x not in cur]
+    if new != cur:
+        stc.req("POST", "/rest/db/ignores", {"folder": fid}, {"ignore": new})
+        got = (stc.req("GET", "/rest/db/ignores", {"folder": fid}) or {}).get("ignore") or []
+        if any(x not in got for x in add) or any(x in got for x in drop):
+            raise RuntimeError(f"Syncthing did not take the ignore list of {fid}")
+
+
+def guard(stc, c, srcs, act=True):
+    """Guardrail 1: every folder is RECEIVE ONLY here. One that is not is paused at once."""
+    bad = []
+    for fid, sub, _ in srcs:
+        f = stc.folder(fid)
+        if f is None:
+            raise RuntimeError(f"Syncthing has no folder {fid}; Library -> Seedbox -> Change the settings sets it up")
+        if f.get("type") != "receiveonly":
+            if act and not f.get("paused"):
+                stc.req("PATCH", "/rest/config/folders/" + fid, body={"paused": True})
+            bad.append(f"{fid} is '{f.get('type')}'")
+        elif f.get("path", "").rstrip("/") != ST_SYNC + "/" + sub:
+            raise RuntimeError(f"Syncthing folder {fid} points at {f.get('path')}, not {ST_SYNC}/{sub}")
+    if bad:
+        raise Unsafe("on this server the Syncthing folder " + ", ".join(bad) + " instead of Receive Only. "
+                     "It is PAUSED, so nothing made here can reach the seedbox. Library -> Seedbox -> "
+                     "Change the settings puts it back to Receive Only.")
+
+
+def connected(stc, dev):
+    return bool(((stc.req("GET", "/rest/system/connections") or {}).get("connections") or {}).get(dev, {}).get("connected"))
+
+
+def prune(now, subs, copied):
+    """Hand-overs Shelfmark never claimed (the reader cancelled, a mapping was wrong) go after
+    KEEP_DAYS, counted from the hand-over (a linked file keeps the seedbox's own time, so its
+    mtime says nothing); a staging leftover from a run that died mid-way after a day."""
     gone = 0
     for sub in subs:
         d = os.path.join(MIRROR, sub)
         for n in (os.listdir(d) if os.path.isdir(d) else []):
             p = os.path.join(d, n)
-            if os.path.getmtime(p) < now - KEEP_DAYS * 86400:
-                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else os.unlink(p)
+            at = (copied.get(sub + "/" + n) or {}).get("at") or os.lstat(p).st_mtime
+            if at < now - KEEP_DAYS * 86400:
+                shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) and not os.path.islink(p) else os.unlink(p)
                 gone += 1
     inc = os.path.join(MIRROR, ".incoming")
     for n in (os.listdir(inc) if os.path.isdir(inc) else []):
@@ -292,133 +319,242 @@ def prune(now, subs):
 
 def run():
     c = envfile(CONF)
-    if not c.get("SEEDBOX_FB_URL"):
+    srcs = sources(c)
+    if not c.get("SEEDBOX_ST_DEVICE") or not srcs:
         print("seedbox: not configured (Library -> Seedbox)")
         return 0
     env = envfile(os.path.join(STACK, ".env"))
     uid, gid = int(env.get("PUID") or 1000), int(env.get("PGID") or 1000)
     st = load_state()
-    copied = st.setdefault("copied", {})
+    copied, seen = st.setdefault("copied", {}), st.setdefault("seen", {})
     now = time.time()
-    fetched, notes = 0, []
+    handed, trimmed, notes = 0, 0, []
     try:
-        sb = Seedbox(c)
-        sb.login()
+        stc = Syncthing(env.get("SYNCTHING_API_KEY"))
+        guard(stc, c, srcs)
+        dev = c["SEEDBOX_ST_DEVICE"]
+        up = connected(stc, dev)
         rt_done = None
-        srcs = sources(c)
-        for fb_path, sub, kind in srcs:
-            dest = os.path.join(MIRROR, sub)
-            os.makedirs(dest, exist_ok=True)
-            chown_tree(dest, uid, gid)
-            if kind == "rt":
-                if not c.get("SEEDBOX_RT_URL"):
-                    notes.append(f"{fb_path}: no rTorrent address, so torrents are not fetched (they could be unfinished)")
-                    continue
-                if rt_done is None:
-                    rt_done = rtorrent_complete(c)
-            present = set()
-            for item in sb.listdir(fb_path):
-                name = item["name"]
-                if name.startswith(SKIP_PREFIX) or item.get("isSymlink"):
-                    continue
-                present.add(name)
-                key = sub + "/" + name
-                if kind == "rt" and name not in rt_done:
-                    continue                        # still downloading: never copied half-done
-                files = sb.walk(item)
-                if not files:
-                    continue                        # an empty folder: nothing to hand over yet
-                sig = signature(files)
-                if (copied.get(key) or {}).get("sig") == sig:
-                    continue                        # already here once: never twice
-                if kind == "sab" and now - max(m for _, _, m in files) < MIN_AGE:
-                    continue                        # SABnzbd may still be moving files into it
-                size = fetch_item(sb, item, dest, uid, gid, files)
-                fetched += 1
-                if signature(sb.walk(item)) == sig:
+        for fid, sub, kind in srcs:
+            local_root, dest = os.path.join(SYNC, sub), os.path.join(MIRROR, sub)
+            if (stc.folder(fid) or {}).get("paused"):
+                notes.append(f"{fid} is paused in Syncthing")
+                continue
+            names = sorted(n for n in (os.listdir(local_root) if os.path.isdir(local_root) else [])
+                           if not n.startswith(SKIP_PREFIX))
+            # the seedbox's list (Syncthing's global view): what is still there to forget the rest
+            on_seedbox = {e["name"] for e in (stc.req("GET", "/rest/db/browse", {"folder": fid, "levels": 0}) or [])}
+            if up:
+                need = stc.req("GET", "/rest/db/need", {"folder": fid, "perpage": 1000000}) or {}
+                pending = {e["name"].split("/", 1)[0] for part in ("progress", "queued", "rest") for e in need.get(part) or []}
+                if kind == "rt" and rt_done is None and names:
+                    rt_done = rtorrent_complete(c) if c.get("SEEDBOX_RT_URL") else {}
+                for name in names:
+                    key, path = sub + "/" + name, os.path.join(local_root, name)
+                    if (copied.get(key) or {}).get("trimmed") or name in pending:
+                        seen.pop(key, None)
+                        continue                    # still arriving (or already dealt with)
+                    if kind == "rt":
+                        if name not in (rt_done or {}):
+                            continue                # rTorrent is still downloading it
+                        fin = rt_done[name] or st.setdefault("rt_first", {}).setdefault(key, int(now))
+                        if now - fin < RT_SETTLE:
+                            continue                # let the seedbox's rescan catch the last pieces
+                    files = walk(path)
+                    if not files or any(os.path.basename(r).startswith(".syncthing.") for r, _, _ in files):
+                        continue
+                    sig = signature(files)
+                    if (seen.get(key) or {}).get("sig") != sig:
+                        seen[key] = {"sig": sig, "since": int(now)}
+                        continue                    # changed since last minute: wait for it to settle
+                    if now - seen[key]["since"] < MIN_AGE or (copied.get(key) or {}).get("sig") == sig:
+                        continue
+                    size = hand_over(path, dest, files, sig, uid, gid)
                     copied[key] = {"sig": sig, "at": int(now), "bytes": size}
-                    print(f"seedbox: copied {key} ({size // 2**20} MiB)")
-                else:                               # it changed while copying: again next minute
-                    notes.append(f"{key} changed on the seedbox while it was copied; copying it again")
-            for key in [k for k in copied if k.startswith(sub + "/") and k[len(sub) + 1:] not in present]:
-                del copied[key]                     # gone from the seedbox: forget it
-        pruned = prune(now, [sub for _, sub, _ in srcs])
+                    handed += 1
+                    print(f"seedbox: handed over {key} ({size // 2**20} MiB)")
+            # after a week: stop syncing a handed-over item and drop this server's copy of it
+            for key, rec in copied.items():
+                name = key[len(sub) + 1:]
+                if not key.startswith(sub + "/") or rec.get("trimmed") or rec.get("at", now) > now - KEEP_DAYS * 86400:
+                    continue
+                line, path = ignore_line(name), os.path.join(local_root, name)
+                if line is None:
+                    notes.append(f"{key}: its name cannot be expressed as a Syncthing ignore; kept here")
+                    continue
+                set_ignores(stc, fid, add=[line])
+                if os.path.lexists(path):
+                    if not inside(path, local_root):
+                        raise Unsafe(f"refused to remove {path}: not inside {local_root}")
+                    shutil.rmtree(path) if os.path.isdir(path) and not os.path.islink(path) else os.unlink(path)
+                rec["trimmed"] = True
+                trimmed += 1
+            # gone from the seedbox: forget it (and let a new item of the same name sync again)
+            for key in [k for k in copied if k.startswith(sub + "/") and k[len(sub) + 1:] not in on_seedbox]:
+                name = key[len(sub) + 1:]
+                if os.path.lexists(os.path.join(local_root, name)):
+                    continue
+                if copied[key].get("trimmed") and ignore_line(name):
+                    set_ignores(stc, fid, drop=[ignore_line(name)])
+                del copied[key]
+            for key in [k for k in seen if k.startswith(sub + "/") and k[len(sub) + 1:] not in names]:
+                del seen[key]
+            for key in [k for k in st.get("rt_first", {}) if k.startswith(sub + "/") and k[len(sub) + 1:] not in names]:
+                del st["rt_first"][key]
+        pruned = prune(now, [sub for _, sub, _ in srcs], copied)
+        if not up:
+            raise RuntimeError("the seedbox's Syncthing is not connected")
         if st.get("fails", 0) >= FAILS_BEFORE_ALERT:
-            alert("Bookstack: seedbox reachable again", "Finished downloads are being fetched again.", "default")
+            alert("Bookstack: seedbox connected again", "Finished downloads are arriving again.", "default")
         st["fails"], st["last_ok"], st["unsafe_alerted"] = 0, int(now), False
         save_state(st)
         for n in notes:
             print("seedbox: " + n)
-        print(f"seedbox: {fetched} item(s) fetched, {pruned} unclaimed item(s) cleared")
+        print(f"seedbox: {handed} item(s) handed to Shelfmark, {trimmed} old synced item(s) dropped, {pruned} unclaimed hand-over(s) cleared")
         return 0
     except Unsafe as e:
         st["last_error"] = f"REFUSED: {e}"[:400]
         if not st.get("unsafe_alerted"):
-            alert("Bookstack: seedbox fetching REFUSED (safety)", f"{e}\n\nNothing is copied until this is fixed (Library -> Seedbox).")
+            alert("Bookstack: seedbox sync REFUSED (safety)", f"{e}\n\nNothing is handed over until this is fixed (Library -> Seedbox).")
             st["unsafe_alerted"] = True
         save_state(st)
         print(f"seedbox: REFUSED ({e})", file=sys.stderr)
         return 2
-    except (urllib.error.URLError, OSError, RuntimeError, ValueError, ET.ParseError) as e:
+    except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError, ET.ParseError, http.client.HTTPException) as e:
         st["fails"] = st.get("fails", 0) + 1
         st["last_error"] = f"{type(e).__name__}: {e}"[:300]
         if st["fails"] == FAILS_BEFORE_ALERT:
             alert("Bookstack: seedbox downloads are not arriving",
-                  f"The seedbox could not be reached for {FAILS_BEFORE_ALERT} minutes in a row: {st['last_error']}\n\n"
-                  "Downloads keep finishing on the seedbox and will be fetched once it answers. Check the seedbox, "
-                  "or Library -> Seedbox if its password changed.")
+                  f"For {FAILS_BEFORE_ALERT} minutes in a row: {st['last_error']}\n\n"
+                  "Downloads keep finishing on the seedbox and arrive once it connects again. Check the "
+                  "seedbox's Syncthing, or Library -> Seedbox -> Check the connection.")
         save_state(st)
         print(f"seedbox: FAILED ({st['last_error']})", file=sys.stderr)
         return 1
 
 
-def check():
-    """Library -> Seedbox calls this before it saves anything: can we log in, see every folder,
-    and (for torrents) ask rTorrent what is finished? One line per finding, exit 1 on any failure."""
+def setup():
+    """Library -> Seedbox: make this server's Syncthing match seedbox.env. The only place that
+    writes Syncthing's config. Prints this server's device ID last."""
     c = envfile(CONF)
-    bad = 0
-    try:
-        sb = Seedbox(c)
-        sb.login()
-        print("ok: Filebrowser login, and the account is download-only (it cannot change anything)")
-    except Unsafe as e:
-        print(f"FAIL: {e}")
-        return 1
-    except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError) as e:
-        code = getattr(e, "code", None)
-        why = {401: "the seedbox's own login (user/password in front of Filebrowser) was refused",
-               403: "Filebrowser refused its username/password"}.get(code, f"{type(e).__name__}: {e}")
-        print(f"FAIL: Filebrowser login: {why}")
-        return 1
-    for fb_path, sub, kind in sources(c):
+    env = envfile(os.path.join(STACK, ".env"))
+    dev, srcs = c.get("SEEDBOX_ST_DEVICE", ""), sources(c)
+    if not DEVICE_RE.match(dev):
+        raise RuntimeError(f"'{dev}' is not a Syncthing device ID")
+    stc = Syncthing(env.get("SYNCTHING_API_KEY"), ST_SETUP)
+    me = stc.req("GET", "/rest/system/status")["myID"]
+    stc.req("PATCH", "/rest/config/options", body={
+        "localAnnounceEnabled": False, "urAccepted": -1, "crashReportingEnabled": False,
+        "autoUpgradeIntervalH": 0, "startBrowser": False})
+    addr = [c["SEEDBOX_ST_ADDRESS"]] if c.get("SEEDBOX_ST_ADDRESS") else ["dynamic"]
+    have = {d["deviceID"] for d in stc.req("GET", "/rest/config/devices") or []}
+    d = {"name": "seedbox", "addresses": addr, "autoAcceptFolders": False, "introducer": False, "paused": False}
+    if dev in have:
+        stc.req("PATCH", "/rest/config/devices/" + dev, body=d)
+    else:
+        stc.req("POST", "/rest/config/devices", body=dict(d, deviceID=dev))
+    wanted = {fid for fid, _, _ in srcs}
+    for f in stc.req("GET", "/rest/config/folders") or []:
+        if f["id"] not in wanted:                   # Syncthing's "Default Folder", a dropped source
+            stc.req("DELETE", "/rest/config/folders/" + f["id"])
+    for fid, sub, kind in srcs:
+        label = ("Bookstack SABnzbd " + sub.split("/", 1)[-1] if kind == "sab" else "Bookstack rTorrent") + " (set Send Only)"
+        spec = {"label": label, "path": ST_SYNC + "/" + sub, "type": "receiveonly",
+                "devices": [{"deviceID": me}, {"deviceID": dev}], "ignorePerms": True,
+                "versioning": {"type": ""}, "paused": False}
+        if stc.folder(fid) is None:
+            stc.req("POST", "/rest/config/folders", body=dict(spec, id=fid))
+        else:                                       # type first, THEN unpause (in one PATCH)
+            stc.req("PATCH", "/rest/config/folders/" + fid, body=spec)
+        if kind == "sab":
+            set_ignores(stc, fid, add=SAB_IGNORES)
+    for id_ in have - {me, dev}:                    # this Syncthing talks to the seedbox and nothing else
+        stc.req("DELETE", "/rest/config/devices/" + id_)
+    guard(stc, c, srcs, act=False)
+    gui = stc.req("GET", "/rest/config/gui") or {}
+    if c.get("SEEDBOX_ST_GUI_PASS") and (gui.get("user") != "bookstack" or not gui.get("password")):
+        try:                                        # Syncthing restarts its API to apply this
+            stc.req("PATCH", "/rest/config/gui", body={"user": "bookstack", "password": c["SEEDBOX_ST_GUI_PASS"]})
+        except (urllib.error.URLError, ConnectionError, http.client.HTTPException):
+            pass
+        for _ in range(30):
+            try:
+                stc.req("GET", "/rest/system/status")
+                break
+            except (urllib.error.URLError, ConnectionError, http.client.HTTPException):
+                time.sleep(1)
+    print(me)
+    return 0
+
+
+def check():
+    """Library -> Seedbox -> Check. One line per finding; exit 1 on a real failure. A seedbox that
+    has not connected or accepted the folders yet is 'waiting', not a failure."""
+    c = envfile(CONF)
+    env = envfile(os.path.join(STACK, ".env"))
+    srcs, dev, bad = sources(c), c.get("SEEDBOX_ST_DEVICE", ""), 0
+    rt_only = sys.argv[1:] == ["--check-rtorrent"]
+    if not rt_only:
         try:
-            n = len(sb.listdir(fb_path))
-            print(f"ok: {fb_path} ({n} item(s) there now)")
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            print(f"FAIL: {fb_path}: {getattr(e, 'code', '')} {e}; create the folder on the seedbox, or check the path as Filebrowser shows it")
+            stc = Syncthing(env.get("SYNCTHING_API_KEY"))
+            me = stc.req("GET", "/rest/system/status")["myID"]
+            print(f"ok: this server's Syncthing is running (its device ID: {me})")
+            guard(stc, c, srcs, act=False)
+            print("ok: every folder here is Receive Only (nothing made here can reach the seedbox)")
+            if connected(stc, dev):
+                print("ok: the seedbox's Syncthing is connected")
+                for fid, sub, _ in srcs:
+                    s = stc.req("GET", "/rest/db/completion", {"folder": fid, "device": dev}) or {}
+                    if s.get("remoteState") == "valid":
+                        n = len(stc.req("GET", "/rest/db/browse", {"folder": fid, "levels": 0}) or [])
+                        print(f"ok: {fid}: shared by the seedbox ({n} item(s) there now)")
+                    else:
+                        print(f"waiting: {fid}: not accepted on the seedbox yet (its Syncthing shows it as a new folder to add; set it Send Only)")
+            else:
+                print(f"waiting: the seedbox's Syncthing has not connected yet: add this server there as a remote device ({me})")
+        except Unsafe as e:
+            print(f"FAIL: {e}")
             bad += 1
-        if kind == "rt":
-            if not c.get("SEEDBOX_RT_URL"):
-                print("warn: no rTorrent address: torrents will not be fetched")
-                continue
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError) as e:
+            print(f"FAIL: this server's Syncthing: {getattr(e, 'code', '')} {e}")
+            bad += 1
+    if any(kind == "rt" for _, _, kind in srcs):
+        if not c.get("SEEDBOX_RT_URL"):
+            print("warn: no rTorrent address: torrents are not handed over (they could be unfinished)")
+        else:
             try:
                 done = rtorrent_complete(c)
                 print(f"ok: rTorrent answers ({len(done)} finished torrent(s) in {c.get('SEEDBOX_RT_DIR')})")
             except (urllib.error.URLError, OSError, RuntimeError, ET.ParseError) as e:
-                print(f"FAIL: rTorrent XML-RPC: {getattr(e, 'code', '')} {e}")
+                why = {401: "the username/password was refused"}.get(getattr(e, "code", None), f"{type(e).__name__}: {e}")
+                print(f"FAIL: rTorrent XML-RPC: {why}")
                 bad += 1
     return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--check"]:
+    args = sys.argv[1:]
+    if args in (["--check"], ["--check-rtorrent"]):
         sys.exit(check())
+    if args == ["--device-id"]:                     # Library -> Seedbox -> Show what to set up
+        try:
+            print(Syncthing(envfile(os.path.join(STACK, ".env")).get("SYNCTHING_API_KEY")).req("GET", "/rest/system/status")["myID"])
+            sys.exit(0)
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError) as e:
+            print(f"FAIL: {e}", file=sys.stderr)
+            sys.exit(1)
+    if args == ["--setup"]:
+        try:
+            sys.exit(setup())
+        except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError, Unsafe) as e:
+            print(f"FAIL: {getattr(e, 'code', '')} {e}", file=sys.stderr)
+            sys.exit(1)
     os.makedirs(MIRROR, exist_ok=True)
     os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
     lock = open(STATE + ".lock", "w")
-    try:                                            # a big audiobook can take longer than a minute
+    try:                                            # a copy across filesystems can outlast a minute
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        print("seedbox: the previous run is still fetching; skipping this minute")
+        print("seedbox: the previous run is still busy; skipping this minute")
         sys.exit(0)
     sys.exit(run())

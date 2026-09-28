@@ -218,11 +218,12 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
       screen reports that Ephemera reaches FlareSolverr.
 - [ ] (Only if Shelfmark's protected sources are used) `Operations → FlareSolverr` on; its
       success screen confirms Shelfmark reaches `flaresolverr:8191`.
-- [ ] Seedbox (only if used): a download-only Filebrowser account exists; Library → Seedbox →
-      Check says "download-only (it cannot change anything)"; Shelfmark shows Torrent / NZB
-      Completion Action as Keep / Copy; the two path mappings and Completed Path Wait 3600 are set.
-      Request one small book through Shelfmark: it arrives in the library, and the torrent is still
-      seeding in ruTorrent afterwards.
+- [ ] Seedbox (only if used): on the seedbox's Syncthing, this server is a remote device and
+      each bookstack folder is **Send Only** (Full Rescan Interval 300); Library → Seedbox → Check
+      says "every folder here is Receive Only", "connected" and "shared by the seedbox" for each
+      folder; Shelfmark shows Torrent / NZB Completion Action as Keep / Copy; the path mappings and
+      Completed Path Wait 3600 are set. Request one small book through Shelfmark: it arrives in the
+      library, and the torrent is still seeding in ruTorrent afterwards.
 - [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
       runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
       check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on

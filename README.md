@@ -474,22 +474,32 @@ successor of *calibre-web-automated-book-downloader*:
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
 
-## Seedbox — Shelfmark downloads on your seedbox, copied home (Library → Seedbox)
+## Seedbox — Shelfmark downloads on your seedbox, brought home by Syncthing (Library → Seedbox)
 Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or
-rTorrent. Those download on the **seedbox**; `scripts/seedbox-fetch.py` (every minute) **copies**
-each finished item back through the seedbox's Filebrowser into `library/seedbox` (Shelfmark's
-`/seedbox`), and Shelfmark's remote path mappings file it into the reader's dropbox.
+rTorrent. Those download on the **seedbox**. The seedbox's own Syncthing sends the bookstack
+folders (SABnzbd's bookstack categories, rTorrent's bookstack folder) to this server's Syncthing
+container (compose profile `seedbox`, into `library/seedbox-sync`), and `scripts/seedbox-fetch.py`
+(every minute) hands each finished, fully arrived item to `library/seedbox` (Shelfmark's
+`/seedbox`) as hard links, where Shelfmark's remote path mappings file it into the reader's
+dropbox. After a week this server drops its own copy (Syncthing is told to ignore the item
+first), so its disk holds about a week of seedbox downloads.
 
-**Copy only: nothing on the seedbox is ever moved, deleted or changed** (private trackers: strict
-seeding, no hit-and-run). Enforced independently three times, and tested by fingerprinting the
-whole seedbox tree around every run (`tests/seedbox-test.sh`, against the real Filebrowser):
-1. the Filebrowser account must be **download-only**; the job reads the account's permissions
-   from its login token and refuses to run (with an alert) otherwise. Filebrowser itself then
-   refuses any write;
-2. the job can only send login, list and download requests; anything else is refused before it
-   leaves the server, and it contains no delete code;
-3. rTorrent is asked one read-only question (name / complete / directory). Torrents are copied
-   only once rTorrent reports them complete, and keep seeding.
+**Nothing on the seedbox is ever moved, deleted or changed** (private trackers: strict seeding,
+no hit-and-run). Enforced independently, and tested with two real Syncthing instances by
+fingerprinting the whole seedbox tree after every run and every destructive act on this side
+(`tests/seedbox-test.sh`):
+1. every folder on this server is **Receive Only**: Syncthing never sends a change made here.
+   Measured: deleting, editing and adding files here leaves the seedbox byte-identical, even
+   with the seedbox side wrongly set to Send & Receive. The job checks it every minute; a folder
+   found otherwise is **paused** at once, with an alert, and nothing runs until it is fixed;
+2. the seedbox's side is **Send Only** (the setup screen says where to set it): it ignores every
+   change from other devices;
+3. the job never writes into the synced copy except to drop a week-old item it already handed
+   over, and every request it sends to Syncthing goes through one allowlist (no revert, no
+   override, no config change beyond pausing a folder);
+4. rTorrent is asked one read-only question (name / complete / directory / finished). Torrents
+   are handed over only once rTorrent reports them complete, at least 10 minutes earlier (the
+   seedbox's rescan, every 5 minutes, must catch the last pieces), and keep seeding.
 
 Shelfmark's own clean-up is pinned in `docker-compose.yml` where its web UI cannot change it:
 after an import it keeps the torrent and the Usenet job (`PROWLARR_TORRENT_ACTION=keep`,

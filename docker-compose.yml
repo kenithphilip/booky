@@ -460,8 +460,9 @@ services:
       # Read access to the library keeps Shelfmark's "already in library" link working.
       - ./library/audiobooks:/audiobooks:ro
       - ./cwa/config:/auth:ro
-      # Library -> Seedbox: finished seedbox downloads are COPIED here (scripts/seedbox-fetch.py);
-      # Shelfmark's remote path mappings point at /seedbox and it files each into the reader's dropbox
+      # Library -> Seedbox: finished seedbox downloads are handed over here (scripts/seedbox-fetch.py,
+      # from the Syncthing copy); Shelfmark's remote path mappings point at /seedbox and it files each
+      # into the reader's dropbox
       - ./library/seedbox:/seedbox
     healthcheck:
       # TWO assertions, because the first one alone is blind in the direction that matters.
@@ -561,6 +562,38 @@ services:
       retries: 3
       start_period: 30s
 
+  syncthing:
+    <<: *common
+    # Library -> Seedbox: receives finished seedbox downloads (SABnzbd jobs, rTorrent data) from
+    # the seedbox's own Syncthing into library/seedbox-sync. Profile "seedbox", which bookstack.sh
+    # adds while SEEDBOX_ENABLED. Every folder here is RECEIVE ONLY and the seedbox's side SEND
+    # ONLY, so nothing done on this server can reach the seedbox (private trackers; measured in
+    # tests/seedbox-test.sh). scripts/seedbox-fetch.py configures it (--setup), checks the folder
+    # types every minute, and hands finished items to Shelfmark's /seedbox.
+    profiles: ["seedbox"]
+    image: ${IMG_SYNCTHING:-syncthing/syncthing:2.1.5}
+    container_name: syncthing
+    hostname: bookstack
+    mem_limit: 384m
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]    # the entrypoint drops to PUID
+    networks: { seedbox: {} }
+    environment:
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - TZ=${TZ}
+      - STGUIAPIKEY=${SYNCTHING_API_KEY:-}
+      - STNOUPGRADE=1
+    # 22000 is Syncthing's own port (TLS, both ends pinned by device ID: this one talks only to
+    # the seedbox's). The GUI/API stays on loopback, for seedbox-fetch.py and an SSH tunnel.
+    ports:
+      - "127.0.0.1:8384:8384"
+      - "0.0.0.0:22000:22000"
+      - "0.0.0.0:22000:22000/udp"
+    volumes:
+      - ./syncthing:/var/syncthing
+      - ./library/seedbox-sync:/sync
+
 # L01: one network per service (see the header). Nothing on these reaches the host's loopback;
 # the host-network services (Caddy, the portal, Kuma) reach each service on its 127.0.0.1 port.
 networks:
@@ -568,3 +601,4 @@ networks:
   abs: {}
   dl: {}
   fetch: {}
+  seedbox: {}

@@ -14,7 +14,8 @@ BOOKSTACK_VERSION=4
 # Image pins (looked up 2026-09-22). Seeded into .env by Configure; changed by Operations -> Update.
 IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.6 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
 IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.3.15 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
-IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2"
+IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2
+IMG_SYNCTHING=syncthing/syncthing:2.1.5"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
 
 # BOOKSTACK_LIB=1 sources this file for tests without running anything.
@@ -104,8 +105,11 @@ torrents_on(){ [ "$(envget TORRENTS_ENABLED)" = true ]; }
 # FlareSolverr (compose profile "solver") is shared: Shelfmark uses it when FLARESOLVERR_ENABLED,
 # Ephemera always needs it. It runs while either one wants it.
 solver_on(){ [ "$(envget FLARESOLVERR_ENABLED)" = true ] || [ "$(envget EPHEMERA_ENABLED)" = true ]; }
+# The seedbox's Syncthing peer (compose profile "seedbox", Library -> Seedbox).
+seedbox_on(){ [ "$(envget SEEDBOX_ENABLED)" = true ]; }
 compose_profiles(){ if torrents_on; then printf '%s\n' --profile torrents; fi
-  if solver_on; then printf '%s\n' --profile solver; fi; }
+  if solver_on; then printf '%s\n' --profile solver; fi
+  if seedbox_on; then printf '%s\n' --profile seedbox; fi; }
 compose(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose ${p[@]+"${p[@]}"} "$@"); }
 composeA(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.authelia.yml ${p[@]+"${p[@]}"} "$@"); }
 composeE(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.ephemera.yml ${p[@]+"${p[@]}"} "$@"); }
@@ -232,7 +236,7 @@ ensure_stack_user(){ # the host account behind uid 1000, which every container r
 }
 # Ownership model (C14): $STACK_DIR, code, compose files, scripts and rendered configs belong to
 # root (root executes them); only the data directories the containers write are uid 1000.
-DATA_DIRS="caddy/data caddy/config cwa abs qbt downloads library kuma librarian/state shelfmark ephemera authelia"
+DATA_DIRS="caddy/data caddy/config cwa abs qbt downloads library kuma librarian/state shelfmark ephemera authelia syncthing"
 own_data_dirs(){
   local d; chown root:root "$STACK_DIR"; chmod 755 "$STACK_DIR"
   for d in $DATA_DIRS; do [ -e "$STACK_DIR/$d" ] && chown -R 1000:1000 "$STACK_DIR/$d"; done
@@ -414,7 +418,12 @@ setup_firewall(){ # deny in; SSH only until Lock SSH; the torrent peer port only
     ufw allow 22/tcp >/dev/null
   fi
   torrent_port "$(torrents_on && echo open || echo close)"
+  seedbox_port "$(seedbox_on && echo open || echo close)"
   ufw --force enable >/dev/null
+}
+seedbox_port(){ # open|close Syncthing's port 22000 (the seedbox connects to it)
+  if [ "$1" = open ]; then ufw allow 22000/tcp >/dev/null; ufw allow 22000/udp >/dev/null
+  else ufw --force delete allow 22000/tcp >/dev/null 2>&1 || true; ufw --force delete allow 22000/udp >/dev/null 2>&1 || true; fi
 }
 torrent_port(){ # open|close the qBittorrent peer port 6881
   if [ "$1" = open ]; then ufw allow 6881/tcp >/dev/null; ufw allow 6881/udp >/dev/null
@@ -493,8 +502,8 @@ step_system() {
 }
 make_dirs() {
   mkdir -p "$STACK_DIR"/{caddy/data,caddy/config,cwa/config,abs/config,abs/metadata,qbt/config,downloads/incomplete,authelia}
-  mkdir -p "$STACK_DIR"/library/{books,ingest,audiobooks,podcasts,staging,dropbox,seedbox}
-  mkdir -p "$STACK_DIR"/{kuma/data,librarian/state,shelfmark/config,ephemera/data,ephemera/downloads}
+  mkdir -p "$STACK_DIR"/library/{books,ingest,audiobooks,podcasts,staging,dropbox,seedbox,seedbox-sync}
+  mkdir -p "$STACK_DIR"/{kuma/data,librarian/state,shelfmark/config,ephemera/data,ephemera/downloads,syncthing}
   own_data_dirs
 }
 
@@ -3302,7 +3311,7 @@ step_logs()   {
   docker logs --tail 200 -f "$s" || true
   trap - INT
 }
-IMG_KEYS="IMG_CWA IMG_ABS IMG_SHELFMARK IMG_QBIT IMG_KUMA IMG_AUTHELIA IMG_FLARESOLVERR"
+IMG_KEYS="IMG_CWA IMG_ABS IMG_SHELFMARK IMG_QBIT IMG_KUMA IMG_AUTHELIA IMG_FLARESOLVERR IMG_SYNCTHING"
 BUILT_IMAGES="bookstack/caddy bookstack/librarian"   # built locally: kept as :prev across an update
 stack_up_all() { # (re)start every enabled service with the tags in .env
   compose up -d || return 1
@@ -3678,17 +3687,20 @@ step_metadata_sources() {
 }
 # ---------- Library -> Seedbox ----------
 # Shelfmark sends a reader's pick to the seedbox's SABnzbd / rTorrent; they download on the
-# SEEDBOX's disk. scripts/seedbox-fetch.py (every minute) carries finished items back through the
-# seedbox's Filebrowser into library/seedbox (Shelfmark's /seedbox), where Shelfmark's remote path
-# mappings find them and file each into the right reader's dropbox. Credentials live in
-# /etc/bookstack/seedbox.env (0600), never in .env, which the containers read.
+# SEEDBOX's disk. The seedbox's own Syncthing (SEND ONLY) sends the bookstack folders to this
+# server's Syncthing container (RECEIVE ONLY) in library/seedbox-sync, and
+# scripts/seedbox-fetch.py (every minute) hands each finished, fully arrived item to
+# library/seedbox (Shelfmark's /seedbox), where Shelfmark's remote path mappings find it and file
+# it into the right reader's dropbox. Nothing on the seedbox is ever changed. Addresses and
+# passwords live in /etc/bookstack/seedbox.env (0600); only Syncthing's API key is in .env,
+# because its container needs it.
 SEEDBOX_ENV_REL=bookstack/seedbox.env
 install_seedbox_units(){
   local u="$ETC/systemd/system"; mkdir -p "$u"
   cat > "$u/bookstack-seedbox.service" << UNIT
 [Unit]
-Description=Bookstack: fetch finished seedbox downloads for Shelfmark
-After=network-online.target
+Description=Bookstack: hand finished seedbox downloads to Shelfmark
+After=network-online.target docker.service
 [Service]
 Type=oneshot
 Environment=STACK_DIR=$STACK_DIR
@@ -3698,7 +3710,7 @@ TimeoutStartSec=6h
 UNIT
   cat > "$u/bookstack-seedbox.timer" << 'UNIT'
 [Unit]
-Description=Bookstack: fetch finished seedbox downloads every minute
+Description=Bookstack: hand finished seedbox downloads to Shelfmark every minute
 [Timer]
 OnCalendar=*:*:00
 AccuracySec=10s
@@ -3713,94 +3725,142 @@ remove_seedbox_units(){
   rm -f "$u/bookstack-seedbox.timer" "$u/bookstack-seedbox.service"; systemctl daemon-reload >/dev/null 2>&1 || true
 }
 seedbox_get(){ { grep -E "^$1=" "$ETC/$SEEDBOX_ENV_REL" 2>/dev/null || true; } | head -1 | cut -d= -f2-; }   # raw values, see step_seedbox
-seedbox_mappings(){ # the two rows the admin types into Shelfmark
+seedbox_fetch(){ env SEEDBOX_ENV="${SEEDBOX_ENV_FILE:-$ETC/$SEEDBOX_ENV_REL}" STACK_DIR="$STACK_DIR" python3 "$STACK_DIR/scripts/seedbox-fetch.py" "$@"; }
+seedbox_mappings(){ # the rows the admin types into Shelfmark
   local sab_own rt_dir
   sab_own=$(seedbox_get SEEDBOX_SAB_OWN); rt_dir=$(seedbox_get SEEDBOX_RT_DIR)
   printf 'In Shelfmark (https://shelf.%s) -> Settings -> Download clients, at the bottom:\n\n' "$(envget DOMAIN)"
-  printf '1. Completed Path Wait (seconds):  3600\n   (the default 60 s is too short: files arrive a few minutes after the seedbox finishes)\n\n'
+  printf '1. Completed Path Wait (seconds):  3600\n   (the default 60 s is too short: files arrive some minutes after the seedbox finishes)\n\n'
   printf '   Torrent / NZB Completion Action show Keep / Copy and cannot be changed there: they are\n   pinned by this server so Shelfmark never removes a torrent or a job after an import.\n\n'
   printf '2. Path Mappings -> Add Mapping:\n'
   [ -n "$sab_own" ] && printf '   Client SABnzbd:  Remote Path  %s\n                    Local Path   /seedbox/sabnzbd\n' "$sab_own"
   [ -n "$rt_dir" ] && [ -n "$(seedbox_get SEEDBOX_RT_URL)" ] && printf '   Client rTorrent: Remote Path  %s\n                    Local Path   /seedbox/rtorrent\n' "$rt_dir"
   printf '\nSave. Then request one small book through Shelfmark as a test.'
 }
+seedbox_remote_steps(){ # what to do in the SEEDBOX's Syncthing; $1 = this server's device ID
+  local ip cats c rt_dir sab_own
+  ip=$(envget PUBLIC_IP); cats=$(seedbox_get SEEDBOX_SAB_CATS); sab_own=$(seedbox_get SEEDBOX_SAB_OWN); rt_dir=$(seedbox_get SEEDBOX_RT_DIR)
+  printf 'On the SEEDBOX, open its Syncthing web page.\n\n'
+  printf '1. "+ Add Remote Device" (bottom right):\n'
+  printf '     Device ID:    %s\n' "$1"
+  printf '     Device Name:  bookstack\n'
+  printf '     Advanced tab -> Addresses:  tcp://%s:22000\n' "${ip:-THIS-SERVER-IP}"
+  printf '     Leave "Auto Accept" OFF. Save.\n\n'
+  printf '2. Within a minute it asks, once per folder: "bookstack wants to share folder ...".\n'
+  printf '   Click Add on each, and BEFORE saving:\n'
+  printf '     General tab  -> Folder Path: the real folder on the seedbox (paths below are as\n'
+  printf '                     rTorrent / SABnzbd see them; the seedbox'"'"'s Syncthing may show the\n'
+  printf '                     same folder under another root, e.g. /sdb/NAME/data/... or ~/...):\n'
+  [ -n "$rt_dir" ] && printf '                       "Bookstack rTorrent"          -> %s\n' "$rt_dir"
+  for c in $cats; do printf '                       "Bookstack SABnzbd %s"  -> %s/%s\n' "$c" "${sab_own:-.../completed}" "$c"; done
+  printf '     Advanced tab -> Folder Type:  Send Only          <- REQUIRED\n'
+  printf '                     Full Rescan Interval (s):  300\n'
+  printf '   Save.\n\n'
+  printf 'Send Only means the seedbox'"'"'s Syncthing only READS these folders: nothing there is ever\n'
+  printf 'moved, deleted or changed, and this server'"'"'s side is Receive Only as well. Syncthing adds\n'
+  printf 'one small marker folder, .stfolder, inside each (its own; rTorrent and SABnzbd ignore it).\n'
+  printf 'A folder that shows 0 files although the seedbox has some means a wrong Folder Path:\n'
+  printf 'remove it there (Edit -> Remove: that deletes nothing on disk) and add it again.\n\n'
+  printf 'Then: Library -> Seedbox -> Check the connection.'
+}
+seedbox_wait(){ local i; for i in $(seq 1 45); do curl -fsS -m 3 http://127.0.0.1:8384/rest/noauth/health >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 step_seedbox(){
-  local cf="$ETC/$SEEDBOX_ENV_REL" ch out
+  local cf="$ETC/$SEEDBOX_ENV_REL" ch out me
   if [ -f "$ETC/systemd/system/bookstack-seedbox.timer" ]; then
-    ch=$(whiptail --title "Seedbox" --menu "Finished seedbox downloads are fetched every minute." 15 80 5 \
+    ch=$(whiptail --title "Seedbox" --menu "Finished seedbox downloads arrive through Syncthing and are handed to Shelfmark every minute." 16 86 6 \
       C "Check the connection now" \
+      S "Show what to set up on the seedbox (this server's Syncthing ID)" \
       M "Show the Shelfmark path mappings to enter" \
       E "Change the settings" \
       D "Turn it off" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in
-      C) out=$(env SEEDBOX_ENV="$cf" STACK_DIR="$STACK_DIR" python3 "$STACK_DIR/scripts/seedbox-fetch.py" --check 2>&1); msg "$out"; return 0;;
+      C) out=$(seedbox_fetch --check 2>&1); msg "$out"; return 0;;
+      S) me=$(seedbox_fetch --device-id 2>&1) || { msg "This server's Syncthing does not answer:\n$me\n\nOperations -> Logs -> syncthing."; return 1; }
+         big "Seedbox: on the seedbox" "$(seedbox_remote_steps "$me")"; return 0;;
       M) big "Seedbox: Shelfmark settings" "$(seedbox_mappings)"; return 0;;
-      D) remove_seedbox_units; msg "Seedbox fetching is off. Items already fetched stay in $STACK_DIR/library/seedbox for a week; the settings stay in $cf."; return 0;;
+      D) remove_seedbox_units
+         compose stop syncthing >/dev/null 2>&1 || true; compose rm -f syncthing >/dev/null 2>&1 || true
+         envset SEEDBOX_ENABLED false; seedbox_port close
+         msg "Seedbox sync is off: this server's Syncthing is stopped and port 22000 closed. Nothing on the seedbox was touched (remove the 'bookstack' device there if you like).\n\nItems already here stay in $STACK_DIR/library/seedbox-sync and library/seedbox; the settings stay in $cf."; return 0;;
       E) ;;
       *) return 0;;
     esac
   fi
   big "Seedbox: what this sets up" "Shelfmark (Prowlarr search) sends a reader's pick to your seedbox's SABnzbd or rTorrent,
-which download on the SEEDBOX. This COPIES each finished item back to this server every
-minute, through the seedbox's Filebrowser (HTTPS; no SSH needed), into a folder Shelfmark sees
-as /seedbox. Shelfmark then files it into that reader's dropbox and the library imports it.
+which download on the SEEDBOX. Syncthing then brings the finished files here:
 
-COPY ONLY: nothing on the seedbox is ever moved, deleted or changed.
-  - torrents are copied only once rTorrent reports them complete, and keep seeding
-  - SABnzbd jobs are copied once finished and stay where they are
-  - the Filebrowser account MUST be download-only; the job refuses to run otherwise
+  seedbox Syncthing (Send Only)  -->  this server's Syncthing (Receive Only)
 
-FIRST, in Filebrowser (as your admin): Settings -> User Management -> New user
-  username: bookstack-reader   password: a new one   Scope: /
-  Permissions: untick EVERYTHING except 'Download'   -> Save
+and every minute each finished, fully arrived item is handed to Shelfmark (/seedbox), which
+files it into that reader's dropbox; the library imports it.
 
-You also need: Filebrowser's address, the seedbox login in front of it (if any), and the
-SABnzbd completed folder and the rTorrent folder as Filebrowser shows them."
-  local fb bu bp fu fp sabfb sabown cats rturl rtfb rtdir rtu rtp srcs c
-  fb=$(ask "Filebrowser address (e.g. https://NAME-filebrowser.YOUR-SEEDBOX):" "$(seedbox_get SEEDBOX_FB_URL)") || return 0
-  [[ "$fb" =~ ^https?://[^/]+/?$ ]] || { msg "'$fb' is not an address like https://host (no path)."; return 1; }
-  bu=$(ask "Seedbox login in front of Filebrowser: username (the browser pop-up). Blank = there is none:" "$(seedbox_get SEEDBOX_BASIC_USER)") || return 0
-  bp=""; [ -n "$bu" ] && { bp=$(askpw "Seedbox login password for $bu:") || return 0; }
-  local cur_fu; cur_fu=$(seedbox_get SEEDBOX_FB_USER)
-  fu=$(ask "The DOWNLOAD-ONLY Filebrowser account you just made (not your admin):" "${cur_fu:-bookstack-reader}") || return 0
-  [ -n "$fu" ] || { msg "A Filebrowser username is needed."; return 1; }
-  fp=$(askpw "Password of Filebrowser account '$fu':") || return 0
-  sabfb=$(ask "SABnzbd's COMPLETED folder as Filebrowser shows it (e.g. /watch/downloads/sabnzbd/completed). Blank = no SABnzbd:" "$(seedbox_get SEEDBOX_SAB_FB)") || return 0
-  sabown=""; cats=""
-  if [ -n "$sabfb" ]; then
-    sabown=$(ask "The same folder as SABnzbd ITSELF shows it (Config -> Folders -> Completed Download Folder, e.g. /data/watch/downloads/sabnzbd/completed):" "$(seedbox_get SEEDBOX_SAB_OWN)") || return 0
+NOTHING ON THE SEEDBOX IS EVER MOVED, DELETED OR CHANGED:
+  - the seedbox side is Send Only: it only reads, and ignores everything from here
+  - this server's side is Receive Only: nothing done here is ever sent; checked every
+    minute, and a folder found otherwise is paused at once
+  - torrents are handed over only once rTorrent reports them complete, and keep seeding
+  - this server keeps about a week of them, then drops its OWN copy (never the seedbox's)
+
+You need: the seedbox's Syncthing Device ID (its Syncthing: Actions -> Show ID), SABnzbd's
+completed folder, and the rTorrent folder and login Shelfmark already uses."
+  local dev addr sabown cats rturl rtdir rtu rtp srcs c fid gp ids="" rc=0
+  dev=$(ask "The seedbox's Syncthing Device ID (on the seedbox's Syncthing page: Actions -> Show ID):" "$(seedbox_get SEEDBOX_ST_DEVICE)") || return 0
+  dev=$(printf '%s' "$dev" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+  [[ "$dev" =~ ^[A-Z2-7]{7}(-[A-Z2-7]{7}){7}$ ]] || { msg "'$dev' is not a Syncthing Device ID (eight groups of seven letters and digits, joined by -). Nothing was changed."; return 1; }
+  addr=$(ask "The seedbox's Syncthing address, only if your seedbox provider lists one (e.g. tcp://NAME.YOUR-SEEDBOX:PORT). Blank = found automatically:" "$(seedbox_get SEEDBOX_ST_ADDRESS)") || return 0
+  [ -z "$addr" ] || [[ "$addr" =~ ^(tcp|quic)://[^/[:space:]]+:[0-9]+$ ]] || { msg "'$addr' is not an address like tcp://host:port. Nothing was changed."; return 1; }
+  sabown=$(ask "SABnzbd's COMPLETED folder as SABnzbd shows it (Config -> Folders -> Completed Download Folder, e.g. /data/watch/downloads/sabnzbd/completed). Blank = no SABnzbd:" "$(seedbox_get SEEDBOX_SAB_OWN)") || return 0
+  cats=""
+  if [ -n "$sabown" ]; then
     cats=$(ask "The SABnzbd categories Shelfmark uses (space-separated):" "$(seedbox_get SEEDBOX_SAB_CATS | grep . || echo "bookstack-ebooks bookstack-audiobooks")") || return 0
   fi
   rturl=$(ask "rTorrent's XML-RPC address, the one that passed Shelfmark's test (e.g. https://NAME-rutorrent.YOUR-SEEDBOX/RPC2). Blank = no torrents:" "$(seedbox_get SEEDBOX_RT_URL)") || return 0
-  rtfb=""; rtdir=""; rtu=""; rtp=""
+  rtdir=""; rtu=""; rtp=""
   if [ -n "$rturl" ]; then
-    rtfb=$(ask "The torrent folder Shelfmark gives rTorrent, as Filebrowser shows it (e.g. /rtorrent/bookstack):" "$(seedbox_get SEEDBOX_RT_FB)") || return 0
-    rtdir=$(ask "The same folder as rTorrent sees it (Shelfmark's rTorrent 'Download Directory', e.g. /sdb/NAME/data/rtorrent/bookstack):" "$(seedbox_get SEEDBOX_RT_DIR)") || return 0
-    rtu=$(ask "rTorrent username (blank = the seedbox login):" "$(seedbox_get SEEDBOX_RT_USER)") || return 0
-    [ -n "$rtu" ] && { rtp=$(askpw "rTorrent password:") || return 0; }
+    rtdir=$(ask "The folder Shelfmark gives rTorrent (Shelfmark's rTorrent 'Download Directory', e.g. /sdb/NAME/data/rtorrent/bookstack):" "$(seedbox_get SEEDBOX_RT_DIR)") || return 0
+    [ -n "$rtdir" ] || { msg "The rTorrent folder is needed to know which torrents are Shelfmark's. Nothing was changed."; return 1; }
+    rtu=$(ask "rTorrent's username (the seedbox login in front of ruTorrent). Blank = none:" "$(seedbox_get SEEDBOX_RT_USER)") || return 0
+    [ -n "$rtu" ] && { rtp=$(askpw "Password for $rtu:") || return 0; }
   fi
-  [ -n "$sabfb" ] || [ -n "$rturl" ] || { msg "Neither SABnzbd nor rTorrent given: nothing to fetch. Nothing was changed."; return 1; }
+  [ -n "$cats" ] || [ -n "$rturl" ] || { msg "Neither SABnzbd nor rTorrent given: nothing to bring back. Nothing was changed."; return 1; }
   srcs=""
-  for c in $cats; do srcs="$srcs${srcs:+;}${sabfb%/}/$c|sabnzbd/$c|sab"; done
-  [ -n "$rturl" ] && srcs="$srcs${srcs:+;}${rtfb%/}|rtorrent|rt"
+  for c in $cats; do
+    [[ "$c" =~ ^[A-Za-z0-9._-]+$ ]] || { msg "'$c' is not a SABnzbd category name this can use (letters, digits, . _ -). Nothing was changed."; return 1; }
+    fid="bookstack-sab-${c#bookstack-}"
+    case " $ids " in *" $fid "*) msg "Two categories give the same Syncthing folder ($fid). Nothing was changed."; return 1;; esac
+    ids="$ids $fid"; srcs="$srcs${srcs:+;}$fid|sabnzbd/$c|sab"
+  done
+  [ -n "$rturl" ] && srcs="$srcs${srcs:+;}bookstack-rtorrent|rtorrent|rt"
+  gp=$(seedbox_get SEEDBOX_ST_GUI_PASS); [ -n "$gp" ] || gp=$(openssl rand -hex 16)
   ( umask 077; mkdir -p "$(dirname "$cf")"
     # raw KEY=value lines: read by seedbox-fetch.py (Python), never sourced by a shell, so a
     # password with $, quotes or spaces arrives exactly as typed (printf %q would add backslashes)
-    { printf 'SEEDBOX_FB_URL=%s\nSEEDBOX_BASIC_USER=%s\nSEEDBOX_BASIC_PASS=%s\nSEEDBOX_FB_USER=%s\nSEEDBOX_FB_PASS=%s\n' "${fb%/}" "$bu" "$bp" "$fu" "$fp"
-      printf 'SEEDBOX_SAB_FB=%s\nSEEDBOX_SAB_OWN=%s\nSEEDBOX_SAB_CATS=%s\n' "${sabfb%/}" "${sabown%/}" "$cats"
-      printf 'SEEDBOX_RT_URL=%s\nSEEDBOX_RT_FB=%s\nSEEDBOX_RT_DIR=%s\nSEEDBOX_RT_USER=%s\nSEEDBOX_RT_PASS=%s\n' "$rturl" "${rtfb%/}" "${rtdir%/}" "$rtu" "$rtp"
+    { printf 'SEEDBOX_ST_DEVICE=%s\nSEEDBOX_ST_ADDRESS=%s\nSEEDBOX_ST_GUI_PASS=%s\n' "$dev" "$addr" "$gp"
+      printf 'SEEDBOX_SAB_OWN=%s\nSEEDBOX_SAB_CATS=%s\n' "${sabown%/}" "$cats"
+      printf 'SEEDBOX_RT_URL=%s\nSEEDBOX_RT_DIR=%s\nSEEDBOX_RT_USER=%s\nSEEDBOX_RT_PASS=%s\n' "$rturl" "${rtdir%/}" "$rtu" "$rtp"
       printf 'SEEDBOX_SOURCES=%s\n' "$srcs"; } > "$cf.new" ) || { msg "Could not write $cf.new. Nothing was changed."; return 1; }
-  clear; echo "Checking the seedbox..."
-  out=$(env SEEDBOX_ENV="$cf.new" STACK_DIR="$STACK_DIR" python3 "$STACK_DIR/scripts/seedbox-fetch.py" --check 2>&1); local rc=$?
-  if [ $rc != 0 ] && ! yesno "The check found problems:\n\n$out\n\nSave these settings anyway?"; then rm -f "$cf.new"; msg "Nothing was saved."; return 1; fi
+  if [ -n "$rturl" ]; then
+    clear; echo "Asking rTorrent..."
+    out=$(SEEDBOX_ENV_FILE="$cf.new" seedbox_fetch --check-rtorrent 2>&1) || rc=$?
+    if [ $rc != 0 ] && ! yesno "The rTorrent check found problems:\n\n$out\n\nSave these settings anyway?"; then rm -f "$cf.new"; msg "Nothing was saved."; return 1; fi
+  fi
   mv -f "$cf.new" "$cf"; chmod 600 "$cf"; chown root:root "$cf" 2>/dev/null || true
-  mkdir -p "$STACK_DIR/library/seedbox"; chown 1000:1000 "$STACK_DIR/library/seedbox" 2>/dev/null || true
+  envdefault SYNCTHING_API_KEY "$(openssl rand -hex 24)" || { msg "Could not write $ENV_FILE. Syncthing was not started."; return 1; }
+  envset SEEDBOX_ENABLED true
+  install -d -o 1000 -g 1000 "$STACK_DIR/syncthing" "$STACK_DIR/library/seedbox" "$STACK_DIR/library/seedbox-sync" \
+    "$STACK_DIR/library/seedbox-sync/rtorrent" "$STACK_DIR/library/seedbox-sync/sabnzbd"
+  for c in $cats; do install -d -o 1000 -g 1000 "$STACK_DIR/library/seedbox-sync/sabnzbd/$c"; done
+  seedbox_port open
+  clear; echo "Starting this server's Syncthing..."
+  compose up -d syncthing >/dev/null 2>&1 && seedbox_wait \
+    || { msg "This server's Syncthing did not start (Operations -> Logs -> syncthing). The settings are saved; run this step again."; return 1; }
+  me=$(seedbox_fetch --setup 2>&1) || { msg "This server's Syncthing could not be set up:\n\n$me\n\nThe settings are saved; run this step again."; return 1; }
+  me=$(printf '%s' "$me" | tail -1)
   running shelfmark && { compose up -d shelfmark >/dev/null 2>&1 || true; }    # the /seedbox mount
   install_seedbox_units
-  big "Seedbox: one more step, in Shelfmark" "$([ $rc = 0 ] && printf 'The seedbox check passed:\n%s\n\n' "$out")Fetching runs every minute from now on.
-
-$(seedbox_mappings)"
+  big "Seedbox: next, on the seedbox" "$(seedbox_remote_steps "$me")"
+  big "Seedbox: and in Shelfmark" "$(seedbox_mappings)"
 }
 menu_library() {
   while true; do
@@ -3815,7 +3875,7 @@ menu_library() {
       W "Keep looking: every reader's waiting list, cancel entries" \
       I "Intake & dropboxes: webhook, Gutenberg mirror, email-to-library" \
       T "Torrents (qBittorrent): enable/disable ($(torrents_on && echo on || echo off))" \
-      B "Seedbox: bring Shelfmark's seedbox downloads back ($([ -f "$ETC/systemd/system/bookstack-seedbox.timer" ] && echo on || echo off))" \
+      B "Seedbox: Shelfmark's seedbox downloads, through Syncthing ($([ -f "$ETC/systemd/system/bookstack-seedbox.timer" ] && echo on || echo off))" \
       Q "Request queue: approvals and failures, all of them, retry / dismiss" \
       P "Parked files: what the importer could not use, retry / delete" \
       R "Audiobookshelf: rescan the library now" \

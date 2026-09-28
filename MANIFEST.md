@@ -121,9 +121,10 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   origin-pull certificate and the Cloudflare token, alerting ahead of expiry (L09, L14)
 - `update-check.sh` — weekly: newer releases for every pinned image, one alert per version (L06)
 - `synthetic.py` — the canary journey, twice a day (`bookstack-canary.timer`, L08)
-- `seedbox-fetch.py` — every minute: COPIES finished seedbox downloads (SABnzbd jobs, torrents
-  rTorrent reports complete) through Filebrowser into `library/seedbox` for Shelfmark; download-only
-  account enforced, read-only requests only, never changes the seedbox (Library → Seedbox)
+- `seedbox-fetch.py` — every minute: hands finished seedbox downloads (SABnzbd jobs, torrents
+  rTorrent reports complete) from the Syncthing copy (`library/seedbox-sync`) to `library/seedbox`
+  for Shelfmark; checks every folder here is Receive Only (pauses one that is not), allowlisted
+  Syncthing requests, never changes the seedbox. `--setup` / `--check` for Library → Seedbox
 - `gate-sync.py` — portal password changes into Authelia's user file (path unit + timer, L05)
 
 ## Files bookstack.sh generates on the HOST (outside $STACK_DIR, not in this repo)
@@ -135,7 +136,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   accounts' passwords and their twice-daily journey (L08)
 - `bookstack-gate-sync.{service,path,timer}` — only while the Authelia gate is on (L05)
 - `/etc/bookstack/seedbox.env` (0600) + `seedbox.state` + `bookstack-seedbox.{service,timer}` —
-  Library → Seedbox: Filebrowser / rTorrent addresses and logins, what was already copied
+  Library → Seedbox: the seedbox's Syncthing device ID, rTorrent address and login, what was
+  already handed over
 - `$STACK_DIR/authelia/oidc-jwks.pem` (0600, uid 1000) — Authelia's OpenID Connect signing key,
   made when the gate is enabled; Audiobookshelf signs in through it (L05)
 - `/etc/bookstack/disk.state` — the disk watchdog's latch and last-alert stamp
