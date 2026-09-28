@@ -58,6 +58,11 @@ SYNC = os.environ.get("SEEDBOX_SYNC", os.path.join(STACK, "library/seedbox-sync"
 ST_SYNC = os.environ.get("SEEDBOX_ST_SYNC", "/sync")            # the same folder inside the container
 ST_URL = os.environ.get("SEEDBOX_ST_URL", "http://127.0.0.1:8384")
 ALERT = os.environ.get("SEEDBOX_ALERT", os.path.join(STACK, "scripts/alert.sh"))
+# What Shelfmark is waiting for right now (the portal writes it, librarian/worker.py
+# _export_waiting): a download the seedbox has had for longer than KEEP_DAYS was dropped here
+# and ignored in Syncthing; asked for again, this brings it back.
+WANTED = os.environ.get("SEEDBOX_WANTED", os.path.join(STACK, "librarian/state/seedbox-wanted.json"))
+WANTED_FRESH = 180
 MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "60"))           # seconds an item must be unchanged
 RT_SETTLE = int(os.environ.get("SEEDBOX_RT_SETTLE", "90"))       # seconds after rTorrent finished it
 KEEP_DAYS = float(os.environ.get("SEEDBOX_KEEP_DAYS", "7"))       # hand-overs and synced copies here
@@ -308,6 +313,32 @@ def connected(stc, dev):
     return bool(((stc.req("GET", "/rest/system/connections") or {}).get("connections") or {}).get(dev, {}).get("connected"))
 
 
+def _words(s):
+    s = re.sub(r"\.(epub|mobi|azw3?|pdf|cbz|fb2|m4b|mp3|zip|rar)$", "", (s or "").lower())
+    return [w for w in re.split(r"[^a-z0-9]+", s) if w]
+
+
+def wanted_now(now):
+    """[(title words, author words)] Shelfmark is waiting for; [] when the list is stale."""
+    try:
+        d = json.load(open(WANTED, encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if now - float(d.get("at") or 0) > WANTED_FRESH:
+        return []
+    return [(_words(w.get("title")), _words(w.get("author"))) for w in d.get("waiting") or [] if _words(w.get("title"))]
+
+
+def is_wanted(name, wanted):
+    """Every word of the title is in the item's name and, when an author is known, one of theirs
+    too (a one-word title alone, like 'Emma', is not enough)."""
+    have = set(_words(name))
+    for title, author in wanted:
+        if set(title) <= have and ((author and set(author) & have) or (not author and len(" ".join(title)) >= 12)):
+            return True
+    return False
+
+
 def prune(now, subs, copied):
     """Hand-overs Shelfmark never claimed (the reader cancelled, a mapping was wrong) go after
     KEEP_DAYS, counted from the hand-over (a linked file keeps the seedbox's own time, so its
@@ -346,6 +377,7 @@ def run():
         dev = c["SEEDBOX_ST_DEVICE"]
         up = connected(stc, dev)
         rt_done = None
+        wanted = wanted_now(now)
         for fid, sub, kind in srcs:
             local_root, dest = os.path.join(SYNC, sub), os.path.join(MIRROR, sub)
             if (stc.folder(fid) or {}).get("paused"):
@@ -355,6 +387,15 @@ def run():
                            if not n.startswith(SKIP_PREFIX))
             # the seedbox's list (Syncthing's global view): what is still there to forget the rest
             on_seedbox = {e["name"] for e in (stc.req("GET", "/rest/db/browse", {"folder": fid, "levels": 0}) or [])}
+            # asked for again after this server dropped its copy: stop ignoring it, so Syncthing
+            # brings it back, and forget the old hand-over so it is handed over afresh
+            for key in [k for k, r in copied.items() if k.startswith(sub + "/") and r.get("trimmed")]:
+                name = key[len(sub) + 1:]
+                if name in on_seedbox and is_wanted(name, wanted) and ignore_line(name):
+                    set_ignores(stc, fid, drop=[ignore_line(name)])
+                    del copied[key]
+                    seen.pop(key, None)
+                    print(f"seedbox: bringing back {key} (Shelfmark is waiting for it)")
             if up:
                 need = stc.req("GET", "/rest/db/need", {"folder": fid, "perpage": 1000000}) or {}
                 pending = {e["name"].split("/", 1)[0] for part in ("progress", "queued", "rest") for e in need.get(part) or []}

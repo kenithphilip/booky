@@ -232,6 +232,18 @@ expect '[ -d "$RT/Middlemarch" ] && [ -f "$RT/Book [2020] {x}/a.epub" ] && [ -f 
 expect 'api vps GET /rest/db/status?folder=bookstack-rtorrent | python3 -c "import json,sys; s=json.load(sys.stdin); assert s[\"needTotalItems\"]==0 and s[\"receiveOnlyTotalItems\"]==0, s"' "...and Syncthing sees no local change to undo and nothing to pull back"
 expect '[ -f "$SYNC/rtorrent/Unfinished/part.epub" ]' "an item never handed over (still downloading) is kept"
 
+echo "== asked for again after it was dropped here: brought back through Syncthing"
+mkdir -p "$STACK/librarian/state"
+python3 -c 'import json,sys,time; json.dump({"at": int(time.time()), "waiting": [{"title": "Emma", "author": ""}, {"title": "Some Other Book", "author": "Nobody"}]}, open(sys.argv[1], "w"))' "$STACK/librarian/state/seedbox-wanted.json"
+runs r7b
+expect '[ ! -e "$SYNC/rtorrent/Book [2020] {x}" ] && api vps GET "/rest/db/ignores?folder=bookstack-rtorrent" | grep -q "Book"' "a one-word title with no author ('Emma') brings nothing back (too loose to trust)"
+python3 -c 'import json,sys,time; json.dump({"at": int(time.time()), "waiting": [{"title": "Book [2020]", "author": "x"}]}, open(sys.argv[1], "w"))' "$STACK/librarian/state/seedbox-wanted.json"
+run > "$T/r7c.out" 2>&1; synced; runs r7d; sleep 2; runs r7e
+expect 'grep -q "bringing back rtorrent/Book \[2020\] {x}" "$T/r7c.out"' "Shelfmark waiting for it: the job stops ignoring it"
+expect '[ -f "$SYNC/rtorrent/Book [2020] {x}/a.epub" ] && [ -f "$M/rtorrent/Book [2020] {x}/a.epub" ]' "...Syncthing brings it back and it is handed to Shelfmark again"
+expect '[ -f "$RT/Book [2020] {x}/a.epub" ]' "...and the seedbox copy was only ever read"
+python3 -c 'import json,sys; json.dump({"at": 0, "waiting": []}, open(sys.argv[1], "w"))' "$STACK/librarian/state/seedbox-wanted.json"
+
 echo "== an item that leaves the seedbox is forgotten, and may come back"
 seed_do 'rm -rf "$RT/Middlemarch"'; synced; run >/dev/null 2>&1
 expect '! grep -q "rtorrent/Middlemarch" "$T/etc/seedbox.state" && ! api vps GET "/rest/db/ignores?folder=bookstack-rtorrent" | grep -q "\"/Middlemarch\""' "its record and its ignore line are dropped"

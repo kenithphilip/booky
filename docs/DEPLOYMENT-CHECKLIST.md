@@ -232,6 +232,9 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
 - [ ] Find a better copy (v5.4): on a badly converted book's page press *Find a better copy*,
       request it again in Shelfmark choosing an EPUB result; within minutes the page says it
       was replaced, the book keeps its owners, and the Kobo gets the new file at its next sync.
+- [ ] Remove from my library (v5.5): a reader removes a shared book; it leaves their My books at
+      once and their shelf in Calibre within minutes; the other reader keeps it. A book nobody
+      has any more is deleted from the server after LIBRARY_RELEASE_DAYS (7).
 - [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
       runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
       check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on

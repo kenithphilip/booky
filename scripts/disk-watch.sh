@@ -8,7 +8,8 @@
 #   <  DISK_RESUME_PCT (80)    : start again whatever THIS script stopped, and drop the flag
 # The three thresholds come from the environment or $STACK_DIR/.env: hardcoding them meant an
 # admin had to edit this file, which copy_code_trees overwrites on every Deploy and Update.
-# Always: delete stale partials, trim journald, Docker build cache and restic's cache.
+# Always: delete stale partials, trim journald, Docker build cache, dangling images, apt's
+# package cache and restic's cache.
 # A full disk wedges SQLite, CWA ingest, Caddy logging and swap at once; nothing restarts out of it.
 set -uo pipefail
 PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
@@ -141,6 +142,11 @@ journalctl --vacuum-size=200M >/dev/null 2>&1
 # the cheap fix is local and one line: raise `until=168h`, and accept that disk. Do NOT stand
 # up a registry and a cross-arch publish pipeline for an event that happens a few times a year.
 docker builder prune -f --filter until=168h >/dev/null 2>&1
+# Image layers nothing refers to any more (every Update and Deploy rebuild leaves the previous
+# caddy/librarian layers behind): DANGLING only. Tagged images stay, including the :prev tags
+# Operations -> Update keeps for its rollback. And the .deb packages apt keeps after upgrades.
+docker image prune -f >/dev/null 2>&1
+apt-get clean >/dev/null 2>&1
 if [ -f /etc/bookstack/restic.env ]; then ( set -a; . /etc/bookstack/restic.env; set +a; restic cache --cleanup >/dev/null 2>&1 ); fi
 # dead-man's switch: Kuma's "Disk watchdog" monitor goes red if this hourly run stops happening.
 # Always "up": the disk level itself is alerted above, through alert.sh, with its own latch.

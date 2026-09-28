@@ -31,6 +31,9 @@ DEDUPE_WARN        = _bool("DEDUPE_WARN", True)         # warn if a title alread
 # Family sharing (share.py): a book already in the library is given to the next reader who asks
 # (their owner tag added to the same copy) instead of being downloaded again.
 FAMILY_SHARING     = _bool("FAMILY_SHARING", True)
+# A book no reader has any more is deleted from the VPS after this many days (its seedbox copy,
+# if any, stays on the seedbox, and a new request brings it back). 0 = never.
+LIBRARY_RELEASE_DAYS = int(os.environ.get("LIBRARY_RELEASE_DAYS", "7") or 7)
 ENRICH_METADATA    = _bool("ENRICH_METADATA", True)     # covers/blurbs from Open Library in the search UI
 CALIBRE_DB         = os.environ.get("CALIBRE_DB", "/calibre-library/metadata.db")  # read-only dedupe check
 # Calibre-Web itself (loopback; the portal shares the host network). Used for a cached

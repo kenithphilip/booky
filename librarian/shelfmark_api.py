@@ -106,6 +106,21 @@ def pending(force=False, cache=True):
     return rows
 
 
+def waiting_for_files():
+    """[{title, author}] of Shelfmark downloads a client reports done but whose file has not
+    appeared yet ("Waiting for completed files"): what the seedbox job should bring back."""
+    if not configured():
+        return []
+    r = _call("GET", "/api/status")
+    if r.status_code != 200:
+        raise ShelfmarkError(f"Shelfmark answered HTTP {r.status_code} for its queue")
+    out = []
+    for task in ((r.json() or {}).get("locating") or {}).values():
+        if isinstance(task, dict) and "completed files" in (task.get("status_message") or "").lower():
+            out.append({"title": task.get("title") or "", "author": task.get("author") or ""})
+    return out
+
+
 def decide(request_id, approve, note=""):
     """Approve (fulfil with the reader's own release choice) or reject one Shelfmark request."""
     path = f"/api/admin/requests/{int(request_id)}/{'fulfil' if approve else 'reject'}"

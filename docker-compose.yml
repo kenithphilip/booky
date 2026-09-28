@@ -250,6 +250,7 @@ services:
       - ABS_LIBRARY_NAME=${ABS_LIBRARY_NAME:-Audiobooks}
       - APPROVALS_REQUIRED=${APPROVALS_REQUIRED:-false}   # family default; Configure explains
       - FAMILY_SHARING=${FAMILY_SHARING:-true}            # a book the family has is shared, not downloaded again
+      - LIBRARY_RELEASE_DAYS=${LIBRARY_RELEASE_DAYS:-7}   # a book no reader has any more is deleted after this (0 = never)
       - NOTIFY_WEBHOOK=${NOTIFY_WEBHOOK:-}
       - NOTIFY_WEBHOOK_FORMAT=${NOTIFY_WEBHOOK_FORMAT:-auto}   # auto = ntfy style when the URL host contains 'ntfy'
       - AUTHELIA_ENABLED=${AUTHELIA_ENABLED:-false}           # portal hides self-service user creation when the gate is on

@@ -7,7 +7,7 @@ against loopback/LAN/tailnet/link-local ranges first (a logged-in user controls 
 request), catalog credentials only ever go to the configured catalog origin, and downloads
 are capped per kind (local files too: a huge PDF must not OOM-kill the portal). Each loop
 keeps a heartbeat in HEARTBEAT for /healthz."""
-import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata, errno, hashlib
+import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddress, logging, unicodedata, errno, hashlib, json
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
@@ -477,6 +477,7 @@ def shelfmark_gate_once(now=None):
     import shelfmark_api
     if not shelfmark_api.configured():
         return 0, 0
+    _export_waiting(shelfmark_api)
     try:
         rows = shelfmark_api.pending(cache=False)
     except shelfmark_api.ShelfmarkError as e:
@@ -524,6 +525,82 @@ def shelfmark_gate_once(now=None):
         except Exception as e:                   # one bad row never blocks the others
             log.warning("Shelfmark gate: request #%s: %s", x.get("id"), e)
     return shared, approved
+
+WAITING_FILE = os.path.join(os.path.dirname(config.STATE_DB), "seedbox-wanted.json")
+_WAITING = {"last": None, "at": 0.0}
+
+def _export_waiting(shelfmark_api, now=None):
+    """The seedbox job (scripts/seedbox-fetch.py) drops its synced copy of a download after a
+    week and tells Syncthing to ignore it. Asked for again, the torrent is already complete on
+    the seedbox, so Shelfmark just waits for the file: this list (librarian/state, which the host
+    reads) is what makes the job bring that copy back through Syncthing."""
+    now = now or time.time()
+    try:
+        titles = shelfmark_api.waiting_for_files()
+    except Exception as e:                       # never let this block the gate
+        log.debug("could not read Shelfmark's queue: %s", e)
+        return
+    if titles == _WAITING["last"] and now - _WAITING["at"] < 60:
+        return
+    tmp = WAITING_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"at": int(now), "waiting": titles}, f)
+        os.replace(tmp, WAITING_FILE)
+        _WAITING.update(last=titles, at=now)
+    except OSError as e:
+        log.warning("could not write %s: %s", WAITING_FILE, e)
+
+# ---- books no reader has any more ---------------------------------------------------------------
+RELEASE_EVERY = 3600
+_LAST_RELEASE = [0.0]
+
+def _owner_tags_by_book():
+    c = library._conn()
+    try:
+        out = {}
+        for bid, name in c.execute("SELECT l.book, t.name FROM books_tags_link l JOIN tags t ON t.id=l.tag "
+                                   "WHERE t.name LIKE ?", (config.OWNER_PREFIX + "%",)):
+            out.setdefault(bid, set()).add(name)
+        return out
+    finally:
+        c.close()
+
+def reconcile_releases(now=None):
+    """Count down the books no reader has any more; hand the due ones to the host job, which
+    deletes them from the VPS (their seedbox copy stays on the seedbox). A book is 'no reader's'
+    when its last reader removed it (admin_cli, after the host took the tag off) or when every
+    owner tag it carries names an account that no longer exists. A book that never had an owner
+    (the admin's own, added in Calibre-Web) is never counted. Returns the number made due."""
+    days = config.LIBRARY_RELEASE_DAYS
+    if days <= 0:
+        return 0
+    now = now or time.time()
+    try:
+        names = {u["name"] for u in cwa.list_users(include_canary=True)}
+        tags = _owner_tags_by_book()
+    except Exception as e:
+        log.warning("release check skipped: %s", e)
+        return 0
+    if not names:
+        return 0                                 # an unreadable user list is never "nobody"
+    busy = {r["calibre_id"] for r in db.pending_tag_pushes(1000)}
+    tracked = {r["calibre_id"]: r for r in db.releases()}
+    pre = len(config.OWNER_PREFIX)
+    for bid, t in tags.items():
+        if {x[pre:] for x in t} & names:
+            if bid in tracked:
+                db.release_keep(bid, now)        # someone has it again
+                tracked.pop(bid)
+        elif bid not in tracked and bid not in busy:
+            db.release_note(bid, "every reader who had it has been removed", sorted(t), now)
+    made = 0
+    for bid, r in tracked.items():
+        if r["status"] == "waiting" and now - r["since"] >= days * 86400 \
+                and bid not in busy and not db.replace_live(bid):
+            db.release_due(bid, now)
+            made += 1
+    return made
 
 def _status_for(note):
     if note.startswith(NEEDS_TAG):
@@ -1594,6 +1671,9 @@ def housekeeping_once(now=None):
         _LAST_RECONCILE[0] = now
         _guarded(reconcile_imports)
         _guarded(reconcile_untagged, now)
+    if now - _LAST_RELEASE[0] >= RELEASE_EVERY:
+        _LAST_RELEASE[0] = now
+        _guarded(reconcile_releases, now)
     if now - _LAST_ENRICH[0] >= ENRICH_EVERY:
         _LAST_ENRICH[0] = now
         _guarded(enrich_once, now)

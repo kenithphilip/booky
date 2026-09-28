@@ -207,6 +207,30 @@ for row in (tags_pending.get("rows") or []) if tags_pending.get("ok") else []:
         admin("tags", "result", str(pid), "fail", "--reason", "could not read the book's tags")
         tag_failed += 1
         continue
+    if row.get("op") == "remove":
+        # 'Remove from my library': THIS reader's tag goes, and nothing else
+        if want_tag not in before:
+            admin("tags", "result", str(pid), "ok")      # already gone
+            tagged += 1
+            continue
+        keep = [t for t in before if t != want_tag]
+        if any("," in t for t in keep):
+            admin("tags", "result", str(pid), "fail", "--reason", "refused: a tag contains a comma")
+            tag_failed += 1
+            continue
+        r = calibredb("set_metadata", str(bid), "--field", "tags:" + ",".join(keep))
+        after = all_tags(bid)
+        if r.returncode != 0 or after is None or sorted(after) != sorted(keep):
+            if after is not None and sorted(after) != sorted(before) and sorted(after) != sorted(keep):
+                owner_moved = True
+                alert("Bookstack: removing a reader's tag changed other tags",
+                      f"Calibre book {bid}: tags were {before}, are now {after} (wanted {keep}).")
+            admin("tags", "result", str(pid), "fail", "--reason", (r.stderr or r.stdout or f"read back {after}")[:250])
+            tag_failed += 1
+            continue
+        admin("tags", "result", str(pid), "ok")
+        tagged += 1
+        continue
     owners_now = [t for t in before if t.startswith("owner:")]
     if share:
         # family sharing: a SECOND owner for a book that already has one (share.py). Never the
@@ -346,9 +370,52 @@ for job in (reps.get("rows") or []) if reps.get("ok") else []:
         replace_failed += 1
 failed += replace_failed
 
+# ---- fifth pass: books no reader has any more ----------------------------------------------
+# The portal counted them down (LIBRARY_RELEASE_DAYS after the last reader removed it, or after
+# every owner's account was removed) and hands over each with the owner tags it saw then. It
+# is deleted from Calibre ONLY if those are still exactly its owner tags: a book someone got
+# again in the meantime (a share, a new request) is refused and kept. Its seedbox copy, if any,
+# is untouched; asking for it again brings it back.
+def book_exists(book_id):
+    r = calibredb("list", "--fields", "title", "--search", f"id:{book_id}", "--for-machine")
+    if r.returncode != 0:
+        return None
+    try:
+        return bool(machine_json(r.stdout))
+    except ValueError:
+        return None
+
+deleted = delete_failed = 0
+due = admin("releases", "due")
+for row in (due.get("rows") or []) if due.get("ok") else []:
+    bid, expect = int(row["calibre_id"]), sorted(row.get("tags") or [])
+    there = book_exists(bid)
+    if there is False:
+        admin("releases", "result", str(bid), "ok")          # already gone (deleted by hand)
+        deleted += 1
+        continue
+    now_owners = owner_tags(bid)
+    if there is None or now_owners is None:
+        admin("releases", "result", str(bid), "fail", "--reason", "could not read the book")
+        delete_failed += 1
+        continue
+    if now_owners != expect:
+        admin("releases", "result", str(bid), "fail", "--reason", f"refused: its owners are now {now_owners}")
+        continue                                              # kept: someone has it again
+    r = calibredb("remove", "--permanent", str(bid))
+    if r.returncode == 0 and book_exists(bid) is False:
+        admin("releases", "result", str(bid), "ok")
+        deleted += 1
+    else:
+        admin("releases", "result", str(bid), "fail", "--reason", (r.stderr or r.stdout or "still there")[-250:])
+        delete_failed += 1
+failed += delete_failed
+
 print(f"metadata push: {applied} applied, {failed} failed")
 if replaced or replace_failed:
     print(f"better copies: {replaced} swapped in, {replace_failed} failed")
+if deleted or delete_failed:
+    print(f"books no reader has: {deleted} deleted from the server, {delete_failed} failed")
 if converted or convert_failed:
     print(f"conversions: {converted} made, {convert_failed} failed")
 if tagged or tag_failed:

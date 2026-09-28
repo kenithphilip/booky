@@ -771,5 +771,28 @@ if len(fam) >= 2:
     check(sorted(book_file(b2)) == ["EPUB"], "only the new EPUB is left (formats made from the old file are gone)")
     st, h, b = p.get(f"{PORTAL}/book/{b2}"); check(b"replaced with a better copy" in b, "the book's page says so")
 
+    print("== 16c. Remove from my library; a book nobody has any more leaves the server")
+    st, h, b = pb.get(f"{PORTAL}/book/{b1}/remove")
+    check(b"Remove from My Books" in b and b"Remove from Device" in b, "the page says how to clear the Kobo and the Kindle")
+    portal_post(pb, f"/book/{b1}/remove", f"/book/{b1}/remove", {})
+    st, h, b = pb.get(PORTAL + "/library"); check(f'/book/{b1}"'.encode() not in b, "gone from bob's My books at once")
+    check(wait(lambda: (host_job(), imported(t1, "bob") is None)[1], 240, 20), "the host job took bob's tag off")
+    check(imported(t1, "alice") == b1, "alice keeps it")
+    solo = calibre("SELECT b.id, b.title, b.path FROM books b JOIN books_tags_link l ON l.book=b.id JOIN tags t ON t.id=l.tag "
+                   "WHERE t.name='owner:alice' AND b.id NOT IN (SELECT l2.book FROM books_tags_link l2 JOIN tags t2 ON t2.id=l2.tag "
+                   "WHERE t2.name LIKE 'owner:%' AND t2.name != 'owner:alice') AND b.id != ? ORDER BY b.id LIMIT 1", b1)
+    check(bool(solo), "alice has a book nobody else has")
+    if solo:
+        sid, stitle, spath = solo[0]
+        portal_post(p, f"/book/{sid}/remove", f"/book/{sid}/remove", {})
+        check(wait(lambda: (host_job(), not calibre("SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=? AND t.name LIKE 'owner:%'", sid))[1], 240, 20),
+              "alice, its last reader, removes it")
+        r = subprocess.run(["docker", "exec", "librarian", "python", "-c",
+                            f"import db; r=[x for x in db.releases() if x['calibre_id']=={sid}]; print(r[0]['status'] if r else 'none'); db.release_due({sid})"],
+                           capture_output=True, text=True)
+        check(r.stdout.strip().splitlines()[:1] == ["waiting"], "its countdown started (made due here instead of waiting the days)", r.stdout + r.stderr)
+        check(wait(lambda: (host_job(), not calibre("SELECT 1 FROM books WHERE id=?", sid))[1], 240, 20), "the host job deleted it from Calibre")
+        check(not os.path.exists(f"{STACK}/library/books/{spath}"), "and its files are gone from the disk")
+
 print(f"\nE2E RESULT: {fails} failed")
 sys.exit(fails)

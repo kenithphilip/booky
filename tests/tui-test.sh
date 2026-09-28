@@ -1821,6 +1821,39 @@ MP_FAFTER="$MP_FBEFORE" rprun
 expect 'grep -q "replaces result 8 fail --reason formats after the swap" "$MP/log"' \
   "old formats that would not go away: reported, not called done"
 unset MP_REPROWS MP_BEFORE MP_AFTER MP_FBEFORE MP_FAFTER
+# 'Remove from my library' (op=remove) and deleting books no reader has any more
+cat > "$MP/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MP/log"
+case "$*" in
+  *"admin_cli pushes pending"*|*"admin_cli converts pending"*|*"admin_cli replaces pending"*) echo '{"ok":true,"rows":[]}';;
+  *"admin_cli tags pending"*) echo "${MP_TAGROWS:-{\"ok\":true,\"rows\":[]\}}";;
+  *"admin_cli releases due"*) echo "${MP_DUE:-{\"ok\":true,\"rows\":[]\}}";;
+  *"admin_cli"*"result"*) echo '{"ok":true,"status":"done"}';;
+  *"--fields tags"*) n=$(cat "$MP/tc" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/tc"
+    if [ "$n" -ge 2 ]; then echo "$MP_AFTER"; else echo "$MP_BEFORE"; fi;;
+  *"--fields title"*) n=$(cat "$MP/ec" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/ec"
+    if [ "$n" -ge 2 ] && [ -n "${MP_GONE_AFTER:-}" ]; then echo '[]'; else echo '[{"id":60,"title":"X"}]'; fi;;
+esac
+EOS
+chmod +x "$MP/bin/docker"
+rmrun(){ rm -f "$MP/tc" "$MP/ec"; mprun; }
+MP_TAGROWS='{"ok":true,"rows":[{"id":11,"calibre_id":60,"rid":null,"owner":"alice","share":0,"op":"remove"}]}' \
+  MP_BEFORE='[{"id":60,"tags":["Classics","owner:alice","owner:bob"]}]' MP_AFTER='[{"id":60,"tags":["Classics","owner:bob"]}]' rmrun
+expect 'grep "calibredb set_metadata" "$MP/log" | grep -q "tags:Classics,owner:bob" && grep -q "tags result 11 ok" "$MP/log"' \
+  "'Remove from my library' takes off only alice's tag: bob's and every other tag stay"
+MP_TAGROWS='{"ok":true,"rows":[{"id":11,"calibre_id":60,"rid":null,"owner":"alice","share":0,"op":"remove"}]}' \
+  MP_BEFORE='[{"id":60,"tags":["Classics","owner:alice","owner:bob"]}]' MP_AFTER='[{"id":60,"tags":["Classics"]}]' rmrun
+expect 'grep -q "ALERT Bookstack: removing a reader.s tag changed other tags" "$MP/log" && grep -q "tags result 11 fail" "$MP/log"' \
+  "a removal that took more than that reader's tag raises the alert and fails"
+MP_DUE='{"ok":true,"rows":[{"calibre_id":60,"tags":[]}]}' MP_BEFORE='[{"id":60,"tags":["Classics"]}]' MP_AFTER='[{"id":60,"tags":["Classics"]}]' MP_GONE_AFTER=1 rmrun
+expect 'grep -q "calibredb remove --permanent 60" "$MP/log" && grep -q "releases result 60 ok" "$MP/log"' \
+  "a book no reader has any more is deleted from Calibre (permanently: no trash on a small disk) once due"
+MP_DUE='{"ok":true,"rows":[{"calibre_id":60,"tags":[]}]}' MP_BEFORE='[{"id":60,"tags":["owner:bob"]}]' MP_AFTER='[{"id":60,"tags":["owner:bob"]}]' rmrun
+expect '! grep -q "calibredb remove" "$MP/log" && grep -q "releases result 60 fail --reason refused: its owners are now" "$MP/log"' \
+  "a book someone has again (bob got it meanwhile) is refused and kept"
+expect 'grep -q "^docker image prune -f" "$REPO/scripts/disk-watch.sh" && grep -q "^apt-get clean" "$REPO/scripts/disk-watch.sh" && ! grep -qE "image prune.*-a|prune -a" "$REPO/scripts/disk-watch.sh"' \
+  "the disk watchdog clears DANGLING images and apt's cache, never tagged images (Update keeps :prev for its rollback)"
 
 # ---------------------------------------------------------------------------------------------
 echo "== FlareSolverr: one shared solver for Shelfmark and Ephemera"

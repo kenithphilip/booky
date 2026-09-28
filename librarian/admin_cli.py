@@ -183,7 +183,26 @@ def _tags(args):
                                                    f"({args.reason[:120]}); admin sets owner:{row['owner']} in CWA")
             import notify
             notify.send("needs-tag", db.get(row["rid"]))
+    if args.outcome == "ok" and row.get("op") == "remove":
+        _maybe_release(row["calibre_id"])
     db.audit("tag_push", None, "host", f"#{args.push_id} {args.outcome} {args.reason[:120]}")
+    return {"ok": True, "status": row["status"]}
+
+def _maybe_release(book_id):
+    """The last reader just removed this book: its countdown to deletion from the VPS starts."""
+    import cwa, worker
+    names = {u["name"] for u in cwa.list_users(include_canary=True)}
+    tags = worker._owner_tags_by_book().get(book_id, set())
+    if names and not ({t[len(config.OWNER_PREFIX):] for t in tags} & names):
+        db.release_note(book_id, "its last reader removed it", sorted(tags))
+
+def _releases(args):
+    """Books no reader has any more, due for deletion from the VPS (the host job deletes)."""
+    if args.what == "due":
+        return {"ok": True, "rows": [{"calibre_id": r["calibre_id"], "tags": json.loads(r["tags"] or "[]")}
+                                     for r in db.releases(("due",))]}
+    row = db.release_result(args.book_id, args.outcome == "ok", error=args.reason)
+    db.audit("release_result", None, "host", f"book {args.book_id} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 
 def _converts(args):
@@ -331,6 +350,13 @@ def _parser():
     cr.add_argument("outcome", choices=("ok", "fail"))
     cr.add_argument("--reason", default="")
 
+    rl = sp.add_parser("releases").add_subparsers(dest="what", required=True)
+    rl.add_parser("due")
+    rlr = rl.add_parser("result")
+    rlr.add_argument("book_id", type=int)
+    rlr.add_argument("outcome", choices=("ok", "fail"))
+    rlr.add_argument("--reason", default="")
+
     rp = sp.add_parser("replaces").add_subparsers(dest="what", required=True)
     rp.add_parser("pending").add_argument("--limit", type=int, default=5)
     rr = rp.add_parser("result")
@@ -368,7 +394,7 @@ def _parser():
     return p
 
 ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
-        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces,
+        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "releases": _releases,
         "canary": _canary, "gate": _gate}
 
 def main(argv=None):

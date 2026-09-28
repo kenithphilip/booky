@@ -39,6 +39,7 @@
 <button type="submit" class="sec">Find a better copy</button>
 <span class="mut">Badly formatted or no cover? The next EPUB of this book replaces this file, for everyone who has it.</span></form>
 {% endif %}
+{% if not admin or session.user in (b.owners or []) %}<p style="margin:10px 0 0"><a class="btn sec" href="{{ url_for('book_remove', book_id=b.id) }}">Remove from my library…</a></p>{% endif %}
 </div></div></div>
 {% if description %}<div class="card"><h3 style="margin-top:0">About this book</h3><p style="white-space:pre-line">{{ description }}</p></div>{% endif %}
 {% endblock %}

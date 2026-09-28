@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('book_page', book_id=b.id) }}">← {{ b.title }}</a></p>
+<div class="card">
+<h2 style="margin-top:0">Remove “{{ b.title }}” from your library?</h2>
+{% if not mine %}
+<p>This book is not on your own shelf, so there is nothing to remove for you. To delete it from the library for everyone, use Calibre-Web.</p>
+{% elif pending %}
+<p>It is already being removed: it leaves <b>My books</b> within a couple of minutes.</p>
+{% else %}
+<p>It leaves <b>My books</b>, your Kobo sync and your downloads within a couple of minutes. Anyone else in the family who has it keeps it.{% if days %} If nobody has it any more, it is deleted from the server after {{ days }} days; asking for it again brings it back.{% endif %}</p>
+<p><b>Copies already on your devices stay there</b> until you delete them yourself:</p>
+<ul>
+<li><b>Kobo:</b> My Books → press and hold the book's cover (or tap ⋯ under it) → <b>Remove</b> → <b>Remove from My Books</b>.</li>
+<li><b>Kindle:</b> Library → press and hold the book's cover → <b>Remove from Device</b>.{% if kindle_mail %} Books sent by e-mail are also kept in your Amazon account: amazon.com → Account → <b>Manage Your Content and Devices</b> → Content → <b>Docs</b> → tick it → <b>Delete</b>.{% endif %}</li>
+<li><b>Phone or tablet reading app:</b> delete it in the app as you would any book.</li>
+</ul>
+<form method="post" action="{{ url_for('book_remove', book_id=b.id) }}" class="row">{{ csrf_field() }}
+<button type="submit">Remove from my library</button>
+<a class="btn sec" href="{{ url_for('book_page', book_id=b.id) }}">Keep it</a></form>
+{% endif %}
+</div>
+{% endblock %}

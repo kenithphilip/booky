@@ -47,6 +47,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   owner tag added to the same copy) instead of downloaded again; strong matches only
 - `filemeta.py` — title/author out of MOBI/AZW3 (EXTH) and FB2, read-only and bounded, so the
   host job finds those books in Calibre after the import (also once CWA converted them)
+- `templates/remove.html` — 'Remove from my library': what happens, and how to clear the
+  copies on a Kobo and a Kindle
 - `kindle.py` — SMTP Send-to-Kindle (+ `python -m kindle test addr`)
 - `fetchers.py` — provider registry + adapters (Gutenberg, Standard Ebooks, IA, LibriVox)
 - `opds.py` — OPDS catalog search-and-grab (your own catalog)

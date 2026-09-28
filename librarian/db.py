@@ -220,8 +220,21 @@ def init():
             attempts INTEGER DEFAULT 0, last_error TEXT, created REAL, updated REAL)""")
         # share=1: family sharing (share.py) — add a SECOND owner to a book that already has one,
         # instead of downloading it again. One open job per (book, reader).
-        if "share" not in {r[1] for r in c.execute("PRAGMA table_info(tag_push)")}:
+        tcols = {r[1] for r in c.execute("PRAGMA table_info(tag_push)")}
+        if "share" not in tcols:
             c.execute("ALTER TABLE tag_push ADD COLUMN share INTEGER DEFAULT 0")
+        # op='remove': a reader took the book out of THEIR library (the book page); only their
+        # owner tag goes, everyone else keeps it
+        if "op" not in tcols:
+            c.execute("ALTER TABLE tag_push ADD COLUMN op TEXT DEFAULT 'add'")
+        # A book no reader has any more (its last reader removed it, or every owner's account is
+        # gone) is deleted from the VPS after LIBRARY_RELEASE_DAYS (worker.reconcile_releases,
+        # the host job deletes). Books that never had an owner (the admin's own, added in
+        # Calibre-Web) are never listed here.
+        c.execute("""CREATE TABLE IF NOT EXISTS book_release(
+            calibre_id INTEGER PRIMARY KEY, since REAL NOT NULL, reason TEXT,
+            status TEXT NOT NULL DEFAULT 'waiting',   -- waiting | due | deleted | kept | failed
+            tags TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, updated REAL)""")
         c.execute("DROP INDEX IF EXISTS tag_push_open")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open_owner ON tag_push(calibre_id, owner) WHERE status = 'pending'")
         # "Find a better copy" (the book page): for REPLACE_DAYS the next EPUB of this book that
@@ -1225,15 +1238,74 @@ def catalog_delete(cid):
 
 
 # ---- L10: owner tags added by the host (scripts/metadata-push.sh, second pass) --------------
-def queue_tag_push(calibre_id, rid, owner, now=None, share=False):
+def queue_tag_push(calibre_id, rid, owner, now=None, share=False, op="add"):
     now = now or time.time()
     try:
         with _lock, _conn() as c:
-            c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, created, updated) VALUES(?,?,?,?,?,?)",
-                      (int(calibre_id), rid, owner, 1 if share else 0, now, now))
+            c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated) VALUES(?,?,?,?,?,?,?)",
+                      (int(calibre_id), rid, owner, 1 if share else 0, op, now, now))
         return True
     except sqlite3.IntegrityError:
         return False                          # one open job per book and reader
+
+def queue_untag(calibre_id, owner, now=None):
+    """'Remove from my library': take this reader's owner tag off the book (host job). A
+    pending ADD for the same book and reader is simply withdrawn instead."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        row = c.execute("SELECT id, op FROM tag_push WHERE calibre_id=? AND owner=? AND status='pending'",
+                        (int(calibre_id), owner)).fetchone()
+        if row and row["op"] != "remove":
+            c.execute("UPDATE tag_push SET status='withdrawn', updated=? WHERE id=?", (now, row["id"]))
+        elif row:
+            return True
+        c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated) VALUES(?,?,?,0,'remove',?,?)",
+                  (int(calibre_id), None, owner, now, now))
+        return True
+
+def untag_pending(calibre_id, owner):
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM tag_push WHERE calibre_id=? AND owner=? AND op='remove' AND status='pending'",
+                         (int(calibre_id), owner)).fetchone() is not None
+
+def release_note(calibre_id, reason, tags, now=None):
+    """This book has no reader any more: start (or keep) its countdown."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO book_release(calibre_id, since, reason, tags, updated) VALUES(?,?,?,?,?) "
+                  "ON CONFLICT(calibre_id) DO UPDATE SET tags=excluded.tags, updated=excluded.updated, "
+                  "status=CASE WHEN book_release.status IN ('kept','failed') THEN 'waiting' ELSE book_release.status END, "
+                  "since=CASE WHEN book_release.status IN ('kept','failed') THEN excluded.since ELSE book_release.since END",
+                  (int(calibre_id), now, reason, json.dumps(tags), now))
+
+def release_keep(calibre_id, now=None):
+    """A reader has it again (a share, a re-request): the countdown stops."""
+    with _lock, _conn() as c:
+        c.execute("UPDATE book_release SET status='kept', updated=? WHERE calibre_id=? AND status IN ('waiting','due')",
+                  (now or time.time(), int(calibre_id)))
+
+def releases(statuses=("waiting", "due")):
+    marks = ",".join("?" * len(statuses))
+    with _conn() as c:
+        return [dict(r) for r in c.execute(f"SELECT * FROM book_release WHERE status IN ({marks}) ORDER BY since", tuple(statuses))]
+
+def release_due(calibre_id, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE book_release SET status='due', updated=? WHERE calibre_id=? AND status='waiting'",
+                  (now or time.time(), int(calibre_id)))
+
+def release_result(calibre_id, ok, error=None, max_attempts=3):
+    now = time.time()
+    with _lock, _conn() as c:
+        row = c.execute("SELECT * FROM book_release WHERE calibre_id=?", (int(calibre_id),)).fetchone()
+        if not row:
+            raise ValueError(f"no release for book {calibre_id}")
+        attempts = (row["attempts"] or 0) + 1
+        st = "deleted" if ok else ("kept" if (error or "").startswith("refused:") else
+                                   "failed" if attempts >= max_attempts else "due")
+        c.execute("UPDATE book_release SET status=?, attempts=?, last_error=?, updated=? WHERE calibre_id=?",
+                  (st, attempts, None if ok else (error or "")[:300], now, int(calibre_id)))
+        return dict(row, status=st)
 
 def tag_push_open_for(rid):
     with _conn() as c:
@@ -1304,7 +1376,7 @@ def replace_result(job_id, ok, error=None, max_attempts=3):
 def pending_tag_pushes(limit=50):
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id, calibre_id, rid, owner, share FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
+            "SELECT id, calibre_id, rid, owner, share, op FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
 
 def tag_push_result(push_id, ok, error=None, max_attempts=5):
     """Record the host's outcome. Success marks the request done; repeated failure gives up."""

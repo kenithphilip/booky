@@ -507,6 +507,29 @@ again (`librarian/share.py`):
   corrected metadata and the Kobo's identity of the book stay, every reader who has it gets the
   new file, and formats made from the old one (the Kobo's KEPUB, a kept MOBI, conversions) are
   removed to be made again. The host job does the swap, reading the owner tags before and after.
+- **Remove from my library** (a book's page): only that reader's owner tag comes off; everyone
+  else keeps the book. The page first says how to delete the copies already on their devices
+  (Kobo: *Remove → Remove from My Books*; Kindle: *Remove from Device*, plus Amazon's *Manage
+  Your Content and Devices* for mailed books), because Calibre-Web's Kobo sync never removes a
+  book it no longer shows (measured in the CWA v4.0.6 source).
+
+## Keeping the VPS small (it has 80 GB; the seedbox has the space)
+- **Books no reader has any more** are deleted from the server `LIBRARY_RELEASE_DAYS` (7) after
+  the last reader removed them, or after every owner's account was removed. The host job
+  deletes only if the book's owner tags are still exactly what the portal saw (a book someone
+  got again in the meantime is kept), permanently (no Calibre trash on a small disk). A book that
+  never had an owner (the admin's own, added in Calibre-Web) is never touched. `0` = never.
+- **Seedbox downloads**: this server keeps its Syncthing copy for a week, then drops it and
+  ignores it (the seedbox keeps seeding). Asked for again, Shelfmark finds the torrent complete
+  and waits for the file; the portal passes what it is waiting for to the seedbox job, which
+  stops ignoring that item, so Syncthing brings it back and it is handed over again.
+- **Hourly** (scripts/disk-watch.sh): stale partial files, the journal (200 MB), Docker's build
+  cache (7 days), dangling image layers left by rebuilds (never tagged images: Update keeps
+  `:prev` for its rollback), apt's package cache, restic's cache. CWA's own copies of every
+  imported/converted file are off by default (Library → Formats).
+- **Memory** is not a cleanup job: every container has a hard `mem_limit`, the idle services are
+  small (measured peak for the whole stack ~2.2 GB of 4 GB), FlareSolverr's browser and Calibre
+  conversions give their memory back when done, and the kernel reclaims what is unused.
 
 ## Seedbox — Shelfmark downloads on your seedbox, brought home by Syncthing (Library → Seedbox)
 Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or

@@ -930,6 +930,8 @@ def my_library():
     prefs = db.get_prefs(user)
     books = library.books_for(user, is_admin, offset=page * library.PAGE, q=q)
     total = library.count_for(user, is_admin, q=q)
+    # removed by this reader a moment ago: gone for them now, the host job catches up in minutes
+    books = [x for x in books if not db.untag_pending(x["id"], user)]
     for b in books:
         b["best"] = library.best_format(b, prefs["preferred_format"])
         b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
@@ -975,6 +977,31 @@ def book_page(book_id):
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
         converting=db.convert_for_book(book_id),
         replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS)
+
+@app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
+@login_required
+def book_remove(book_id):
+    """'Remove from my library': this reader's owner tag comes off the book (the host job does it;
+    the portal mounts the library read-only). Everyone else who has it keeps it. The page first
+    says what happens and how to delete the copies already on their devices, which the library
+    cannot reach (Calibre-Web's Kobo sync never removes a book it no longer shows)."""
+    user, is_admin = session["user"], session.get("admin", False)
+    b = library.book_detail(user, book_id, is_admin)
+    if not b:
+        abort(404)
+    mine = (not is_admin) or user in (b.get("owners") or [])
+    if request.method == "GET":
+        return render_template("remove.html", b=b, mine=mine, pending=db.untag_pending(book_id, user),
+                               kindle_mail=_cwa_user(user).get("kindle_mail") or "",
+                               days=config.LIBRARY_RELEASE_DAYS)
+    if not mine:
+        flash("This book is not on your own shelf; delete it for everyone in Calibre-Web.")
+        return redirect(url_for("book_page", book_id=book_id))
+    db.queue_untag(book_id, user)
+    _audit("remove_from_library", f"book {book_id}")
+    flash(f"“{b['title']}” is being removed from your library: it leaves My books within a couple of "
+          "minutes. Delete the copies on your Kobo or Kindle as the page showed.")
+    return redirect(url_for("my_library"))
 
 @app.route("/book/<int:book_id>/replace", methods=["POST"])
 @login_required
