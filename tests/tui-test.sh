@@ -2330,6 +2330,8 @@ expect '[ -z "$risky" ]' "no script pipes a long-output command into grep -q (ta
 [ -n "$risky" ] && printf '       %s\n' "$risky"
 unset risky
 
+expect '[ "$COMPOSE_IGNORE_ORPHANS" = true ] && grep -q "^export COMPOSE_IGNORE_ORPHANS=true" "$REPO/scripts/disk-watch.sh" && grep -q "^export COMPOSE_IGNORE_ORPHANS=true" "$REPO/scripts/selftest.sh" && ! grep -rn -- "--remove-orphans" "$REPO/bookstack.sh" "$REPO"/scripts/*.sh | grep -v "^[^:]*:[0-9]*: *#"' "Authelia and Ephemera (overlay files) are expected, not orphans: no warning, and nothing ever removes them"
+
 echo "== Daily disk summary for the admin (scripts/disk-report.sh, v5.6)"
 DR="$T/dr"; mkdir -p "$DR/bin" "$DR/stack/library/books" "$DR/stack/library/audiobooks" "$DR/stack/library/seedbox-sync" "$DR/etc"
 cat > "$DR/bin/df" <<'EOS'

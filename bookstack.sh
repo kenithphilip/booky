@@ -117,6 +117,11 @@ seedbox_on(){ [ "$(envget SEEDBOX_ENABLED)" = true ]; }
 compose_profiles(){ if torrents_on; then printf '%s\n' --profile torrents; fi
   if solver_on; then printf '%s\n' --profile solver; fi
   if seedbox_on; then printf '%s\n' --profile seedbox; fi; }
+# Authelia and Ephemera live in overlay files (docker-compose.authelia.yml / .ephemera.yml), so a
+# plain `docker compose` sees their containers as "orphans" and says so on every call. They are
+# expected: silence the warning, and NEVER act on its advice (--remove-orphans deletes Authelia,
+# and with it every site's login gate).
+export COMPOSE_IGNORE_ORPHANS=true
 compose(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose ${p[@]+"${p[@]}"} "$@"); }
 composeA(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.authelia.yml ${p[@]+"${p[@]}"} "$@"); }
 composeE(){ local p; mapfile -t p < <(compose_profiles); (cd "$STACK_DIR" && docker compose -f docker-compose.yml -f docker-compose.ephemera.yml ${p[@]+"${p[@]}"} "$@"); }

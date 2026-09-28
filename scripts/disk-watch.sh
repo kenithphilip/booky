@@ -33,6 +33,7 @@ PAUSE_FLAG="${DISK_PAUSE_FLAG:-$STACK_DIR/library/staging/.disk-paused}"
 state_get(){ grep -E "^$1=" "$STATE" 2>/dev/null | head -1 | cut -d= -f2-; }
 state_set(){ { grep -vE "^$1=" "$STATE" 2>/dev/null || true; echo "$1=$2"; } > "$STATE.tmp"; mv "$STATE.tmp" "$STATE"; }
 torrents_on(){ [ "$(envget TORRENTS_ENABLED)" = true ]; }
+export COMPOSE_IGNORE_ORPHANS=true   # Authelia/Ephemera run from overlay files: expected, never remove them
 compose(){ if torrents_on; then (cd "$STACK_DIR" && docker compose --profile torrents "$@"); else (cd "$STACK_DIR" && docker compose "$@"); fi; }
 running(){ docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true; }
 

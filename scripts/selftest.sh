@@ -29,6 +29,7 @@ guard(){ printf '  [set ] %s\n' "$1"; guards=$((guards+1)); }
 guards=0
 envget(){ local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
+export COMPOSE_IGNORE_ORPHANS=true   # Authelia/Ephemera run from overlay files: expected, never remove them
 compose(){ (cd "$STACK_DIR" && docker compose "$@"); }
 # curl already prints 000 when it cannot connect, and then exits non-zero: "|| echo 000" made that
 # "000000", so the one check that WANTS a refused connection (the origin lock) reported a failure
