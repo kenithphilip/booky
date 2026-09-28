@@ -503,7 +503,7 @@ step_system() {
 make_dirs() {
   mkdir -p "$STACK_DIR"/{caddy/data,caddy/config,cwa/config,abs/config,abs/metadata,qbt/config,downloads/incomplete,authelia}
   mkdir -p "$STACK_DIR"/library/{books,ingest,audiobooks,podcasts,staging,dropbox,seedbox,seedbox-sync}
-  mkdir -p "$STACK_DIR"/{kuma/data,librarian/state,shelfmark/config,ephemera/data,ephemera/downloads,syncthing}
+  mkdir -p "$STACK_DIR"/{kuma/data,librarian/state,shelfmark/config,shelfmark/netrc,ephemera/data,ephemera/downloads,syncthing}
   own_data_dirs
 }
 
@@ -3729,12 +3729,13 @@ seedbox_fetch(){ env SEEDBOX_ENV="${SEEDBOX_ENV_FILE:-$ETC/$SEEDBOX_ENV_REL}" ST
 seedbox_mappings(){ # the rows the admin types into Shelfmark
   local sab_own rt_dir
   sab_own=$(seedbox_get SEEDBOX_SAB_OWN); rt_dir=$(seedbox_get SEEDBOX_RT_DIR)
-  printf 'In Shelfmark (https://shelf.%s) -> Settings -> Download clients, at the bottom:\n\n' "$(envget DOMAIN)"
+  printf 'In Shelfmark (https://shelf.%s) -> Settings -> Advanced, under "Remote Path Mappings":\n\n' "$(envget DOMAIN)"
   printf '1. Completed Path Wait (seconds):  3600\n   (the default 60 s is too short: files arrive some minutes after the seedbox finishes)\n\n'
-  printf '   Torrent / NZB Completion Action show Keep / Copy and cannot be changed there: they are\n   pinned by this server so Shelfmark never removes a torrent or a job after an import.\n\n'
+  printf '   (Settings -> Download Clients: set NZB Completion Action to Copy there too. This server\n   already pins torrents: keep, Usenet: copy, and that pin wins, but the page shows its own\n   saved value, Move by default, until you change it.)\n\n'
   printf '2. Path Mappings -> Add Mapping:\n'
   [ -n "$sab_own" ] && printf '   Client SABnzbd:  Remote Path  %s\n                    Local Path   /seedbox/sabnzbd\n' "$sab_own"
   [ -n "$rt_dir" ] && [ -n "$(seedbox_get SEEDBOX_RT_URL)" ] && printf '   Client rTorrent: Remote Path  %s\n                    Local Path   /seedbox/rtorrent\n' "$rt_dir"
+  printf '\n3. In Prowlarr (on the seedbox) -> Indexers -> each indexer -> Show Advanced: keep\n   "Redirect" OFF. Then Prowlarr fetches each .torrent from the tracker itself, from the\n   seedbox'"'"'s IP (IP-locked trackers need this); with it on, this server would.\n'
   printf '\nSave. Then request one small book through Shelfmark as a test.'
 }
 seedbox_remote_steps(){ # what to do in the SEEDBOX's Syncthing; $1 = this server's device ID
@@ -3763,6 +3764,18 @@ seedbox_remote_steps(){ # what to do in the SEEDBOX's Syncthing; $1 = this serve
   printf 'remove it there (Edit -> Remove: that deletes nothing on disk) and add it again.\n\n'
   printf 'Then: Library -> Seedbox -> Check the connection.'
 }
+# Shelfmark (requests) reads NETRC=/run/netrc/seedbox for EVERY request and sends a login only to
+# the one host named in it: Prowlarr's, whose download links sit behind the seedbox login.
+seedbox_netrc(){
+  local d="$STACK_DIR/shelfmark/netrc" host user pass q
+  host=$(seedbox_get SEEDBOX_PROWLARR_URL); host="${host#*://}"; host="${host%%[:/]*}"
+  user=$(seedbox_get SEEDBOX_RT_USER); pass=$(seedbox_get SEEDBOX_RT_PASS)
+  install -d -o 1000 -g 1000 -m 700 "$d" || return 1
+  if [ -z "$host" ] || [ -z "$user" ]; then rm -f "$d/seedbox"; return 0; fi
+  netrc_q(){ local v="${1//\\/\\\\}"; printf '"%s"' "${v//\"/\\\"}"; }     # netrc: quoted, \ and " escaped
+  ( umask 077; printf 'machine %s login %s password %s\n' "$host" "$(netrc_q "$user")" "$(netrc_q "$pass")" > "$d/seedbox.new" ) || return 1
+  chown 1000:1000 "$d/seedbox.new" 2>/dev/null || true; mv -f "$d/seedbox.new" "$d/seedbox"
+}
 seedbox_wait(){ local i; for i in $(seq 1 45); do curl -fsS -m 3 http://127.0.0.1:8384/rest/noauth/health >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 step_seedbox(){
   local cf="$ETC/$SEEDBOX_ENV_REL" ch out me
@@ -3781,7 +3794,7 @@ step_seedbox(){
       M) big "Seedbox: Shelfmark settings" "$(seedbox_mappings)"; return 0;;
       D) remove_seedbox_units
          compose stop syncthing >/dev/null 2>&1 || true; compose rm -f syncthing >/dev/null 2>&1 || true
-         envset SEEDBOX_ENABLED false; seedbox_port close
+         envset SEEDBOX_ENABLED false; seedbox_port close; rm -f "$STACK_DIR/shelfmark/netrc/seedbox"
          msg "Seedbox sync is off: this server's Syncthing is stopped and port 22000 closed. Nothing on the seedbox was touched (remove the 'bookstack' device there if you like).\n\nItems already here stay in $STACK_DIR/library/seedbox-sync and library/seedbox; the settings stay in $cf."; return 0;;
       E) ;;
       *) return 0;;
@@ -3816,14 +3829,20 @@ completed folder, and the rTorrent folder and login Shelfmark already uses."
     cats=$(ask "The SABnzbd categories Shelfmark uses (space-separated):" "$(seedbox_get SEEDBOX_SAB_CATS | grep . || echo "bookstack-ebooks bookstack-audiobooks")") || return 0
   fi
   rturl=$(ask "rTorrent's XML-RPC address, the one that passed Shelfmark's test (e.g. https://NAME-rutorrent.YOUR-SEEDBOX/RPC2). Blank = no torrents:" "$(seedbox_get SEEDBOX_RT_URL)") || return 0
-  rtdir=""; rtu=""; rtp=""
+  rtdir=""; rtu=""; rtp=""; pr=""
   if [ -n "$rturl" ]; then
     rtdir=$(ask "The folder Shelfmark gives rTorrent (Shelfmark's rTorrent 'Download Directory', e.g. /sdb/NAME/data/rtorrent/bookstack):" "$(seedbox_get SEEDBOX_RT_DIR)") || return 0
     [ -n "$rtdir" ] || { msg "The rTorrent folder is needed to know which torrents are Shelfmark's. Nothing was changed."; return 1; }
-    rtu=$(ask "rTorrent's username (the seedbox login in front of ruTorrent). Blank = none:" "$(seedbox_get SEEDBOX_RT_USER)") || return 0
-    [ -n "$rtu" ] && { rtp=$(askpw "Password for $rtu:") || return 0; }
   fi
   [ -n "$cats" ] || [ -n "$rturl" ] || { msg "Neither SABnzbd nor rTorrent given: nothing to bring back. Nothing was changed."; return 1; }
+  # Shelfmark fetches each .torrent / .nzb from Prowlarr itself before handing it to rTorrent or
+  # SABnzbd; behind the seedbox's login that fetch needs the login too (a netrc for that one host)
+  local prdef; prdef=$(seedbox_get SEEDBOX_PROWLARR_URL)
+  [ -z "$prdef" ] && [[ "$rturl" =~ ^(https?://[^/]*)rutorrent([^/]*) ]] && prdef="${BASH_REMATCH[1]}prowlarr${BASH_REMATCH[2]}"
+  pr=$(ask "Prowlarr's address on the seedbox, as in Shelfmark -> Prowlarr but WITHOUT the user:password@ part (e.g. https://NAME-prowlarr.YOUR-SEEDBOX). Shelfmark fetches each .torrent / .nzb from it:" "$prdef") || return 0
+  pr="${pr%/}"; [[ "$pr" =~ ^https?://([^/@:]+)(:[0-9]+)?$ ]] || { msg "'$pr' is not an address like https://host (no user:password@, no path). Nothing was changed."; return 1; }
+  rtu=$(ask "The seedbox login in front of its apps (the browser pop-up for ruTorrent / Prowlarr): username. Blank = there is none:" "$(seedbox_get SEEDBOX_RT_USER)") || return 0
+  [ -n "$rtu" ] && { rtp=$(askpw "Seedbox login password for $rtu:") || return 0; }
   srcs=""
   for c in $cats; do
     [[ "$c" =~ ^[A-Za-z0-9._-]+$ ]] || { msg "'$c' is not a SABnzbd category name this can use (letters, digits, . _ -). Nothing was changed."; return 1; }
@@ -3839,13 +3858,13 @@ completed folder, and the rTorrent folder and login Shelfmark already uses."
     { printf 'SEEDBOX_ST_DEVICE=%s\nSEEDBOX_ST_ADDRESS=%s\nSEEDBOX_ST_GUI_PASS=%s\n' "$dev" "$addr" "$gp"
       printf 'SEEDBOX_SAB_OWN=%s\nSEEDBOX_SAB_CATS=%s\n' "${sabown%/}" "$cats"
       printf 'SEEDBOX_RT_URL=%s\nSEEDBOX_RT_DIR=%s\nSEEDBOX_RT_USER=%s\nSEEDBOX_RT_PASS=%s\n' "$rturl" "${rtdir%/}" "$rtu" "$rtp"
+      printf 'SEEDBOX_PROWLARR_URL=%s\n' "$pr"
       printf 'SEEDBOX_SOURCES=%s\n' "$srcs"; } > "$cf.new" ) || { msg "Could not write $cf.new. Nothing was changed."; return 1; }
-  if [ -n "$rturl" ]; then
-    clear; echo "Asking rTorrent..."
-    out=$(SEEDBOX_ENV_FILE="$cf.new" seedbox_fetch --check-rtorrent 2>&1) || rc=$?
-    if [ $rc != 0 ] && ! yesno "The rTorrent check found problems:\n\n$out\n\nSave these settings anyway?"; then rm -f "$cf.new"; msg "Nothing was saved."; return 1; fi
-  fi
+  clear; echo "Asking the seedbox (Prowlarr, rTorrent)..."
+  out=$(SEEDBOX_ENV_FILE="$cf.new" seedbox_fetch --check-rtorrent 2>&1) || rc=$?
+  if [ $rc != 0 ] && ! yesno "The seedbox check found problems:\n\n$out\n\nSave these settings anyway?"; then rm -f "$cf.new"; msg "Nothing was saved."; return 1; fi
   mv -f "$cf.new" "$cf"; chmod 600 "$cf"; chown root:root "$cf" 2>/dev/null || true
+  seedbox_netrc || { msg "Could not write $STACK_DIR/shelfmark/netrc/seedbox, so Shelfmark cannot fetch .torrent / .nzb files from Prowlarr. Run this step again."; return 1; }
   envdefault SYNCTHING_API_KEY "$(openssl rand -hex 24)" || { msg "Could not write $ENV_FILE. Syncthing was not started."; return 1; }
   envset SEEDBOX_ENABLED true
   install -d -o 1000 -g 1000 "$STACK_DIR/syncthing" "$STACK_DIR/library/seedbox" "$STACK_DIR/library/seedbox-sync" \

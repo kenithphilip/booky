@@ -2112,13 +2112,17 @@ print("ok: stub check"); sys.exit(0)
 PYS
 DEV=PUN4DSQ-U7H4CSC-5EPCANX-EKFOQFH-OYPFUOP-C7JS42P-SAB4XTW-6CVGKA4
 reset "$(printf '%s' "$DEV" | tr '[:upper:]' '[:lower:]')" "" "/data/watch/downloads/sabnzbd/completed/" "" \
-      "https://hcus-rutorrent.primeape.seedbox.link/RPC2" "/sdb/hcus/data/rtorrent/bookstack" "hcus" "p\$w'd \"x"
+      "https://hcus-rutorrent.primeape.seedbox.link/RPC2" "/sdb/hcus/data/rtorrent/bookstack" "" "hcus" "p\$w'd \"x"
 step_seedbox; rc=$?
 expect '[ $rc = 0 ] && grep -qxF "SEEDBOX_RT_PASS=p\$w'"'"'d \"x" "$sbe" && [ "$(stat -c %a "$sbe" 2>/dev/null || stat -f %Lp "$sbe")" = 600 ]' "a password with \$, quotes and spaces is stored exactly as typed (the job reads it raw), 0600"
 expect 'grep -qxF "SEEDBOX_ST_DEVICE=$DEV" "$sbe" && grep -qxF "SEEDBOX_SAB_OWN=/data/watch/downloads/sabnzbd/completed" "$sbe" && grep -q "^SEEDBOX_ST_GUI_PASS=[0-9a-f]\{32\}$" "$sbe"' "the device ID is normalised to upper case; a GUI password is generated"
 expect 'grep -qxF "SEEDBOX_SOURCES=bookstack-sab-ebooks|sabnzbd/bookstack-ebooks|sab;bookstack-sab-audiobooks|sabnzbd/bookstack-audiobooks|sab;bookstack-rtorrent|rtorrent|rt" "$sbe"' "both SABnzbd categories and the rTorrent folder become Syncthing folders"
 expect '[ "$(envget SEEDBOX_ENABLED)" = true ] && [ "$(envget SYNCTHING_API_KEY | wc -c)" -ge 40 ] && ! grep -qE "^SEEDBOX_(ST|RT|SAB)" "$ENV_FILE"' ".env gets only the switch and Syncthing's API key; seedbox passwords never go there (the containers read .env)"
 expect 'grep -F "docker: " "$LOG" | grep -q -- "--profile seedbox up -d syncthing" && seen "ufw: allow 22000/tcp"' "this server's Syncthing is started (profile seedbox) and its port opened"
+expect 'grep -qxF "SEEDBOX_PROWLARR_URL=https://hcus-prowlarr.primeape.seedbox.link" "$sbe"' "Prowlarr's address is suggested from ruTorrent's (hcus-rutorrent -> hcus-prowlarr)"
+nrc="$STACK_DIR/shelfmark/netrc/seedbox"
+expect '[ "$(cat "$nrc")" = "machine hcus-prowlarr.primeape.seedbox.link login \"hcus\" password \"p\$w'"'"'d \\\"x\"" ] && [ "$(stat -c %a "$nrc" 2>/dev/null || stat -f %Lp "$nrc")" = 600 ]' "Shelfmark gets the seedbox login for Prowlarr's host only (netrc, quotes escaped, 0600)"
+expect 'grep -q "NETRC=/run/netrc/seedbox" "$REPO/docker-compose.yml" && grep -q "./shelfmark/netrc:/run/netrc:ro" "$REPO/docker-compose.yml"' "...mounted read-only into Shelfmark, which reads it for its .torrent / .nzb fetches"
 expect '[ -d "$STACK_DIR/library/seedbox-sync/sabnzbd/bookstack-ebooks" ] && [ -d "$STACK_DIR/library/seedbox-sync/rtorrent" ] && [ -d "$STACK_DIR/syncthing" ]' "its folders exist before it starts (so Docker does not make them root's)"
 su="$T/etc/systemd/system/bookstack-seedbox"
 expect 'grep -q "^OnCalendar=\*:\*:00" "$su.timer" && grep -qF "ExecStart=/usr/bin/python3 $STACK_DIR/scripts/seedbox-fetch.py" "$su.service" && seen "systemctl: enable --now bookstack-seedbox.timer"' "every minute, through scripts/seedbox-fetch.py"
@@ -2130,16 +2134,16 @@ expect 'grep -q "profiles: \[\"seedbox\"\]" "$REPO/docker-compose.yml" && grep -
 expect 'grep -q "library/seedbox\" " "$REPO/scripts/backup.sh" && grep -q "library/seedbox-sync" "$REPO/scripts/backup.sh"' "backups skip the transient seedbox copies"
 # a failing rTorrent check: nothing saved unless the admin insists
 cp "$sbe" "$T/sbe.good"
-reset "E" "" "" "" "" "" "" "" "wrong" "no"
+reset "E" "" "" "" "" "" "" "" "" "wrong" "no"
 step_seedbox; rc=$?
-expect '[ $rc = 1 ] && cmp -s "$sbe" "$T/sbe.good" && [ ! -e "$sbe.new" ] && grep -F "yesno: " "$LOG" | grep -q "The rTorrent check found problems"' "a failing rTorrent check saves nothing (the working settings stay)"
+expect '[ $rc = 1 ] && cmp -s "$sbe" "$T/sbe.good" && [ ! -e "$sbe.new" ] && grep -F "yesno: " "$LOG" | grep -q "The seedbox check found problems"' "a failing seedbox check saves nothing (the working settings stay)"
 reset "E" "not-a-device-id"
 step_seedbox; rc=$?
 expect '[ $rc = 1 ] && cmp -s "$sbe" "$T/sbe.good" && seen "is not a Syncthing Device ID"' "a mistyped device ID is refused before anything changes"
 reset "S"; step_seedbox
 expect 'grep -qF "Device ID:    STUBVPS-AAAAAAA" "$LOG"' "Show what to set up: this server's ID again, any time"
 reset "D"; step_seedbox
-expect '[ ! -f "$su.timer" ] && seen "systemctl: disable --now bookstack-seedbox.timer" && [ "$(envget SEEDBOX_ENABLED)" = false ] && seen "ufw: --force delete allow 22000/tcp" && grep -F "docker: " "$LOG" | grep -q "stop syncthing"' "turning it off stops the job and Syncthing and closes its port"
+expect '[ ! -f "$su.timer" ] && seen "systemctl: disable --now bookstack-seedbox.timer" && [ "$(envget SEEDBOX_ENABLED)" = false ] && seen "ufw: --force delete allow 22000/tcp" && grep -F "docker: " "$LOG" | grep -q "stop syncthing" && [ ! -e "$nrc" ]' "turning it off stops the job and Syncthing, closes its port and takes Shelfmark's seedbox login away"
 
 echo "== L20: restart unhealthy containers, carefully (scripts/heal.sh)"
 HL="$T/hl"; mkdir -p "$HL/bin"

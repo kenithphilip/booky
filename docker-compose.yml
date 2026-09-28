@@ -374,6 +374,11 @@ services:
       # failed Usenet job it added is deleted, which Usenet (no seeding) does not mind.
       - PROWLARR_TORRENT_ACTION=keep
       - PROWLARR_USENET_ACTION=copy
+      # Library -> Seedbox: Shelfmark fetches each .torrent / .nzb from the seedbox's Prowlarr before
+      # handing it to rTorrent / SABnzbd, and those links sit behind the seedbox's login. requests
+      # reads this netrc for every request but sends the login only to the host named in it.
+      # No file (seedbox off) = no login sent anywhere.
+      - NETRC=/run/netrc/seedbox
       - CWA_DB_PATH=/auth/app.db
       # Where downloads land. The per-user level is written into the NAMING TEMPLATES, not
       # into the destination path, for two reasons (both re-verified on the pinned
@@ -464,6 +469,7 @@ services:
       # from the Syncthing copy); Shelfmark's remote path mappings point at /seedbox and it files each
       # into the reader's dropbox
       - ./library/seedbox:/seedbox
+      - ./shelfmark/netrc:/run/netrc:ro
     healthcheck:
       # TWO assertions, because the first one alone is blind in the direction that matters.
       # (a) /api/auth/check reports auth_mode "cwa". This proves Shelfmark STARTED with a

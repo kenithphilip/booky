@@ -518,6 +518,19 @@ def check():
         except (urllib.error.URLError, OSError, RuntimeError, ValueError, KeyError) as e:
             print(f"FAIL: this server's Syncthing: {getattr(e, 'code', '')} {e}")
             bad += 1
+    if c.get("SEEDBOX_PROWLARR_URL"):            # Shelfmark fetches .torrent / .nzb files from here
+        url = c["SEEDBOX_PROWLARR_URL"].rstrip("/") + "/ping"
+        h = {"User-Agent": "bookstack-seedbox/2"}
+        if c.get("SEEDBOX_RT_USER"):
+            raw = f'{c["SEEDBOX_RT_USER"]}:{c.get("SEEDBOX_RT_PASS", "")}'.encode()
+            h["Authorization"] = "Basic " + base64.b64encode(raw).decode()
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=30).read()
+            print("ok: the seedbox login opens Prowlarr (Shelfmark can fetch .torrent / .nzb files)")
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            why = {401: "the seedbox login was refused"}.get(getattr(e, "code", None), f"{type(e).__name__}: {e}")
+            print(f"FAIL: Prowlarr at {c['SEEDBOX_PROWLARR_URL']}: {why}")
+            bad += 1
     if any(kind == "rt" for _, _, kind in srcs):
         if not c.get("SEEDBOX_RT_URL"):
             print("warn: no rTorrent address: torrents are not handed over (they could be unfinished)")

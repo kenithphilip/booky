@@ -501,6 +501,13 @@ fingerprinting the whole seedbox tree after every run and every destructive act 
    are handed over only once rTorrent reports them complete, at least 10 minutes earlier (the
    seedbox's rescan, every 5 minutes, must catch the last pieces), and keep seeding.
 
+Shelfmark itself fetches only the small .torrent / .nzb file, from the seedbox's Prowlarr, to
+hand it to rTorrent / SABnzbd. Those links sit behind the seedbox's login, so Library → Seedbox
+gives Shelfmark that login for Prowlarr's host alone (`shelfmark/netrc/seedbox`, read-only,
+`NETRC`); requests sends it nowhere else. Keep each Prowlarr indexer's **Redirect** off: then
+Prowlarr fetches the .torrent from the tracker itself, from the seedbox's IP (IP-locked trackers
+need that), and this server never talks to a tracker or a peer.
+
 Shelfmark's own clean-up is pinned in `docker-compose.yml` where its web UI cannot change it:
 after an import it keeps the torrent and the Usenet job (`PROWLARR_TORRENT_ACTION=keep`,
 `PROWLARR_USENET_ACTION=copy`). It never removes a torrent on a cancel or failure (a hard rule in
