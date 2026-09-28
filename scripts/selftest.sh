@@ -422,20 +422,17 @@ if [ -n "$D" ]; then
   # fetch fails it starts ANYWAY with an empty trust list and silently falls back to the socket
   # peer — which behind Cloudflare is an EDGE address. Then the whole family shares one
   # rate-limit bucket and every fail2ban jail would ban Cloudflare itself. Nothing warned.
-  # The four requests just made came through Cloudflare, so the access log must now hold a line
-  # whose client_ip differs from remote_ip. If it never does, the list did not load.
-  alog="$STACK_DIR/caddy/data/access.log"
-  if [ -s "$alog" ]; then
-    if tail -500 "$alog" 2>/dev/null | python3 -c '
-import sys, json
-for line in sys.stdin:
-    try: r = json.loads(line).get("request") or {}
-    except Exception: continue
-    ci, ri = r.get("client_ip"), r.get("remote_ip")
-    if ci and ri and ci != ri: sys.exit(0)
-sys.exit(1)' 2>/dev/null; then ok "Caddy resolves the real client IP behind Cloudflare (client_ip != remote_ip in the access log)"
-    else bad "Caddy is logging the Cloudflare EDGE address as the client: its Cloudflare IP list never loaded (no egress at start?). Rate limits are shared by everyone and a fail2ban ban would hit Cloudflare — restart caddy with working egress: docker compose restart caddy"; fi
-  else warn "no Caddy access log yet; real-client-IP trust not verified"; fi
+  # The four requests just made came through Cloudflare. scripts/caddy-clientip.sh reads the
+  # whole log itself: the old `tail -500 | python3` stopped at the first good line, tail died of
+  # SIGPIPE on a real-sized log, and pipefail turned a PASS into this FAIL on the live server
+  # (2026-09-28; the same trap as the sshd -T | grep -q false alarm).
+  cichk="$STACK_DIR/scripts/caddy-clientip.sh"
+  CLIENTIP_SINCE=0 STACK_DIR="$STACK_DIR" "$cichk" >/dev/null 2>&1; circ=$?
+  case "$circ" in
+    0) ok "Caddy resolves the real client IP behind Cloudflare (client_ip != remote_ip for Cloudflare-delivered requests)";;
+    1) bad "Caddy is logging the Cloudflare EDGE address as the client: its Cloudflare IP list never loaded (no egress at start?). Rate limits are shared by everyone and a fail2ban ban would hit Cloudflare. scripts/heal.sh restarts Caddy within the hour; or now: docker compose restart caddy";;
+    *) warn "could not tell whether Caddy resolves client IPs behind Cloudflare (no Cloudflare-delivered request in the access log yet, or no /etc/bookstack/cf-ips.txt)";;
+  esac
   # CWA ships convert-library / epub-fixer / cwa-logs / cwa-internal / reconnect with no auth at
   # all. The 403 is in the production Caddyfile only — assert it on the real edge, anonymously.
   for u in /cwa-convert-library-overview /cwa-internal/reconnect-db '/cwa-convert-library-start;x'; do

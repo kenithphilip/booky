@@ -2226,6 +2226,15 @@ cilog "100,127.0.0.1,127.0.0.1"
 expect '[ "$(cichk)" = 2 ]' "no Cloudflare-delivered request at all: cannot tell (never a restart on a guess)"
 cilog "100,173.245.48.7,173.245.48.7" "200,173.245.48.7,198.51.100.4"
 expect '[ "$(cichk 150)" = 0 ] && [ "$(cichk 250)" = 2 ]' "only requests served since a restart count"
+python3 - "$CI/log" <<'PYB'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for i in range(3000):                 # a real-sized log: ~3 MB, far beyond a pipe's 64 KB
+        f.write(json.dumps({"ts": 1000.0 + i, "request": {"remote_ip": "173.245.48.7", "client_ip": "203.0.113.%d" % (i % 250),
+                            "headers": {"User-Agent": ["x" * 900]}}}) + "\n")
+PYB
+expect '[ "$(cichk)" = 0 ]' "a real-sized log with every visitor resolved reads as loaded (the live false alarm was tail dying of SIGPIPE under pipefail)"
+expect 'grep -q "caddy-clientip.sh" "$REPO/scripts/selftest.sh" && ! grep -q "tail -500 \"\$alog\" 2>/dev/null | python3" "$REPO/scripts/selftest.sh"' "the self-test uses the same checker, not a pipe that stops early"
 HB="$T/hb"; mkdir -p "$HB/bin"
 cat > "$HB/bin/docker" <<'EOS'
 #!/usr/bin/env bash

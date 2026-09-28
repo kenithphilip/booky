@@ -43,6 +43,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 - `wanted.py` — keep looking: matching and the widening recheck schedule
 - `catalogs.py` — the admin's own OPDS catalogs (any number), each a first-class source
 - `shelfmark_api.py` — Shelfmark's pending requests on the portal's Pending card (service login)
+- `fetch_wheels.py` — build-time fallback when pypi.org's index stalls: fetches the pinned files
+  through its plain HTML pages; pip then installs them hash-checked with no index
 - `share.py` — family sharing: a book the family already has is given to the next reader (their
   owner tag added to the same copy) instead of downloaded again; strong matches only
 - `filemeta.py` — title/author out of MOBI/AZW3 (EXTH) and FB2, read-only and bounded, so the
