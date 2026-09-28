@@ -17,7 +17,10 @@ import sys
 MARKER = re.compile(r"^[ \t]*# @AUTHELIA_GATE:([a-z]+)@[ \t]*$")
 BYPASS = {
     # Kobo sync (token), OPDS and KOReader sync (HTTP Basic) - devices cannot do SSO
-    "books": "/kobo/* /opds /opds/* /kosync /kosync/*",
+    # /api/...: the Kobo reading-services calls CWA v4.0.7+ answers itself (constant empty JSON);
+    # the device sends them with its own token and no session. Everything else under those
+    # prefixes is 403 in the Caddyfile BEFORE this gate, so only the four stub shapes arrive here.
+    "books": "/kobo/* /opds /opds/* /kosync /kosync/* /api/v3/content/* /api/UserStorage/* /api/internal/notebooks /api/internal/notebooks/*",
     # Audiobookshelf apps: their own token login, first-run root creation (POST /init — with the
     # gate on there is no Authelia account yet either, so gating it traps the admin), token
     # refresh (POST /auth/refresh; the access token lives 1 h, so without it the apps log out or

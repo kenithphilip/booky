@@ -382,6 +382,16 @@ check(st == 302 and "auth.example.test" in h.get("Location", "") and b"Sign in</
 st, h, b = g.get(GATE + "/", headers={"Host": "books.example.test", **BROWSER}); check(st == 302 and "auth.example.test" in h.get("Location", ""), "Calibre-Web web UI is gated: a browser is redirected to the Authelia portal", f"status {st} loc {h.get('Location','')[:80]}")
 st, h, b = g.get(GATE + "/api/health", headers={"Host": "request.example.test", "Accept": "application/json"}); check(st == 401, "non-browser request without a session gets 401 (no content leaks)", str(st))
 st, h, b = g.get(f"{GATE}/kobo/{alice_kobo}/v1/initialization", headers={"Host": "books.example.test", "User-Agent": "Kobo"}); check(st == 200 and b"Resources" in b, "/kobo/* bypasses the gate (Kobo devices keep syncing)", str(st))
+# CWA v4.0.7+ points the Kobo's reading services at THIS site; the device aborts its sync when
+# these fail (a real Kobo did, on the day v4.0.7 was deployed). Through the real gate and route:
+rsh = json.loads(b).get("Resources", {}).get("reading_services_host", "") if st == 200 else ""
+check(rsh.startswith("http") and "kobo.com" not in rsh, "CWA tells the Kobo to use this site (not Kobo's cloud) for its reading services", rsh)
+for path, want in (("/api/v3/content/checkforchanges", b"[]"), ("/api/UserStorage/Metadata", b"{}"), ("/api/v3/content/abc-123/annotations", b'"totalResults":0'), ("/api/internal/notebooks", b'"totalResults":0')):
+    st, h, b = g.get(GATE + path, headers={"Host": "books.example.test", "User-Agent": "Kobo", "Authorization": "Bearer x"})
+    check(st == 200 and want in b.replace(b" ", b""), f"{path}: the Kobo gets CWA's own empty answer through the gate (its sync completes)", f"{st} {b[:80]!r}")
+for path in ("/api/v3/content/x/progress", "/api/v3/library/sync", "/api/userstorage/Metadata", "/api/v3/content/checkforchanges;x"):
+    st, h, b = g.get(GATE + path, headers={"Host": "books.example.test", "User-Agent": "Kobo"})
+    check(st == 403, f"{path}: still 403 (the relay to Kobo's servers stays closed)", str(st))
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test", **basic("alice", ALICE_PW)}); check(st == 200, "/opds bypasses the gate (reader apps keep working)", str(st))
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test"}); check(st == 401, "/opds still requires CWA credentials behind the bypass", str(st))
 st, h, b = g.get(GATE + "/opds", headers={"Host": "books.example.test", "Remote-User": "admin"}); check(st == 401, "a client-supplied Remote-User header is stripped on a bypassed path", str(st))

@@ -52,4 +52,22 @@ for c in $HEAL; do
     "$ALERT" "Bookstack: could not restart unhealthy $c" "docker restart $c failed. Operations -> Logs -> $c." high >/dev/null 2>&1 || true
   fi
 done
+
+# Caddy that lost Cloudflare's address list (scripts/caddy-clientip.sh): every visitor looks like
+# one Cloudflare edge address, so the family shares one rate limit and a fail2ban ban would hit
+# Cloudflare. Not a healthcheck failure (Caddy has none): a specific, measured fault with a
+# known cure. At most once an hour, judged only on requests served since the last restart.
+if docker inspect -f '{{.State.Running}}' caddy 2>/dev/null | grep -q true; then
+  last=$(get restart_caddy_cf); last=${last:-0}
+  chk="${CLIENTIP_CHECK:-$STACK_DIR/scripts/caddy-clientip.sh}"
+  CLIENTIP_SINCE="$last" STACK_DIR="$STACK_DIR" "$chk" >/dev/null 2>&1; rc=$?
+  if [ "$rc" = 1 ] && [ $(( now - last )) -ge 3600 ]; then
+    if docker restart caddy >/dev/null 2>&1; then
+      put restart_caddy_cf "$now"
+      "$ALERT" "Bookstack: restarted Caddy (Cloudflare address list not loaded)" \
+        "Caddy was logging the Cloudflare edge as every visitor (its Cloudflare address list did not load when it started), so rate limits were shared by everyone. It was restarted to load the list again." >/dev/null 2>&1 || true
+      logger -t bookstack-heal "restarted caddy: Cloudflare address list not loaded" 2>/dev/null || true
+    fi
+  fi
+fi
 exit 0

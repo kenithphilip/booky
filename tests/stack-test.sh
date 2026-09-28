@@ -188,6 +188,7 @@ m = re.search(r"\n\troute \{\n\t\t@cwa_admin_jobs .*?\n\t\}\n", tpl, re.S)
 if not m:
     sys.exit("could not find the @cwa_admin_jobs route in caddy/Caddyfile.template")
 block = re.sub(r"^\t", "", m.group(0), flags=re.M).lstrip("\n")
+block = block.replace("@@KOBO_RS_BLOCK@@", "")          # what render_caddyfile writes for CWA >= v4.0.7
 marker = "\t# @AUTHELIA_GATE:books@"
 if marker not in s:
     sys.exit("books gate marker missing from the test Caddyfile")

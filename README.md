@@ -446,6 +446,14 @@ CWA's import-time Kindle fixer (keep off), originals to keep alongside, and
 the duplicate policy (`new_record` required for isolation). Deploy applies the secure
 defaults; users choose their own *download* format on Devices.
 
+**Kobo reading services (CWA v4.0.7+).** v4.0.7 points a Kobo's reading-services calls at this
+site and answers four of them itself (`/api/v3/content/checkforchanges`, `…/annotations`,
+`/api/UserStorage/…`, `/api/internal/notebooks`) with empty JSON; a Kobo whose calls fail
+aborts its whole sync. Caddy lets exactly those four shapes through (and Authelia bypasses
+them); every other path under `/api/v3`, `/api/UserStorage` and `/api/internal` is still the
+open relay to Kobo's servers and stays 403. With an older CWA pinned (a rollback), Deploy
+renders the full block again, because there those same paths ARE the relay.
+
 **Kobo receives EPUB, not KEPUB.** CWA v4.0.6 and v4.0.7 look for `kepubify` only under
 `/opt/kepubify/` while its image installs it at `/usr/bin/kepubify`, so KEPUB conversion is
 never enabled and never has been here. EPUB syncs and reads fine on a Kobo; the one

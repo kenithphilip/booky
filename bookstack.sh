@@ -18,6 +18,13 @@ IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARE
 IMG_SYNCTHING=syncthing/syncthing:2.1.5"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
 
+# A terminal this server has no description for (Ghostty's xterm-ghostty, kitty, WezTerm...)
+# makes whiptail, clear and tput fail with "'xterm-ghostty': unknown terminal type". Fall back
+# to the one every server knows; the colours and keys work the same.
+if [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1 && ! tput -T "$TERM" longname >/dev/null 2>&1; then
+  export TERM=xterm-256color
+fi
+
 # BOOKSTACK_LIB=1 sources this file for tests without running anything.
 if [ "${BOOKSTACK_LIB:-0}" != 1 ]; then
   [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo bash $0"; exit 1; }
@@ -151,8 +158,11 @@ render_caddyfile(){
   local f="$STACK_DIR/caddy/Caddyfile" bind; bind=$(envget BIND_IP); bind="${bind:-$(envget PUBLIC_IP)}"
   [ -n "$bind" ] || { msg "Neither BIND_IP nor PUBLIC_IP is set; run Install -> Configure first. Caddyfile NOT rendered."; return 1; }
   # optional vhosts: their DNS name and upstream only exist while the feature is enabled
-  local drop=""
+  local drop="" rsblock
   torrents_on || drop="$drop TORRENTS"
+  # Kobo reading services (see the Caddyfile template): CWA v4.0.7+ answers four stub paths
+  # itself and the Kobo aborts its sync without them; older CWA relays those same paths
+  rsblock=$(cwa_rs_block "$(img IMG_CWA)")
   [ "$(envget EPHEMERA_ENABLED)" = true ] || drop="$drop EPHEMERA"
   [ "$(envget AUTHELIA_ENABLED)" = true ] || drop="$drop AUTHELIA"
   # keep the last good file: apply_caddy puts it back when the new one does not validate
@@ -162,7 +172,7 @@ render_caddyfile(){
   # one of them used to write a corrupted (or zero-byte) Caddyfile and still report success.
   local rc=0
   CFR_DOMAIN="$(envget DOMAIN)" CFR_ADMIN_EMAIL="$(envget ADMIN_EMAIL)" CFR_BIND_IP="$bind" \
-  CFR_TAILSCALE_IP="$(envget TAILSCALE_IP)" CFR_ADMIN_HASH="$(envget ADMIN_HASH)" \
+  CFR_TAILSCALE_IP="$(envget TAILSCALE_IP)" CFR_ADMIN_HASH="$(envget ADMIN_HASH)" CFR_KOBO_RS_BLOCK="$rsblock" \
   python3 - "$STACK_DIR/caddy/Caddyfile.template" "$f.new" "$drop" <<'PYC' || rc=$?
 import os, sys
 tmpl, out, drop = sys.argv[1], sys.argv[2], sys.argv[3].split()
@@ -174,7 +184,7 @@ for name in drop:                       # a feature's whole vhost block, markers
         if j < len(s) and s[j] == "\n":
             j += 1
         s = s[:i] + s[j:]
-for k in ("DOMAIN", "ADMIN_EMAIL", "BIND_IP", "TAILSCALE_IP", "ADMIN_HASH"):
+for k in ("DOMAIN", "ADMIN_EMAIL", "BIND_IP", "TAILSCALE_IP", "ADMIN_HASH", "KOBO_RS_BLOCK"):
     s = s.replace("@@%s@@" % k, os.environ["CFR_" + k])
 if "@@" in s:                           # a placeholder this script does not know about
     sys.exit(2)
@@ -188,6 +198,40 @@ PYC
   # written in place (never mv): the running container bind-mounts this exact inode
   cat "$f.new" > "$f"; rm -f "$f.new"
   chown root:root "$f"; chmod 644 "$f"      # read-only for the container; not writable by uid 1000
+}
+# Caddy learns Cloudflare's ranges only when it starts (and every 12 h after). A start during a
+# network blip leaves it treating every visitor as the Cloudflare edge (measured on the real
+# server 2026-09-28): one rate limit for the whole family, fail2ban aiming at Cloudflare. So
+# Deploy and Update end with a full restart and PROVE the list loaded (scripts/caddy-clientip.sh
+# on requests made through Cloudflare just now), once more if it did not. 0 ok, 1 not loaded,
+# 2 cannot tell (no Cloudflare-delivered request to judge by). scripts/heal.sh keeps watching.
+caddy_restart_verified(){
+  local chk="$STACK_DIR/scripts/caddy-clientip.sh" d t rc=2
+  [ -x "$chk" ] || return 2
+  d=$(envget DOMAIN)
+  for _ in 1 2; do
+    t=$(date +%s)
+    compose restart caddy >/dev/null 2>&1 || return 1
+    sleep 6
+    for _ in 1 2 3; do curl -s -o /dev/null -m 10 "https://books.$d/login" || true; done
+    sleep 2
+    CLIENTIP_SINCE="$t" STACK_DIR="$STACK_DIR" "$chk"; rc=$?
+    [ "$rc" = 1 ] || return "$rc"
+    sleep 15                          # a blip: give the network a moment, then once more
+  done
+  return 1
+}
+caddy_cf_warn(){ [ $? = 1 ] && echo "WARNING: Caddy still logs the Cloudflare edge as every visitor after two restarts (its Cloudflare address list did not load: no outbound network?). scripts/heal.sh restarts it again within the hour; Operations -> Logs -> caddy." >&2; return 0; }
+cwa_rs_block(){ # IMG_CWA -> "" for v4.0.7 or newer (or an unversioned tag), else the relay prefixes to block
+  local t="${1##*:}" a b c
+  t="${t#v}"
+  if [[ "$t" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}; c=${BASH_REMATCH[3]}
+    if [ "$a" -lt 4 ] || { [ "$a" = 4 ] && [ "$b" = 0 ] && [ "$c" -lt 7 ]; }; then
+      printf ' /api/v3 /api/v3/* /api/UserStorage /api/UserStorage/*'; return 0
+    fi
+  fi
+  printf ''
 }
 render_caddy_all(){ # Caddyfile + the Authelia gate when enabled
   render_caddyfile || return 1
@@ -1070,6 +1114,8 @@ step_deploy() {
   sync_shelfmark_requests
   compose up -d caddy || { msg "Caddy failed to start. Operations -> Logs -> caddy."; return 1; }
   apply_caddy || true     # an already-running Caddy is not recreated by `up`: validate + reload the new file
+  echo "Restarting Caddy so it loads Cloudflare's address list afresh..."
+  caddy_restart_verified || caddy_cf_warn
   install_disk_watch
   install_postboot_unit   # the unattended 04:30 reboot needs checking even without restic configured
   install_selftest_timer  # ...and every hour after it, pushed to Kuma
@@ -3435,6 +3481,8 @@ step_update() {
     update_failed "pull/build/start failed"; return 1
   fi
   apply_caddy >/dev/null 2>&1 || true
+  echo "Restarting Caddy so it loads Cloudflare's address list afresh..."
+  caddy_restart_verified || caddy_cf_warn
   # (e) health gate: container health checks + the local endpoints this update could break
   echo "Waiting for health checks (up to 5 min)..."
   if ! wait_healthy 300; then update_failed "a container did not become healthy"; return 1; fi

@@ -374,8 +374,13 @@ expect 'grep -q "^# @AUTHELIA_BEGIN@" "$STACK_DIR/caddy/Caddyfile.template" && g
 cwaj=$(grep -F '@cwa_admin_jobs path ' "$STACK_DIR/caddy/Caddyfile" | head -1)
 cwajp=$(grep -F '@cwa_admin_jobs_params path_regexp' "$STACK_DIR/caddy/Caddyfile" | head -1)
 expect '[ -n "$cwaj" ] && [ -n "$cwajp" ] && grep -q "respond @cwa_admin_jobs " "$STACK_DIR/caddy/Caddyfile" && grep -q "respond @cwa_admin_jobs_params " "$STACK_DIR/caddy/Caddyfile"' "the rendered Caddyfile still carries the CWA admin-jobs 403 route and its ;-parameter companion"
-expect 'printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/v3([[:space:]]|$)" && printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/v3/\*([[:space:]]|$)"' "the unauthenticated Kobo relay /api/v3 and /api/v3/* are 403 at the edge (F.2)"
-expect 'printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/UserStorage([[:space:]]|$)" && printf "%s\n" "$cwaj" | grep -Eq "(^|[[:space:]])/api/UserStorage/\*([[:space:]]|$)"' "...and /api/UserStorage and /api/UserStorage/* with it (F.2)"
+expect 'grep -q "respond @kobo_relay \"Not available\" 403" "$STACK_DIR/caddy/Caddyfile" && grep -q "path /api/v3 /api/v3/\* /api/UserStorage /api/UserStorage/\* /api/internal /api/internal/\*" "$STACK_DIR/caddy/Caddyfile" && grep -q "not path_regexp kobo_rs_stub" "$STACK_DIR/caddy/Caddyfile"' "the Kobo relay under /api is 403 at the edge, except CWA v4.0.7's four stub paths the Kobo sync needs (F.2)"
+expect '[ -z "$(cwa_rs_block crocodilestick/calibre-web-automated:v4.0.7)" ] && [ -z "$(cwa_rs_block x/y:v4.1.0)" ] && [ -z "$(cwa_rs_block x/y:latest)" ] && [ "$(cwa_rs_block crocodilestick/calibre-web-automated:v4.0.6)" = " /api/v3 /api/v3/* /api/UserStorage /api/UserStorage/*" ]' \
+  "the stub paths open only for CWA v4.0.7+: on v4.0.6 (a rollback) the same paths ARE the relay and stay fully blocked"
+envset IMG_CWA crocodilestick/calibre-web-automated:v4.0.6; render_caddyfile
+cwaj6=$(grep -F '@cwa_admin_jobs path ' "$STACK_DIR/caddy/Caddyfile" | head -1)
+expect 'printf "%s\n" "$cwaj6" | grep -Eq "(^|[[:space:]])/api/v3/\*([[:space:]]|$)" && printf "%s\n" "$cwaj6" | grep -Eq "(^|[[:space:]])/api/UserStorage/\*([[:space:]]|$)"' "...rendered with CWA v4.0.6 pinned, the whole relay is in the 403 list again"
+envset IMG_CWA ""; render_caddyfile
 expect 'printf "%s\n" "$cwajp" | grep -q "api/v3" && printf "%s\n" "$cwajp" | grep -qi "api/UserStorage"' "the ;-smuggling path_regexp covers both relay prefixes too, so /api/v3/x;y is blocked as well (F.2)"
 abak=$(envget AUTHELIA_ENABLED); envset AUTHELIA_ENABLED false; render_caddyfile
 expect '! grep -q "^auth\.example\.test {" "$STACK_DIR/caddy/Caddyfile"' "auth. is not rendered while the gate is off (A34)"
@@ -453,7 +458,7 @@ reset "example.test" "admin@example.test" "UTC" "cf-token-123" "yes"; step_confi
 
 echo "== Authelia gate + users"
 inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 4 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && grep -qE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile"' "gate injected into 4 vhosts (shelf without a bypass matcher)"
-expect 'grep -qF "not path_regexp ^(?:/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
+expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
 render_caddyfile; expect '! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "re-render removes the gate (disable path)"
 envset AUTHELIA_ENABLED true; reset "example.test" "admin@example.test" "UTC" "" "yes"; step_configure >/dev/null
 expect 'grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Configure re-applies the gate when Authelia is enabled"
@@ -2199,6 +2204,47 @@ reset "D"; step_canary
 expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" ] && grep -F "docker: " "$LOG" | grep -q "python -m cwa remove-user canary-a" && seen "systemctl: disable --now bookstack-canary.timer"' "turning it off removes the timer, both accounts and their credentials"
 echo "== self-test: a refused connection reads as 000, not 000000"
 expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
+
+echo "== Caddy and Cloudflare's address list (scripts/caddy-clientip.sh, heal.sh, Deploy/Update)"
+CI="$T/ci"; mkdir -p "$CI"
+printf '173.245.48.0/20\n2400:cb00::/32\n' > "$CI/ranges"
+cilog(){ python3 - "$CI/log" "$@" <<'PYL'
+import json, sys
+out, rows = sys.argv[1], sys.argv[2:]
+with open(out, "w") as f:
+    for r in rows:
+        ts, ri, ci = r.split(",")
+        f.write(json.dumps({"ts": float(ts), "request": {"remote_ip": ri, "client_ip": ci}}) + "\n")
+PYL
+}
+cichk(){ CADDY_ACCESS_LOG="$CI/log" CF_IPS_STATE="$CI/ranges" CLIENTIP_SINCE="${1:-0}" bash "$REPO/scripts/caddy-clientip.sh"; echo $?; }
+cilog "100,173.245.48.7,203.0.113.9" "101,100.100.1.2,100.100.1.2"
+expect '[ "$(cichk)" = 0 ]' "a Cloudflare-delivered request logged with the visitor's own address: the list is loaded"
+cilog "100,173.245.48.7,173.245.48.7" "101,2400:cb00::5,2400:cb00::5" "102,127.0.0.1,127.0.0.1"
+expect '[ "$(cichk)" = 1 ]' "every Cloudflare-delivered request logged as the edge itself: NOT loaded (loopback lines do not count)"
+cilog "100,127.0.0.1,127.0.0.1"
+expect '[ "$(cichk)" = 2 ]' "no Cloudflare-delivered request at all: cannot tell (never a restart on a guess)"
+cilog "100,173.245.48.7,173.245.48.7" "200,173.245.48.7,198.51.100.4"
+expect '[ "$(cichk 150)" = 0 ] && [ "$(cichk 250)" = 2 ]' "only requests served since a restart count"
+HB="$T/hb"; mkdir -p "$HB/bin"
+cat > "$HB/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$HB/log"
+case "$*" in "inspect -f {{.State.Running}} caddy") echo true;; esac
+exit 0
+EOS
+printf '#!/usr/bin/env bash\nexit "${CI_RC:-0}"\n' > "$HB/check"; printf '#!/usr/bin/env bash\necho "ALERT $1" >> "$HB/log"\n' > "$HB/alert"
+chmod +x "$HB/bin/docker" "$HB/check" "$HB/alert"
+hrun(){ : > "$HB/log"; HB="$HB" PATH="$HB/bin:$PATH" HEAL_SERVICES="" HEAL_STATE="$HB/state" HEAL_ALERT="$HB/alert" CLIENTIP_CHECK="$HB/check" STACK_DIR="$T" bash "$REPO/scripts/heal.sh"; }
+rm -f "$HB/state"; CI_RC=1 hrun
+expect 'grep -q "docker restart caddy" "$HB/log" && grep -q "ALERT Bookstack: restarted Caddy (Cloudflare address list not loaded)" "$HB/log"' "heal.sh restarts Caddy when it lost Cloudflare's list, and says so"
+CI_RC=1 hrun
+expect '! grep -q "docker restart caddy" "$HB/log"' "...at most once an hour"
+rm -f "$HB/state"; CI_RC=0 hrun; CI_RC=2 hrun
+expect '! grep -q "docker restart caddy" "$HB/log"' "...and never when the list is loaded or it cannot tell"
+expect 'declare -f step_deploy | grep -q caddy_restart_verified && declare -f step_update | grep -q caddy_restart_verified' "Deploy and Update end with a full Caddy restart that is PROVEN to load Cloudflare's list"
+expect '[ "$(TERM=no-such-terminal-xyz bash -c "$(sed -n "/^if \[ -n \"\${TERM:-}\" \] && command -v tput/,/^fi/p" "$REPO/bookstack.sh"); echo \$TERM")" = xterm-256color ] && [ "$(TERM=xterm bash -c "$(sed -n "/^if \[ -n \"\${TERM:-}\" \] && command -v tput/,/^fi/p" "$REPO/bookstack.sh"); echo \$TERM")" = xterm ]' \
+  "an unknown terminal (Ghostty's xterm-ghostty) falls back to xterm-256color; a known one is left alone"
 
 echo "== Old image versions: removed once a day, the rollback point kept"
 MT="$T/mt"; mkdir -p "$MT/bin" "$MT/stack"

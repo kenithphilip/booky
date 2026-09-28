@@ -256,11 +256,12 @@ books.@@DOMAIN@@ {
 	# Nothing else in CWA v4.0.6 mounts under /api (only /gdrive, /kobo/<auth_token>,
 	# /kobo_auth and /login have url_prefixes; the web UI's own calls go to /ajax/*), so the
 	# 403 cannot break the pages, OPDS, KOReader or /kobo/<token>/ sync.
-	# No real Kobo sends these here today: cps/kobo.py:1370/1389 only advertises
+	# On CWA v4.0.6 no real Kobo sent these here: cps/kobo.py:1370/1389 only advertised
 	# "reading_services_host" as THIS server when config_hardcover_annotations_sync is on and
 	# the hardcover module loaded; otherwise the device keeps the built-in
 	# https://readingservices.kobo.com (kobo.py:1543) and never touches our origin. So the 403
 	# costs a device nothing, and every request it does answer was somebody else's.
+	# v4.0.7 changed that (see the comment on the route below): four stub paths now pass.
 	# IF Hardcover annotation sync is ever enabled (config_hardcover_annotations_sync +
 	# config_kobo_sync), these two prefixes must MOVE OUT of the block below and INTO:
 	#   * the Authelia bypass list for books (authelia/inject-gate.py BYPASS["books"] and the
@@ -284,9 +285,27 @@ books.@@DOMAIN@@ {
 	# through Caddy - so nothing a reader, the portal, Shelfmark, OPDS, Kobo or KOReader does
 	# can break.
 	# route{} so the 403 is decided ahead of the Authelia gate route below.
+	# CWA v4.0.7 CHANGED the Kobo reading services (cps/kobo.py HandleInitRequest and
+	# _kobo_reading_services_stub, read 2026-09-28): with the Kobo store proxy off (ours) it tells
+	# the device reading_services_host = THIS site, and the device then calls four paths at the
+	# site root: /api/v3/content/checkforchanges, /api/v3/content/<id>/annotations,
+	# /api/UserStorage/*, /api/internal/notebooks. A @kobo.before_app_request hook answers exactly
+	# those with constant empty JSON before any view runs, and if they fail the device ABORTS the
+	# whole sync ("Sync Failed", measured on a real Kobo the day it was deployed). So on v4.0.7+
+	# those four shapes pass (Authelia bypasses them too, authelia/inject-gate.py) and every
+	# OTHER /api/v3, /api/UserStorage and /api/internal path — still the open relay below — stays
+	# 403. @@KOBO_RS_BLOCK@@ is filled by bookstack.sh render_caddyfile: empty for CWA >= v4.0.7,
+	# the four relay prefixes for anything older (whose stub-shaped paths ARE the relay).
 	route {
-		@cwa_admin_jobs path /cwa-convert-library-overview /cwa-convert-library-start /cwa-convert-library /cwa-convert-library/* /convert-library-status /convert-library-cancel /cwa-epub-fixer-overview /cwa-epub-fixer-start /cwa-epub-fixer /cwa-epub-fixer/* /epub-fixer-status /epub-fixer-cancel /cwa-logs /cwa-logs/* /cwa-internal /cwa-internal/* /reconnect /api/v3 /api/v3/* /api/UserStorage /api/UserStorage/* /duplicates/invalidate-cache
+		@cwa_admin_jobs path /cwa-convert-library-overview /cwa-convert-library-start /cwa-convert-library /cwa-convert-library/* /convert-library-status /convert-library-cancel /cwa-epub-fixer-overview /cwa-epub-fixer-start /cwa-epub-fixer /cwa-epub-fixer/* /epub-fixer-status /epub-fixer-cancel /cwa-logs /cwa-logs/* /cwa-internal /cwa-internal/* /reconnect /duplicates/invalidate-cache@@KOBO_RS_BLOCK@@
 		respond @cwa_admin_jobs "Not available" 403
+		# `path` is case-insensitive, path_regexp is not, and CWA's stub compares exact strings:
+		# /api/userstorage/x is caught here and never reaches the relay either.
+		@kobo_relay {
+			path /api/v3 /api/v3/* /api/UserStorage /api/UserStorage/* /api/internal /api/internal/*
+			not path_regexp kobo_rs_stub ^/api/(?:v3/content/checkforchanges|v3/content/[^/]+/annotations|UserStorage/[A-Za-z0-9._/-]+|internal/notebooks(?:/[A-Za-z0-9._/-]*)?)$
+		}
+		respond @kobo_relay "Not available" 403
 		# The one shape the exact list above cannot express: an old-style ';' path parameter.
 		# /cwa-convert-library-start;x is a different string to `path` but the same endpoint to
 		# some routers. Werkzeug 404s it today, so this is defence in depth, not a live hole.

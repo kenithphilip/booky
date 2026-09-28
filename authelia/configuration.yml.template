@@ -32,6 +32,12 @@ access_control:
         - '^/kobo/.*$'
         - '^/opds([/?].*)?$'
         - '^/kosync([/?].*)?$'
+        # the Kobo reading-services stubs CWA v4.0.7+ answers itself (see the Caddyfile: every
+        # other /api path is 403 before the gate)
+        - '^/api/v3/content/checkforchanges(\?.*)?$'
+        - '^/api/v3/content/[^/?]+/annotations(\?.*)?$'
+        - '^/api/UserStorage/[^?]+(\?.*)?$'
+        - '^/api/internal/notebooks(/[^?]*)?(\?.*)?$'
     - domain: 'audio.@@DOMAIN@@'
       policy: bypass
       resources:

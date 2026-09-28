@@ -3,6 +3,8 @@
 # Self-test) or directly: bash /srv/bookstack/scripts/selftest.sh
 # Exit code = number of failed checks.
 set -uo pipefail
+# an unknown terminal (Ghostty's xterm-ghostty...) must not break tput/clear here either
+if [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1 && ! tput -T "$TERM" longname >/dev/null 2>&1; then export TERM=xterm-256color; fi
 STACK_DIR="${STACK_DIR:-/srv/bookstack}"
 TMPDIR="${TMPDIR:-/tmp}"
 ENV_FILE="$STACK_DIR/.env"
@@ -445,10 +447,27 @@ sys.exit(1)' 2>/dev/null; then ok "Caddy resolves the real client IP behind Clou
   # caller is anonymous (cps/readingservices.py requires_reading_services_auth_and_config), with
   # the caller's method, headers and body — an open relay wearing this origin's IP. Anything but
   # 403 here means the Caddyfile on the box predates that block.
-  for u in /api/v3/content/checkforchanges /api/UserStorage/Metadata '/api/v3/x;y'; do
+  for u in '/api/v3/x;y' /api/v3/content/x/progress /api/userstorage/Metadata; do
     c=$(code "https://books.$D$u")
     [ "$c" = 403 ] && ok "books.$D$u -> 403 (Kobo reading-services relay blocked at the edge)" || bad "books.$D$u -> $c (must be 403: Calibre-Web relays it to readingservices.kobo.com for anyone)"
   done
+  # CWA v4.0.7+ tells the Kobo to call four reading-services paths HERE and answers them itself
+  # with constant empty JSON; a Kobo whose calls fail aborts its whole sync. Exactly that JSON
+  # proves both that they pass and that CWA's stub (not the relay) answered them.
+  cwav=$(envget IMG_CWA); cwav="${cwav##*:}"; cwav="${cwav#v}"
+  if [[ "$cwav" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]] && { [ "${BASH_REMATCH[1]}" -lt 4 ] || { [ "${BASH_REMATCH[1]}" = 4 ] && [ "${BASH_REMATCH[2]}" = 0 ] && [ "${BASH_REMATCH[3]}" -lt 7 ]; }; }; then
+    for u in /api/v3/content/checkforchanges /api/UserStorage/Metadata; do
+      c=$(code "https://books.$D$u")
+      [ "$c" = 403 ] && ok "books.$D$u -> 403 (CWA $cwav relays it: blocked)" || bad "books.$D$u -> $c (must be 403 on CWA $cwav: it relays to readingservices.kobo.com)"
+    done
+  else
+    for pair in "/api/v3/content/checkforchanges|[]" "/api/UserStorage/Metadata|{}"; do
+      u="${pair%%|*}"; want="${pair#*|}"
+      b=$(curl -s -m 12 "https://books.$D$u" 2>/dev/null | tr -d ' \r\n')
+      [ "$b" = "$want" ] && ok "books.$D$u answers CWA's own empty reply (the Kobo's sync needs it)" \
+        || bad "books.$D$u answered '${b:0:80}', not '$want': a Kobo's sync fails on it (re-run Install -> Deploy to render the Caddyfile)"
+    done
+  fi
   c=$(code -k "https://$(envget PUBLIC_IP)/" -H "Host: books.$D")
   [ "$c" = 000 ] && ok "origin refuses direct (non-Cloudflare) connections" || bad "origin answered a direct connection ($c) — mTLS/firewall not enforcing"
   cc=$(curl -sI -m 12 "https://books.$D/login" 2>/dev/null | grep -i '^cf-cache-status:' | awk '{print toupper($2)}' | tr -d '\r')
