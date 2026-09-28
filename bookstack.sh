@@ -985,12 +985,15 @@ install_cert_watch() { # L09: daily certificate / origin CA / Cloudflare token e
 install_heal() { # L20: restart a container Docker reports unhealthy (scripts/heal.sh; no socket-mounted container)
   write_cron bookstack-heal "*/2 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/heal.sh 2>&1 | logger -t bookstack-heal"
 }
-install_metadata_push() { # every 15 min: the portal's queued metadata -> Calibre, so devices show it
+install_metadata_push() { # every 2 min: the portal's queued metadata and owner tags -> Calibre
   # A host job because the portal cannot do it: it mounts the library read-only and has no Docker
   # socket, both on purpose. Output goes to the journal (logger), not /dev/null: this is the job
   # that alerts if a write ever changes a book's owner tag, and its routine output is how an admin
   # confirms it is running at all.
-  write_cron bookstack-metapush "*/15 * * * *" "STACK_DIR=$STACK_DIR $STACK_DIR/scripts/metadata-push.sh 2>&1 | logger -t bookstack-metapush"
+  # Every 2 minutes: it also adds the owner tag to books whose file could not carry one (MOBI,
+  # AZW3, FB2, TXT), and the reader is waiting for that. flock: a long conversion must never
+  # overlap the next run.
+  write_cron bookstack-metapush "*/2 * * * *" "STACK_DIR=$STACK_DIR flock -n /run/lock/bookstack-metapush.lock $STACK_DIR/scripts/metadata-push.sh 2>&1 | logger -t bookstack-metapush"
 }
 # Loop until the factory admin/admin123 is gone. Cancel generates a random password (shown in
 # the summary): there is no path that leaves the default live behind a public hostname.
@@ -1060,6 +1063,7 @@ step_deploy() {
   # L16: the portal's Shelfmark service login (recreate the portal so it sees the credentials)
   if ensure_shelfmark_service; then compose up -d librarian >/dev/null 2>&1 || true
   else echo "(could not create the Shelfmark service account; Shelfmark approvals stay in Shelfmark's own UI)"; fi
+  sync_shelfmark_requests
   compose up -d caddy || { msg "Caddy failed to start. Operations -> Logs -> caddy."; return 1; }
   apply_caddy || true     # an already-running Caddy is not recreated by `up`: validate + reload the new file
   install_disk_watch
@@ -2258,6 +2262,7 @@ step_sources() {
   yesno "Manage your OWN catalogs now (any number of OPDS feeds: Calibre, Calibre-Web, COPS, Kavita, Komga, BookLore, a library's feed)?\n\nThe portal's admin page can do the same." && { step_catalogs || true; }
   # Shelfmark reads the approval rule from its environment (REQUESTS_ENABLED): recreate it too
   ensure_shelfmark_service >/dev/null 2>&1 || true
+  sync_shelfmark_requests
   compose up -d shelfmark >/dev/null 2>&1 || true
   prune_shelfmark_placeholder
   if restart_portal; then msg "Sources updated and the portal restarted."
@@ -3618,6 +3623,18 @@ menu_install() {
     case "$ch" in Q) step_quick || true;; 1) step_system || true;; 2) step_tailscale || true;; 3) step_configure || true;;
       4) step_cloudflare || true;; 5) step_deploy || true;; 6) step_backup || true;; 7) step_alerts || true;; 0) return 0;; esac
   done
+}
+# Shelfmark's request step (REQUESTS_ENABLED): on while the admin approves requests, or while
+# family sharing needs every reader's download to pass the portal first — the latter only once
+# the portal can answer (its service login exists): a request nobody answers would wait forever.
+sync_shelfmark_requests(){
+  local want=false
+  if [ "$(envget APPROVALS_REQUIRED)" = true ]; then want=true
+  elif [ "$(envget FAMILY_SHARING)" != false ] && [ -n "$(envget SHELFMARK_SVC_USER)" ] && [ -n "$(envget SHELFMARK_SVC_PASS)" ]; then want=true; fi
+  [ "$(envget SHELFMARK_REQUESTS)" = "$want" ] && return 0
+  envset SHELFMARK_REQUESTS "$want" || return 0
+  if running shelfmark; then compose up -d shelfmark >/dev/null 2>&1 || true; fi
+  return 0
 }
 # ---------- L16: the portal's service login for Shelfmark's approval API ----------
 # Shelfmark has no API key, so the portal signs in as a dedicated Calibre-Web ADMIN account with

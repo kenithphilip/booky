@@ -37,6 +37,16 @@ files are there the portal's Download and Devices pages pick them up with no fur
 **Decision needed from the owner:** leave Kobo on EPUB (recommended — it works, and the trap
 above is a live foot-gun), or schedule the three steps above for a night when nobody reads.
 
+## 2026-09-28 — the same foreign gate blocked the v5.3.0 commit
+
+Identical output to the 2026-09-23 entry below (`BLOCKED: staged Python does not pass the checks
+that execute. RUFF: error: Failed to spawn: ruff`), this time on
+`git add -A && git commit ... v5.3.0`. The command did not run at all: nothing was staged,
+committed, tagged or pushed. Nothing was modified or routed around. v5.3.0 is complete and
+green in the working tree (portal suite 519 passed, installer harness 725 passed, seedbox
+harness 43 passed, end-to-end on real containers 0 failed). The owner commits it from their own
+shell. The decision below is still open.
+
 ## 2026-09-23 — BLOCKER: a foreign pre-commit gate refuses every `git add` here
 
 A `PreToolUse` hook configured outside this repo,

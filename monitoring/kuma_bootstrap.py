@@ -105,7 +105,7 @@ def desired_monitors(cfg):
     if p.get("disk"):
         out.append(_push("push-disk", "Disk watchdog (hourly)", p["disk"], 75 * 60))
     if p.get("metapush"):
-        out.append(_push("push-metapush", "Metadata push to Calibre (every 15 min)", p["metapush"], 45 * 60))
+        out.append(_push("push-metapush", "Metadata push to Calibre (every 2 min)", p["metapush"], 15 * 60))
     if p.get("cfips"):
         out.append(_push("push-cfips", "Cloudflare IP allowlist refresh (nightly)", p["cfips"], 26 * 3600))
     if p.get("backup"):

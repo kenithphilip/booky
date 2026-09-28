@@ -176,6 +176,13 @@ def _tags(args):
             db.set_status(row["rid"], "done", f"tagged owner:{row['owner']} in Calibre by the host job")
             import notify
             notify.send("done", db.get(row["rid"]))
+    elif row["status"] == "failed" and row.get("rid"):
+        rec = db.get(row["rid"])
+        if rec and rec["status"] == "needs-tag":          # the host gave up: now it is the admin's
+            db.set_status(row["rid"], "needs-tag", f"needs-tag: the owner tag could not be added in Calibre "
+                                                   f"({args.reason[:120]}); admin sets owner:{row['owner']} in CWA")
+            import notify
+            notify.send("needs-tag", db.get(row["rid"]))
     db.audit("tag_push", None, "host", f"#{args.push_id} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 

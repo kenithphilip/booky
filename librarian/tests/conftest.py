@@ -29,7 +29,7 @@ import config, db, cwa  # noqa: E402  (after env)
 def _reset_dirs():
     for d in DIRS.values():
         shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)   # a thread left by an earlier test may have recreated it
 
 
 def make_cwa_db(path):

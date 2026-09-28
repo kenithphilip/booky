@@ -224,6 +224,11 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
       folder; Shelfmark shows Torrent / NZB Completion Action as Keep / Copy; the path mappings and
       Completed Path Wait 3600 are set. Request one small book through Shelfmark: it arrives in the
       library, and the torrent is still seeding in ruTorrent afterwards.
+- [ ] Family sharing (v5.3): after Deploy, `grep SHELFMARK_REQUESTS /srv/bookstack/.env` says
+      `true`. As a reader, request in Shelfmark a book another reader already has: within
+      seconds it closes with "Already in the family library", nothing reaches rTorrent/SABnzbd,
+      and within a few minutes it is under that reader's My books. A MOBI-only book lands in
+      the reader's library by itself (no needs-tag alert).
 - [ ] v5, backups at home (free): Install -> Backups -> "A computer at home"; the home computer
       runs the printed `docker run`, the Tailscale rule is in place, and the step's own login
       check passed. First backup succeeds; `docker exec restic-rest ls /data/bookstack` on

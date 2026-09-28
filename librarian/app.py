@@ -61,6 +61,10 @@ def _friendly_detail(detail, is_admin=False):
         return "added to your audiobooks"
     if worker.TAG_WAIT_NOTE in d:
         return "in your audiobooks; the app is still indexing it"
+    if d.startswith(worker.NEEDS_TAG) and worker.FAMILY_NOTE in d:
+        return "already in the family library: it appears in your library in a few minutes, nothing was downloaded"
+    if d.startswith(worker.NEEDS_TAG) and (worker.AUTO_TAG_NOTE in d or "being added in Calibre" in d):
+        return "imported; it appears in your library in a few minutes"
     if d.startswith(worker.NEEDS_TAG):
         return "imported, but the admin has to tag it to you before you can see it"
     if "dropbox/" in d:               # .failed/ paths mean nothing to a user
@@ -1406,7 +1410,9 @@ def _health():
     """What /healthz and the admin page report: are the worker loops alive, can we write
     /ingest, is there disk, can CWA's app.db be opened. Never raises."""
     now = time.time()
-    loops = ["queue", "dropbox", "housekeeping", "wanted"] + (["imap"] if config.IMAP_HOST else [])
+    import shelfmark_api
+    loops = ["queue", "dropbox", "housekeeping", "wanted"] + (["imap"] if config.IMAP_HOST else []) \
+        + (["shelfmark"] if shelfmark_api.configured() else [])   # readers' Shelfmark requests wait on it
     ages = {n: (round(now - worker.HEARTBEAT[n]) if n in worker.HEARTBEAT else None) for n in loops}
     problems = [f"{n} loop stale" for n, a in ages.items() if a is None or a > STALE_SECONDS]
     pending, oldest = 0, 0

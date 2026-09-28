@@ -694,6 +694,20 @@ db.link_calibre(rid, {book_id}, 'alice'); print(worker.queue_device_pushes())"""
     check(bool(calibre("SELECT text FROM comments WHERE book=?", book_id)), "a missing description was filled in")
     check([t for (t,) in calibre("SELECT t.name FROM tags t JOIN books_tags_link l ON l.tag=t.id WHERE l.book=? AND t.name LIKE 'owner:%'", book_id)] == ["owner:alice"],
           "the owner tag is exactly as it was after all of it")
+print("== 15b. A MOBI (cannot carry the owner tag) is tagged in Calibre automatically after the import")
+kite = open(f"{REPO}/librarian/tests/fixtures/untaggable/kite-runner.mobi", "rb").read()
+st, h, b = upload_as(pb, "Khaled Hosseini - The Kite Runner (2003).mobi", kite); check(st == 302, "bob's MOBI upload accepted", str(st))
+kid = wait(lambda: (calibre("SELECT id FROM books WHERE title='The Kite Runner'") or [[None]])[0][0], 300, 5)
+check(kid is not None, "CWA imported the MOBI (and converted it, the shipped setting)")
+if kid:
+    fmts = sorted(f for (f,) in calibre("SELECT format FROM data WHERE book=?", kid))
+    def kite_tagged():
+        host_job()                                  # the cron's work, on demand
+        return imported("The Kite Runner", "bob")
+    check(wait(kite_tagged, 300, 20) is not None, f"the host job added owner:bob in Calibre, no admin involved (formats {fmts})")
+    check(not imported("The Kite Runner", "alice"), "and nobody else's tag")
+    st, h, b = pb.get(PORTAL + "/library"); check(b"The Kite Runner" in b, "bob sees it under My books")
+    st, h, b = p.get(PORTAL + "/library"); check(b"The Kite Runner" not in b, "alice does not")
 st, h, b = ss.post(SHELF + "/api/requests", json_body={
     "book_data": {"title": "The Time Machine", "author": "H. G. Wells", "provider": "openlibrary", "provider_id": "OL52267W"},
     "release_data": {"source": "direct_download", "source_id": "0" * 32, "title": "The Time Machine", "format": "epub"},
@@ -706,6 +720,33 @@ if m:
     portal_post(pa, f"/shelfmark/{m.group(1).decode()}/deny", "/status", {"reason": "e2e: denied from the portal"})
     st, h, b = ss.get(SHELF + "/api/requests")
     check(b'"status":"rejected"' in b.replace(b" ", b"") and b"denied from the portal" in b, "denied from the portal, and the reader sees it (with the reason) in Shelfmark")
+
+print("== 16. Family sharing: a book alice has is given to bob, never downloaded or imported twice")
+fam = calibre("SELECT b.id, b.title, (SELECT group_concat(a.name, ' & ') FROM books_authors_link l2 JOIN authors a ON a.id=l2.author WHERE l2.book=b.id) "
+              "FROM books b JOIN books_tags_link l ON l.book=b.id JOIN tags t ON t.id=l.tag WHERE t.name='owner:alice' "
+              "AND b.title GLOB '[A-Za-z]*' ORDER BY b.id")
+fam = [r for r in fam if r[2] and r[2].lower() not in ("unknown", "unknown author")]
+check(len(fam) >= 2, "alice has at least two books with a real author to share", repr(fam))
+if len(fam) >= 2:
+    (b1, t1, a1), (b2, t2, a2) = fam[0], fam[1]
+    sb = Session(); st, h, b = sb.post(SHELF + "/api/auth/login", json_body={"username": "bob", "password": BOB_PW})
+    check(st == 200, "shelfmark login bob", str(st))
+    st, h, b = sb.post(SHELF + "/api/requests", json_body={
+        "book_data": {"title": t1, "author": a1, "provider": "openlibrary", "provider_id": "OLE2EFAM"},
+        "release_data": {"source": "direct_download", "source_id": "1" * 32, "title": t1, "format": "epub"},
+        "context": {"source": "direct_download", "content_type": "ebook", "request_level": "release"}})
+    check(st == 201, f"bob requests '{t1}' (alice's) in Shelfmark", f"{st} {b[:120]!r}")
+    def closed():
+        st, h, b = sb.get(SHELF + "/api/requests")
+        return b if b'"status":"rejected"' in b.replace(b" ", b"") and b"family library" in b else None
+    check(wait(closed, 60, 3) is not None, "the portal closed it within seconds, BEFORE any download: 'already in the family library'")
+    check(wait(lambda: (host_job(), imported(t1, "bob"))[1], 240, 20) == b1, "the host job gave bob alice's copy (the same Calibre book)")
+    check(imported(t1, "alice") == b1, "alice keeps it")
+    before = calibre("SELECT count(*) FROM books")[0][0]
+    st, h, b = upload_as(pb, f"{t2}.epub", make_epub(t2, a2)); check(st == 302, f"bob drops a copy of '{t2}' (alice's) through the portal", str(st))
+    check(wait(lambda: (host_job(), imported(t2, "bob"))[1], 300, 20) == b2, "the arrival is merged: bob gets alice's copy")
+    check(calibre("SELECT count(*) FROM books")[0][0] == before, "and no second copy was imported")
+    st, h, b = pb.get(PORTAL + "/library"); check(t1.encode() in b and t2.encode() in b, "both appear under bob's My books")
 
 print(f"\nE2E RESULT: {fails} failed")
 sys.exit(fails)

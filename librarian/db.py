@@ -218,7 +218,12 @@ def init():
             id INTEGER PRIMARY KEY AUTOINCREMENT, calibre_id INTEGER NOT NULL, rid INTEGER,
             owner TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',   -- pending | done | failed
             attempts INTEGER DEFAULT 0, last_error TEXT, created REAL, updated REAL)""")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open ON tag_push(calibre_id) WHERE status = 'pending'")
+        # share=1: family sharing (share.py) — add a SECOND owner to a book that already has one,
+        # instead of downloading it again. One open job per (book, reader).
+        if "share" not in {r[1] for r in c.execute("PRAGMA table_info(tag_push)")}:
+            c.execute("ALTER TABLE tag_push ADD COLUMN share INTEGER DEFAULT 0")
+        c.execute("DROP INDEX IF EXISTS tag_push_open")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open_owner ON tag_push(calibre_id, owner) WHERE status = 'pending'")
         # L21: Send-to-Kindle runs in the worker, not inside the web request (a slow relay with a
         # 45 MB attachment could outlast Cloudflare's 100 s and show a 524 for a mail that went out)
         c.execute("""CREATE TABLE IF NOT EXISTS kindle_jobs(
@@ -1210,15 +1215,15 @@ def catalog_delete(cid):
 
 
 # ---- L10: owner tags added by the host (scripts/metadata-push.sh, second pass) --------------
-def queue_tag_push(calibre_id, rid, owner, now=None):
+def queue_tag_push(calibre_id, rid, owner, now=None, share=False):
     now = now or time.time()
     try:
         with _lock, _conn() as c:
-            c.execute("INSERT INTO tag_push(calibre_id, rid, owner, created, updated) VALUES(?,?,?,?,?)",
-                      (int(calibre_id), rid, owner, now, now))
+            c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, created, updated) VALUES(?,?,?,?,?,?)",
+                      (int(calibre_id), rid, owner, 1 if share else 0, now, now))
         return True
     except sqlite3.IntegrityError:
-        return False                          # one open job per book
+        return False                          # one open job per book and reader
 
 def tag_push_open_for(rid):
     with _conn() as c:
@@ -1227,7 +1232,7 @@ def tag_push_open_for(rid):
 def pending_tag_pushes(limit=50):
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id, calibre_id, rid, owner FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
+            "SELECT id, calibre_id, rid, owner, share FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
 
 def tag_push_result(push_id, ok, error=None, max_attempts=5):
     """Record the host's outcome. Success marks the request done; repeated failure gives up."""

@@ -82,22 +82,27 @@ def _row(x):
             "author": b.get("author") or ", ".join(b.get("authors") or []) if isinstance(b.get("authors"), list) else b.get("author") or "",
             "source": rel.get("source") or x.get("source_hint") or "", "format": rel.get("format") or "",
             "kind": x.get("content_type") or "ebook", "level": "release" if rel else "book",
-            "note": x.get("note") or ""}
+            "note": x.get("note") or "",
+            "isbns": [v for v in (b.get("isbn_13"), b.get("isbn_10")) if v]}
 
 
-def pending(force=False):
+def pending(force=False, cache=True):
     """[rows] waiting in Shelfmark, cached briefly. Returns [] when not configured; raises
-    ShelfmarkError when configured but unreachable (the page says so rather than showing none)."""
+    ShelfmarkError when configured but unreachable (the page says so rather than showing none).
+    cache=False (the worker's family-sharing gate, every few seconds): always fetched, and never
+    written into the page's cache, which would otherwise hide a brand-new request from the
+    admin's Pending card for up to CACHE_SECONDS."""
     if not configured():
         return []
     now = time.time()
-    if not force and _state["pending"] is not None and now - _state["at"] < CACHE_SECONDS:
+    if cache and not force and _state["pending"] is not None and now - _state["at"] < CACHE_SECONDS:
         return _state["pending"]
     r = _call("GET", "/api/admin/requests", params={"status": "pending", "limit": 100})
     if r.status_code != 200:
         raise ShelfmarkError(f"Shelfmark answered HTTP {r.status_code} for its request list")
     rows = [_row(x) for x in (r.json() or []) if isinstance(x, dict)]
-    _state.update(pending=rows, at=now)
+    if cache:
+        _state.update(pending=rows, at=now)
     return rows
 
 

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FictionBook xmlns="http://www.gribuser.ru/xml/fictionbook/2.0" xmlns:l="http://www.w3.org/1999/xlink">
+<description>
+    <title-info>
+        <genre>antique</genre>
+        <author><first-name>Khaled</first-name><last-name>Hosseini</last-name></author><author><first-name>Ünïcode</first-name><last-name>Co</last-name></author>
+        <book-title>The Kite Runner</book-title>
+        <lang>en</lang>
+    </title-info>
+    <document-info>
+        <author><first-name>Khaled</first-name><last-name>Hosseini</last-name></author><author><first-name>Ünïcode</first-name><last-name>Co</last-name></author>
+        <program-used>calibre 9.1.0</program-used>
+        <date>28.9.2026</date>
+        <id>0f7341c5-e9d2-4bad-9d25-f3d8197736f8</id>
+        <version>1.0</version>
+    </document-info>
+    <publish-info>
+    </publish-info>
+</description>
+<body>
+<section>
+<p>Chapter one.</p>
+<p> </p>
+<p>It was a cold day.</p>
+</section>
+</body>
+
+</FictionBook>

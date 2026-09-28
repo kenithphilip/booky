@@ -1750,6 +1750,39 @@ expect 'grep -q "ALERT Bookstack: a metadata update CHANGED a book" "$MP/log" &&
   "a write that CHANGED the owner tag raises a high alert and fails the push, it is never just logged"
 expect 'grep -q "bookstack-metapush" "$REPO/bookstack.sh" && grep -q "logger -t bookstack-metapush" "$REPO/bookstack.sh"' \
   "the push job is installed as a cron entry whose output reaches the journal, not /dev/null"
+expect 'grep -q "\*/2 \* \* \* \*" <(grep -A2 "write_cron bookstack-metapush" "$REPO/bookstack.sh") && grep -q "flock -n /run/lock/bookstack-metapush.lock" "$REPO/bookstack.sh"' \
+  "every 2 minutes (a reader waits for the owner tag), under flock so a long conversion never overlaps the next run"
+# owner tags: the L10 adoption and the family share (a SECOND owner, librarian/share.py)
+cat > "$MP/bin/docker" <<'EOS'
+#!/usr/bin/env bash
+echo "docker $*" >> "$MP/log"
+case "$*" in
+  *"admin_cli pushes pending"*|*"admin_cli converts pending"*) echo '{"ok":true,"rows":[]}';;
+  *"admin_cli tags pending"*) echo "$MP_TAGROWS";;
+  *"admin_cli tags result"*) echo '{"ok":true,"status":"done"}';;
+  *"calibredb list"*)
+    n=$(cat "$MP/listcount" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$MP/listcount"
+    if [ "$n" -ge 2 ]; then echo "$MP_AFTER"; else echo "$MP_BEFORE"; fi;;
+  *"calibredb set_metadata"*) : ;;
+esac
+EOS
+chmod +x "$MP/bin/docker"
+share_row='{"ok":true,"rows":[{"id":8,"calibre_id":50,"rid":3,"owner":"bob","share":1}]}'
+MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["Fiction","owner:alice"]}]' MP_AFTER='[{"id":50,"tags":["Fiction","owner:alice","owner:bob"]}]' mprun
+expect 'grep "calibredb set_metadata" "$MP/log" | grep -q "tags:Fiction,owner:alice,owner:bob" && grep -q "tags result 8 ok" "$MP/log"' \
+  "a family share ADDS bob next to alice (her tag and every other tag kept), read back and confirmed"
+MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["Fiction"]}]' MP_AFTER='[{"id":50,"tags":["Fiction"]}]' mprun
+expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 8 fail --reason refused: a family share, but the book has no owner yet" "$MP/log"' \
+  "a share never adopts an UNTAGGED book (that is someone's import in progress)"
+MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["owner:alice","owner:bob"]}]' MP_AFTER='[{"id":50,"tags":["owner:alice","owner:bob"]}]' mprun
+expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 8 ok" "$MP/log"' \
+  "bob already has it: nothing is written, the job is simply done"
+MP_TAGROWS='{"ok":true,"rows":[{"id":9,"calibre_id":50,"rid":4,"owner":"bob","share":0}]}' MP_BEFORE='[{"id":50,"tags":["owner:alice"]}]' MP_AFTER='[{"id":50,"tags":["owner:alice"]}]' mprun
+expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 9 fail --reason refused: the book already has" "$MP/log"' \
+  "an ordinary (non-share) tag job still refuses a book that already has an owner"
+MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["owner:alice"]}]' MP_AFTER='[{"id":50,"tags":["owner:bob"]}]' mprun
+expect 'grep -q "ALERT Bookstack: adding an owner tag changed other tags" "$MP/log" && grep -q "tags result 8 fail" "$MP/log"' \
+  "a share that would REMOVE alice (read-back differs) raises the alert and fails"
 
 # ---------------------------------------------------------------------------------------------
 echo "== FlareSolverr: one shared solver for Shelfmark and Ephemera"
@@ -2096,6 +2129,19 @@ expect '[ ! -f "$ce" ] && [ ! -f "$cu.timer" ] && [ -z "$(envget CANARY_USERS)" 
 echo "== self-test: a refused connection reads as 000, not 000000"
 expect 'bash -c "$(grep -E "^code\(\)" "$REPO/scripts/selftest.sh"); curl(){ printf 000; return 7; }; [ \"\$(code https://x)\" = 000 ] && curl(){ printf 403; return 0; } && [ \"\$(code https://x)\" = 403 ]"' "code() gives exactly 000 when curl cannot connect (the origin-lock check wants 000; it got 000000 on the real server)"
 
+echo "== Family sharing: Shelfmark's request step follows the portal's ability to answer it"
+envset APPROVALS_REQUIRED false; envset FAMILY_SHARING true; envset SHELFMARK_SVC_USER ""; envset SHELFMARK_SVC_PASS ""; envset SHELFMARK_REQUESTS ""
+sync_shelfmark_requests
+expect '[ "$(envget SHELFMARK_REQUESTS)" = false ]' "no portal service login yet: requests stay OFF (a request nobody answers would wait forever)"
+envset SHELFMARK_SVC_USER svc-portal; envset SHELFMARK_SVC_PASS x; sync_shelfmark_requests
+expect '[ "$(envget SHELFMARK_REQUESTS)" = true ]' "with the portal able to answer, every reader's download passes it first (shared, or approved in seconds)"
+envset FAMILY_SHARING false; sync_shelfmark_requests
+expect '[ "$(envget SHELFMARK_REQUESTS)" = false ]' "family sharing off and no approvals: Shelfmark downloads directly, as before"
+envset APPROVALS_REQUIRED true; envset SHELFMARK_SVC_USER ""; sync_shelfmark_requests
+expect '[ "$(envget SHELFMARK_REQUESTS)" = true ]' "approvals on: requests on, as L16 always did"
+envset APPROVALS_REQUIRED false; envset FAMILY_SHARING true; envset SHELFMARK_SVC_USER svc-portal
+expect 'declare -f step_deploy | grep -q sync_shelfmark_requests' "Deploy sets it after the service login is ensured"
+
 echo "== Library -> Seedbox: the seedbox's downloads through Syncthing (nothing there ever changes)"
 sbe="$T/etc/bookstack/seedbox.env"; rm -f "$sbe"
 mkdir -p "$STACK_DIR/scripts"; cat > "$STACK_DIR/scripts/seedbox-fetch.py" <<'PYS'
@@ -2198,7 +2244,7 @@ probe(){ case "$1" in
   L17) grep -q "def _turnstile_ok" "$REPO/librarian/app.py" && grep -q "step_turnstile" "$REPO/bookstack.sh";;
   L12) grep -q "def kobo_status" "$REPO/librarian/cwa.py" && grep -q "kobo_test" "$REPO/librarian/app.py";;
   L09) [ -x "$REPO/scripts/cert-watch.sh" ] && grep -q install_cert_watch "$REPO/bookstack.sh";;
-  L16) grep -q "REQUESTS_ENABLED=\${APPROVALS_REQUIRED" "$REPO/docker-compose.yml" && [ -f "$REPO/librarian/shelfmark_api.py" ];;
+  L16) grep -q "REQUESTS_ENABLED=\${SHELFMARK_REQUESTS:-\${APPROVALS_REQUIRED" "$REPO/docker-compose.yml" && [ -f "$REPO/librarian/shelfmark_api.py" ];;
   L11) grep -q "kepubify" "$REPO/librarian/Dockerfile" && grep -q "def _kepub_from_epub" "$REPO/librarian/library.py";;
   L10) grep -q "def reconcile_untagged" "$REPO/librarian/worker.py" && grep -q '"tags", "pending"' "$REPO/scripts/metadata-push.sh";;
   L08) grep -rqi 'canary' "$REPO/bookstack.sh" "$REPO/scripts";;          # scheduled journey

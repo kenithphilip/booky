@@ -28,6 +28,9 @@ NOTIFY_WEBHOOK     = os.environ.get("NOTIFY_WEBHOOK", "")  # POST on new request
 # when the host name contains "ntfy", which is what the installer's Alerts step suggests).
 NOTIFY_WEBHOOK_FORMAT = os.environ.get("NOTIFY_WEBHOOK_FORMAT", "auto").lower()
 DEDUPE_WARN        = _bool("DEDUPE_WARN", True)         # warn if a title already exists in the library
+# Family sharing (share.py): a book already in the library is given to the next reader who asks
+# (their owner tag added to the same copy) instead of being downloaded again.
+FAMILY_SHARING     = _bool("FAMILY_SHARING", True)
 ENRICH_METADATA    = _bool("ENRICH_METADATA", True)     # covers/blurbs from Open Library in the search UI
 CALIBRE_DB         = os.environ.get("CALIBRE_DB", "/calibre-library/metadata.db")  # read-only dedupe check
 # Calibre-Web itself (loopback; the portal shares the host network). Used for a cached

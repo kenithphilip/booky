@@ -220,3 +220,94 @@ def test_the_tailnet_upload_site_raises_the_limit_and_only_it_can(client, users,
     r = client.post("/upload", data={"csrf": csrf_of(client, "/upload"), "file": (io.BytesIO(big), "a.epub")},
                     content_type="multipart/form-data", headers={"X-Bookstack-Upload": "tailnet"})
     assert r.status_code != 413 and not (r.status_code == 302 and r.headers["Location"].endswith("/upload") and b"larger than" in client.get("/upload").data)
+
+
+# ---- MOBI / AZW3 / FB2 tagged automatically after the import (v5.3) ---------------------------
+import os, shutil
+import filemeta, notify
+FIX = os.path.join(os.path.dirname(__file__), "fixtures", "untaggable")
+
+
+def test_filemeta_reads_title_and_author_from_real_calibre_files():
+    for ext in ("mobi", "azw3", "fb2"):
+        m = filemeta.read(os.path.join(FIX, f"kite-runner.{ext}"), ext)
+        assert m == {"title": "The Kite Runner", "author": "Khaled Hosseini & Ünïcode Co"}, (ext, m)
+    assert filemeta.read(os.path.join(FIX, "plain-name-mobi6.mobi"), "mobi") == {"title": "Plain Name", "author": "A B"}
+
+
+def test_filemeta_never_raises_on_junk(tmp_path):
+    for ext, data in (("mobi", b"x" * 100), ("mobi", b"\0" * 60 + b"BOOKMOBI" + b"\xff" * 30), ("fb2", b"\xff\xfe<title-info>"),
+                      ("azw3", b"")):
+        p = tmp_path / f"j.{ext}"; p.write_bytes(data)
+        assert filemeta.read(str(p), ext) == {}
+    assert filemeta.read(str(tmp_path / "missing.mobi"), "mobi") == {}
+
+
+def test_a_mobi_arrival_records_its_metadata_and_raises_no_alarm(users, monkeypatch, tmp_path):
+    told = []
+    monkeypatch.setattr(notify, "send", lambda ev, r: told.append(ev))
+    src = tmp_path / "Khaled Hosseini - The Kite Runner (2003).mobi"
+    shutil.copyfile(os.path.join(FIX, "kite-runner.mobi"), src)
+    rid = db.add("alice", {"kind": "ebook", "source": "dropbox", "title": src.name, "download_url": "local"})
+    note = worker._atomic_ingest(str(src), "alice", "Khaled Hosseini - The Kite Runner (2003)", "mobi", rid)
+    assert note.startswith(worker.NEEDS_TAG) and worker.AUTO_TAG_NOTE in note
+    r = db.get(rid)
+    assert r["file_title"] == "The Kite Runner" and "Khaled Hosseini" in r["file_author"]
+    worker._finish(rid, worker.NEEDS_TAG, note)
+    assert told == [], "no 'needs an owner tag' alarm while the host job is adding it"
+
+
+def test_a_mobi_that_cwa_converted_to_epub_is_still_found(users):
+    rid = _needs_tag("alice", "Khaled Hosseini - The Kite Runner (2003).mobi", file_title="The Kite Runner")
+    db.set_file_meta(rid, {"title": "The Kite Runner", "author": "Khaled Hosseini"})
+    add_calibre_book(7, "The Kite Runner", "Khaled Hosseini", tags=[], formats=("epub",))
+    _stamp(7, time.time())
+    assert worker.reconcile_untagged() == 1 and db.pending_tag_pushes()[0]["calibre_id"] == 7
+
+
+def test_a_shelfmark_named_file_without_metadata_is_found_by_its_name(users):
+    """The row that was already waiting when this shipped: no file_title, only the file name."""
+    _needs_tag("alice", "Khaled Hosseini - The Kite Runner (2003).mobi")
+    add_calibre_book(7, "The Kite Runner", "Khaled Hosseini", tags=[], formats=("epub",))
+    _stamp(7, time.time())
+    assert worker.reconcile_untagged() == 1 and db.pending_tag_pushes()[0]["calibre_id"] == 7
+
+
+def test_an_author_that_disagrees_is_not_a_match(users):
+    rid = _needs_tag("alice", "x.mobi")
+    db.set_file_meta(rid, {"title": "Emma", "author": "Jane Austen"})
+    add_calibre_book(7, "Emma", "Somebody Else", tags=[], formats=("epub",))
+    _stamp(7, time.time())
+    assert worker.reconcile_untagged() == 0
+
+
+def test_not_found_in_time_the_admin_hears_once(users, monkeypatch):
+    told = []
+    monkeypatch.setattr(notify, "send", lambda ev, r: told.append((ev, r["detail"])))
+    rid = db.add("alice", {"kind": "ebook", "source": "dropbox", "title": "Nowhere.mobi", "download_url": "local"})
+    db.set_status(rid, worker.NEEDS_TAG, f"{worker.NEEDS_TAG}: mobi cannot carry a tag; {worker.AUTO_TAG_NOTE}")
+    assert worker.reconcile_untagged() == 0 and told == [], "too early to worry"
+    later = time.time() + worker.AUTO_TAG_ESCALATE + 60
+    worker.reconcile_untagged(now=later)
+    worker.reconcile_untagged(now=later + 60)
+    assert [e for e, _ in told] == [worker.NEEDS_TAG], "exactly one alert"
+    assert "not found in Calibre automatically" in db.get(rid)["detail"]
+
+
+def test_a_host_that_gives_up_hands_it_to_the_admin(users, monkeypatch, capsys):
+    told = []
+    monkeypatch.setattr(notify, "send", lambda ev, r: told.append(ev))
+    rid = _needs_tag("alice", "notes")
+    add_calibre_book(5, f"notes [alice-{rid}]", "Unknown", tags=[], formats=("txt",))
+    worker.reconcile_untagged()
+    job = db.pending_tag_pushes()[0]
+    for _ in range(5):
+        admin_cli.main(["tags", "result", str(job["id"]), "fail", "--reason", "calibredb exited 1"])
+    capsys.readouterr()
+    assert told == [worker.NEEDS_TAG] and "could not be added in Calibre" in db.get(rid)["detail"]
+
+
+def test_the_reader_is_told_it_is_on_its_way():
+    import app
+    assert "few minutes" in app._friendly_detail(f"needs-tag: mobi cannot carry a tag; {worker.AUTO_TAG_NOTE}")
+    assert "admin has to tag" in app._friendly_detail("needs-tag: mobi cannot carry a tag and the book was not found")

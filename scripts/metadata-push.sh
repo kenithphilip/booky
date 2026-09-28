@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Apply the portal's queued metadata to CALIBRE's database, so the family's devices show it.
-# Installed by bookstack.sh as /etc/cron.d/bookstack-metapush (every 15 minutes).
+# Installed by bookstack.sh as /etc/cron.d/bookstack-metapush (every 2 minutes, under flock).
 #
 # Why a host job and not the portal: Kobo sync serves from Calibre's metadata.db, and the portal
 # deliberately cannot write it — it mounts the library read-only and has no Docker socket. The
@@ -181,7 +181,10 @@ for row in pending.get("rows", []):
 # For books whose FILE could not carry the owner tag (MOBI/AZW3/FB2/TXT/DJVU; comics CWA's
 # Kindle fixer stripped). ONE operation, and the narrowest possible: add owner:<x> to a book
 # that has NO owner tag at all. A book that already has one is refused, never "corrected" —
-# that would be moving a book between family members' libraries. `calibredb set_metadata
+# that would be moving a book between family members' libraries. The one exception is a
+# family share (share=1, librarian/share.py): a SECOND owner added to a book that already has
+# one, so the next reader gets the family's copy instead of a new download; existing owners
+# are never removed, and an untagged book is never adopted that way. `calibredb set_metadata
 # --field tags:` REPLACES the whole list, so the list written is the current one plus the
 # owner tag, and it is read back and compared: every other tag must be exactly as it was.
 def all_tags(book_id):
@@ -197,16 +200,28 @@ def all_tags(book_id):
 tagged = tag_failed = 0
 tags_pending = admin("tags", "pending")
 for row in (tags_pending.get("rows") or []) if tags_pending.get("ok") else []:
-    pid, bid, owner = row["id"], row["calibre_id"], row["owner"]
+    pid, bid, owner, share = row["id"], row["calibre_id"], row["owner"], bool(row.get("share"))
     want_tag = f"owner:{owner}"
     before = all_tags(bid)
     if before is None:
         admin("tags", "result", str(pid), "fail", "--reason", "could not read the book's tags")
         tag_failed += 1
         continue
-    if any(t.startswith("owner:") for t in before):
+    owners_now = [t for t in before if t.startswith("owner:")]
+    if share:
+        # family sharing: a SECOND owner for a book that already has one (share.py). Never the
+        # first owner of an untagged book: that is an import in progress, not a family copy.
+        if want_tag in before:
+            admin("tags", "result", str(pid), "ok")      # already theirs: nothing to write
+            tagged += 1
+            continue
+        if not owners_now:
+            admin("tags", "result", str(pid), "fail", "--reason", "refused: a family share, but the book has no owner yet")
+            tag_failed += 1
+            continue
+    elif owners_now:
         admin("tags", "result", str(pid), "fail", "--reason",
-              f"refused: the book already has {[t for t in before if t.startswith('owner:')]}")
+              f"refused: the book already has {owners_now}")
         tag_failed += 1
         continue
     if any("," in t for t in before) or "," in want_tag:

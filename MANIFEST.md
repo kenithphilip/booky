@@ -43,6 +43,10 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 - `wanted.py` — keep looking: matching and the widening recheck schedule
 - `catalogs.py` — the admin's own OPDS catalogs (any number), each a first-class source
 - `shelfmark_api.py` — Shelfmark's pending requests on the portal's Pending card (service login)
+- `share.py` — family sharing: a book the family already has is given to the next reader (their
+  owner tag added to the same copy) instead of downloaded again; strong matches only
+- `filemeta.py` — title/author out of MOBI/AZW3 (EXTH) and FB2, read-only and bounded, so the
+  host job finds those books in Calibre after the import (also once CWA converted them)
 - `kindle.py` — SMTP Send-to-Kindle (+ `python -m kindle test addr`)
 - `fetchers.py` — provider registry + adapters (Gutenberg, Standard Ebooks, IA, LibriVox)
 - `opds.py` — OPDS catalog search-and-grab (your own catalog)
@@ -106,7 +110,7 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   401-only filter never saw, so the jail could not fire on the one real password oracle
 
 ## scripts/ additions
-- `metadata-push.sh` — every 15 min (cron `bookstack-metapush`, output to the journal), three
+- `metadata-push.sh` — every 2 min (cron `bookstack-metapush`, under flock, output to the journal), three
   passes, all through CWA's own tools as PUID:PGID with the owner tag checked before and after:
   (1) fill-only metadata (title/sort/authors/series/description/publisher/date/language/ISBN
   and a missing cover, fetched only from provider image hosts); (2) L10 owner tags for books

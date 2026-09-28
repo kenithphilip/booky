@@ -83,11 +83,11 @@ class Index:
     a book that only someone else owns (F53), and a 20-result search page costs one query, not
     twenty."""
 
-    def __init__(self, owner=None, is_admin=False):
+    def __init__(self, owner=None, is_admin=False, force=False):
         self.by_title = {}          # norm_title -> [(book_id, author_token_set)]
         self.by_ident = {}          # (type, value) -> book_id
         self.stale = None           # set when metadata.db had to be read in immutable mode
-        if not config.DEDUPE_WARN:
+        if not (config.DEDUPE_WARN or force):   # force: family sharing reads it regardless
             return
         scope, params = library._scope_sql(owner, is_admin)
         try:

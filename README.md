@@ -49,8 +49,16 @@ not guessed — see `docs/PLAN-v5.md`), then built and proven on the real contai
   language and ISBN** into Calibre so the Kobo shows them — fill-only, never overwriting.
 - **Convert to any format** from a book's page (EPUB, AZW3, MOBI, PDF, TXT, DOCX, FB2, RTF) with
   Calibre's own converter, and **real KEPUB downloads** for Kobo readers.
-- **MOBI/AZW3/FB2/TXT get their owner tag** added in Calibre by the host job (L10), and
-  **Send-to-Kindle runs in the background** (no more 524 on a slow mail relay).
+- **MOBI/AZW3/FB2/TXT get their owner tag** added in Calibre by the host job (L10) within a
+  few minutes, also after CWA converted them to EPUB (the file's own title and author are read
+  at arrival to find the book again); the admin hears only if that fails. **Send-to-Kindle
+  runs in the background** (no more 524 on a slow mail relay).
+- **Family sharing.** A book already in the library is given to the next reader who asks,
+  never downloaded or imported twice (seedbox traffic, tracker ratio, disk): their owner tag is
+  added to the same copy. It applies to Shelfmark requests (before anything downloads), to
+  dropbox / Shelfmark arrivals and to portal requests, for ebooks and audiobooks. Only a strong
+  match counts: ISBN, Calibre UUID, or the same title AND author. `FAMILY_SHARING=false` in
+  `.env` turns it off.
 - **One login behind the gate** (Authelia on): the portal and Calibre-Web trust Authelia's
   answer, so a family member signs in once. Caddy strips `Remote-User` on every path and adds a
   secret only to requests Authelia let through; a portal password change reaches Authelia's
@@ -118,8 +126,8 @@ the result; every blocker they found is fixed and covered by a test.
   intake webhook bypass Authelia via anchored, case-sensitive regexps (one list in
   `authelia/inject-gate.py`, mirrored in the Authelia rules); each is rate-limited per client.
 - **Uploads that stay visible.** PDF (Info + XMP) and CBZ get the owner tag before import
-  and are excluded from auto-conversion; MOBI/AZW3/FB2/TXT park in a `needs-tag` state the
-  admin resolves; unsupported files and any symlink planted in a dropbox are parked under
+  and are excluded from auto-conversion; MOBI/AZW3/FB2/TXT get it in Calibre after the import
+  (host job) and reach the admin as `needs-tag` only if that fails; unsupported files and any symlink planted in a dropbox are parked under
   `.failed/` and reported, never followed or deleted. Non-Latin filenames are kept.
 - **Kindle correctness.** Send-to-Kindle only mails EPUB/PDF/TXT (Amazon rejects the rest);
   the upload cap is 95 MB (Cloudflare's body limit); EPUBs keep their compression. The two
@@ -372,7 +380,7 @@ tells a reader which numbers they are missing and which comes next. What it is, 
 - **Where it lives.** In the portal's own database. Your stored book files are never modified
   for it. The one thing written into a file remains the `owner:` tag, and that is access
   control, not description.
-- **How the devices get it.** Kobo shows what Calibre's database says, so every 15 minutes a
+- **How the devices get it.** Kobo shows what Calibre's database says, so every 2 minutes a
   host job (`scripts/metadata-push.sh`) writes title, title sort, authors and series into
   Calibre — but only to FILL GAPS: a title a family member corrected by hand, or a series they
   set themselves, is never overwritten. It reads each book's owner tag before and after the
@@ -473,6 +481,25 @@ successor of *calibre-web-automated-book-downloader*:
   ever anything but `cwa`.
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
+
+## Family sharing — one copy, many readers
+Every reader sees only books carrying their own `owner:` tag. When a reader asks for a book
+the family already has, the portal adds their tag to the existing copy instead of fetching it
+again (`librarian/share.py`):
+- **Shelfmark:** every reader's download arrives as a request (`REQUESTS_ENABLED`, switched on
+  by Deploy once the portal's Shelfmark service login exists). The portal answers each within
+  seconds: a family copy is given to the reader and the request is closed with the note
+  "Already in the family library" (Shelfmark cannot mark a picked release done without
+  downloading it, so it shows as *rejected*, with that note); anything else is approved at once,
+  or, with approvals on, waits on the Pending card as before. Admins download directly in
+  Shelfmark; their repeats are merged on arrival.
+- **Arrivals** (dropbox, Shelfmark, e-mail) and **portal requests**: matched before anything is
+  imported or downloaded; a match is merged, the duplicate file is dropped.
+- **Ebooks:** the host job adds the second owner in Calibre (`tag_push` with `share=1`), reading
+  every tag back: existing owners are never removed and an untagged book is never adopted.
+  **Audiobooks:** the portal tags the Audiobookshelf item directly.
+- **Matching:** ISBN or Calibre UUID, or the same title AND an overlapping author. Title alone
+  never shares, and two candidates are never guessed between. Audiobooks match on the name.
 
 ## Seedbox — Shelfmark downloads on your seedbox, brought home by Syncthing (Library → Seedbox)
 Shelfmark can search your seedbox's Prowlarr and send a reader's pick to the seedbox's SABnzbd or

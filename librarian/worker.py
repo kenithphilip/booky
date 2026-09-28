@@ -11,7 +11,7 @@ import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddre
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
-import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe, wanted
+import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe, wanted, filemeta, share
 from tagger import (add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError,
                     MAX_ZIP_MEMBERS as TAG_MAX_ZIP_MEMBERS)
 
@@ -20,6 +20,10 @@ UA = {"User-Agent": "bookstack-librarian/4.3"}
 HEARTBEAT = {}          # loop name -> time.time() of its last pass ("queue", "dropbox", "housekeeping", "imap")
 NEEDS_TAG = "needs-tag" # terminal status for formats that cannot carry the owner tag
 TAGGING = "tagging"     # audiobook placed; waiting for Audiobookshelf to index it so the owner tag can be set
+# MOBI/AZW3/FB2/TXT cannot carry the owner tag in the file: the host job adds it in Calibre after
+# the import (reconcile_untagged + scripts/metadata-push.sh). No alarm while that is under way.
+AUTO_TAG_NOTE = "the owner tag is added in Calibre automatically after the import"
+AUTO_TAG_ESCALATE = 45 * 60   # still not found in Calibre after this: tell the admin and the reader
 
 def _beat(name):
     HEARTBEAT[name] = time.time()
@@ -27,6 +31,8 @@ def _beat(name):
 def _finish(rid, status, detail=None):
     db.set_status(rid, status, detail)
     r = db.get(rid)
+    if status == NEEDS_TAG and AUTO_TAG_NOTE in (detail or ""):
+        return                  # being tagged in Calibre; reconcile_untagged speaks up if that fails
     if r and status in notify.EVENTS:
         notify.send(status, r)
 
@@ -336,6 +342,10 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
             # the file's own title/author/identifiers, recorded against the request. For a
             # dropbox or Shelfmark arrival this replaces "the filename" as the only evidence.
             db.set_file_meta(rid, seen)
+            fam = _family_copy(owner, rid, seen)
+            if fam:                            # before anything is mailed or imported
+                os.remove(part)
+                return fam
             if ext in ("epub", "pdf"):
                 note += _drm_note(part, ext)
                 # before CWA consumes the file; Amazon takes EPUB and PDF by mail
@@ -346,7 +356,15 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
                 note = (f"{NEEDS_TAG}: CWA's Kindle EPUB fixer is ON and strips the owner tag from comics "
                         f"on import; turn it off (Library -> Formats) or set {_owner_tag(owner)} in CWA")
         else:
-            note = f"{NEEDS_TAG}: {ext} cannot carry a tag; admin sets {_owner_tag(owner)} in CWA"
+            # the title/author the file carries: how the book is found in Calibre afterwards,
+            # also when CWA converted it to EPUB and named it from its own metadata
+            meta = filemeta.read(part, ext)
+            db.set_file_meta(rid, meta)
+            fam = _family_copy(owner, rid, meta)
+            if fam:
+                os.remove(part)
+                return fam
+            note = f"{NEEDS_TAG}: {ext} cannot carry a tag; {AUTO_TAG_NOTE}: {_owner_tag(owner)}"
         os.rename(part, os.path.join(config.INGEST_DIR, f"{_unique(final_base, owner, rid)}.{ext}"))
     except BaseException:
         for leftover in (part, part + ".tmp"):
@@ -354,6 +372,118 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
                 os.remove(leftover)
         raise
     return note
+
+FAMILY_NOTE = "already in the family library"
+
+def _family_copy(owner, rid, meta):
+    """Family sharing (share.py): an arrival that is a book already in the library is not
+    imported a second time. The reader gets the existing copy (their owner tag is added by the
+    host job); a book they already have is simply not duplicated. None = import it as usual."""
+    if not meta or not (meta.get("title") or meta.get("identifiers")):
+        return None
+    m = share.find_ebook(meta.get("title"), meta.get("author") or "", meta.get("identifiers") or ())
+    if not m:
+        return None
+    if owner in m["owners"]:
+        return f"already in your library (matched by {m['how']}); this copy was not imported again"
+    share.give_ebook(m, owner, rid)
+    return (f"{NEEDS_TAG}: {FAMILY_NOTE} (matched by {m['how']}), this copy was not imported again; "
+            f"{AUTO_TAG_NOTE}: {_owner_tag(owner)}")
+
+def _family_audio(owner, base):
+    """_family_copy for an audiobook: the arrival's name ('Author - Title', either order) is all
+    there is, so both halves must agree with one Audiobookshelf item. None = add it as usual."""
+    parts = [x.strip() for x in re.split(r"\s+[-\u2013\u2014]\s+", _strip_name_tail(base), maxsplit=1)]
+    if len(parts) != 2 or not all(parts):
+        return None
+    m = share.find_audiobook(parts[1], parts[0]) or share.find_audiobook(parts[0], parts[1])
+    if not m:
+        return None
+    if owner in m["owners"]:
+        return "already in your audiobooks; this copy was not added again"
+    try:
+        share.give_audiobook(m, owner)
+    except Exception as e:                       # ABS refused the tag: add the copy as usual
+        log.warning("family sharing: could not tag ABS item %s for %s: %s", m["item_id"], owner, e)
+        return None
+    return f"{FAMILY_NOTE}: added to your audiobooks, this copy was not added again"
+
+def _family_request(req):
+    """A portal request for a book the family already has: nothing is downloaded."""
+    owner = req["owner"]
+    if req["kind"] == "audio":
+        m = share.find_audiobook(req.get("title"), req.get("author") or "")
+        if not m:
+            return None
+        if owner in m["owners"]:
+            return "already in your audiobooks; nothing downloaded"
+        try:
+            share.give_audiobook(m, owner)
+        except Exception as e:                   # could not tag it: download as usual
+            log.warning("family sharing: could not tag ABS item %s for %s: %s", m["item_id"], owner, e)
+            return None
+        return f"{FAMILY_NOTE}: added to your audiobooks, nothing downloaded"
+    m = share.find_ebook(req.get("title"), req.get("author") or "")
+    if not m:
+        return None
+    if owner in m["owners"]:
+        return f"already in your library (matched by {m['how']}); nothing downloaded"
+    share.give_ebook(m, owner, req["id"])
+    return f"{NEEDS_TAG}: {FAMILY_NOTE} (matched by {m['how']}), nothing downloaded; {AUTO_TAG_NOTE}: {_owner_tag(owner)}"
+
+SHELF_SHARED = ("Already in the family library: it has been added to your library, so nothing was "
+                "downloaded. It appears there within a few minutes.")
+SHELF_OWNED = "Already in your library, so nothing was downloaded."
+
+def shelfmark_gate_once(now=None):
+    """Every reader's Shelfmark download arrives as a request (REQUESTS_ENABLED, see
+    docker-compose.yml). BEFORE anything is downloaded:
+      * a book the family already has is given to the reader (share.py) and the request is
+        closed with a note saying so. Shelfmark cannot mark a picked release done without
+        downloading it, so it shows as 'rejected', with that note;
+      * anything else is approved at once, unless APPROVALS_REQUIRED, when it waits on the
+        portal's Pending card for the admin, as before.
+    Admin accounts download directly in Shelfmark; their repeats are merged on arrival instead.
+    Returns (shared, approved)."""
+    import shelfmark_api
+    if not shelfmark_api.configured():
+        return 0, 0
+    try:
+        rows = shelfmark_api.pending(cache=False)
+    except shelfmark_api.ShelfmarkError as e:
+        log.warning("Shelfmark gate: %s", e)
+        return 0, 0
+    shared = approved = 0
+    for x in rows:
+        owner = x.get("requester") or ""
+        try:
+            if not owner or cwa.get_user(owner) is None:
+                continue                         # not a library account: the admin decides
+        except cwa.CwaError:
+            continue
+        try:
+            if x["kind"] == "audiobook":
+                m = share.find_audiobook(x["title"], x["author"])
+                if m and owner not in m["owners"]:
+                    share.give_audiobook(m, owner)
+            else:
+                m = share.find_ebook(x["title"], x["author"], share.isbn_ids(*x.get("isbns", ())))
+                if m and owner not in m["owners"]:
+                    rid = db.add(owner, {"kind": "ebook", "source": "shelfmark", "title": x["title"],
+                                         "author": x["author"], "download_url": "local"}, status=NEEDS_TAG)
+                    db.set_status(rid, NEEDS_TAG, f"{NEEDS_TAG}: {FAMILY_NOTE} (matched by {m['how']}), "
+                                                  f"nothing downloaded; {AUTO_TAG_NOTE}: {_owner_tag(owner)}")
+                    share.give_ebook(m, owner, rid, now)
+            if m:
+                shelfmark_api.decide(x["id"], False, SHELF_OWNED if owner in m["owners"] else SHELF_SHARED)
+                db.audit("family_share", owner, "shelfmark", f"#{x['id']} {x['title'][:80]} ({m['how']})")
+                shared += 1
+            elif not config.APPROVALS_REQUIRED:
+                shelfmark_api.decide(x["id"], True, "")
+                approved += 1
+        except Exception as e:                   # one bad row never blocks the others
+            log.warning("Shelfmark gate: request #%s: %s", x.get("id"), e)
+    return shared, approved
 
 def _status_for(note):
     if note.startswith(NEEDS_TAG):
@@ -582,6 +712,10 @@ def _place_audio_file(src, owner, base, rid=None):
         _beat("dropbox")
         if _audio_duplicate(owner, base, _tree_size(inc)):
             raise ValueError("this audiobook is already in your audiobooks (same name and size)")
+        fam = _family_audio(owner, base)
+        if fam:
+            shutil.rmtree(inc, ignore_errors=True)
+            return fam
         final = _audio_final(owner, base)
         os.rename(inc, final)
     except Exception:
@@ -636,11 +770,14 @@ def _place_audio_dir(src_dir, owner, base, rid=None):
     except OSError:
         shutil.copytree(src_dir, inc, copy_function=_copy_beating)
     expanded = []
+    fam = None
     try:
         expanded = _expand_audio_zips(inc)
         if _audio_duplicate(owner, base, _tree_size(inc)):
             raise ValueError("this audiobook is already in your audiobooks (same name and size)")
-        os.rename(inc, final)
+        fam = _family_audio(owner, base)
+        if not fam:
+            os.rename(inc, final)
     except BaseException:
         if moved:
             for _archive, made in expanded:      # undo the unpacking, keep the archive
@@ -656,6 +793,11 @@ def _place_audio_dir(src_dir, owner, base, rid=None):
         else:
             shutil.rmtree(inc, ignore_errors=True)
         raise
+    if fam:                                      # the family already has it: this copy goes
+        shutil.rmtree(inc, ignore_errors=True)
+        if not moved:
+            shutil.rmtree(src_dir, ignore_errors=True)
+        return fam
     # in the library now, and Audiobookshelf cannot read a zip: the archive has done its job
     for archive, _made in expanded:
         try:
@@ -1073,6 +1215,10 @@ def _process(req):
             raise RuntimeError(f"the account '{req['owner']}' no longer exists; not imported")
         if req.get("is_torrent"):
             raise RuntimeError("the P2P (torrent) download path was removed; request it again")
+        fam = _family_request(req)
+        if fam:
+            _finish(req["id"], _status_for(fam), fam)
+            return
         if req["kind"] == "audio":
             _place_audio_http(req)
         else:
@@ -1697,41 +1843,78 @@ def kindle_once(now=None):
 # ---- L10: owner tags for books whose file could not carry one ----------------------------------
 UNTAGGED_WINDOW = 7 * 86400          # needs-tag rows younger than this are still reconciled
 
+_NAME_TAIL = re.compile(r"(\.(mobi|azw3?|prc|fb2|txt)|\s*\[[^\]]*-\d+\]|\s*\((19|20)\d\d\))\s*$", re.I)
+
+def _strip_name_tail(name):
+    """'Author - Title (2003).mobi', 'Title [alice-12].fb2' -> the name without extension,
+    our ' [owner-rid]' marker and a trailing year, in whatever order they come."""
+    prev = None
+    while prev != name:
+        prev, name = name, _NAME_TAIL.sub("", name).strip()
+    return name
+
+def _untagged_guesses(r):
+    """(title, author) pairs to look for in Calibre, most trusted first: what the FILE said
+    (filemeta.py), then the request / file name read as it is, as 'Author - Title (Year)'
+    (Shelfmark's naming) and as 'Title - Author'."""
+    out = []
+    if r.get("file_title"):
+        out.append((r["file_title"], r.get("file_author") or ""))
+    base = _strip_name_tail(r.get("title") or "")
+    if base:
+        out.append((base, r.get("author") or ""))
+        parts = [x.strip() for x in re.split(r"\s+[-\u2013\u2014]\s+", base, maxsplit=1)]
+        if len(parts) == 2 and all(parts):
+            out += [(parts[1], parts[0]), (parts[0], parts[1])]
+    return out
+
+def _same_book(guess, title, authors):
+    """Title agrees (the comparable core, or near-identical clean text) and, when both sides
+    name an author, the names overlap. A known author that disagrees is a no."""
+    import matching
+    gt, ga = guess
+    if not (dedupe.norm_title(gt) and dedupe.norm_title(gt) == dedupe.norm_title(title)) \
+            and matching.similarity(matching.clean(gt), matching.clean(title)) < 0.9:
+        return False
+    want, have = dedupe.author_tokens(ga), dedupe.author_tokens(authors)
+    return not (want and have) or bool(want & have)
+
 def _untagged_match(r):
     """The Calibre book for a needs-tag request, or None. The ' [owner-rid]' marker first (it
-    survives when Calibre took the title from the file name: TXT, FB2 without metadata); then a
-    strict fallback for a MOBI/AZW3 whose own metadata replaced the name — same format, arrived
-    after the file was placed, NO owner tag yet, title agreeing with what the file said, and
-    exactly one such book. Anything less certain is left for the admin, as before."""
-    import sqlite3, matching
+    survives when Calibre took the title from the file name: TXT, FB2 without metadata); then
+    a strict fallback for a book whose own metadata replaced the name, in ANY format (CWA
+    converts MOBI/AZW3/FB2 to EPUB on import): arrived after the file was placed, NO owner tag
+    yet, title and author agreeing with what the file (or its name) said, and exactly one such
+    book. Anything less certain is left for the admin, as before."""
+    import sqlite3
     cid = r.get("calibre_id") or _in_calibre(_ingest_marker(r["owner"], r["id"]))
     if cid:
         return int(cid)
-    ext = (r.get("detail") or "").split(":", 1)[1].strip().split(" ", 1)[0] if ":" in (r.get("detail") or "") else ""
-    want = r.get("file_title") or r.get("title") or ""
-    if not want:
+    guesses = _untagged_guesses(r)
+    if not guesses:
         return None
     try:
         c = library._conn()
         try:
             rows = c.execute(
-                "SELECT b.id, b.title FROM books b JOIN data d ON d.book=b.id "
+                "SELECT b.id, b.title, (SELECT group_concat(a.name, ' & ') FROM books_authors_link bal "
+                "JOIN authors a ON a.id=bal.author WHERE bal.book=b.id) FROM books b "
                 "WHERE b.timestamp >= datetime(?, 'unixepoch', '-120 seconds') "
-                + ("AND lower(d.format)=? " if ext.isalpha() else "") +
                 "AND NOT EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag "
                 "WHERE l.book=b.id AND t.name LIKE ?)",
-                ((r["updated"] or r["created"]),) + ((ext.lower(),) if ext.isalpha() else ()) + (f"{config.OWNER_PREFIX}%",)).fetchall()
+                ((r["updated"] or r["created"]), f"{config.OWNER_PREFIX}%")).fetchall()
         finally:
             c.close()
     except sqlite3.Error as e:
         log.warning("could not read metadata.db for untagged book %s: %s", r["id"], e)
         return None
-    wt = matching.clean(want)
-    hits = [row[0] for row in rows if matching.similarity(wt, matching.clean(row[1])) >= 0.9]
+    hits = [bid for bid, title, authors in rows if any(_same_book(g, title, authors or "") for g in guesses)]
     return int(hits[0]) if len(hits) == 1 else None
 
 def reconcile_untagged(now=None):
-    """Queue the host job that adds the owner tag in Calibre (scripts/metadata-push.sh)."""
+    """Queue the host job that adds the owner tag in Calibre (scripts/metadata-push.sh). A book
+    that could not be found automatically within AUTO_TAG_ESCALATE is handed to the admin, with
+    one alert, as before this ran on its own."""
     now = now or time.time()
     queued = 0
     for r in db.rows_by_status((NEEDS_TAG,), limit=100):
@@ -1744,6 +1927,11 @@ def reconcile_untagged(now=None):
             db.link_calibre(r["id"], cid, r["owner"])
             db.set_status(r["id"], NEEDS_TAG, f"{r.get('detail') or NEEDS_TAG}; the owner tag is being added in Calibre")
             queued += 1
+        elif not cid and AUTO_TAG_NOTE in (r.get("detail") or "") \
+                and (r.get("updated") or r.get("created") or now) < now - AUTO_TAG_ESCALATE:
+            ext = (r.get("detail") or "").split(":", 1)[1].strip().split(" ", 1)[0]
+            _finish(r["id"], NEEDS_TAG, f"{NEEDS_TAG}: {ext} cannot carry a tag and the book was not found in "
+                                        f"Calibre automatically; admin sets {_owner_tag(r['owner'])} in CWA")
     return queued
 
 PLACEHOLDER_AUTHORS = {"", "unknown", "unknown author", "anonymous"}
@@ -1957,6 +2145,9 @@ def run_forever():
     _beat("queue")
     threading.Thread(target=_loop, args=("dropbox", scan_dropbox_once, 10), daemon=True).start()
     threading.Thread(target=_loop, args=("housekeeping", housekeeping_once, 15), daemon=True).start()
+    # every reader's Shelfmark download waits here for a few seconds: shared if the family has
+    # it, else approved (or held for the admin when APPROVALS_REQUIRED)
+    threading.Thread(target=_loop, args=("shelfmark", shelfmark_gate_once, 8), daemon=True).start()
     # its own thread: a keep-looking pass is catalog searches (up to ~12 s each) and, once per
     # entry, the metadata chain — never allowed to hold up tag jobs or import reconciliation
     threading.Thread(target=_loop, args=("wanted", wanted_once, WANTED_EVERY), daemon=True).start()
