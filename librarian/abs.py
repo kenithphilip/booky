@@ -189,6 +189,24 @@ def find_items_by_folder(folder, token=None):
             out.append(it)
     return out
 
+def items_for(owner, is_admin=False, token=None):
+    """The audiobooks a reader can see (their owner tag; the admin: all), for the portal's
+    download list: [{id, title, author, path, size, is_file}]."""
+    lib_id, _ = ensure_library(token=token)
+    r = _req("GET", f"/api/libraries/{lib_id}/items", token=token, params={"limit": 0})
+    if r.status_code != 200:
+        raise AbsError(f"Audiobookshelf answered HTTP {r.status_code} for its items")
+    tag, out = owner_tag(owner), []
+    for it in _json(r).get("results", []):
+        media = it.get("media") or {}
+        if not is_admin and tag not in (media.get("tags") or []):
+            continue
+        md = media.get("metadata") or {}
+        out.append({"id": it.get("id"), "title": md.get("title") or it.get("relPath") or "?",
+                    "author": md.get("authorName") or "", "path": it.get("path") or "",
+                    "size": it.get("size") or media.get("size") or 0, "is_file": bool(it.get("isFile"))})
+    return sorted(out, key=lambda x: (x["author"].lower(), x["title"].lower()))
+
 def find_item_by_folder(folder, token=None):
     """The first item under the folder (kept for callers that only need existence)."""
     items = find_items_by_folder(folder, token=token)

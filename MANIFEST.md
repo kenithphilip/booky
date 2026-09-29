@@ -47,6 +47,17 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   through its plain HTML pages; pip then installs them hash-checked with no index
 - `share.py` — family sharing: a book the family already has is given to the next reader (their
   owner tag added to the same copy) instead of downloaded again; strong matches only
+- `comics.py` — comics and manga (docs/COMICS.md): requests, the family copy first, the search and
+  the queueing THROUGH Shelfmark as the reader, arrivals (CBR/CB7 repacked as CBZ with unar,
+  matched to the request, ComicInfo.xml + ComicBookInfo written in), which comics need a Kobo copy
+  (an owner whose Kobo syncs, or 'Make Kobo copy'), Kindle jobs that need a Kindle copy first
+- `comicmeta.py` — what a series is: Metron / ComicVine (Western, account / key) and MangaUpdates
+  (manga, manhwa, manhua; no key), cached a day; kind and reading direction; `python -m comicmeta check`
+- `comicrel.py` — which release is the one asked for: parses a release title (series, volume,
+  issue, chapter range, year, language, digital, edition, pack) and applies the hard rules and the
+  scoring of docs/COMICS.md ("Classification")
+- `templates/comics.html`, `comic_series.html` — the Comics page and a series' issues/volumes;
+  `audiobooks.html` — My audiobooks, each a download (one file, or one ZIP for a folder)
 - `filemeta.py` — title/author out of MOBI/AZW3 (EXTH) and FB2, read-only and bounded, so the
   host job finds those books in Calibre after the import (also once CWA converted them)
 - `templates/remove.html` — 'Remove from my library': what happens, and how to clear the
@@ -138,6 +149,11 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 - `caddy-clientip.sh` — has Caddy loaded Cloudflare's address list? (recent Cloudflare-delivered
   requests vs their resolved client address); Deploy/Update restart Caddy until it has, heal.sh
   restarts it (at most hourly) when it has not
+- `comic-convert.sh` — every 3 min when comics are on (cron `bookstack-comics`, flock): KCC in a
+  throwaway container (no network, PUID:PGID, `KCC_MEMORY` cap), one at a time. Adds the colour,
+  fixed-layout Kobo copy to the same Calibre book as KEPUB (tags read before and after); makes the
+  Kindle copy of a comic being sent (KCC's Send-to-Kindle EPUB, lower quality, then split into
+  parts to stay under the mail limit) in `library/staging/kindle-comics/<job>/`
 - `mem-tidy.sh` — nightly 03:45 (cron `bookstack-memtidy`): restarts an idle Calibre-Web,
   Shelfmark, Audiobookshelf or Syncthing whose memory grew past 70 % of its limit
 - `seedbox-fetch.py` — every 20 seconds: hands finished seedbox downloads (SABnzbd jobs, torrents
@@ -184,6 +200,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   production Caddyfile (every optional site, the Authelia gate injected) on it
 
 ## docs/
+- `COMICS.md` — comics and manga: the path of a request (through Shelfmark), classification and
+  scoring, device copies, what the owner sets up
 - `DEPLOYMENT-CHECKLIST.md` — what is verified locally per version and what to check on the VPS
 - `RESEARCH-GAPS.md` — the v4.2 research sweep: VPS sizing, 20 pre-deploy items (done), 22 later
 - `DECISIONS-PENDING.md` — blockers and deliberate deferrals

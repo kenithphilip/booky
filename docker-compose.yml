@@ -204,6 +204,12 @@ services:
       - SHELFMARK_AUTH_METHOD=${SHELFMARK_AUTH_METHOD:-cwa}   # L05: proxy behind the gate
       - ABS_OIDC_SECRET=${ABS_OIDC_SECRET:-}               # L05: Audiobookshelf's client at Authelia
       - HARDCOVER_API_KEY=${HARDCOVER_API_KEY:-}
+      # comics and manga (docs/COMICS.md, Library -> Comics): searched and downloaded through
+      # Shelfmark; described by Metron / ComicVine (Western) and MangaUpdates (manga, no key)
+      - COMICS_ENABLED=${COMICS_ENABLED:-false}
+      - METRON_USER=${METRON_USER:-}
+      - METRON_PASS=${METRON_PASS:-}
+      - COMICVINE_API_KEY=${COMICVINE_API_KEY:-}
       - CONVERT_MAX_PER_DAY=${CONVERT_MAX_PER_DAY:-10}      # on-demand conversions per reader per day
       - MAX_UPLOAD_TAILNET_MB=${MAX_UPLOAD_TAILNET_MB:-2048} # L18: upload.<domain> (Tailscale only)
       - KOSYNC_ENABLED=${KOSYNC_ENABLED:-false}

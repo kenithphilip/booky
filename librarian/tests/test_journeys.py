@@ -636,7 +636,7 @@ def test_j38_j39_the_pages_speak_plain_language(client, users, monkeypatch):
     home = client.get("/").get_data(as_text=True)
     assert "Project Gutenberg" in home and "Internet Archive" in home and "internet_archive" not in home
     assert "Start here" in home and "books+alice@example.test" in home
-    assert "Audiobooks ↗" in home                        # nav link to Audiobookshelf
+    assert 'href="/audiobooks"' in home                  # My audiobooks (downloads; it links to Audiobookshelf)
     assert "Shelfmark" in home and "extended search" not in home
     assert "books+alice@example.test" in client.get("/upload").get_data(as_text=True)
     rid = _req("alice", source="dropbox", download_url="local", status="done")

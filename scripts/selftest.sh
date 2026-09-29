@@ -173,6 +173,18 @@ if [ -f /etc/systemd/system/bookstack-canary.timer ]; then
   if systemctl is-failed bookstack-canary.service >/dev/null 2>&1; then bad "the last canary journey FAILED: what a family member would hit (journalctl -u bookstack-canary -n 60; /admin -> Canary journey)"
   else ok "canary journey scheduled (06:20 / 18:20); last run did not fail"; fi
 fi
+# v5.7 comics (docs/COMICS.md): the device-copy job, its converter, the archive tools, the metadata
+if [ "$(envget COMICS_ENABLED)" = true ]; then
+  [ -f /etc/cron.d/bookstack-comics ] && ok "comic device copies scheduled (every 3 min)" || bad "comics are on but the device-copy job is not scheduled (re-run Deploy)"
+  kcc=$(envget IMG_KCC); kcc="${kcc:-ghcr.io/ciromattia/kcc:v12.0.0}"
+  docker image inspect "$kcc" >/dev/null 2>&1 && ok "KCC image present ($kcc)" || warn "KCC image $kcc is not pulled yet: Kobo/Kindle copies of comics wait for it (re-run Deploy)"
+  docker exec librarian sh -c 'command -v unar >/dev/null' 2>/dev/null && ok "the portal can open CBR and CB7 comics (unar)" || bad "the portal image has no unar: CBR/CB7 comics fail to import (Operations -> Update rebuilds it)"
+  if [ "$SCHEDULED" != 1 ]; then
+    cm=$(docker exec librarian python -m comicmeta check 2>/dev/null | tail -1)
+    case "$cm" in *'"ok": true'*) ok "comic metadata providers answer ($(printf '%s' "$cm" | grep -o '"providers": {[^}]*}' | sed 's/"providers": //'))";;
+      *) warn "a comic metadata provider did not answer: ${cm:-no reply} (Library -> Comics)";; esac
+  fi
+fi
 # L14: which certificate the origin lock accepts
 case "$(envget AOP_MODE)" in
   zone) ok "origin lock: only this zone's own Cloudflare client certificate is accepted";;

@@ -117,6 +117,7 @@ mkdir -p cwa/config abs/config abs/metadata shelfmark/config librarian/state tes
 envset DOMAIN example.test; envset ADMIN_EMAIL admin@example.test; envset TZ UTC
 envset PUID "$(id -u)"; envset PGID "$(id -g)"; envset CF_API_TOKEN dummy; envset CF_DNS_TOKEN dummy
 envset LIBRARIAN_SECRET 'pa$$w0rd&|it'"'"'s"tricky'; envset INTAKE_TOKEN e2e-intake; envset PUBLIC_IP 127.0.0.1; envset BIND_IP 127.0.0.1; envset TAILSCALE_IP 127.0.0.1
+envset COMICS_ENABLED true             # v5.7 comics (docs/COMICS.md): the section after the canary journey
 envset ADMIN_HASH '$2a$14$hash'; envset APPROVALS_REQUIRED true; envset SHELFMARK_LANGUAGE en; envset AUTHELIA_ENABLED true
 # L16: the portal's service login for Shelfmark's approval API (bookstack.sh ensure_shelfmark_service)
 SVC_PW="svc-e2e-$(date +%s)-pw"; envset SHELFMARK_SVC_USER svc-portal; envset SHELFMARK_SVC_PASS "$SVC_PW"
@@ -277,6 +278,106 @@ if [ $crc = 1 ] && grep -q "ALERT Bookstack: canary journey FAILED at 'Shelfmark
    && docker exec librarian python -m admin_cli canary recent --limit 1 | tail -1 | grep -q '"failed": "Shelfmark login"'; then
   echo "   [ OK ] a broken step fails the run, names the step in the alert, pushes DOWN to Kuma and shows on /admin"
 else echo "   [FAIL] canary journey with Shelfmark unreachable (exit $crc)"; cat "$STACK/canary-alert.log" "$STACK/canary-push.log"; rc=$((rc+1)); fi
+echo "== v5.7: a comic, from a reader's dropbox to her Kobo and her Kindle (docs/COMICS.md)"
+cfail(){ echo "   [FAIL] $1"; rc=$((rc+1)); }
+python3 - "$STACK/testfiles/comic.cbz" <<'PY'
+import struct, sys, zipfile, zlib
+def png(w, h, i):
+    rows = b"".join(b"\x00" + bytes(v for x in range(w) for v in ((x * 7 + i * 40) % 256, (y * 5) % 256, (x + y + i * 90) % 256)) for y in range(h))
+    ch = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    return b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", zlib.compress(rows, 6)) + ch(b"IEND", b"")
+with zipfile.ZipFile(sys.argv[1], "w") as z:
+    for i in range(12):
+        z.writestr(f"{i + 1:03d}.png", png(600, 900, i))
+PY
+crid=$(docker exec -i librarian python - <<'PY'
+import db
+db.init()
+rid, _ = db.comic_add("alice", {"provider": "mangaupdates", "series_id": "990001", "series_name": "E2E Manga", "kind": "manga",
+                                "reading": "rtl", "number": "3", "label": "Vol. 3", "language": "en", "authors": ["E2E Mangaka"]})
+db.comic_update(rid, status="downloading", release_title="E2E Manga v03 (Digital)")
+print(rid)
+PY
+)
+mkdir -p "$STACK/library/dropbox/alice"
+cp "$STACK/testfiles/comic.cbz" "$STACK/library/dropbox/alice/E2E Manga v03 (Digital) (e2e).cbz"
+cbid=""
+for _ in $(seq 1 60); do
+  cbid=$(python3 - "$STACK/library/books/metadata.db" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+r = c.execute("SELECT b.id FROM books b JOIN books_series_link l ON l.book=b.id JOIN series s ON s.id=l.series "
+              "WHERE s.name='E2E Manga' AND b.series_index=3").fetchone()
+print(r[0] if r else "")
+PY
+)
+  [ -n "$cbid" ] && break; sleep 3
+done
+if [ -n "$cbid" ]; then
+  echo "   [ OK ] the volume arrived in Calibre as E2E Manga #3 (book $cbid), the series read from the file"
+  facts=$(python3 - "$STACK/library/books/metadata.db" "$cbid" <<'PY'
+import sqlite3, sys
+c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+tags = sorted(t for (t,) in c.execute("SELECT t.name FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=?", (sys.argv[2],)))
+fmts = sorted(f for (f,) in c.execute("SELECT format FROM data WHERE book=?", (sys.argv[2],)))
+print("|".join(tags), "|".join(fmts))
+PY
+)
+  case "$facts" in *Manga*owner:alice*" CBZ") echo "   [ OK ] tagged Manga and owner:alice, kept as CBZ ($facts)";; *) cfail "tags/formats after import: $facts";; esac
+  st=$(docker exec librarian python -c "import db; db.init(); print(db.comic_get($crid)['status'])")
+  [ "$st" = done ] && echo "   [ OK ] alice's comic request reads 'done'" || cfail "comic request status '$st'"
+  docker exec librarian python -c "import db; db.init(); db.comic_convert_force($cbid)"
+  t0=$(date +%s)
+  COMICS_ENABLED=true COMIC_METAPUSH_LOCK="$STACK/metapush.lock" STACK_DIR="$STACK" bash "$REPO/scripts/comic-convert.sh" > "$STACK/comic-convert.log" 2>&1
+  t1=$(date +%s)
+  # through calibredb, inside the container: Calibre-Web's latest writes sit in the WAL, which a
+  # reader on the Mac side of OrbStack's VM does not see (on the server both share one kernel)
+  kfile=$(docker exec -u "$(id -u):$(id -g)" -e HOME=/tmp calibre-web /app/calibre/calibredb list --fields formats \
+          --search "id:$cbid" --for-machine --with-library /calibre-library 2>/dev/null | python3 -c '
+import json, sys
+out = sys.stdin.read(); rows = json.loads(out[out.find("["):]) if "[" in out else []
+print(next((f[len("/calibre-library/"):] for r in rows for f in r.get("formats", []) if f.endswith(".kepub")), ""))')
+  if [ -n "$kfile" ] && [ -f "$STACK/library/books/$kfile" ]; then
+    echo "   [ OK ] KCC made the Kobo copy and it was added to the same book as KEPUB ($((t1 - t0)) s)"
+    python3 - "$STACK/library/books/$kfile" <<'PY' && echo "   [ OK ] the Kobo copy is fixed-layout and in colour" || cfail "the Kobo copy is not a colour fixed-layout EPUB"
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+opf = next(n for n in z.namelist() if n.endswith(".opf"))
+ok_layout = b"pre-paginated" in z.read(opf)
+jpg = next(n for n in z.namelist() if n.lower().endswith((".jpg", ".jpeg")))
+d = z.read(jpg); i = d.find(b"\xff\xc0") if d.find(b"\xff\xc0") > 0 else d.find(b"\xff\xc2")
+colour = d[i + 9] == 3 if i > 0 else False
+sys.exit(0 if ok_layout and colour else 1)
+PY
+  else
+    cfail "no KEPUB after comic-convert.sh: $(tail -3 "$STACK/comic-convert.log")"
+  fi
+  tok=$(docker exec librarian python -m cwa kobo-url alice 2>/dev/null | grep -o '[0-9a-f]\{32\}' | head -1)
+  btok=$(docker exec librarian python -m cwa kobo-url bob 2>/dev/null | grep -o '[0-9a-f]\{32\}' | head -1)
+  kobo_fmt(){ curl -s -m 30 -H "User-Agent: Kobo eReader" -H "x-kobo-synctoken: " "http://127.0.0.1:18083/kobo/$1/v1/library/sync" | python3 -c '
+import json, sys
+fmts = []
+for e in json.load(sys.stdin) or []:
+    ent = e.get("NewEntitlement") or e.get("ChangedEntitlement") or {}
+    md = ent.get("BookMetadata") or {}
+    if "E2E Manga" in (md.get("Title") or ""):
+        fmts += [u.get("Format") for u in md.get("DownloadUrls") or []]
+print(",".join(f for f in fmts if f))'; }
+  # Calibre-Web notices calibredb's write a little later (a real Kobo syncs long after): ask for a minute
+  af=""; for _ in $(seq 1 20); do af=$(kobo_fmt "$tok"); [ -n "$af" ] && break; sleep 3; done
+  bf=$(kobo_fmt "$btok")
+  case "$af" in *EPUB3FL*|*KEPUB*) echo "   [ OK ] alice's Kobo is offered the comic as $af (fixed layout, through her existing link)";; *) cfail "alice's Kobo sync offers the comic as '${af:-nothing}'";; esac
+  [ -z "$bf" ] && echo "   [ OK ] bob's Kobo is not offered alice's comic" || cfail "bob's Kobo sees alice's comic ($bf)"
+  kjob=$(docker exec librarian python -c "import db, comics; db.init(); print(comics.kindle_request('alice', False, $cbid, 'E2E Manga Vol. 3'))")
+  COMICS_ENABLED=true COMIC_METAPUSH_LOCK="$STACK/metapush.lock" STACK_DIR="$STACK" bash "$REPO/scripts/comic-convert.sh" >> "$STACK/comic-convert.log" 2>&1
+  kj=$(docker exec librarian python -c "import db, json; db.init(); j=[x for x in db.kindle_recent('alice', 5) if x['id']==$kjob][0]; print(j['status'], j.get('files'))")
+  kdir="$STACK/library/staging/kindle-comics/$kjob"
+  if [ "${kj%% *}" = queued ] && ls "$kdir"/*.epub >/dev/null 2>&1 && [ -z "$(find "$kdir" -name '*.epub' -size +45M)" ]; then
+    echo "   [ OK ] a Kindle copy (Colorsoft, Send-to-Kindle EPUB) was made under the mail limit and handed to the portal to mail"
+  else cfail "Kindle comic job: $kj; $(tail -3 "$STACK/comic-convert.log")"; fi
+else
+  cfail "the comic never reached Calibre: $(docker exec librarian python -c "import db; db.init(); print(db.comic_get($crid))" 2>&1 | tail -1)"
+fi
 echo "== process stability"
 if compose logs librarian 2>/dev/null | grep -qE 'SIGBUS|SIGSEGV|Worker failed to boot|Fatal Python error'; then
   echo "   [FAIL] the portal worker crashed during the run:"; compose logs librarian 2>/dev/null | grep -B2 -A25 -E 'SIGBUS|SIGSEGV|Fatal Python error' | head -60; rc=$((rc+1))

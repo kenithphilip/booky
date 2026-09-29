@@ -1,0 +1,37 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('comics_page') }}">← Comics &amp; manga</a></p>
+<div class="card"><div class="row" style="align-items:flex-start;gap:16px">
+{% if s.cover and s.cover.startswith('https://') %}<img src="{{ url_for('cover', u=s.cover) }}" alt="" style="width:120px;height:auto;border-radius:4px">{% endif %}
+<div style="flex:1">
+<h2 style="margin-top:0">{{ s.name }}</h2>
+<p class="mut">{{ labels.get(s.kind, s.kind) }}{% if s.year %} · {{ s.year }}{% endif %}{% if s.publisher %} · {{ s.publisher }}{% endif %}{% if s.authors %} · {{ s.authors | join(', ') }}{% endif %}{% if s.status %} · {{ s.status }}{% endif %}</p>
+{% if s.desc %}<p style="white-space:pre-line">{{ s.desc }}</p>{% endif %}
+{% if s.kind == 'novel' %}<div class="flash">This is a novel, not a comic: <a href="{{ url_for('index', q=s.name) }}">request it on the Search page</a>.</div>{% endif %}
+{% if s.provider == 'mangaupdates' and s.count_english and s.count_original and s.count_english < s.count_original %}
+<p class="mut">{{ s.count_original }} volumes in the original, {{ s.count_english }} in English so far{% if language != 'en' %} (you read {{ languages.get(language, language) }}: the original count is shown){% endif %}.</p>{% endif %}
+</div></div></div>
+
+{% if s.kind != 'novel' %}
+{% if not items %}<p class="mut">No {{ 'issues' if s.kind == 'comic' else 'volumes' }} are listed for this series yet.</p>{% else %}
+<form method="post" action="{{ url_for('comic_request') }}">{{ csrf_field() }}
+<input type="hidden" name="provider" value="{{ s.provider }}"><input type="hidden" name="series_id" value="{{ s.id }}">
+<div class="card row">
+<label>Language <select name="language" style="width:auto">{% for code, name in languages.items() %}<option value="{{ code }}" {{ 'selected' if code == language }}>{{ name }}</option>{% endfor %}</select></label>
+<label>Reading <select name="reading" style="width:auto">
+<option value="rtl" {{ 'selected' if reading == 'rtl' }}>right to left (manga)</option>
+<option value="ltr" {{ 'selected' if reading == 'ltr' }}>left to right</option></select></label>
+<button type="submit">Request the ticked ones</button><span class="busy">Requesting…</span>
+</div>
+<p class="mut">Only copies in the language you choose are downloaded. Up to 25 at a time.</p>
+<table>
+{% for it in items %}
+{% set st = mine.get(it.number) %}{% set lib = have.get(it.number) %}
+<tr><td style="width:32px">{% if not lib and st not in ('queued', 'downloading', 'pending', 'done', 'shared') %}<input type="checkbox" name="number" value="{{ it.number }}" id="n{{ loop.index }}">{% endif %}</td>
+<td><label for="n{{ loop.index }}">{{ it.label }}{% if it.title %} <span class="mut">· {{ it.title }}</span>{% endif %}</label>{% if it.date %} <span class="mut">· {{ it.date }}</span>{% endif %}</td>
+<td class="mut" style="white-space:nowrap">{% if lib == 'yours' %}<span class="st-done">in your library</span>{% elif lib == 'family' %}in the family library (ticking it adds it to yours, no download){% elif st %}{{ {'queued': 'looking', 'downloading': 'downloading', 'pending': 'waiting for approval', 'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled'}.get(st, st) }}{% endif %}</td></tr>
+{% endfor %}
+</table>
+</form>
+{% endif %}
+{% endif %}
+{% endblock %}

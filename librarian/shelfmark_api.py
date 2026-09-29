@@ -50,10 +50,10 @@ def _login():
     return cookie
 
 
-def _call(method, path, **kw):
+def _call(method, path, timeout=TIMEOUT, **kw):
     if _proxy():
         try:
-            r = requests.request(method, f"{config.SHELFMARK_API}{path}", timeout=TIMEOUT, headers={
+            r = requests.request(method, f"{config.SHELFMARK_API}{path}", timeout=timeout, headers={
                 "Remote-User": config.SHELFMARK_SVC_USER, "Remote-Groups": "admins"}, **kw)
         except requests.RequestException as e:
             raise ShelfmarkError(f"Shelfmark did not answer ({type(e).__name__})") from e
@@ -64,7 +64,7 @@ def _call(method, path, **kw):
         cookie = _state["cookie"] or _login()
     for attempt in (0, 1):
         try:
-            r = requests.request(method, f"{config.SHELFMARK_API}{path}", timeout=TIMEOUT,
+            r = requests.request(method, f"{config.SHELFMARK_API}{path}", timeout=timeout,
                                  headers={"Cookie": cookie}, **kw)
         except requests.RequestException as e:
             raise ShelfmarkError(f"Shelfmark did not answer ({type(e).__name__})") from e
@@ -157,4 +157,60 @@ def decide(request_id, approve, note=""):
         except ValueError:
             err = None
         raise ShelfmarkError(err or f"Shelfmark answered HTTP {r.status_code}")
+    return r.json()
+
+
+# ---- comics: search and download THROUGH Shelfmark, as the reader (docs/COMICS.md) ------------------
+# Shelfmark does the download exactly as for a book: the seedbox's client with its ebook category,
+# the .torrent through the seedbox login, the torrent kept seeding, the file brought home by the
+# path mappings and delivered into the READER's dropbox (on_behalf_of_user_id). The portal only
+# chooses the release.
+SEARCH_TIMEOUT = (5, 150)
+
+
+def user_id(username):
+    """The reader's Shelfmark account id (Shelfmark creates it from Calibre-Web at their first
+    sign-in, or with 'sync-cwa'). None when it does not exist yet."""
+    r = _call("GET", "/api/admin/users")
+    if r.status_code != 200:
+        raise ShelfmarkError(f"Shelfmark answered HTTP {r.status_code} for its user list")
+    for u in r.json() or []:
+        if isinstance(u, dict) and (u.get("username") or "").lower() == (username or "").lower():
+            return u.get("id")
+    r = _call("POST", "/api/admin/users/sync-cwa")          # a reader who never opened Shelfmark
+    if r.status_code == 200:
+        for u in (_call("GET", "/api/admin/users").json() or []):
+            if isinstance(u, dict) and (u.get("username") or "").lower() == (username or "").lower():
+                return u.get("id")
+    return None
+
+
+def search_releases(query, content_type="ebook"):
+    """[release] Shelfmark's Prowlarr search finds for free text (category Books 7000, which
+    includes Comics 7030). Each release is the dict Shelfmark itself sends back to queue it."""
+    if not configured():
+        raise ShelfmarkError("the portal has no Shelfmark login")
+    params = {"provider": "manual", "book_id": "comic", "manual_query": query, "title": query,
+              "source": "prowlarr", "content_type": content_type}
+    try:
+        r = _call("GET", "/api/releases", params=params, timeout=SEARCH_TIMEOUT)
+    except ShelfmarkError:
+        raise
+    if r.status_code == 503:
+        raise ShelfmarkError(((r.json() or {}).get("error") if r.content else None) or "Prowlarr did not answer")
+    if r.status_code != 200:
+        raise ShelfmarkError(f"Shelfmark answered HTTP {r.status_code} to a release search")
+    return [x for x in ((r.json() or {}).get("releases") or []) if isinstance(x, dict)]
+
+
+def queue_release(release, for_user_id, content_type="ebook"):
+    """Hand one release to Shelfmark's download queue under the reader's account."""
+    body = dict(release, content_type=content_type, on_behalf_of_user_id=int(for_user_id))
+    r = _call("POST", "/api/releases/download", json=body)
+    if r.status_code != 200:
+        try:
+            err = (r.json() or {}).get("error")
+        except ValueError:
+            err = None
+        raise ShelfmarkError(err or f"Shelfmark answered HTTP {r.status_code} when queueing")
     return r.json()

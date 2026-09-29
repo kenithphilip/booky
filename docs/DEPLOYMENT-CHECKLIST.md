@@ -200,6 +200,31 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.7 (comics and manga, audiobook downloads)
+- Unit 612 passed, installer 790 passed, end-to-end 287 checks / 0 failed. KCC made the 12-page
+  colour test volume's Kobo copy in 14 s on the Mac (a 200-page volume on the VPS: see below).
+- End-to-end on the real containers: a manga volume dropped in alice's dropbox is matched to her
+  request, arrives in Calibre as series "E2E Manga" #3 tagged Manga + owner:alice (the series read
+  from the ComicBookInfo the portal wrote), KCC v12.0.0 adds a colour fixed-layout KEPUB to the
+  same book, and Calibre-Web's real Kobo sync offers it to alice as EPUB3FL while bob's Kobo is
+  not offered it. A Kindle copy (Colorsoft, KCC's Send-to-Kindle EPUB) is made under the mail
+  limit. A broken CBR fails with its reason on the Status page.
+- Measured: bsdtar cannot open solid RAR 3/4 archives ("RAR solid archive support unavailable"),
+  unar can (rarfile's own RAR 3 and RAR 5 test archives, tests/fixtures/rar). unar costs ~205 MB in
+  the portal image (GNUstep + ICU runtime), once.
+- Read from source: Calibre-Web v4.0.7's Kobo sync prefers a stored KEPUB and sends pre-paginated
+  books as EPUB3FL; its cover/metadata enforcer only rewrites .epub/.azw3 (so the .kepub is safe);
+  Shelfmark v1.4.0 queues a release for another user with on_behalf_of_user_id (admin only) and
+  searches Prowlarr category 7000, which includes Comics 7030.
+- On the VPS after Deploy (things only the real box and devices can show):
+  - Library -> Comics, then in Shelfmark: Settings -> Formats: tick CBR.
+  - Request one manga volume (~200 pages) for a reader with a colour Kobo: watch
+    `journalctl -t bookstack-comics` for the conversion time, and `docker stats` for KCC's peak
+    memory against KCC_MEMORY (1536m). An out-of-memory conversion says so in the Kobo copy's
+    failure note.
+  - Sync the Kobo: the volume shows as a series book, in colour, pages turning right to left.
+  - Send one to the Colorsoft: colour, and whether panel view works (Aa menu).
+
 ## Verified locally in v5.6.1 (self-test false alarms seen on the live server)
 - Live 2026-09-28: "Tailscale IP not on any interface" while `ip -o addr show tailscale0` showed
   it: `ip -o addr | grep -q` under pipefail (SIGPIPE). Every long-output `| grep -q` in the

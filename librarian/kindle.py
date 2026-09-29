@@ -89,7 +89,7 @@ class MailNotConfigured(Exception):
 def configured():
     return bool(config.SMTP_HOST and config.SMTP_FROM)
 
-def send(to_addr, path, title=None, filename=None, author=None, book_title=None):
+def send(to_addr, path, title=None, filename=None, author=None, book_title=None, fix=True):
     """`title` is the MAIL SUBJECT. `book_title`/`author` are what the LIBRARY says the book is,
     and only they rewrite the Kindle copy's metadata. Kept apart on purpose: the auto-Kindle path
     passes a subject that can be a bare filename before import, and stamping that into the book's
@@ -113,7 +113,8 @@ def send(to_addr, path, title=None, filename=None, author=None, book_title=None)
     msg["To"] = to_addr
     msg["Subject"] = title or filename
     msg.set_content("Sent from your library.")
-    send_path, note = kindle_ready(path, title=book_title, author=author)
+    # fix=False: a comic KCC made for Amazon's converter goes as it is (its fixed layout is the point)
+    send_path, note = kindle_ready(path, title=book_title, author=author) if fix else (path, "")
     try:
         with open(send_path, "rb") as f:
             msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=filename)

@@ -59,7 +59,7 @@ MAX_PDF_MB    = int(os.environ.get("MAX_PDF_MB", "250"))
 # unseen, so it came back every 60 s). Keep this well under MAX_UPLOAD_MB.
 MAX_MAIL_MB   = int(os.environ.get("MAX_MAIL_MB", "40"))
 GUTENBERG_MIRROR = os.environ.get("GUTENBERG_MIRROR", "")     # e.g. a local/rsynced Gutenberg mirror base URL
-EBOOK_EXTS = ("epub", "mobi", "azw3", "pdf", "cbz", "cbr", "txt", "fb2")
+EBOOK_EXTS = ("epub", "mobi", "azw3", "pdf", "cbz", "cbr", "cb7", "txt", "fb2")
 AUDIO_EXTS = ("mp3", "m4b", "m4a", "flac", "ogg", "opus", "aac", "wav", "zip")
 
 # --- Email-to-library (optional IMAP intake) ---
@@ -250,3 +250,24 @@ KINDLE_DEFAULT_LANG = os.environ.get("KINDLE_DEFAULT_LANG", "en")   # dc:languag
 # 20 is far above a reader's real use (a family of four sends a handful a week). 0 = unlimited.
 KINDLE_MAX_PER_DAY = int(os.environ.get("KINDLE_MAX_PER_DAY", "20"))
 KINDLE_TEST_COOLDOWN = 300   # seconds between "send a test to my Kindle" clicks, per user
+
+# --- Comics and manga (docs/COMICS.md) -------------------------------------------------
+# The Comics page, searched through Shelfmark and delivered to the readers' devices. Western
+# comics are described by Metron (free account) with ComicVine as a fallback (free key), manga /
+# manhwa / manhua by MangaUpdates (no key). A comic arrives as a CBZ in the reader's dropbox,
+# like any Shelfmark download; the host job scripts/comic-convert.sh adds the Kobo copy (KCC).
+COMICS_ENABLED = _bool("COMICS_ENABLED", False)
+METRON_USER = os.environ.get("METRON_USER", "")
+METRON_PASS = os.environ.get("METRON_PASS", "")
+COMICVINE_API_KEY = os.environ.get("COMICVINE_API_KEY", "")
+COMIC_EXTS = ("cbz", "cbr", "cb7")
+# A comic request nothing matched is searched again after 1 h, 6 h, then daily, for this long.
+COMIC_SEARCH_DAYS = int(os.environ.get("COMIC_SEARCH_DAYS", "30") or 30)
+COMIC_MAX_OPEN_PER_USER = int(os.environ.get("COMIC_MAX_OPEN_PER_USER", "50") or 50)
+# A download Shelfmark accepted but whose file never arrived: searched again (another release)
+COMIC_ARRIVAL_HOURS = int(os.environ.get("COMIC_ARRIVAL_HOURS", "24") or 24)
+# CBR/CB7 are repacked as CBZ with The Unarchiver's unar (every RAR version, solid ones included,
+# and 7z); libarchive's bsdtar is the fallback (it cannot open solid RAR 3/4 archives)
+UNAR = os.environ.get("UNAR", "unar")
+LSAR = os.environ.get("LSAR", "lsar")
+BSDTAR = os.environ.get("BSDTAR", "bsdtar")

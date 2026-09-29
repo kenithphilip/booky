@@ -15,7 +15,7 @@ BOOKSTACK_VERSION=5.6
 IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.7 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
 IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.4.0 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
 IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2
-IMG_SYNCTHING=syncthing/syncthing:2.1.5"
+IMG_SYNCTHING=syncthing/syncthing:2.1.5 IMG_KCC=ghcr.io/ciromattia/kcc:v12.0.0"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
 
 # A terminal this server has no description for (Ghostty's xterm-ghostty, kitty, WezTerm...)
@@ -1026,6 +1026,14 @@ install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 9
   install_cert_watch
   install_update_check
   install_disk_report
+  install_comic_convert
+}
+comics_on(){ [ "$(envget COMICS_ENABLED)" = true ]; }
+# KCC is not a compose service (the host job runs it in a throwaway container): pulled here, never fatal
+pull_kcc(){ comics_on || return 0; docker pull -q "$(img IMG_KCC)" >/dev/null 2>&1 || echo "(could not pull $(img IMG_KCC); comic device copies wait for it)"; return 0; }
+install_comic_convert() { # comics: KCC device copies, one at a time (scripts/comic-convert.sh); off = no cron
+  if ! comics_on; then rm -f "$ETC/cron.d/bookstack-comics"; return 0; fi
+  write_cron bookstack-comics "*/3 * * * *" "flock -n /run/lock/bookstack-comics.lock env STACK_DIR=$STACK_DIR $STACK_DIR/scripts/comic-convert.sh 2>&1 | logger -t bookstack-comics"
 }
 disk_report_hour(){ local h; h=$(adv_value DISK_REPORT_HOUR 9); case "$h" in ''|*[!0-9]*) h=9;; esac; [ "$h" -le 23 ] || h=9; printf '%s' "$((10#$h))"; }
 install_disk_report() { # daily disk summary for the admin (scripts/disk-report.sh); DISK_REPORT=false removes it
@@ -1096,6 +1104,7 @@ step_deploy() {
   # reports it on /healthz and Self-test compares it with $STACK_DIR/.version (J03).
   BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap || { msg "Image build failed (caddy/librarian/kuma-bootstrap). See the output above; nothing was started."; return 1; }
   compose pull --ignore-buildable || { msg "Image pull failed. Check the network / registry and run Deploy again."; return 1; }
+  pull_kcc
   # Caddy (the only thing that listens publicly) starts LAST: after the admin password is
   # set and Audiobookshelf has its root user, never before.
   local early="calibre-web audiobookshelf uptime-kuma"; torrents_on && early="$early qbittorrent"
@@ -3381,7 +3390,7 @@ step_logs()   {
   docker logs --tail 200 -f "$s" || true
   trap - INT
 }
-IMG_KEYS="IMG_CWA IMG_ABS IMG_SHELFMARK IMG_QBIT IMG_KUMA IMG_AUTHELIA IMG_FLARESOLVERR IMG_SYNCTHING"
+IMG_KEYS="IMG_CWA IMG_ABS IMG_SHELFMARK IMG_QBIT IMG_KUMA IMG_AUTHELIA IMG_FLARESOLVERR IMG_SYNCTHING IMG_KCC"
 BUILT_IMAGES="bookstack/caddy bookstack/librarian"   # built locally: kept as :prev across an update
 stack_up_all() { # (re)start every enabled service with the tags in .env
   compose up -d || return 1
@@ -3492,6 +3501,7 @@ step_update() {
   install_postboot_unit
   render_caddy_all || { update_failed "the new Caddyfile could not be rendered"; return 1; }
   # the rebuilt images carry this checkout's version (J03); Self-test compares it with .version
+  pull_kcc
   if ! { compose pull --ignore-buildable && BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap && stack_up_all; }; then
     update_failed "pull/build/start failed"; return 1
   fi
@@ -3777,6 +3787,40 @@ step_metadata_sources() {
   msg "Metadata sources$note\n\nAlways on: Open Library (book search, author pages, links to free copies) and the bookinfo/Hardcover mirrors for library enrichment.\nOptional now: Hardcover $([ -n "$(envget HARDCOVER_API_KEY)" ] && echo ON || echo off), Google Books $([ -n "$(envget GOOGLE_BOOKS_API_KEY)" ] && echo ON || echo off) — in the portal's enrichment AND in Shelfmark's own metadata search.$([ $rc != 0 ] && printf '\n\nWARNING: the portal or Shelfmark could not be recreated, so the change is not live yet (Operations -> Logs).')"
   return $rc
 }
+# ---------- Library -> Comics (docs/COMICS.md) ----------
+# The portal's Comics page: readers pick issues or volumes; the portal finds the release through
+# Shelfmark's own search and queues it IN SHELFMARK under the reader's account, so the seedbox,
+# the seeding and the delivery are exactly those of a Shelfmark book. KCC (a throwaway container
+# run by scripts/comic-convert.sh) makes the Kobo copy for readers whose Kobo syncs, and the
+# Kindle copy when one is sent.
+comics_check(){ docker exec -i librarian python -m comicmeta check 2>/dev/null | tail -1; }
+step_comics() {
+  local on u p cv cur out note="" rc=0
+  if comics_on; then
+    yesno "Comics & manga are ON.\n\nKeep them on? (No switches the Comics page off; nothing already in the library changes.)" \
+      || { envset COMICS_ENABLED false; install_comic_convert; restart_portal_ok || rc=1
+           msg "Comics & manga are OFF. The Comics page is gone; comics already in the library stay in everyone's library."; return $rc; }
+  else
+    yesno "Turn on Comics & manga?\n\nReaders get a Comics page: they pick issues or volumes, and each one arrives like a book: on their Kobo (its existing link), their Kindle (Send to Kindle) and as a CBZ download for phones and tablets.\n\nDownloads go through Shelfmark (the seedbox, its ebook category, torrents kept seeding) — nothing new on the seedbox." || return 0
+  fi
+  cur=$(envget METRON_USER)
+  u=$(ask "Metron user name (free account at metron.cloud: Western comics metadata). Manga needs no account.\n\nBlank = keep '${cur:-none}'. Type - to remove." "") || u=""
+  case "$u" in -) envset METRON_USER ""; envset METRON_PASS ""; note="$note\nMetron: removed.";; "") ;;
+    *) p=$(askpw "Metron password for $u") || p=""
+       if [ -n "$p" ]; then envset METRON_USER "$u"; envset METRON_PASS "$p"; note="$note\nMetron: saved for $u."; fi;; esac
+  cur=$(envget COMICVINE_API_KEY)
+  cv=$(askpw "ComicVine API key (optional fallback for Western comics; comicvine.gamespot.com/api, free).\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || cv=""
+  case "$cv" in -) envset COMICVINE_API_KEY ""; note="$note\nComicVine: removed.";; "") ;; *) envset COMICVINE_API_KEY "$cv"; note="$note\nComicVine: saved.";; esac
+  envset COMICS_ENABLED true
+  restart_portal_ok || rc=1
+  install_comic_convert
+  clear; echo "Fetching KCC (Kindle Comic Converter) for the device copies..."
+  docker pull -q "$(img IMG_KCC)" >/dev/null 2>&1 || note="$note\nWARNING: could not pull $(img IMG_KCC); Kobo/Kindle copies wait until it can be pulled (Operations -> Update retries)."
+  wait_for http://127.0.0.1:8090/healthz 30 || true
+  out=$(comics_check)
+  msg "Comics & manga are ON.$note\n\nMetadata check: ${out:-the portal did not answer}\n\nOne thing to do in Shelfmark: Settings -> Formats: tick CBR (EPUB, PDF and CBZ are already allowed). Many comics come as CBR; the portal repacks them as CBZ.\n\nDevice copies: a colour, fixed-layout Kobo copy is made for readers whose Kobo syncs (or with 'Make Kobo copy' on the comic's page); Kindle copies are made when a comic is sent. KCC runs one conversion at a time, with at most $(adv_value KCC_MEMORY 1536m) of memory."
+  return $rc
+}
 # ---------- Library -> Seedbox ----------
 # Shelfmark sends a reader's pick to the seedbox's SABnzbd / rTorrent; they download on the
 # SEEDBOX's disk. The seedbox's own Syncthing (SEND ONLY) sends the bookstack folders to this
@@ -3984,6 +4028,7 @@ menu_library() {
       K "Metadata sources: Open Library (always on) + optional Hardcover / Google Books keys" \
       C "Your catalogs: add / test / remove your own OPDS feeds" \
       W "Keep looking: every reader's waiting list, cancel entries" \
+      X "Comics & manga: the Comics page, metadata accounts, Kobo/Kindle copies ($(comics_on && echo on || echo off))" \
       I "Intake & dropboxes: webhook, Gutenberg mirror, email-to-library" \
       T "Torrents (qBittorrent): enable/disable ($(torrents_on && echo on || echo off))" \
       B "Seedbox: Shelfmark's seedbox downloads, through Syncthing ($([ -f "$ETC/systemd/system/bookstack-seedbox.timer" ] && echo on || echo off))" \
@@ -3993,7 +4038,7 @@ menu_library() {
       G "How per-user isolation works (guide)" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in F) step_formats || true;; A) step_abs_setup || true;; M) step_mail || true;; S) step_sources || true;; H) step_shelfmark || true;;
-      K) step_metadata_sources || true;; C) step_catalogs || true;; W) step_wanted || true;;
+      K) step_metadata_sources || true;; C) step_catalogs || true;; W) step_wanted || true;; X) step_comics || true;;
       I) step_intake || true;; T) step_torrents || true;; B) step_seedbox || true;; Q) step_requests || true;; P) step_parked || true;; R) step_abs_scan || true;;
       G) step_isolation || true;; 0) return 0;; esac
   done

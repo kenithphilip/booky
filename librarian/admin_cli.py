@@ -213,6 +213,21 @@ def _converts(args):
     db.audit("convert_result", None, "host", f"#{args.job_id} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 
+def _comics(args):
+    """The host job scripts/comic-convert.sh: which comics need a Kobo copy, which Kindle sends
+    need a Kindle copy, and what came of it. Everything it may touch comes from here."""
+    import comics
+    if args.what == "kobo-due":
+        return {"ok": True, "rows": comics.kobo_due(limit=args.limit)}
+    if args.what == "kobo-result":
+        st = db.comic_convert_result(args.calibre_id, args.outcome == "ok", args.reason)
+        db.audit("comic_kobo", None, "host", f"book {args.calibre_id} {args.outcome} {args.reason[:120]}")
+        return {"ok": True, "status": st}
+    if args.what == "kindle-due":
+        return {"ok": True, "rows": comics.kindle_due(limit=args.limit)}
+    comics.kindle_result(args.job, args.outcome == "ok", args.files, args.reason)
+    return {"ok": True}
+
 def _replaces(args):
     """'Find a better copy': the host job swaps a staged EPUB into the same Calibre book."""
     if args.what == "pending":
@@ -382,6 +397,19 @@ def _parser():
     rlr.add_argument("outcome", choices=("ok", "fail"))
     rlr.add_argument("--reason", default="")
 
+    cm = sp.add_parser("comics").add_subparsers(dest="what", required=True)
+    cm.add_parser("kobo-due").add_argument("--limit", type=int, default=1)
+    kr = cm.add_parser("kobo-result")
+    kr.add_argument("calibre_id", type=int)
+    kr.add_argument("outcome", choices=("ok", "fail"))
+    kr.add_argument("--reason", default="")
+    cm.add_parser("kindle-due").add_argument("--limit", type=int, default=1)
+    kk = cm.add_parser("kindle-result")
+    kk.add_argument("job", type=int)
+    kk.add_argument("outcome", choices=("ok", "fail"))
+    kk.add_argument("--files", nargs="*", default=[])
+    kk.add_argument("--reason", default="")
+
     rp = sp.add_parser("replaces").add_subparsers(dest="what", required=True)
     rp.add_parser("pending").add_argument("--limit", type=int, default=5)
     rr = rp.add_parser("result")
@@ -419,7 +447,7 @@ def _parser():
     return p
 
 ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
-        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "releases": _releases, "busy": _busy,
+        "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "comics": _comics, "releases": _releases, "busy": _busy,
         "canary": _canary, "gate": _gate}
 
 def main(argv=None):

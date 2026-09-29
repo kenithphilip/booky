@@ -43,6 +43,19 @@ waiting=$(bytes library/ingest library/staging library/dropbox downloads)
 appdata=$(bytes cwa abs librarian/state shelfmark caddy/data uptime-kuma syncthing authelia)
 docker_imgs=$(docker system df --format '{{.Type}}={{.Size}}' 2>/dev/null | sed -n 's/^Images=//p' | head -1)
 docker_cache=$(docker system df --format '{{.Type}}={{.Size}}' 2>/dev/null | sed -n 's/^Build Cache=//p' | head -1)
+# comics live in the same Calibre library: their share of it, from Calibre's own sizes
+comics=$(python3 - "$STACK_DIR/library/books/metadata.db" 2>/dev/null <<'PY'
+import sqlite3, sys
+try:
+    c = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    print(c.execute("""SELECT COALESCE(SUM(d.uncompressed_size), 0) FROM data d WHERE EXISTS (
+        SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=d.book
+        AND t.name IN ('Comics','Manga','Manhwa','Manhua'))""").fetchone()[0])
+except Exception:
+    print(0)
+PY
+)
+comics=${comics:-0}; case "$comics" in ''|*[!0-9]*) comics=0;; esac
 known=$(( ebooks + audio + seed + waiting + appdata ))
 other=$(( used - known )); [ "$other" -lt 0 ] && other=0
 
@@ -76,7 +89,7 @@ mem=$(free -b 2>/dev/null | awk '/^Mem:/{t=$2; u=$3} /^Swap:/{s=$3} END{ if (t) 
 text="Used $(gb "$used") of $(gb "$size") (${pct}%), $(gb "$avail") free${ipct:+ · inodes ${ipct}%}
 $trend
 
-Ebooks $(gb "$ebooks") · Audiobooks $(gb "$audio") · Seedbox copies $(gb "$seed")
+Ebooks $(gb "$ebooks")$([ "$comics" -gt 0 ] && printf ' (comics %s of it)' "$(gb "$comics")") · Audiobooks $(gb "$audio") · Seedbox copies $(gb "$seed")
 Imports waiting $(gb "$waiting") · App data $(gb "$appdata")
 System, Docker and the rest $(gb "$other")${docker_imgs:+ (Docker images $docker_imgs${docker_cache:+, build cache $docker_cache})}
 ${mem}"

@@ -11,7 +11,7 @@ import os, time, threading, shutil, tempfile, glob, zipfile, re, socket, ipaddre
 from uuid import uuid4
 from urllib.parse import urlsplit, urljoin
 import requests
-import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe, wanted, filemeta, share
+import config, db, notify, abs as absapi, kindle, cwa, library, metadata, dedupe, wanted, filemeta, share, comics
 from tagger import (add_owner_tag, add_owner_tag_pdf, add_owner_tag_cbz, precheck_zip, TagError,
                     MAX_ZIP_MEMBERS as TAG_MAX_ZIP_MEMBERS)
 
@@ -642,6 +642,8 @@ def reconcile_releases(now=None):
 def _status_for(note):
     if note.startswith(NEEDS_TAG):
         return NEEDS_TAG
+    if note.startswith("skipped:"):
+        return "skipped"
     return TAGGING if TAG_WAIT_NOTE in note else "done"
 
 def _auto_kindle(owner, path, filename, title=None):
@@ -964,14 +966,18 @@ def _place_audio_dir(src_dir, owner, base, rid=None):
 
 def ingest_local_file(path, owner, rid=None):
     """Ingest one file a user legally owns, mapping it to that user. EPUB, PDF and CBZ are
-    owner-tagged before import; mobi/azw3/fb2/txt import untagged ('needs-tag'); CBR is
-    refused (RAR cannot be tagged and CWA converts it badly): convert to CBZ."""
+    owner-tagged before import; mobi/azw3/fb2/txt import untagged ('needs-tag'); a comic (CBZ,
+    CBR, CB7) goes through comics.py first: repacked as CBZ, matched to the reader's request,
+    its series and number written into it (docs/COMICS.md)."""
     name = os.path.basename(path)
     stem, _, ext = name.rpartition(".") if "." in name else (name, "", "")
     ext, base = ext.lower(), _safe(stem)
-    if ext == "cbr":
-        raise ValueError("CBR (RAR) comics are not supported: convert to CBZ and upload again")
     sniffed = _sniff_ext(path)
+    if ext in config.COMIC_EXTS or (not ext and sniffed == "cbr"):
+        if os.path.getsize(path) > _limit_for("ebook"):
+            raise ValueError(f"file is {os.path.getsize(path) >> 20} MB; the limit for this kind is "
+                             f"{_limit_for('ebook') >> 20} MB (MAX_EBOOK_MB)")
+        return _ingest_comic(path, owner, rid)
     if ext in config.EBOOK_EXTS and sniffed in AUDIO_SNIFFED:
         ext = sniffed          # an .m4b renamed .epub (or mailed as one) is still an audiobook
     elif ext not in config.AUDIO_EXTS and ext not in config.EBOOK_EXTS and sniffed:
@@ -986,6 +992,21 @@ def ingest_local_file(path, owner, rid=None):
     if ext in config.EBOOK_EXTS:
         return _atomic_ingest(path, owner, base, ext, rid)
     raise ValueError(f"unsupported file type '.{ext}' (kept in .failed/, not deleted)")
+
+def _ingest_comic(path, owner, rid):
+    work = tempfile.mkdtemp(dir=os.path.dirname(_tmpdir()))
+    try:
+        got = comics.prepare_arrival(path, owner, work)
+        if got[0] == "skip":
+            return got[1]
+        cbz, base, req = got
+        note = _atomic_ingest(cbz, owner, _safe(base), "cbz", rid, title=base)
+        comics.arrived(req, note)
+        return note
+    except comics.ComicError as e:
+        raise ValueError(str(e))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 # ---- dropbox watcher ------------------------------------------------------------------------
 SETTLE_SECONDS = 12   # a file must be untouched this long before it is picked up
@@ -1975,6 +1996,9 @@ def kindle_once(now=None):
     now = now or time.time()
     n = 0
     for j in db.kindle_due(now):
+        if j.get("kind") == "comic":
+            n += _kindle_comic(j, now)
+            continue
         f = next((x for x in (library.file_for(j["owner"], j["book_id"], fmt, bool(j["is_admin"]))
                               for fmt in config.KINDLE_FORMATS) if x), None)
         addr = (cwa.get_user(j["owner"]) or {}).get("kindle_mail") or ""
@@ -1996,6 +2020,76 @@ def kindle_once(now=None):
                                  detail=f"retrying: {str(e)[:150]}")
         n += 1
     return n
+
+def _kindle_comic(j, now):
+    """A comic's Kindle copy, made by the host job (KCC) in staging/kindle-comics/<job>/: one or
+    more parts under the Send-to-Kindle mail limit, each mailed as it is (no EPUB fixes: KCC
+    wrote them for Amazon's converter). The files are removed once sent or given up."""
+    d = os.path.join(config.STAGING_DIR, comics.KINDLE_STAGE, str(j["id"]))
+    addr = (cwa.get_user(j["owner"]) or {}).get("kindle_mail") or ""
+    names = json.loads(j.get("files") or "[]")
+    if not addr or not names:
+        db.kindle_update(j["id"], status="failed", detail="your Kindle address or the Kindle copy is gone")
+        shutil.rmtree(d, ignore_errors=True)
+        return 1
+    try:
+        for i, name in enumerate(names, 1):
+            part = f" (part {i} of {len(names)})" if len(names) > 1 else ""
+            kindle.send(addr, os.path.join(d, name), f"{j['title']}{part}", name, book_title=f"{j['title']}{part}",
+                        fix=False)
+        db.kindle_update(j["id"], status="sent", attempts=j["attempts"] + 1,
+                         detail=f"sent in {len(names)} parts" if len(names) > 1 else "sent")
+        shutil.rmtree(d, ignore_errors=True)
+    except Exception as e:
+        tries = j["attempts"] + 1
+        if tries > len(KINDLE_RETRY):
+            db.kindle_update(j["id"], status="failed", attempts=tries, detail=f"could not send: {str(e)[:200]}")
+            shutil.rmtree(d, ignore_errors=True)
+        else:
+            db.kindle_update(j["id"], attempts=tries, next_try=now + KINDLE_RETRY[tries - 1], detail=f"retrying: {str(e)[:150]}")
+    return 1
+
+# ---- comics (docs/COMICS.md): search through Shelfmark, notice what never arrived ------------------
+COMICS_EVERY = 60
+_COMIC_LINKED = set()
+
+def comics_once(now=None):
+    if not config.COMICS_ENABLED:
+        return 0
+    import shelfmark_api
+    now = now or time.time()
+    if not shelfmark_api.configured():
+        return 0
+    try:
+        queue = shelfmark_api.queue_status()
+    except Exception as e:
+        log.debug("comics: could not read Shelfmark's queue: %s", e)
+        queue = None
+    comics.watch_downloads(shelfmark_api, queue, now)
+    n = 0
+    for req in db.comic_due(now, limit=2):
+        try:
+            comics.search_once(req, shelfmark_api, now)
+        except Exception as e:                   # one bad request never blocks the others
+            log.warning("comics: request %s: %s", req["id"], e)
+            db.comic_update(req["id"], next_try=now + 3600, detail=f"error: {str(e)[:200]}; trying again in an hour")
+        n += 1
+    _link_arrived_comics(now)
+    return n
+
+def _link_arrived_comics(now):
+    """A delivered comic's Calibre id (for its page and for auto-send to Kindle)."""
+    for req in db.comic_open(statuses=("done",)):
+        if req.get("calibre_id") or req["id"] in _COMIC_LINKED or now - (req.get("updated") or now) > 86400:
+            continue
+        m = comics.find_in_library(req["series_name"], req["number"], req["kind"])
+        if not m or req["owner"] not in m["owners"]:
+            continue
+        _COMIC_LINKED.add(req["id"])
+        db.comic_update(req["id"], calibre_id=m["book_id"])
+        prefs = db.get_prefs(req["owner"])
+        if prefs.get("auto_kindle") and (cwa.get_user(req["owner"]) or {}).get("kindle_mail"):
+            comics.kindle_request(req["owner"], _is_admin(req["owner"]), m["book_id"], comics._title(req))
 
 # ---- L10: owner tags for books whose file could not carry one ----------------------------------
 UNTAGGED_WINDOW = 7 * 86400          # needs-tag rows younger than this are still reconciled
@@ -2308,6 +2402,7 @@ def run_forever():
     # its own thread: a keep-looking pass is catalog searches (up to ~12 s each) and, once per
     # entry, the metadata chain — never allowed to hold up tag jobs or import reconciliation
     threading.Thread(target=_loop, args=("wanted", wanted_once, WANTED_EVERY), daemon=True).start()
+    threading.Thread(target=_loop, args=("comics", comics_once, COMICS_EVERY), daemon=True).start()
     if config.IMAP_HOST:
         import imap
         threading.Thread(target=imap.poll_forever, daemon=True).start()

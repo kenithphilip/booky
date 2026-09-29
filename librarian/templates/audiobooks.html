@@ -1,0 +1,15 @@
+{% extends "base.html" %}{% block body %}
+<h2>My audiobooks</h2>
+<p class="mut">Listen in {% if cfg.AUDIO_URL %}<a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a>{% else %}Audiobookshelf{% endif %}
+or its app (it keeps your place, and can keep books on the phone for offline listening). Or download one here for any other player:
+a single file as it is, a folder of files as one ZIP.</p>
+{% if error %}<div class="flash">{{ error }}</div>{% endif %}
+{% if not items and not error %}<p class="mut">No audiobooks yet.</p>{% endif %}
+<table>
+{% for it in items %}
+<tr><td><strong>{{ it.title }}</strong>{% if it.author %} <span class="mut">· {{ it.author }}</span>{% endif %}</td>
+<td class="mut" style="white-space:nowrap">{% if it.size %}{{ '%.0f' % (it.size / 1048576) }} MB{% endif %}</td>
+<td><a class="btn sec" href="{{ url_for('audiobook_download', item_id=it.id) }}">Download</a></td></tr>
+{% endfor %}
+</table>
+{% endblock %}

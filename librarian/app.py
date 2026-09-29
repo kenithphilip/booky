@@ -1,13 +1,14 @@
 import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress
 from functools import wraps
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, quote
 from uuid import uuid4
 from flask import (Flask, request, session, redirect, url_for, render_template, flash,
-                   Response, jsonify, send_file, abort)
+                   Response, jsonify, send_file, abort, stream_with_context)
 from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
+import comics, comicmeta
 import abs as absapi
 
 app = Flask(__name__)
@@ -555,7 +556,11 @@ def _cover_host_ok(url):
     p = urlsplit(url)
     h = (p.hostname or "").lower()
     return p.scheme == "https" and p.username is None and (
-        h == "covers.openlibrary.org" or h == "archive.org" or h.endswith(".archive.org"))
+        h == "covers.openlibrary.org" or h == "archive.org" or h.endswith(".archive.org")
+        or h in COMIC_COVER_HOSTS)
+
+# the comic providers' own image hosts (comicmeta.py), for the Comics pages
+COMIC_COVER_HOSTS = ("cdn.mangaupdates.com", "static.metron.cloud", "comicvine.gamespot.com")
 
 def _cover_key(url):
     """The Open Library cover id + size, or None for a URL we will not put on disk. Only the
@@ -629,7 +634,8 @@ def _cover_prune():
 @login_required
 def cover():
     u = request.args.get("u", "")
-    if not u.startswith("https://covers.openlibrary.org/"):
+    if not (u.startswith("https://covers.openlibrary.org/") or
+            (_cover_host_ok(u) and (urlsplit(u).hostname or "").lower() in COMIC_COVER_HOSTS)):
         return "", 404
     key = _cover_key(u)
     if key:
@@ -870,9 +876,6 @@ def upload():
         if ext not in config.EBOOK_EXTS + config.AUDIO_EXTS:
             flash("That file type is not supported.")
             return redirect(url_for("upload"))
-        if ext == "cbr":
-            flash("CBR (RAR) comics cannot be tagged to you: convert it to CBZ and upload again.")
-            return redirect(url_for("upload"))
         # keep the real (Unicode) name; only path separators / control characters go
         owner = session["user"]
         if not cwa._valid_name(owner):
@@ -962,9 +965,11 @@ def book_page(book_id):
     work = meta.get("work") or {}
     prefs = db.get_prefs(user)
     b["best"] = library.best_format(b, prefs["preferred_format"])
-    b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
+    b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"]) or "cbz" in b["formats"]
+    is_comic = "cbz" in b["formats"]
     return render_template(
-        "book.html", b=b, admin=is_admin,
+        "book.html", b=b, admin=is_admin, is_comic=is_comic,
+        kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
         # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
         description=b["description"] or work.get("description") or "",
         first_year=work.get("first_publish_year"),
@@ -1130,6 +1135,9 @@ def send_kindle(book_id):
     if not library.visible(user, book_id, is_admin):
         abort(404)                          # not this user's book (or no such book)
     f = next((x for x in (library.file_for(user, book_id, fmt, is_admin) for fmt in config.KINDLE_FORMATS) if x), None)
+    comic = None if f else library.file_for(user, book_id, "cbz", is_admin)
+    if comic:
+        f = comic
     if not f:
         flash("No Kindle-compatible format yet (Amazon takes EPUB or PDF by mail); "
               "the library converts new books to EPUB on import when conversion is on.")
@@ -1150,10 +1158,208 @@ def send_kindle(book_id):
     # queued, not sent here: the worker mails it (worker.kindle_once), so a slow mail relay can
     # never outlast Cloudflare's 100 s and show a 524 for a mail that did go out. Counted now,
     # at the click, so the daily limit means what it says.
+    if comic:
+        jid = comics.kindle_request(user, is_admin, book_id, f["title"])
+        _audit("kindle_send", f"{f['filename']} (comic job {jid})")
+        flash(f"Making a Kindle copy of \"{f['title']}\" and sending it — a few minutes; the result shows on "
+              f"your Status page. A big volume arrives in parts.")
+        return redirect(url_for("book_page", book_id=book_id))
     jid = db.kindle_enqueue(user, is_admin, book_id, f["title"])
     _audit("kindle_send", f"{f['filename']} (job {jid})")
     flash(f"Sending \"{f['title']}\" to your Kindle — it is on its way; the result shows on your Status page.")
     return redirect(url_for("my_library"))
+
+# ---- comics and manga (docs/COMICS.md) --------------------------------------------------------
+def _comics_on():
+    if not config.COMICS_ENABLED:
+        abort(404)
+
+@app.route("/comics")
+@login_required
+def comics_page():
+    _comics_on()
+    user = session["user"]
+    q, kind = (request.args.get("q") or "").strip()[:120], request.args.get("kind", "manga")
+    kind = kind if kind in ("comic", "manga") else "manga"
+    results, error = [], None
+    if q:
+        try:
+            results = comicmeta.search(q, kind)
+        except comicmeta.MetaError as e:
+            error = str(e)
+    rows = db.comic_list(None if session.get("admin") and request.args.get("all") else user)
+    return render_template("comics.html", q=q, kind=kind, results=results, error=error, rows=rows,
+                           providers=comicmeta.providers(), labels=comicmeta.KIND_LABEL)
+
+def _series_or_404(provider, sid, language):
+    if provider not in ("metron", "comicvine", "mangaupdates") or not re.fullmatch(r"\d{1,20}", sid or ""):
+        abort(404)
+    try:
+        return comicmeta.series(provider, sid, language)
+    except comicmeta.MetaError as e:
+        flash(f"Could not read this series: {e}")
+        return None, None
+
+@app.route("/comics/series/<provider>/<sid>")
+@login_required
+def comic_series(provider, sid):
+    _comics_on()
+    user = session["user"]
+    language = db.get_prefs(user).get("language") or config.BOOK_LANGUAGE
+    language = request.args.get("lang", language) if request.args.get("lang") in config.LANGUAGES else language
+    info, items = _series_or_404(provider, sid, language)
+    if not info:
+        return redirect(url_for("comics_page"))
+    mine = db.comic_series_status(user, provider, sid)
+    have = {}
+    for it in items:
+        m = comics.find_in_library(info["name"], it["number"], info["kind"])
+        if m:
+            have[it["number"]] = "yours" if user in m["owners"] else "family"
+    return render_template("comic_series.html", s=info, items=items, mine=mine, have=have, language=language,
+                           languages=config.LANGUAGES, labels=comicmeta.KIND_LABEL,
+                           reading=comicmeta.READING.get(info["kind"], "ltr"))
+
+@app.route("/comics/request", methods=["POST"])
+@login_required
+def comic_request():
+    _comics_on()
+    user = session["user"]
+    provider, sid = request.form.get("provider", ""), request.form.get("series_id", "")
+    language = request.form.get("language") if request.form.get("language") in config.LANGUAGES else None
+    reading = request.form.get("reading") if request.form.get("reading") in ("ltr", "rtl") else None
+    info, items = _series_or_404(provider, sid, language or config.BOOK_LANGUAGE)
+    if not info:
+        return redirect(url_for("comics_page"))
+    wanted = set(request.form.getlist("number"))
+    picked = [it for it in items if it["number"] in wanted][:25]
+    if not picked:
+        flash("Choose at least one issue or volume.")
+        return redirect(url_for("comic_series", provider=provider, sid=sid))
+    said = {}
+    for it in picked:
+        try:
+            rid, what = comics.request(user, info, it, language, reading)
+            said[what] = said.get(what, 0) + 1
+            _audit("comic_request", f"{info['name']} {it['label']} ({what}, #{rid})")
+            if what == "queued":
+                notify.admin("requested", {"owner": user, "title": f"{info['name']} {it['label']}",
+                                           "source": "comics", "status": "queued", "seq": notify.seq_id("comic", rid)})
+        except comics.ComicError as e:
+            flash(str(e))
+            break
+    words = {"queued": "requested", "shared": "added from the family library", "owned": "already yours",
+             "exists": "already requested", "pending": "waiting for approval"}
+    if said:
+        flash("; ".join(f"{n} {words[w]}" for w, n in said.items()) + ".")
+    return redirect(url_for("comic_series", provider=provider, sid=sid))
+
+@app.route("/comics/requests/<int:rid>/<action>", methods=["POST"])
+@login_required
+def comic_request_action(rid, action):
+    _comics_on()
+    user, is_admin = session["user"], session.get("admin", False)
+    r = db.comic_get(rid)
+    if not r or (r["owner"] != user and not is_admin):
+        abort(404)
+    if action == "cancel" and r["status"] in ("queued", "pending", "not-found", "failed"):
+        db.comic_update(rid, status="cancelled", detail="cancelled")
+    elif action == "retry" and r["status"] in ("not-found", "failed", "cancelled"):
+        db.comic_update(rid, status="queued", next_try=time.time(), attempts=0, detail="looking again")
+    elif action == "approve" and is_admin and r["status"] == "pending":
+        db.comic_update(rid, status="queued", next_try=time.time(), detail="approved")
+    else:
+        abort(400)
+    _audit(f"comic_{action}", f"#{rid} {r['series_name']} {r.get('label') or r['number']}")
+    return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
+                    else url_for("comics_page"))
+
+@app.route("/book/<int:book_id>/kobo", methods=["POST"])
+@login_required
+def book_kobo_copy(book_id):
+    """'Make Kobo copy' for a comic (made automatically only for readers whose Kobo syncs)."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not library.visible(user, book_id, is_admin) or not library.file_for(user, book_id, "cbz", is_admin):
+        abort(404)
+    db.comic_convert_force(book_id)
+    _audit("comic_kobo_copy", f"book {book_id}")
+    flash("Making the Kobo copy — a few minutes. Then sync your Kobo.")
+    return redirect(url_for("book_page", book_id=book_id))
+
+# ---- audiobooks: a download for phones and tablets (the listening itself is Audiobookshelf's) ----
+@app.route("/audiobooks")
+@login_required
+def my_audiobooks():
+    user, is_admin = session["user"], session.get("admin", False)
+    items, error = [], None
+    if absapi.configured():
+        try:
+            items = absapi.items_for(user, is_admin)
+        except Exception as e:
+            error = f"Audiobookshelf did not answer ({str(e)[:100]})"
+    else:
+        error = "Audiobookshelf is not set up yet"
+    return render_template("audiobooks.html", items=items, error=error)
+
+@app.route("/audiobooks/<item_id>/download")
+@login_required
+def audiobook_download(item_id):
+    """One audiobook as it is on disk: a single file as it is, a folder as one ZIP (stored, not
+    compressed: audio does not compress), streamed. Only a reader who has it (the admin: any)."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item_id or ""):
+        abort(404)
+    try:
+        it = next((x for x in absapi.items_for(user, is_admin) if x["id"] == item_id), None)
+    except Exception:
+        it = None
+    root = os.path.realpath(config.AUDIO_DIR)
+    real = os.path.realpath(it["path"]) if it else ""
+    if not it or not (real == root or real.startswith(root + os.sep)) or not os.path.exists(real):
+        _audit("download_denied", f"audiobook {item_id}")
+        abort(404)
+    name = re.sub(r'[\\/:*?"<>|]+', " ", f"{it['author']} - {it['title']}" if it["author"] else it["title"]).strip()[:150]
+    _audit("download", f"audiobook {name}")
+    if os.path.isfile(real):
+        return send_file(real, as_attachment=True, download_name=f"{name}{os.path.splitext(real)[1]}", max_age=0)
+    return Response(stream_with_context(_zip_stream(real)), mimetype="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name)}.zip"})
+
+def _zip_stream(folder):
+    """A ZIP of a folder, written as it is sent (no temporary copy of a 1 GB audiobook)."""
+    import zipfile, io
+
+    class _Sink(io.RawIOBase):
+        def __init__(self):
+            self.chunks = []
+        def writable(self):
+            return True
+        def write(self, b):
+            self.chunks.append(bytes(b))
+            return len(b)
+
+    sink = _Sink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
+        for base, dirs, files in os.walk(folder):
+            dirs.sort()
+            for f in sorted(files):
+                full = os.path.join(base, f)
+                if os.path.islink(full) or f.startswith("."):
+                    continue
+                with open(full, "rb") as src, z.open(os.path.relpath(full, folder), "w", force_zip64=True) as dst:
+                    while True:
+                        buf = src.read(1024 * 1024)
+                        if not buf:
+                            break
+                        dst.write(buf)
+                        if sink.chunks:
+                            yield b"".join(sink.chunks)
+                            sink.chunks.clear()
+                if sink.chunks:
+                    yield b"".join(sink.chunks)
+                    sink.chunks.clear()
+    if sink.chunks:
+        yield b"".join(sink.chunks)
 
 # ---- devices: Kindle address, Kobo link, preferences ---------------------------------
 @app.route("/devices", methods=["GET", "POST"])

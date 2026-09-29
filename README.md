@@ -506,6 +506,34 @@ successor of *calibre-web-automated-book-downloader*:
 - Exposure identical to the portal (Cloudflare → mTLS → optional Authelia → its session);
   `/api/auth/*` shares the Caddy login rate limit. Health: `http://127.0.0.1:8084/api/health`.
 
+## Comics & manga (Library → Comics; docs/COMICS.md)
+Readers get a **Comics** page: search a series (Western comics through Metron, manga, manhwa and
+manhua through MangaUpdates), tick the issues or volumes they want. Nothing is read online; each
+one arrives like a book:
+
+| Where | How |
+|---|---|
+| Kobo (colour) | its existing link: a colour, fixed-layout copy made by KCC. Made automatically for readers whose Kobo syncs, or with **Make Kobo copy** on the comic's page |
+| Kindle (Colorsoft) | **Send to Kindle** (or auto-send): a Kindle copy made at that moment, never stored; a big volume arrives in parts |
+| Phone / iPad | My books → download the CBZ (Panels, Chunky, KOReader) |
+
+- **Downloads go through Shelfmark**, as the reader: the seedbox, Shelfmark's ebook category and
+  label, torrents kept seeding, Syncthing, the path mappings, the reader's dropbox. Nothing on the
+  seedbox is new. The portal only chooses the release.
+- **The right release**: a chapter never fills a volume request, the reader's language only (raws
+  and other languages are dropped), the series and number must match (no spin-offs, no wrong
+  year), a single digital volume beats a pack, Usenet beats a torrent at equal quality, a dead
+  torrent is never picked. Nothing right: it looks again (1 h, 6 h, then daily, 30 days).
+- **Family sharing**: an issue or volume someone has is added to the next reader's library.
+- **CBR, CB7** are repacked as CBZ; the series and number are written into the file, so Calibre
+  and the Kobo show them as a series.
+- Setup: **Library → Comics** (a free Metron account; ComicVine optional), and in Shelfmark tick
+  **CBR** under Formats. Following a series and reading trackers (AniList) come in v5.8.
+
+**Audiobooks on a phone or tablet**: the portal's **Audiobooks** page downloads any audiobook
+the reader has (one file as it is, a folder as one ZIP) for any player; Audiobookshelf's app
+keeps your place and can keep books offline too.
+
 ## Family sharing — one copy, many readers
 Every reader sees only books carrying their own `owner:` tag. When a reader asks for a book
 the family already has, the portal adds their tag to the existing copy instead of fetching it

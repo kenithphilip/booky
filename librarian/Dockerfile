@@ -1,7 +1,9 @@
 FROM python:3.12.14-slim
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends libxml2 libxslt1.1 \
+# unar (The Unarchiver): CBR (RAR, solid RAR 3/4 too) and CB7 comics are repacked as CBZ (comics.py);
+# libarchive-tools (bsdtar) is its fallback. Both are in Debian's main archive.
+RUN apt-get update && apt-get install -y --no-install-recommends libxml2 libxslt1.1 unar libarchive-tools \
     && rm -rf /var/lib/apt/lists/*
 # requirements.lock pins every transitive dependency with hashes (regenerate with
 # `uvx --from pip-tools pip-compile --generate-hashes requirements.txt -o requirements.lock`);

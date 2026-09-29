@@ -269,12 +269,13 @@ def test_pdf_and_cbz_are_tagged_before_import_other_formats_need_a_tag(tmp_path)
     assert m["/Keywords"] == "Science, owner:alice" and m["/Title"] == "paper"
     cbz = make_cbz(str(tmp_path / "comic.cbz"))
     assert worker.ingest_local_file(str(cbz), "alice", rid=2) == "tagged owner:alice"
-    assert json.loads(zipfile.ZipFile(os.path.join(config.INGEST_DIR, "comic [alice-2].cbz")).comment.decode())["ComicBookInfo/1.0"]["tags"] == ["owner:alice"]
+    assert json.loads(zipfile.ZipFile(os.path.join(config.INGEST_DIR, "comic [alice-2].cbz")).comment.decode())["ComicBookInfo/1.0"]["tags"] == ["Comics", "owner:alice"]
     mobi = tmp_path / "old.mobi"; mobi.write_bytes(b"BOOKMOBI")
     note = worker.ingest_local_file(str(mobi), "alice", rid=3)
     assert note.startswith("needs-tag") and "owner:alice" in note and worker._status_for(note) == "needs-tag"
     assert "old [alice-3].mobi" in _ingested()
-    with pytest.raises(ValueError, match="CBZ"):
+    (tmp_path / "x.cbr").write_bytes(b"Rar!\x1a\x07\x00")      # v5.7: CBR is repacked; a broken one says why
+    with pytest.raises(ValueError, match="archive|pages|unpack"):
         worker.ingest_local_file(str(tmp_path / "x.cbr"), "alice")
     (tmp_path / "x.exe").write_bytes(b"MZ")
     with pytest.raises(ValueError, match="unsupported file type"):

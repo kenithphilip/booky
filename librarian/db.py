@@ -293,6 +293,27 @@ def init():
             last_error TEXT, last_ok REAL)""")
         # admin notifications about things polled every few seconds (Shelfmark's queue): told once
         c.execute("""CREATE TABLE IF NOT EXISTS notified(key TEXT PRIMARY KEY, at REAL NOT NULL)""")
+        # comics (docs/COMICS.md): what the metadata providers said (a day), the readers' requests,
+        # which Calibre books have their Kobo copy, and Kindle jobs that need a comic converted first
+        c.execute("""CREATE TABLE IF NOT EXISTS http_cache(key TEXT PRIMARY KEY, data TEXT NOT NULL, at REAL NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS comic_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
+            provider TEXT NOT NULL, series_id TEXT NOT NULL, series_name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'comic', reading TEXT NOT NULL DEFAULT 'ltr', strip INTEGER,
+            number TEXT NOT NULL, label TEXT, year INTEGER, publisher TEXT, language TEXT NOT NULL DEFAULT 'en',
+            cover TEXT, authors TEXT, summary TEXT,
+            status TEXT NOT NULL DEFAULT 'queued',   -- queued | downloading | done | shared | not-found | failed | cancelled
+            detail TEXT, tried TEXT DEFAULT '[]', release_title TEXT, release_id TEXT,
+            attempts INTEGER DEFAULT 0, next_try REAL, queued_at REAL, calibre_id INTEGER,
+            created REAL, updated REAL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS comic_requests_owner ON comic_requests(owner, status)")
+        c.execute("""CREATE TABLE IF NOT EXISTS comic_convert(
+            calibre_id INTEGER PRIMARY KEY, status TEXT NOT NULL,   -- due | done | failed
+            forced INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, next_try REAL, detail TEXT, updated REAL)""")
+        kcols = {r[1] for r in c.execute("PRAGMA table_info(kindle_jobs)")}
+        for col, typ in (("kind", "TEXT DEFAULT 'book'"), ("files", "TEXT")):
+            if col not in kcols:
+                c.execute(f"ALTER TABLE kindle_jobs ADD COLUMN {col} {typ}")
 
 def first_notice(key, now=None, keep_days=30):
     """True the first time `key` is seen (and remembers it), False after that. Survives a
@@ -301,6 +322,25 @@ def first_notice(key, now=None, keep_days=30):
     with _lock, _conn() as c:
         c.execute("DELETE FROM notified WHERE at < ?", (now - keep_days * 86400,))
         return c.execute("INSERT OR IGNORE INTO notified(key, at) VALUES(?, ?)", (key, now)).rowcount == 1
+
+# ---- a small cache for provider answers (comicmeta.py) ----------------------------------------
+def cache_get(key, max_age):
+    """The cached value, or None. max_age None: any age (a provider that is down)."""
+    with _conn() as c:
+        r = c.execute("SELECT data, at FROM http_cache WHERE key=?", (key,)).fetchone()
+    if not r or (max_age is not None and time.time() - r["at"] > max_age):
+        return None
+    return json.loads(r["data"])
+
+def cache_put(key, data, keep_days=14):
+    now = time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO http_cache(key, data, at) VALUES(?,?,?)", (key, json.dumps(data), now))
+        c.execute("DELETE FROM http_cache WHERE at < ?", (now - keep_days * 86400,))
+
+def cache_clear_prefix(prefix):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM http_cache WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
 
 def get_prefs(owner):
     with _conn() as c:
@@ -1553,3 +1593,121 @@ def gate_done(user, outcome, detail=""):
             return "dropped"
         return "kept"
 
+
+
+# ---- comics (docs/COMICS.md) --------------------------------------------------------------------
+COMIC_OPEN = ("queued", "downloading")
+COMIC_FIELDS = ("provider", "series_id", "series_name", "kind", "reading", "strip", "number", "label", "year",
+                "publisher", "language", "cover", "authors", "summary")
+
+def _comic(r):
+    if not r:
+        return None
+    d = dict(r)
+    d["tried"] = json.loads(d.get("tried") or "[]")
+    d["authors"] = json.loads(d["authors"]) if d.get("authors") else []
+    return d
+
+def comic_add(owner, fields, now=None):
+    """A reader's request for one issue or volume. An open request for the same one is returned
+    instead of a second (id, created?)."""
+    now = now or time.time()
+    f = {k: fields.get(k) for k in COMIC_FIELDS if fields.get(k) is not None}   # NOT NULL columns keep their defaults
+    f["authors"] = json.dumps(fields.get("authors") or [])
+    with _lock, _conn() as c:
+        r = c.execute(f"SELECT id FROM comic_requests WHERE owner=? AND provider=? AND series_id=? AND number=? "
+                      f"AND status IN ({','.join('?' * len(COMIC_OPEN))})",
+                      (owner, f.get("provider"), f.get("series_id"), f.get("number"), *COMIC_OPEN)).fetchone()
+        if r:
+            return r["id"], False
+        cols = ", ".join(f)
+        rid = c.execute(f"INSERT INTO comic_requests(owner, {cols}, status, next_try, created, updated) "
+                        f"VALUES(?, {','.join('?' * len(f))}, 'queued', ?, ?, ?)",
+                        (owner, *f.values(), now, now, now)).lastrowid
+        return rid, True
+
+def comic_get(rid):
+    with _conn() as c:
+        return _comic(c.execute("SELECT * FROM comic_requests WHERE id=?", (rid,)).fetchone())
+
+def comic_update(rid, **f):
+    if "tried" in f:
+        f["tried"] = json.dumps(f["tried"])
+    f["updated"] = time.time()
+    with _lock, _conn() as c:
+        c.execute(f"UPDATE comic_requests SET {', '.join(f'{k}=?' for k in f)} WHERE id=?", (*f.values(), rid))
+
+def comic_due(now, limit=3):
+    with _conn() as c:
+        return [_comic(r) for r in c.execute(
+            "SELECT * FROM comic_requests WHERE status='queued' AND (next_try IS NULL OR next_try <= ?) "
+            "ORDER BY next_try, id LIMIT ?", (now, limit))]
+
+def comic_open(owner=None, statuses=COMIC_OPEN):
+    sql = f"SELECT * FROM comic_requests WHERE status IN ({','.join('?' * len(statuses))})"
+    args = list(statuses)
+    if owner:
+        sql += " AND owner=?"
+        args.append(owner)
+    with _conn() as c:
+        return [_comic(r) for r in c.execute(sql + " ORDER BY id", args)]
+
+def comic_list(owner=None, limit=200, closed_days=30, now=None):
+    now = now or time.time()
+    sql = "SELECT * FROM comic_requests WHERE (status IN ('queued','downloading') OR updated >= ?)"
+    args = [now - closed_days * 86400]
+    if owner:
+        sql += " AND owner=?"
+        args.append(owner)
+    with _conn() as c:
+        return [_comic(r) for r in c.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))]
+
+def comic_count_open(owner):
+    with _conn() as c:
+        return c.execute(f"SELECT COUNT(*) FROM comic_requests WHERE owner=? AND status IN "
+                         f"({','.join('?' * len(COMIC_OPEN))})", (owner, *COMIC_OPEN)).fetchone()[0]
+
+def comic_series_status(owner, provider, series_id):
+    """{number: status} of this reader's requests in one series (the newest per number)."""
+    with _conn() as c:
+        rows = c.execute("SELECT number, status FROM comic_requests WHERE owner=? AND provider=? AND series_id=? "
+                         "ORDER BY id", (owner, provider, str(series_id))).fetchall()
+    return {r["number"]: r["status"] for r in rows}
+
+# which comics have their Kobo copy (the host job asks, converts, reports)
+def comic_convert_state(calibre_ids):
+    if not calibre_ids:
+        return {}
+    ids = list(calibre_ids)
+    with _conn() as c:
+        return {r["calibre_id"]: dict(r) for r in c.execute(
+            f"SELECT * FROM comic_convert WHERE calibre_id IN ({','.join('?' * len(ids))})", ids)}
+
+def comic_convert_force(calibre_id, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO comic_convert(calibre_id, status, forced, attempts, next_try, updated) "
+                  "VALUES(?, 'due', 1, 0, ?, ?) ON CONFLICT(calibre_id) DO UPDATE SET "
+                  "status='due', forced=1, attempts=0, next_try=excluded.next_try, updated=excluded.updated",
+                  (calibre_id, now, now))
+
+def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3):
+    """ok: done. A failure is tried again after 1 h, then 6 h, and left 'failed' after three."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        r = c.execute("SELECT attempts FROM comic_convert WHERE calibre_id=?", (calibre_id,)).fetchone()
+        attempts = (r["attempts"] if r else 0) + (0 if ok else 1)
+        status = "done" if ok else ("failed" if attempts >= max_attempts else "due")
+        nxt = None if ok else now + (3600 if attempts == 1 else 6 * 3600)
+        # forced (a reader's 'Make Kobo copy') is spent once the copy is made or given up on
+        c.execute("INSERT INTO comic_convert(calibre_id, status, attempts, next_try, detail, updated) "
+                  "VALUES(?,?,?,?,?,?) ON CONFLICT(calibre_id) DO UPDATE SET status=excluded.status, "
+                  "attempts=excluded.attempts, next_try=excluded.next_try, detail=excluded.detail, "
+                  "updated=excluded.updated, forced=CASE WHEN excluded.status='due' THEN forced ELSE 0 END",
+                  (calibre_id, status, attempts, nxt, (detail or "")[:300], now))
+        return status
+
+def kindle_comic_jobs(status, limit=5):
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM kindle_jobs WHERE kind='comic' AND status=? ORDER BY id LIMIT ?", (status, limit))]

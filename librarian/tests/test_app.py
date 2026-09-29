@@ -175,7 +175,8 @@ def test_upload_keeps_unicode_names_lands_in_own_dropbox_and_filters_types(clien
     assert open(os.path.join(config.DROPBOX_DIR, "alice", "my book (2).epub"), "rb").read() == b"PK\x03\x04second copy"
     assert open(os.path.join(config.DROPBOX_DIR, "alice", "my book.epub"), "rb").read() == open(epub, "rb").read()
     r = up("evil.exe", io.BytesIO(b"x")); assert b"not supported" in r.data
-    r = up("comic.cbr", io.BytesIO(b"Rar!")); assert b"convert it to CBZ" in r.data
+    r = up("comic.cbr", io.BytesIO(b"Rar!")); assert b"convert it to CBZ" not in r.data   # v5.7: accepted, repacked on import
+    assert os.path.exists(os.path.join(config.DROPBOX_DIR, "alice", "comic.cbr"))
     r = client.post("/upload", data={"csrf": csrf_of(client, "/upload")}, content_type="multipart/form-data", follow_redirects=True)
     assert b"Choose a file" in r.data
 

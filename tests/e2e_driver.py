@@ -307,8 +307,15 @@ def upload_as(sess, fn, content):
 st, h, b = upload_as(p, "PDF Paper Book.pdf", make_pdf("PDF Paper Book")); check(st == 302, "PDF upload accepted", str(st))
 st, h, b = upload_as(p, "Comic Test Book.cbz", make_cbz()); check(st == 302, "CBZ upload accepted", str(st))
 st, h, b = upload_as(p, "Война и мир.epub", make_epub("Война и мир", "Лев Толстой")); check(st == 302, "Cyrillic filename accepted", str(st))
-st, h, b = upload_as(p, "bad.cbr", b"Rar!\x1a\x07\x00"); st2, h2, b2 = p.get(PORTAL + "/upload")
-check(b"convert it to CBZ" in b2, "CBR is refused with an explanation")
+# v5.7: CBR is accepted (repacked as CBZ on import); a broken one fails with a reason, never silently
+st, h, b = upload_as(p, "bad.cbr", b"Rar!\x1a\x07\x00"); check(st == 302, "a CBR upload is accepted (repacked as CBZ on import)", str(st))
+for _ in range(30):
+    st2, h2, b2 = p.get(PORTAL + "/status")
+    if b"bad.cbr" in b2 and (b"no pages" in b2 or b"could not unpack" in b2 or b"not a readable comic" in b2):
+        break
+    time.sleep(2)
+check(b"bad.cbr" in b2 and (b"no pages" in b2 or b"could not unpack" in b2 or b"not a readable comic" in b2),
+      "a broken CBR fails on import with the reason on the Status page")
 st, h, b = upload_as(pb, "plain notes.txt", b"just some text\n"); check(st == 302, "TXT upload accepted (cannot carry a tag)")
 pdf_id = wait(lambda: imported("PDF Paper Book", "alice"), 300, 5); check(pdf_id is not None, "PDF imported WITH owner:alice (tag carried in /Keywords)")
 cbz_id = wait(lambda: imported("Comic Test Book", "alice"), 300, 5); check(cbz_id is not None, "CBZ imported WITH owner:alice (ComicBookInfo tag)")

@@ -1143,7 +1143,7 @@ echo "== update: pre-update backup, code + tags, local health gate, rollback"
 printf '#!/usr/bin/env bash\necho "backup.sh $*" >> "%s"\nexit ${BACKUP_RC:-0}\n' "$LOG" > "$STACK_DIR/scripts/backup.sh"
 printf '#!/usr/bin/env bash\nexit ${SELFTEST_RC:-0}\n' > "$STACK_DIR/scripts/selftest.sh"; chmod +x "$STACK_DIR/scripts/"*.sh
 copy_code_trees(){ echo "copy_code_trees" >> "$LOG"; record_version; }   # keep the stub scripts above in place
-C6="<cancel> <cancel> <cancel> <cancel> <cancel> <cancel> <cancel>"   # skip the remaining 7 of 8 image prompts
+C6="<cancel> <cancel> <cancel> <cancel> <cancel> <cancel> <cancel> <cancel>"   # skip the remaining 8 of 9 image prompts
 export BACKUP_RC=1; reset; step_update; rc=$?; export BACKUP_RC=0
 expect '[ $rc = 1 ] && seen "backup.sh --tag pre-update" && seen "Pre-update backup failed" && ! seen "compose pull"' "step_update returns 1 when the pre-update backup fails (nothing pulled)"
 envset IMG_CWA crocodilestick/calibre-web-automated:v4.0.6
@@ -2380,6 +2380,22 @@ envset DISK_REPORT false; install_disk_report; expect '[ ! -e "$T/etc/cron.d/boo
 envset DISK_REPORT ""; envset DISK_REPORT_HOUR ""
 expect 'declare -f install_disk_watch | grep -q install_disk_report' "Deploy installs it with the other scheduled jobs"
 expect 'declare -f step_deploy | grep -q "absctl backups"' "Deploy switches on Audiobookshelf's own nightly database copy"
+
+echo "== v5.7: Library -> Comics (docs/COMICS.md)"
+envset COMICS_ENABLED ""; envset METRON_USER ""; envset METRON_PASS ""; envset COMICVINE_API_KEY ""
+install_comic_convert
+expect '[ ! -e "$T/etc/cron.d/bookstack-comics" ]' "comics off: no conversion job"
+reset "yes" "comicfan" "metron-pw" "<blank>"; step_comics >/dev/null
+expect '[ "$(envget COMICS_ENABLED)" = true ] && [ "$(envget METRON_USER)" = comicfan ] && [ "$(envget METRON_PASS)" = metron-pw ] && [ -z "$(envget COMICVINE_API_KEY)" ]' "turning comics on stores the Metron account (the password through a password box) and no ComicVine key"
+expect 'grep -q "flock -n /run/lock/bookstack-comics.lock env STACK_DIR=.*scripts/comic-convert.sh" "$T/etc/cron.d/bookstack-comics" && grep -q "^\*/3 \* \* \* \* root" "$T/etc/cron.d/bookstack-comics"' "the device-copy job runs every 3 minutes, never twice at once"
+expect 'seen "docker: pull -q ghcr.io/ciromattia/kcc:v12.0.0" && seen "compose up -d librarian" && seen "python -m comicmeta check"' "KCC is pulled, the portal recreated, and the metadata providers asked"
+expect 'grep -F msgbox "$LOG" | grep -q "tick CBR"' "the admin is told the one Shelfmark setting comics need (CBR)"
+reset "no"; step_comics >/dev/null
+expect '[ "$(envget COMICS_ENABLED)" = false ] && [ ! -e "$T/etc/cron.d/bookstack-comics" ]' "turning comics off removes the job; nothing in the library changes"
+envset COMICS_ENABLED ""
+expect 'declare -f menu_library | grep -q step_comics && declare -f install_disk_watch | grep -q install_comic_convert && declare -f step_deploy | grep -q pull_kcc && declare -f step_update | grep -q pull_kcc' "in the Library menu; installed with the other jobs; KCC pulled by Deploy and Update"
+expect 'printf "%s" "$IMG_DEFAULTS" | grep -q "IMG_KCC=ghcr.io/ciromattia/kcc:v12.0.0" && printf "%s" "$IMG_KEYS" | grep -qw IMG_KCC && grep -q "^IMG_KCC=ghcr.io/ciromattia/kcc:v12.0.0" "$REPO/.env.example"' "KCC is pinned like every other image (Update can move it, the image sweep keeps it)"
+expect 'bash -n "$REPO/scripts/comic-convert.sh" && grep -q -- "--network\", \"none\"" "$REPO/scripts/comic-convert.sh" && grep -q -- "--memory\", MEM" "$REPO/scripts/comic-convert.sh" && grep -q -- "--forcecolor" "$REPO/scripts/comic-convert.sh"' "KCC runs with no network, a memory cap, and in colour"
 
 echo "== Family sharing: Shelfmark's request step follows the portal's ability to answer it"
 envset APPROVALS_REQUIRED false; envset FAMILY_SHARING true; envset SHELFMARK_SVC_USER ""; envset SHELFMARK_SVC_PASS ""; envset SHELFMARK_REQUESTS ""
