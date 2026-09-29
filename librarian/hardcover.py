@@ -7,7 +7,7 @@ Calibre-Web's own Hardcover provider (cps/metadata_provider/hardcover.py) and Ha
 docs: search(query, query_type: "Series" | "Author"), series.book_series { position book },
 books.release_date / compilation / canonical_id. Compilations (omnibuses, box sets) and
 duplicate records are left out."""
-import json
+import datetime, json
 import requests
 import config
 
@@ -66,7 +66,9 @@ def search(query, kind="Series", limit=10):
         out.append({"id": str(doc["id"]), "name": doc.get("name") or "",
                     "author": doc.get("author_name") or "", "books_count": doc.get("primary_books_count") or doc.get("books_count"),
                     "books": [b for b in (doc.get("books") or []) if isinstance(b, str)][:6]})
-    return out
+    # the real series first: a search for 'Discworld' answered a 4-book stray by 'Unknown' before
+    # Pratchett's 41-book series (measured 2026-09-29)
+    return sorted(out, key=lambda r: -(r["books_count"] or 0))
 
 
 def _book(b, position=None):
@@ -88,20 +90,28 @@ def series_books(series_id):
     books = []
     for bs in s.get("book_series") or []:
         b = bs.get("book") or {}
-        if b.get("compilation") or b.get("canonical_id") or not b.get("id"):
-            continue
+        if b.get("compilation") or b.get("canonical_id") or not b.get("id") or not (b.get("title") or "").strip():
+            continue                             # omnibuses, duplicates, and untitled stray records
         books.append(_book(b, bs.get("position")))
     return s.get("name") or "", bool(s.get("is_completed")), books
 
 
+AUTHOR_MIN_READERS = 5
+
+
 def author_books(author_id, limit=60):
-    """(author name, [book]) — the author's books, newest first, no compilations or duplicates."""
-    d = _q("""query A($id: Int!, $n: Int!) { authors(where: {id: {_eq: $id}}) { name }
-                books(where: {contributions: {author: {id: {_eq: $id}}}, compilation: {_eq: false}, canonical_id: {_is_null: true}},
+    """(author name, [book]) — the author's RELEASED books, newest first, no compilations or
+    duplicates, and only those at least AUTHOR_MIN_READERS people shelved: an author's record also
+    holds game supplements, split editions and handbooks with one or two readers, and placeholders
+    dated 2035 (measured 2026-09-29). A genuinely new book below the mark is noticed a day or two
+    later, when it passes it."""
+    d = _q("""query A($id: Int!, $n: Int!, $t: date!, $r: Int!) { authors(where: {id: {_eq: $id}}) { name }
+                books(where: {contributions: {author: {id: {_eq: $id}}}, compilation: {_eq: false}, canonical_id: {_is_null: true},
+                              release_date: {_lte: $t}, users_count: {_gte: $r}},
                       order_by: {release_date: desc_nulls_last}, limit: $n) { id title release_date contributions { author { name } } } }""",
-           {"id": int(author_id), "n": limit})
+           {"id": int(author_id), "n": limit, "t": datetime.date.today().isoformat(), "r": AUTHOR_MIN_READERS})
     a = (d.get("authors") or [{}])
-    return (a[0].get("name") if a else "") or "", [_book(b) for b in d.get("books") or []]
+    return (a[0].get("name") if a else "") or "", [_book(b) for b in d.get("books") or [] if (b.get("title") or "").strip()]
 
 
 def check():

@@ -200,6 +200,16 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.8.1 (Hardcover against the real API)
+- With the owner's key: `{ me }` answers only as `Authorization: Bearer <hc_pat_...>` (the bare
+  token is HTTP 400); search(Series|Author), series(...).book_series and books(where: ...) all
+  answer. Measured and handled: search ranks a 4-book stray above Pratchett's 41-book Discworld
+  (now sorted by size); a series holds untitled duplicate records (skipped); an author's books
+  include 2035 placeholders, game supplements and split editions with 1-8 readers (author
+  follows count released books with >= 5 readers). The installer's key check now strips a pasted
+  "Bearer "/line break and shows Hardcover's own reason and the key's length when it refuses.
+- whiptail under the POSIX locale printed a dash as "<80><94>": bookstack.sh uses C.UTF-8.
+
 ## Verified locally in v5.8 (following, New for you, reading status, AniList)
 - Unit 628 passed, installer 792 passed, end-to-end 288 checks / 0 failed. End to end: alice's
   Kobo PUTs 'Finished' for her comic to the real Calibre-Web (as a Kobo does), and the portal reads

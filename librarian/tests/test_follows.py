@@ -248,3 +248,31 @@ def test_a_revoked_connection_is_said_on_devices(al, monkeypatch):
     monkeypatch.setattr(anilist, "_gql", lost)
     anilist.sync_once()
     assert "connect again" in db.anilist_get("bob")["detail"]
+
+
+# ---- Hardcover's data, as measured against the real API (2026-09-29) --------------------------------
+def test_the_real_series_comes_first_and_stray_records_are_left_out(monkeypatch):
+    monkeypatch.setattr(config, "HARDCOVER_API_KEY", "hc_pat_x")
+    hits = {"hits": [{"document": {"id": 270374, "name": "Discworld", "author_name": "Unknown", "books_count": 4}},
+                     {"document": {"id": 1018, "name": "Discworld", "author_name": "Terry Pratchett", "books_count": 41}}]}
+    monkeypatch.setattr(hardcover, "_q", lambda q, v: {"search": {"results": hits}})
+    assert [h["id"] for h in hardcover.search("Discworld")] == ["1018", "270374"]
+    series = {"series": [{"name": "Discworld", "is_completed": True, "book_series": [
+        {"position": 4, "book": {"id": 1, "title": "Mort", "release_date": "1987-01-01", "compilation": False, "canonical_id": None, "contributions": []}},
+        {"position": 4, "book": {"id": 2, "title": "", "release_date": "1987-01-01", "compilation": False, "canonical_id": None, "contributions": []}},
+        {"position": None, "book": {"id": 3, "title": "Discworld Omnibus", "compilation": True, "canonical_id": None, "contributions": []}},
+        {"position": 5, "book": {"id": 4, "title": "Sourcery", "compilation": False, "canonical_id": 9, "contributions": []}}]}]}
+    monkeypatch.setattr(hardcover, "_q", lambda q, v: series)
+    assert [b["title"] for b in hardcover.series_books("1018")[2]] == ["Mort"]
+
+def test_an_authors_books_are_asked_for_released_and_read_ones_only(monkeypatch):
+    monkeypatch.setattr(config, "HARDCOVER_API_KEY", "hc_pat_x")
+    asked = {}
+    def q(query, v):
+        asked.update(v, query=query)
+        return {"authors": [{"name": "Brandon Sanderson"}], "books": [{"id": 1, "title": "Wind and Truth", "release_date": "2024-12-06"}]}
+    monkeypatch.setattr(hardcover, "_q", q)
+    name, books = hardcover.author_books("204214")
+    assert name == "Brandon Sanderson" and books[0]["title"] == "Wind and Truth"
+    assert asked["t"] == datetime.date.today().isoformat() and asked["r"] == hardcover.AUTHOR_MIN_READERS
+    assert "release_date: {_lte: $t}" in asked["query"] and "users_count: {_gte: $r}" in asked["query"]

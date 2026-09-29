@@ -24,6 +24,13 @@ CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same bas
 if [ -n "${TERM:-}" ] && command -v tput >/dev/null 2>&1 && ! tput -T "$TERM" longname >/dev/null 2>&1; then
   export TERM=xterm-256color
 fi
+# A Debian minimal install logs in with the POSIX locale, and whiptail then prints every non-ASCII
+# character of a message (a dash, an arrow, a reader's accented name) as "<80><94>" (seen live
+# 2026-09-29). C.UTF-8 ships with every Debian libc: use it unless a UTF-8 locale is already set.
+if command -v locale >/dev/null 2>&1 && [ "$(locale charmap 2>/dev/null)" != UTF-8 ] \
+   && locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$'; then
+  export LC_ALL=C.UTF-8
+fi
 
 # BOOKSTACK_LIB=1 sources this file for tests without running anything.
 if [ "${BOOKSTACK_LIB:-0}" != 1 ]; then
@@ -3757,11 +3764,23 @@ write_shelfmark_metadata_env() {
   chown root:root "$f.new" 2>/dev/null || true
   mv -f "$f.new" "$f"
 }
-metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it
+KEY_REASON=""
+metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it; KEY_REASON says why not
+  local k ans
   case "$1" in
-    hardcover) curl -fsS -m 15 -X POST https://api.hardcover.app/v1/graphql \
-                 -H "Authorization: Bearer ${2#Bearer }" -H "Content-Type: application/json" \
-                 --data '{"query":"{ me { id } }"}' 2>/dev/null | grep '"me"' >/dev/null;;   # grep reads it all: no SIGPIPE
+    hardcover)
+      # what a paste can carry along: "Bearer ", surrounding spaces, a line break where the settings
+      # page wrapped it. Hardcover's own answer is kept, so a refusal says WHY (a cut-short paste
+      # and a regenerated key both read "Token is not associated with a user").
+      k=$(printf '%s' "${2#Bearer }" | tr -d ' \t\r\n')
+      ans=$(curl -sS -m 15 -X POST https://api.hardcover.app/v1/graphql \
+              -H "Authorization: Bearer $k" -H "Content-Type: application/json" \
+              --data '{"query":"{ me { id } }"}' 2>&1)
+      case "$ans" in *'"me"'*) return 0;; esac
+      KEY_REASON="Hardcover said: $(printf '%s' "$ans" | sed -n 's/.*"error_description":"\([^"]*\)".*/\1/p;s/.*"message":"\([^"]*\)".*/\1/p' | head -1)"
+      [ "$KEY_REASON" = "Hardcover said: " ] && KEY_REASON="Hardcover said: ${ans:0:120}"
+      KEY_REASON="$KEY_REASON (the key was ${#k} characters: a whole one is several hundred; a new key on hardcover.app also ends the old one)"
+      return 1;;
     google) curl -fsS -m 15 "https://www.googleapis.com/books/v1/volumes?q=isbn:9780141439518&maxResults=1&key=$2" >/dev/null 2>&1;;
   esac
 }
@@ -3772,8 +3791,9 @@ step_metadata_sources() {
   case "$hc" in
     -) envset HARDCOVER_API_KEY ""; note="$note\nHardcover: removed.";;
     "") ;;
-    *) if metadata_key_ok hardcover "$hc"; then envset HARDCOVER_API_KEY "$hc"; note="$note\nHardcover: accepted and saved."
-       else note="$note\nHardcover: the token was REFUSED by api.hardcover.app, not saved."; fi;;
+    *) hc=$(printf '%s' "${hc#Bearer }" | tr -d ' \t\r\n')
+       if metadata_key_ok hardcover "$hc"; then envset HARDCOVER_API_KEY "$hc"; note="$note\nHardcover: accepted and saved."
+       else note="$note\nHardcover: the token was REFUSED, not saved. $KEY_REASON"; fi;;
   esac
   cur=$(envget GOOGLE_BOOKS_API_KEY)
   gb=$(askpw "Google Books API key (optional; console.cloud.google.com -> APIs -> Books API -> Credentials; free, 1000 lookups a day). Without one Google Books is not used: its keyless quota is shared worldwide and is usually exhausted.\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || gb=""
