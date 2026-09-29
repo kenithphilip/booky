@@ -231,10 +231,18 @@ def init():
         # gone) is deleted from the VPS after LIBRARY_RELEASE_DAYS (worker.reconcile_releases,
         # the host job deletes). Books that never had an owner (the admin's own, added in
         # Calibre-Web) are never listed here.
+        c.execute("""CREATE TABLE IF NOT EXISTS audio_release(
+            item_id TEXT PRIMARY KEY, title TEXT, since REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'waiting',   -- waiting | deleted | kept | failed (v6.1)
+            attempts INTEGER DEFAULT 0, last_error TEXT, updated REAL)""")
         c.execute("""CREATE TABLE IF NOT EXISTS book_release(
             calibre_id INTEGER PRIMARY KEY, since REAL NOT NULL, reason TEXT,
             status TEXT NOT NULL DEFAULT 'waiting',   -- waiting | due | deleted | kept | failed
             tags TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, updated REAL)""")
+        # v6.1: a removal waits for the reader's Kobo to be told (not_before; kobo_wait = how)
+        for col, typ in (("not_before", "REAL"), ("kobo_wait", "TEXT")):
+            if col not in {r[1] for r in c.execute("PRAGMA table_info(tag_push)")}:
+                c.execute(f"ALTER TABLE tag_push ADD COLUMN {col} {typ}")
         c.execute("DROP INDEX IF EXISTS tag_push_open")
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS tag_push_open_owner ON tag_push(calibre_id, owner) WHERE status = 'pending'")
         # "Find a better copy" (the book page): for REPLACE_DAYS the next EPUB of this book that
@@ -322,6 +330,8 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS comic_convert(
             calibre_id INTEGER PRIMARY KEY, status TEXT NOT NULL,   -- due | done | failed
             forced INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, next_try REAL, detail TEXT, updated REAL)""")
+        if "remake" not in {r[1] for r in c.execute("PRAGMA table_info(comic_convert)")}:
+            c.execute("ALTER TABLE comic_convert ADD COLUMN remake INTEGER DEFAULT 0")   # v6.1: replace the Kobo copy
         # v5.8: what readers follow, what turned up for them, and their AniList link
         c.execute("""CREATE TABLE IF NOT EXISTS follows(
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
@@ -1427,15 +1437,22 @@ def queue_tag_push(calibre_id, rid, owner, now=None, share=False, op="add"):
     now = now or time.time()
     try:
         with _lock, _conn() as c:
+            if op == "add":
+                # v6.1: the reader asks again while their removal waits for the Kobo: the removal is
+                # withdrawn (their tag never came off, so there is nothing to add)
+                if c.execute("UPDATE tag_push SET status='withdrawn', updated=? WHERE calibre_id=? AND owner=? "
+                             "AND status='pending' AND op='remove'", (now, int(calibre_id), owner)).rowcount:
+                    return True
             c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated) VALUES(?,?,?,?,?,?,?)",
                       (int(calibre_id), rid, owner, 1 if share else 0, op, now, now))
         return True
     except sqlite3.IntegrityError:
         return False                          # one open job per book and reader
 
-def queue_untag(calibre_id, owner, now=None):
+def queue_untag(calibre_id, owner, now=None, not_before=None, kobo_wait=None):
     """'Remove from my library': take this reader's owner tag off the book (host job). A
-    pending ADD for the same book and reader is simply withdrawn instead."""
+    pending ADD for the same book and reader is simply withdrawn instead. v6.1: not_before /
+    kobo_wait hold it until the reader's Kobo has been told to delete it (kobo_waits())."""
     now = now or time.time()
     with _lock, _conn() as c:
         row = c.execute("SELECT id, op FROM tag_push WHERE calibre_id=? AND owner=? AND status='pending'",
@@ -1444,8 +1461,8 @@ def queue_untag(calibre_id, owner, now=None):
             c.execute("UPDATE tag_push SET status='withdrawn', updated=? WHERE id=?", (now, row["id"]))
         elif row:
             return True
-        c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated) VALUES(?,?,?,0,'remove',?,?)",
-                  (int(calibre_id), None, owner, now, now))
+        c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated, not_before, kobo_wait) "
+                  "VALUES(?,?,?,0,'remove',?,?,?,?)", (int(calibre_id), None, owner, now, now, not_before, kobo_wait))
         return True
 
 def untag_pending(calibre_id, owner):
@@ -1462,6 +1479,35 @@ def release_note(calibre_id, reason, tags, now=None):
                   "status=CASE WHEN book_release.status IN ('kept','failed') THEN 'waiting' ELSE book_release.status END, "
                   "since=CASE WHEN book_release.status IN ('kept','failed') THEN excluded.since ELSE book_release.since END",
                   (int(calibre_id), now, reason, json.dumps(tags), now))
+
+# ---- v6.1: audiobooks nobody has any more (Audiobookshelf items), deleted after LIBRARY_RELEASE_DAYS ----
+def audio_release_note(item_id, title, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO audio_release(item_id, title, since, status, updated) VALUES(?,?,?,'waiting',?) "
+                  "ON CONFLICT(item_id) DO UPDATE SET status='waiting', since=CASE WHEN audio_release.status='waiting' "
+                  "THEN audio_release.since ELSE excluded.since END, title=excluded.title, updated=excluded.updated",
+                  (item_id, (title or "")[:300], now, now))
+
+def audio_releases(statuses=("waiting",)):
+    marks = ",".join("?" * len(statuses))
+    with _conn() as c:
+        return [dict(r) for r in c.execute(f"SELECT * FROM audio_release WHERE status IN ({marks}) ORDER BY since", tuple(statuses))]
+
+def audio_release_waiting(item_id):
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM audio_release WHERE item_id=? AND status='waiting'", (item_id,)).fetchone() is not None
+
+def audio_release_set(item_id, status, error=None, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE audio_release SET status=?, attempts=attempts+?, last_error=?, updated=? WHERE item_id=?",
+                  (status, 1 if error else 0, (error or "")[:300] or None, now or time.time(), item_id))
+
+def release_waiting(calibre_id):
+    """v6.1: is this book counting down to deletion (nobody has it, the file is still here)?"""
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM book_release WHERE calibre_id=? AND status='waiting'",
+                         (int(calibre_id),)).fetchone() is not None
 
 def release_keep(calibre_id, now=None):
     """A reader has it again (a share, a re-request): the countdown stops."""
@@ -1561,7 +1607,19 @@ def replace_result(job_id, ok, error=None, max_attempts=3):
 def pending_tag_pushes(limit=50):
     with _conn() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id, calibre_id, rid, owner, share, op FROM tag_push WHERE status='pending' ORDER BY id LIMIT ?", (limit,))]
+            "SELECT id, calibre_id, rid, owner, share, op FROM tag_push WHERE status='pending' "
+            "AND (not_before IS NULL OR not_before <= ?) ORDER BY id LIMIT ?", (time.time(), limit))]
+
+def kobo_waits():
+    """Removals held for a Kobo sync (v6.1)."""
+    with _conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT id, calibre_id, owner, kobo_wait, not_before FROM tag_push WHERE status='pending' AND op='remove' "
+            "AND kobo_wait IS NOT NULL AND not_before > ?", (time.time(),))]
+
+def kobo_wait_over(push_id, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE tag_push SET not_before=?, updated=? WHERE id=?", (now or time.time(), now or time.time(), push_id))
 
 def tag_push_result(push_id, ok, error=None, max_attempts=5):
     """Record the host's outcome. Success marks the request done; repeated failure gives up."""
@@ -1877,13 +1935,14 @@ def comic_convert_state(calibre_ids):
         return {r["calibre_id"]: dict(r) for r in c.execute(
             f"SELECT * FROM comic_convert WHERE calibre_id IN ({','.join('?' * len(ids))})", ids)}
 
-def comic_convert_force(calibre_id, now=None):
+def comic_convert_force(calibre_id, now=None, remake=False):
+    """'Make Kobo copy' now; remake (v6.1): a new one REPLACES the Kobo copy there is."""
     now = now or time.time()
     with _lock, _conn() as c:
-        c.execute("INSERT INTO comic_convert(calibre_id, status, forced, attempts, next_try, updated) "
-                  "VALUES(?, 'due', 1, 0, ?, ?) ON CONFLICT(calibre_id) DO UPDATE SET "
-                  "status='due', forced=1, attempts=0, next_try=excluded.next_try, updated=excluded.updated",
-                  (calibre_id, now, now))
+        c.execute("INSERT INTO comic_convert(calibre_id, status, forced, attempts, next_try, updated, remake) "
+                  "VALUES(?, 'due', 1, 0, ?, ?, ?) ON CONFLICT(calibre_id) DO UPDATE SET "
+                  "status='due', forced=1, attempts=0, next_try=excluded.next_try, updated=excluded.updated, "
+                  "remake=excluded.remake", (calibre_id, now, now, 1 if remake else 0))
 
 def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, final=False):
     """ok: done. A failure is tried again after 1 h, then 6 h, and left 'failed' after three.
@@ -1898,7 +1957,8 @@ def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, 
         c.execute("INSERT INTO comic_convert(calibre_id, status, attempts, next_try, detail, updated) "
                   "VALUES(?,?,?,?,?,?) ON CONFLICT(calibre_id) DO UPDATE SET status=excluded.status, "
                   "attempts=excluded.attempts, next_try=excluded.next_try, detail=excluded.detail, "
-                  "updated=excluded.updated, forced=CASE WHEN excluded.status='due' THEN forced ELSE 0 END",
+                  "updated=excluded.updated, forced=CASE WHEN excluded.status='due' THEN forced ELSE 0 END, "
+                  "remake=CASE WHEN excluded.status='due' THEN remake ELSE 0 END",
                   (calibre_id, status, attempts, nxt, (detail or "")[:300], now))
         return status
 

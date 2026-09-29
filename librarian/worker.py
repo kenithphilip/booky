@@ -612,6 +612,53 @@ def _owner_tags_by_book():
     finally:
         c.close()
 
+KOBO_REMOVE_WAIT = 7 * 86400
+
+def release_kobo_waits(now=None):
+    """v6.1: a reader's removal waits (their owner tag stays) until their Kobo has synced and been
+    told to delete the book (cwa.kobo_remove); then it goes ahead. A Kobo that never syncs holds
+    it at most KOBO_REMOVE_WAIT (queue_untag's not_before). Returns how many went ahead."""
+    n = 0
+    for w in db.kobo_waits():
+        try:
+            if cwa.kobo_removed(w["owner"], w["calibre_id"], w["kobo_wait"]):
+                db.kobo_wait_over(w["id"], now)
+                n += 1
+        except Exception as e:                   # app.db busy: next pass
+            log.debug("Kobo removal check for book %s: %s", w["calibre_id"], e)
+    return n
+
+def reconcile_audio_releases(now=None):
+    """v6.1: audiobooks nobody has any more (their last reader removed them) are deleted from the
+    server after LIBRARY_RELEASE_DAYS, like books; one a reader has again (asked for it) is kept.
+    Returns the number deleted."""
+    days = config.LIBRARY_RELEASE_DAYS
+    if days <= 0 or not absapi.configured():
+        return 0
+    now = now or time.time()
+    gone = 0
+    for r in db.audio_releases():
+        try:
+            owners = absapi.item_owners(r["item_id"])
+        except Exception as e:
+            log.warning("audiobook release check for %s: %s", r["item_id"], e)
+            continue
+        if owners is None:
+            db.audio_release_set(r["item_id"], "deleted", now=now)       # already gone
+        elif owners:
+            db.audio_release_set(r["item_id"], "kept", now=now)          # a reader has it again
+        elif now - r["since"] >= days * 86400:
+            try:
+                absapi.delete_item(r["item_id"])
+                db.audio_release_set(r["item_id"], "deleted", now=now)
+                share._ABS_ITEMS["at"] = 0.0
+                db.audit("audiobook_deleted", None, "worker", f"{r['item_id']} {r.get('title') or ''}"[:200])
+                gone += 1
+            except Exception as e:
+                db.audio_release_set(r["item_id"], "failed" if (r.get("attempts") or 0) >= 2 else "waiting",
+                                     error=str(e), now=now)
+    return gone
+
 def reconcile_releases(now=None):
     """Count down the books no reader has any more; hand the due ones to the host job, which
     deletes them from the VPS (their seedbox copy stays on the seedbox). A book is 'no reader's'
@@ -1755,6 +1802,7 @@ def housekeeping_once(now=None):
     a passive app.db WAL checkpoint every few minutes (so Shelfmark, which ignores the WAL,
     sees password changes made in CWA's own UI) and with it the password-drift check."""
     now = now or time.time()
+    _guarded(release_kobo_waits, now)
     process_tag_jobs(now)
     _guarded(nudge_ingest_once, now)
     _guarded(kindle_once, now)
@@ -1765,6 +1813,7 @@ def housekeeping_once(now=None):
     if now - _LAST_RELEASE[0] >= RELEASE_EVERY:
         _LAST_RELEASE[0] = now
         _guarded(reconcile_releases, now)
+        _guarded(reconcile_audio_releases, now)
     if now - _LAST_ENRICH[0] >= ENRICH_EVERY:
         _LAST_ENRICH[0] = now
         _guarded(enrich_once, now)

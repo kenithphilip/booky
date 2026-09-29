@@ -772,6 +772,37 @@ st, h, b = portal_post(p, "/devices", "/devices", {"action": "hcwant", "hc_want"
 r = subprocess.run(["docker", "exec", "librarian", "python", "-c", "import db; p = db.get_prefs('alice'); print(p['hc_want'], p['hc_want_kind'])"], capture_output=True, text=True)
 check(r.stdout.split() == ["True", "both"], "Want to Read on (ebook and audiobook)", r.stdout + r.stderr[-120:])
 portal_post(p, "/devices", "/devices", {"action": "hcwant", "hc_want": ""})
+# --- v6.1: Remove from my library reaches the Kobo (Calibre-Web's archive), then the tag comes off
+rm_bytes = make_epub("E2E Remove Me", "Test Harness")
+st, h, b = upload_as(p, "Test Harness - E2E Remove Me.epub", rm_bytes)
+rm_id = wait(lambda: imported("E2E Remove Me", "alice"), 300, 5)
+check(rm_id is not None, "alice's book to remove arrived", str(st))
+if rm_id:
+    def kobo_sync_raw(token):
+        st, h, b = Session().get(f"{CWA}/kobo/{token}/v1/library/sync", headers={"User-Agent": "Kobo eReader", "x-kobo-synctoken": ""})
+        return jload(b) if st == 200 else None
+    got = kobo_sync_raw(alice_kobo) or []
+    check(any((it.get("NewEntitlement") or it.get("ChangedEntitlement") or {}).get("BookMetadata", {}).get("Title") == "E2E Remove Me" for it in got),
+          "her Kobo has it (synced)")
+    st, h, b = portal_post(p, f"/book/{rm_id}/remove", f"/book/{rm_id}/remove", {})
+    check(st == 302, "alice removes it from her library", str(st))
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-c", f"import db; print(db.untag_pending({rm_id}, 'alice'), len([x for x in db.pending_tag_pushes() if x['calibre_id'] == {rm_id}]))"], capture_output=True, text=True)
+    check(r.stdout.split() == ["True", "0"], "it left My books at once; her owner tag waits for the Kobo", r.stdout + r.stderr[-120:])
+    got = kobo_sync_raw(alice_kobo) or []
+    # a real Kobo gets it as a ChangedEntitlement (its sync token is newer than the book); this
+    # token-less sync gets every entry as New: either way the flag is what the Kobo acts on
+    removed = [e for it in got for e in [it.get("ChangedEntitlement") or it.get("NewEntitlement")]
+               if e and (e.get("BookMetadata") or {}).get("Title") == "E2E Remove Me"]
+    check(bool(removed) and removed[0]["BookEntitlement"].get("IsRemoved") is True,
+          "the Kobo's next sync tells it to delete the book (IsRemoved, as Calibre-Web's own Archive does)", json.dumps(removed)[:200])
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-c", "import worker; print(worker.release_kobo_waits())"], capture_output=True, text=True)
+    check(r.stdout.strip() == "1", "the portal sees the Kobo has been told, and lets the removal go ahead", r.stdout + r.stderr[-160:])
+    job = subprocess.run(["bash", f"{REPO_DIR}/scripts/metadata-push.sh"], capture_output=True, text=True,
+                         env=dict(os.environ, STACK_DIR=STACK), timeout=900)
+    check(wait(lambda: imported("E2E Remove Me", "alice") is None, 120, 5), "the host job took her owner tag off", job.stdout[-200:])
+    st, titles = kobo_sync_titles(alice_kobo)
+    check("E2E Remove Me" not in titles, "and it is never offered to her Kobo again", str(sorted(titles))[:160])
+
 # --- the admin's dashboard and the reader's Help
 st, h, b = pa.get(PORTAL + "/admin")
 check(st == 200 and b"What needs you" in b and b"This week" in b, "the admin dashboard opens with What needs you", str(st))
@@ -903,6 +934,7 @@ if len(fam) >= 2:
     if solo:
         sid, stitle, spath = solo[0]
         portal_post(p, f"/book/{sid}/remove", f"/book/{sid}/remove", {})
+        kobo_sync_titles(alice_kobo)             # v6.1: her Kobo syncs (told to delete it); then the tag comes off
         check(wait(lambda: (host_job(), not calibre("SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=? AND t.name LIKE 'owner:%'", sid))[1], 240, 20),
               "alice, its last reader, removes it")
         r = subprocess.run(["docker", "exec", "librarian", "python", "-c",

@@ -423,6 +423,83 @@ def set_read_status(name, book_id, status):
     return status
 
 @_guard
+def kobo_remove(name, book_id):
+    """v6.1: take a book off this reader's Kobo at its next sync, as Calibre-Web itself does (CWA
+    v4.0.8 cps/web.py toggle_archived, kobo.py HandleSyncRequest). Returns how, or None when the
+    book never went to their Kobo:
+      'archive' (the Kobo syncs every book): archived for this reader and dropped from the Kobo's
+                synced list, so the next sync sends it again with IsRemoved and the Kobo deletes
+                it. That sync only includes a book the reader can still SEE: their owner tag must
+                stay until it has happened (the portal waits for it).
+      'shelf'   (the Kobo syncs only chosen shelves): off this reader's Kobo shelves; CWA's
+                two-way sync then sends the removal for a synced book no shelf holds any more,
+                whether or not the reader can still see it."""
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    uid, bid = u["id"], int(book_id)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+    with _conn() as c:
+        try:
+            synced = c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
+        except sqlite3.OperationalError:
+            return None                          # no Kobo has ever synced here
+        if not synced:
+            return None
+        shelves_only = (c.execute("SELECT kobo_only_shelves_sync FROM user WHERE id=?", (uid,)).fetchone() or [0])[0]
+        if shelves_only:
+            c.execute("DELETE FROM book_shelf_link WHERE book_id=? AND shelf IN "
+                      "(SELECT id FROM shelf WHERE user_id=? AND kobo_sync=1)", (bid, uid))
+            how = "shelf"
+        else:
+            row = c.execute("SELECT id FROM archived_book WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
+            if row:
+                c.execute("UPDATE archived_book SET is_archived=1, last_modified=? WHERE id=?", (now, row["id"]))
+            else:
+                c.execute("INSERT INTO archived_book(user_id, book_id, is_archived, last_modified) VALUES(?,?,1,?)",
+                          (uid, bid, now))
+            c.execute("DELETE FROM kobo_synced_books WHERE user_id=? AND book_id=?", (uid, bid))
+            how = "archive"
+        c.commit()
+    _checkpoint()
+    return how
+
+@_guard
+def kobo_removed(name, book_id, how):
+    """Has the Kobo had the removal kobo_remove() arranged? 'archive': its sync put the book back
+    on the synced list (CWA records every book it sends, the removal too); 'shelf': the sync
+    dropped it from that list."""
+    u = get_user(name)
+    if not u:
+        return True                              # the account is gone: nothing left to wait for
+    with _conn() as c:
+        try:
+            on = c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? AND book_id=?",
+                           (u["id"], int(book_id))).fetchone() is not None
+        except sqlite3.OperationalError:
+            return True
+    return on if how == "archive" else not on
+
+@_guard
+def kobo_unarchive(name, book_id):
+    """v6.1: a book given to a reader (again) is not 'archived' for them any more, or their Kobo
+    would be told to delete it the moment it arrives."""
+    u = get_user(name)
+    if not u:
+        return False
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+    with _conn() as c:
+        try:
+            n = c.execute("UPDATE archived_book SET is_archived=0, last_modified=? WHERE user_id=? AND book_id=? "
+                          "AND is_archived=1", (now, u["id"], int(book_id))).rowcount
+        except sqlite3.OperationalError:
+            return False
+        c.commit()
+    if n:
+        _checkpoint()
+    return bool(n)
+
+@_guard
 def kobo_status(name):
     """What CWA itself records about this reader's Kobo (L12), read-only: how many books it has
     handed to the device (kobo_synced_books) and when a reading position last arrived

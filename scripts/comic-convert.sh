@@ -115,7 +115,7 @@ def own(path):
 def safe_rel(rel):
     return rel and not rel.startswith("/") and ".." not in rel.split("/")
 
-def kcc(src, outdir, profile, fmt, kind, strip, title, extra=()):
+def kcc(src, outdir, profile, fmt, kind, strip, title, extra=(), landscape=False):
     """One KCC run in a throwaway container: no network, PUID:PGID, capped. [output files].
     v6.0.1: KCC sees the comic under a plain name of ours (comic.<ext>, alone in its folder): a
     library file whose name starts with '-' was read by KCC's 7-Zip as an option ('Extraction
@@ -143,6 +143,10 @@ def kcc(src, outdir, profile, fmt, kind, strip, title, extra=()):
             args.append("-m")
         if strip:
             args.append("-w")
+        elif landscape:
+            # v6.1: a landscape BOOK (every page wide: The Complete Peanuts) is rotated to fill the
+            # screen (turn the device); KCC's default cut each wide page in half as a 'spread'
+            args += ["-r", "1"]
         args += list(extra) + [f"/in/{os.path.basename(plain)}"]
         r = run(args, timeout=3600)            # a 700-page colour volume took ~4 min; 2 GB, about 12
     finally:
@@ -187,7 +191,7 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
             print(f"comic-convert: book {bid}: not enough free disk for its Kobo copy yet; later")
             continue                                        # not a failure: tried again next run
         made = kcc(src, out, KOBO_PROFILE, "EPUB", row.get("kind"), row.get("strip"), row.get("title") or "Comic",
-                   ("-b", "0"))
+                   ("-b", "0"), landscape=bool(row.get("landscape")))
         if len(made) > 1:
             raise RuntimeError("KCC split it into several files although asked not to: not added")
         mb = os.path.getsize(made[0]) >> 20
@@ -201,7 +205,8 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         run(["docker", "exec", "calibre-web", "chown", f"{UID}:{GID}", inside], timeout=30)
         lock = flock_metapush()
         try:
-            r = calibredb("add_format", "--dont-replace", str(bid), inside)
+            # remake (v6.1, 'Remake Kobo copy'): the new copy replaces the old one
+            r = calibredb("add_format", *([] if row.get("remake") else ["--dont-replace"]), str(bid), inside)
         finally:
             if lock:
                 lock.close()
@@ -245,7 +250,8 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         for fmt, extra in (("KFX", ()), ("KFX", ("--jpeg-quality", "75")),
                            ("EPUB", ("--targetsize", str(max(10, int(row.get("max_mb") or 45) * 85 // 100)), "-b", "1"))):
             shutil.rmtree(out, ignore_errors=True)
-            made = kcc(src, out, KINDLE_PROFILE, fmt, row.get("kind"), row.get("strip"), title, extra)
+            made = kcc(src, out, KINDLE_PROFILE, fmt, row.get("kind"), row.get("strip"), title, extra,
+                       landscape=bool(row.get("landscape")))
             if all(os.path.getsize(f) <= limit for f in made):
                 break
         else:

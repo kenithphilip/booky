@@ -238,7 +238,8 @@ def items_for(owner, is_admin=False, token=None):
         md = media.get("metadata") or {}
         out.append({"id": it.get("id"), "title": md.get("title") or it.get("relPath") or "?",
                     "author": md.get("authorName") or "", "path": it.get("path") or "",
-                    "size": it.get("size") or media.get("size") or 0, "is_file": bool(it.get("isFile"))})
+                    "size": it.get("size") or media.get("size") or 0, "is_file": bool(it.get("isFile")),
+                    "mine": tag in (media.get("tags") or [])})
     return sorted(out, key=lambda x: (x["author"].lower(), x["title"].lower()))
 
 def find_item_by_folder(folder, token=None):
@@ -265,6 +266,24 @@ def untag_item(item_id, tag, token=None):
     r = _req("PATCH", f"/api/items/{item_id}/media", token=token, json={"tags": sorted(t for t in tags if t != tag)})
     if r.status_code != 200:
         raise AbsError(f"could not untag ABS item: {r.status_code} {r.text[:120]}")
+    return True
+
+def item_owners(item_id, token=None):
+    """v6.1: the readers an item belongs to (its owner:<name> tags), or None when it is gone."""
+    r = _req("GET", f"/api/items/{item_id}", token=token)
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise AbsError(f"Audiobookshelf answered HTTP {r.status_code} for item {item_id}")
+    tags = (_json(r).get("media") or {}).get("tags") or []
+    return sorted(t[len(config.OWNER_PREFIX):] for t in tags if t.startswith(config.OWNER_PREFIX))
+
+def delete_item(item_id, token=None):
+    """v6.1: an audiobook nobody has any more, off the server: Audiobookshelf deletes the item
+    AND its files (hard=1). Only after LIBRARY_RELEASE_DAYS with no owner (worker)."""
+    r = _req("DELETE", f"/api/items/{item_id}", token=token, params={"hard": 1}, timeout=120)
+    if r.status_code not in (200, 204, 404):
+        raise AbsError(f"Audiobookshelf could not delete item {item_id}: HTTP {r.status_code} {r.text[:120]}")
     return True
 
 def tag_folder(folder, owner, attempts=None, delay=5, sleep=time.sleep):

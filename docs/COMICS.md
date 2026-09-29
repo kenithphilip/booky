@@ -90,6 +90,11 @@ From a pack, only the requested volume is imported; the rest of the pack stays o
   imports one item per reader in turn; a large download (comic or audiobook) starts only when the
   disk has room beside the downloads already under way, and waits its turn otherwise, keeping the
   reader's yes.
+- v6.1: a landscape BOOK (most pages clearly wider than tall: The Complete Peanuts) is marked
+  "Landscape pages" and KCC rotates its pages (`-r 1`) instead of cutting each one in half as a
+  "spread" (its default): a 10-page landscape test made 21 halves by default, 11 whole turned pages
+  rotated. A portrait comic with the odd spread keeps the default. Comics imported earlier are
+  measured from their file when their Kobo copy is made; **Remake Kobo copy** replaces an old one.
 - A comic nobody asked for is titled from its release name ("The Complete Peanuts Vol. 1 (2004)"),
   never with " - " in it (Calibre read "X - Y" in the file name as title and author).
 

@@ -691,10 +691,16 @@ again (`librarian/share.py`):
   new file, and formats made from the old one (the Kobo's KEPUB, a kept MOBI, conversions) are
   removed to be made again. The host job does the swap, reading the owner tags before and after.
 - **Remove from my library** (a book's page): only that reader's owner tag comes off; everyone
-  else keeps the book. The page first says how to delete the copies already on their devices
-  (Kobo: *Remove → Remove from My Books*; Kindle: *Remove from Device*, plus Amazon's *Manage
-  Your Content and Devices* for mailed books), because Calibre-Web's Kobo sync never removes a
-  book it no longer shows (measured in the CWA v4.0.6 source, unchanged in v4.0.7).
+  else keeps the book. v6.1: **the Kobo deletes it at its next sync**, as Calibre-Web's own
+  Archive does (CWA v4.0.8 web.py toggle_archived / kobo.py): the book is archived for that
+  reader and dropped from the Kobo's synced list, so the next sync sends it with `IsRemoved`; a
+  Kobo that syncs only chosen shelves has it taken off those shelves (CWA's two-way sync). The
+  sync only tells a Kobo about a book the reader can still see, so their owner tag comes off
+  after the Kobo has synced (at most 7 days). Asked for again before that, it simply stays. A
+  Kindle cannot be reached (Amazon has no such API): the page says how (*Remove from Device*,
+  and *Manage Your Content and Devices* for mailed books).
+- **Remove from my audiobooks** (v6.1, My audiobooks): the reader's owner tag comes off the
+  Audiobookshelf item; a copy downloaded in its app stays until they delete it there.
 
 ## Keeping the VPS small (it has 80 GB; the seedbox has the space)
 - **Books no reader has any more** are deleted from the server `LIBRARY_RELEASE_DAYS` (7) after
@@ -702,6 +708,8 @@ again (`librarian/share.py`):
   deletes only if the book's owner tags are still exactly what the portal saw (a book someone
   got again in the meantime is kept), permanently (no Calibre trash on a small disk). A book that
   never had an owner (the admin's own, added in Calibre-Web) is never touched. `0` = never.
+  v6.1: audiobooks too (Audiobookshelf deletes the item and its files), and a book or audiobook
+  asked for again during the countdown is given back, never downloaded again.
 - **Seedbox downloads**: this server keeps its Syncthing copy for a week, then drops it and
   ignores it (the seedbox keeps seeding). Asked for again, Shelfmark finds the torrent complete
   and waits for the file; the portal passes what it is waiting for to the seedbox job, which

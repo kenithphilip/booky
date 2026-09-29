@@ -56,7 +56,18 @@ def find_ebook(title, author="", identifiers=()):
     except sqlite3.Error as e:
         log.warning("family sharing: could not read metadata.db: %s", e)
         return None
-    return dict(m, owners=owners) if owners else None
+    if owners:
+        return dict(m, owners=owners)
+    # v6.1: nobody has it any more, but it is still here, counting down to deletion (removed in the
+    # last LIBRARY_RELEASE_DAYS): asked for again, it is given back, never downloaded again. Not an
+    # untagged book otherwise: that is someone's import still under way.
+    try:
+        import db
+        if db.release_waiting(m["book_id"]):
+            return dict(m, owners=[], released=True)
+    except Exception as e:
+        log.warning("family sharing: could not read the release countdown: %s", e)
+    return None
 
 
 def audiobook_owned_by(title, author, owner, exclude=()):
@@ -117,14 +128,26 @@ def _audiobook_match(title, author="", owner=None, exclude=()):
         return mine[0] if mine else None
     owned = [h for h in hits if h["owners"]]
     if not owned:
-        return None                          # an untagged item is someone's import still under way
+        # v6.1: removed by its last reader, still here counting down: given back, never downloaded
+        # again. Any other untagged item is someone's import still under way.
+        try:
+            import db
+            back = [h for h in hits if db.audio_release_waiting(h["item_id"])]
+        except Exception:
+            back = []
+        return dict(back[0], released=True) if back else None
     return max(owned, key=lambda h: len(h["owners"]))   # copies of the same book: the most shared one
 
 
 def give_ebook(match, owner, rid=None, now=None):
     """Queue the host job that adds owner:<owner> to the existing Calibre book."""
-    if owner not in match["owners"]:
+    if owner not in match["owners"] or db.untag_pending(match["book_id"], owner):
         db.queue_tag_push(match["book_id"], rid, owner, now, share=True)   # False: already queued
+    try:                                         # v6.1: never 'archived' for them (their Kobo would drop it)
+        import cwa
+        cwa.kobo_unarchive(owner, match["book_id"])
+    except Exception as e:
+        log.warning("could not clear the Kobo archive mark of book %s for %s: %s", match["book_id"], owner, e)
     if rid:
         db.link_calibre(rid, match["book_id"], owner)
 

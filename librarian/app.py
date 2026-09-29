@@ -807,6 +807,12 @@ def status():
     # what waits for the reader's answer first, then what is under way, then the rest (newest first within)
     order = {"confirm": 0, "held": 1, "pending": 2, "downloading": 3, "queued": 4, "not-found": 5}
     book_reqs = sorted(db.bookreq_list(None if is_admin else session["user"]), key=lambda b: order.get(b["status"], 6))
+    # v6.1: a book the reader removed since is not a link any more (its page would be a 404)
+    ids = [b["calibre_id"] for b in book_reqs if b.get("calibre_id")]
+    here = library.visible_ids(session["user"], ids, is_admin) if ids else set()
+    for b in book_reqs:
+        b["gone"] = bool(b.get("calibre_id")) and (b["calibre_id"] not in here
+                                                   or db.untag_pending(b["calibre_id"], b["owner"]))
     return render_template("status.html", rows=rows, pending=pending, failed=failed,
                            admin=is_admin, looking=looking, kindle_sends=kindle_sends,
                            shelf_pending=shelf_pending, shelf_error=shelf_error, book_reqs=book_reqs)
@@ -1041,7 +1047,7 @@ def book_page(book_id):
     return render_template(
         "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
-        kobo_ahead=comics.kobo_position(book_id) if is_comic and "kepub" not in b["formats"] else None,
+        kobo_ahead=comics.kobo_position(book_id) if is_comic else None,
         # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
         description=b["description"] or work.get("description") or "",
         first_year=work.get("first_publish_year"),
@@ -1075,10 +1081,18 @@ def book_remove(book_id):
     if not mine:
         flash("This book is not on your own shelf; delete it for everyone in Calibre-Web.")
         return redirect(url_for("book_page", book_id=book_id))
-    db.queue_untag(book_id, user)
-    _audit("remove_from_library", f"book {book_id}")
-    flash(f"“{b['title']}” is being removed from your library: it leaves My books within a couple of "
-          "minutes. Delete the copies on your Kobo or Kindle as the page showed.")
+    # v6.1: off their Kobo too, at its next sync; their owner tag stays until that has happened
+    # (Calibre-Web only tells a Kobo about a book the reader can still see), at most 7 days
+    try:
+        kobo = cwa.kobo_remove(user, book_id)
+    except (cwa.CwaError, cwa.CwaUnavailable) as e:
+        app.logger.warning("Kobo removal of book %s for %s: %s", book_id, user, e)
+        kobo = None
+    db.queue_untag(book_id, user, not_before=(time.time() + worker.KOBO_REMOVE_WAIT) if kobo else None, kobo_wait=kobo)
+    _audit("remove_from_library", f"book {book_id}" + (f" (Kobo: {kobo})" if kobo else ""))
+    flash(f"“{b['title']}” is being removed from your library: it leaves My books now"
+          + (" and your Kobo at its next sync (Wi-Fi on, then Sync)." if kobo else ".")
+          + " Delete any copy on a Kindle or in a reading app as the page showed.")
     return redirect(url_for("my_library"))
 
 @app.route("/book/<int:book_id>/replace", methods=["POST"])
@@ -1575,9 +1589,11 @@ def book_kobo_copy(book_id):
     user, is_admin = session["user"], session.get("admin", False)
     if not library.visible(user, book_id, is_admin) or not library.file_for(user, book_id, "cbz", is_admin):
         abort(404)
-    db.comic_convert_force(book_id)
-    _audit("comic_kobo_copy", f"book {book_id}")
-    flash("Making the Kobo copy — a few minutes. Then sync your Kobo.")
+    remake = request.form.get("remake") == "1"                # v6.1: replace the Kobo copy there is
+    db.comic_convert_force(book_id, remake=remake)
+    _audit("comic_kobo_copy", f"book {book_id}" + (" (remake)" if remake else ""))
+    flash(("Remaking" if remake else "Making") + " the Kobo copy — a few minutes. Then sync your Kobo"
+          + (" (it replaces the old copy there)." if remake else "."))
     return redirect(url_for("book_page", book_id=book_id))
 
 # ---- following series and authors; New for you (v5.8, follows.py) -------------------------------
@@ -1970,6 +1986,32 @@ def audiobook_cover(item_id):
     resp = Response(got[0], mimetype=got[1] if got[1].startswith("image/") else "image/jpeg")
     resp.headers["Cache-Control"] = "private, max-age=86400"
     return resp
+
+@app.route("/audiobooks/<item_id>/remove", methods=["POST"])
+@login_required
+def audiobook_remove(item_id):
+    """v6.1: 'Remove from my audiobooks': this reader's owner tag comes off the Audiobookshelf item
+    (anyone else who has it keeps it). When nobody has it any more it is deleted from the server
+    after LIBRARY_RELEASE_DAYS (worker.reconcile_audio_releases); asked for again, it comes back."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", item_id or "") or not absapi.configured():
+        abort(404)
+    user = session["user"]
+    try:
+        meta = absapi.item_meta(item_id) or {}
+        if not absapi.untag_item(item_id, absapi.owner_tag(user)):
+            flash("It is not in your audiobooks.")
+            return redirect(url_for("my_audiobooks"))
+        share._ABS_ITEMS["at"] = 0.0
+        left = absapi.item_owners(item_id)
+    except absapi.AbsError as e:
+        flash(f"Audiobookshelf did not take it out: {e}")
+        return redirect(url_for("my_audiobooks"))
+    if left == [] and config.LIBRARY_RELEASE_DAYS > 0:
+        db.audio_release_note(item_id, meta.get("title"))
+    _audit("remove_audiobook", item_id)
+    flash(f"“{meta.get('title') or 'The audiobook'}” is out of your audiobooks. A copy downloaded in the "
+          "Audiobookshelf app stays on your phone until you delete it there (the book's ⋯ menu → Delete download).")
+    return redirect(url_for("my_audiobooks"))
 
 @app.route("/audiobooks/<item_id>/wrong", methods=["POST"])
 @login_required

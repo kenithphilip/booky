@@ -13,7 +13,11 @@ a single file as it is, a folder of files as one ZIP.</p>
 {% if it.got_it %}<details style="display:inline-block"><summary class="mut">Wrong?</summary>
 <form method="post" action="{{ url_for('audiobook_wrong', item_id=it.id) }}">{{ csrf_field() }}
 <span class="mut" style="display:block;white-space:normal;max-width:32ch">Takes it out of your audiobooks; that copy is never offered again and another is found (asking you first).</span>
-<button type="submit" class="danger">Wrong audiobook</button></form></details>{% endif %}</td></tr>
+<button type="submit" class="danger">Wrong audiobook</button></form></details>{% endif %}
+{% if it.mine %}<details style="display:inline-block"><summary class="mut">Remove</summary>
+<form method="post" action="{{ url_for('audiobook_remove', item_id=it.id) }}">{{ csrf_field() }}
+<span class="mut" style="display:block;white-space:normal;max-width:34ch">Takes it out of your audiobooks. Anyone else in the family who has it keeps it{% if cfg.LIBRARY_RELEASE_DAYS %}; if nobody has it any more it is deleted from the server after {{ cfg.LIBRARY_RELEASE_DAYS }} days{% endif %}. A copy downloaded in the Audiobookshelf app stays until you delete it there.</span>
+<button type="submit" class="danger">Remove from my audiobooks</button></form></details>{% endif %}</td></tr>
 {% endfor %}
 </table>
 {% endblock %}

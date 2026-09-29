@@ -90,11 +90,17 @@ def request(owner, title, author="", series=None, language=None, hardcover_id=No
         m = share.find_ebook(title, author) or _own_copy(owner, title, author)
     if m:
         if owner in m["owners"]:
+            if db.untag_pending(m["book_id"], owner):       # v6.1: removed, and asked for again before it went
+                share.give_ebook(m, owner, rid)
+                db.bookreq_update(rid, status="owned", calibre_id=m["book_id"],
+                                  detail="you had just removed it: it stays in your library")
+                return rid, "owned"
             db.bookreq_update(rid, status="owned", calibre_id=m["book_id"], detail="already in your library")
             return rid, "owned"
         share.give_ebook(m, owner)
         db.bookreq_update(rid, status="shared", calibre_id=m["book_id"],
-                          detail="already in the family library: added to yours, nothing downloaded")
+                          detail=("still in the library (removed lately): given back to you, nothing downloaded"
+                                  if m.get("released") else "already in the family library: added to yours, nothing downloaded"))
         notify.admin("shared", {"owner": owner, "title": title, "author": author, "source": "books",
                                 "status": "shared", "seq": notify.seq_id("book", rid)})
         return rid, "shared"
@@ -373,6 +379,29 @@ def _active_titles(queue):
     return out
 
 
+def close_owned_offers():
+    """v6.1: a copy waiting for the reader's yes, of a book (or audiobook) that is theirs by now
+    (arrived another way, shared by the family, fixed by hand): closed, never offered again."""
+    n = 0
+    for req in db.bookreq_open(statuses=("confirm",)):
+        try:
+            if req.get("kind") == "audio":
+                a = share.audiobook_owned_by(req["title"], req.get("author") or "", req["owner"], exclude=_rejected_items(req))
+                if a:
+                    db.bookreq_update(req["id"], status="owned", abs_item=a["item_id"], candidate=None,
+                                      detail="already in your audiobooks: nothing to confirm")
+                    n += 1
+                continue
+            m = _library_copy(req)
+            if m and req["owner"] in m["owners"]:
+                db.bookreq_update(req["id"], status="owned", calibre_id=m["book_id"], candidate=None,
+                                  detail="already in your library: nothing to confirm")
+                n += 1
+        except Exception as e:                   # one unreadable row never stops the others
+            log.warning("could not check request %s against the library: %s", req.get("id"), e)
+    return n
+
+
 def watch_downloads(shelfmark_api, queue=None, now=None):
     """Downloads under way: done once the book is in the library with the reader's tag; the next
     release when Shelfmark's download failed, or when nothing arrived in BOOK_ARRIVAL_HOURS and
@@ -380,6 +409,7 @@ def watch_downloads(shelfmark_api, queue=None, now=None):
     another (the file came, only its title in Calibre differs): after BOOK_ARRIVAL_HOURS it is
     closed and the reader is told to look in their library. Returns (arrived, retried)."""
     now = now or time.time()
+    close_owned_offers()
     rows = db.bookreq_open(statuses=("downloading",))
     if not rows:
         return 0, 0

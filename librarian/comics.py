@@ -17,6 +17,7 @@ log = logging.getLogger("comics")
 COMIC_TAGS = {"comic": "Comics", "collected": "Comics", "manga": "Manga", "manhwa": "Manhwa", "manhua": "Manhua"}
 ALL_COMIC_TAGS = ("Comics", "Manga", "Manhwa", "Manhua")
 STRIP_TAG = "Long strip"            # webtoon-style vertical pages: KCC's webtoon mode
+LANDSCAPE_TAG = "Landscape pages"   # v6.1: wide pages (The Complete Peanuts): rotated on e-readers, never split
 RTL_KINDS = ("manga",)
 RETRY = (3600, 6 * 3600) + (86400,) * 60
 CHAPTER_SEARCH_DAYS = 7              # a chapter nobody posted in a week will not be; the volume will come
@@ -316,12 +317,17 @@ def watch_downloads(shelfmark_api, queue=None, now=None):
     now = now or time.time()
     failed_titles = {(f.get("title") or "").strip().lower() for f in (shelfmark_api.failed(queue) if queue else [])}
     n = 0
-    for req in db.comic_open(statuses=("downloading",)):
+    for req in db.comic_open(statuses=("downloading", "confirm")):
         # v6.0.1: already in the reader's library by series and number (it arrived under another
-        # name, or the admin fixed its metadata in Calibre-Web): done, never downloaded again
+        # name, or the admin fixed its metadata in Calibre-Web): done, never downloaded again.
+        # v6.1: a copy waiting for the reader's yes too (the Peanuts was offered again after it arrived)
         m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
         if m and req["owner"] in m["owners"]:
-            db.comic_update(req["id"], status="done", calibre_id=m["book_id"], detail="in your library")
+            db.comic_update(req["id"], status="done", calibre_id=m["book_id"], candidate=None,
+                            detail="in your library" if req["status"] == "downloading" else
+                            "already in your library: nothing to confirm")
+            continue
+        if req["status"] != "downloading":
             continue
         rel = (req.get("release_title") or "").strip().lower()
         stale = now - (req.get("queued_at") or now) > config.COMIC_ARRIVAL_HOURS * 3600
@@ -367,8 +373,9 @@ def prepare_arrival(path, owner, workdir):
                     "language": info.get("LanguageISO") or "", "pages": page_count(cbz)}
             return "skip", _hold(req, path, problems, meta), req
     strip = looks_like_strip(cbz)
+    landscape = not strip and looks_landscape(cbz)
     base = _title(req) if req else display_title(stem)
-    write_metadata(cbz, req, base, strip)
+    write_metadata(cbz, req, base, strip, landscape)
     return cbz, base, req
 
 
@@ -592,13 +599,13 @@ def _natural(s):
 
 
 # ---- metadata written into the file -------------------------------------------------------------------
-def write_metadata(cbz, req, stem, strip):
+def write_metadata(cbz, req, stem, strip, landscape=False):
     """ComicInfo.xml (read by KCC, Panels, Chunky, KOReader) and a ComicBookInfo block in the
     zip comment (the only comic metadata Calibre reads: series, number, credits, tags). The
     owner tag is added afterwards by the ordinary CBZ tagger, which keeps this block."""
     from tagger import CBI_KEY
     kind = (req or {}).get("kind") or "comic"
-    tags = [COMIC_TAGS.get(kind, "Comics")] + ([STRIP_TAG] if strip else [])
+    tags = [COMIC_TAGS.get(kind, "Comics")] + ([STRIP_TAG] if strip else []) + ([LANDSCAPE_TAG] if landscape else [])
     title = _title(req) if req else stem
     ci = {"Title": title}
     cbi = {"title": title, "tags": tags}
@@ -679,6 +686,39 @@ def image_size(data):
     return None
 
 
+def looks_landscape(cbz, sample=12):
+    """v6.1: a landscape BOOK, most sampled pages clearly wider than tall (The Complete Peanuts:
+    three or four strips stacked on a wide page). KCC's default takes a wide page for a two-page
+    spread and cuts it in half, which cut every strip; such a book is rotated instead. A portrait
+    comic with the odd double spread keeps KCC's default."""
+    try:
+        with zipfile.ZipFile(cbz) as z:
+            names = sorted((n for n in z.namelist() if n.lower().endswith(IMAGE_EXTS)), key=_natural)
+            if len(names) < 3:
+                return False
+            step = max(1, len(names) // sample)
+            wide = seen = 0
+            for n in names[::step][:sample]:
+                with z.open(n) as f:
+                    size = image_size(f.read(256 * 1024))
+                if size and size[1]:
+                    seen += 1
+                    wide += size[0] / size[1] >= 1.15
+            return seen >= 3 and wide * 10 >= seen * 6
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def _shape_flags(rel, tags_landscape):
+    """Landscape from the tag, or (a comic imported before v6.1) from its pages."""
+    if tags_landscape:
+        return True
+    try:
+        return looks_landscape(os.path.join(config.LIBRARY_DIR, rel)) if rel else False
+    except Exception:
+        return False
+
+
 def looks_like_strip(cbz, sample=8):
     """A webtoon: most sampled pages at least 2.5 times taller than wide."""
     try:
@@ -737,6 +777,7 @@ def comic_books(ids=None):
         b["owners"] = sorted(t[len(config.OWNER_PREFIX):] for t in tags if t.startswith(config.OWNER_PREFIX))
         b["kind"] = "manga" if "Manga" in tags else "manhwa" if "Manhwa" in tags else "manhua" if "Manhua" in tags else "comic"
         b["strip"] = STRIP_TAG in tags
+        b["landscape"] = LANDSCAPE_TAG in tags
         b["rel"] = b["formats"].get("CBZ")
     return out
 
@@ -759,14 +800,16 @@ def kobo_queue(now=None):
     state = db.comic_convert_state(books.keys())
     kobo, forced, lanes = {}, [], {}
     for bid, b in sorted(books.items()):
-        if not b["rel"] or "KEPUB" in b["formats"]:
-            continue
         st = state.get(bid)
+        remake = bool(st and st.get("remake") and st.get("forced") and st["status"] == "due")
+        if not b["rel"] or ("KEPUB" in b["formats"] and not remake):
+            continue
         if st and (st["status"] in ("done", "failed") and not st.get("forced")):
             continue
         if st and st.get("next_try") and st["next_try"] > now:
             continue
-        row = {"calibre_id": bid, "rel": b["rel"], "title": b["title"], "kind": b["kind"], "strip": b["strip"]}
+        row = {"calibre_id": bid, "rel": b["rel"], "title": b["title"], "kind": b["kind"], "strip": b["strip"],
+               "landscape": b["landscape"], "remake": remake}
         if st and st.get("forced") and st["status"] == "due":
             forced.append((st.get("updated") or 0, row))
             continue
@@ -785,8 +828,11 @@ def kobo_queue(now=None):
 
 
 def kobo_due(now=None, limit=3):
-    """The next comics for the host job (kobo_queue's head)."""
-    return kobo_queue(now)[:limit]
+    """The next comics for the host job (kobo_queue's head), each with its page shape."""
+    rows = kobo_queue(now)[:limit]
+    for r in rows:
+        r["landscape"] = not r["strip"] and _shape_flags(r["rel"], r["landscape"])
+    return rows
 
 
 def kobo_position(book_id, now=None):
@@ -816,7 +862,8 @@ def kindle_due(limit=2):
             db.kindle_update(j["id"], status="failed", detail="the comic is no longer in your library")
             continue
         out.append({"job": j["id"], "calibre_id": j["book_id"], "rel": b["rel"], "title": b["title"],
-                    "kind": b["kind"], "strip": b["strip"], "max_mb": config.KINDLE_MAX_MB})
+                    "kind": b["kind"], "strip": b["strip"], "max_mb": config.KINDLE_MAX_MB,
+                    "landscape": not b["strip"] and _shape_flags(b["rel"], b["landscape"])})
     return out
 
 

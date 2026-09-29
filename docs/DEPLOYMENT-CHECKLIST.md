@@ -200,6 +200,27 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.1.0 (removal reaches the Kobo; audiobooks removed and released; landscape comics)
+- Remove from my library now takes the book off the reader's Kobo at its next sync: the portal does
+  what Calibre-Web's own Archive does (CWA v4.0.8: archived_book for the reader, the book off
+  kobo_synced_books; the next sync sends it with IsRemoved). A Kobo that syncs only chosen shelves
+  has it taken off those shelves (CWA's two-way sync). Their owner tag waits for that sync (the
+  sync ignores books a reader cannot see), at most 7 days. Asked for again meanwhile, it stays.
+- Remove from my audiobooks (My audiobooks); an audiobook nobody has any more is deleted from the
+  server after LIBRARY_RELEASE_DAYS, like books. During that countdown a book or audiobook asked
+  for again is given back, never downloaded again.
+- A copy waiting for a reader's yes is closed when the book (or comic, or audiobook) is theirs by
+  then (the Peanuts was offered again after it arrived). Requests shows a removed book as removed.
+- Landscape comics (The Complete Peanuts) are rotated on the Kobo and the Kindle, not cut in half;
+  Remake Kobo copy on a comic's page replaces an old copy.
+- After Deploy: on The Complete Peanuts' page press **Remake Kobo copy**; after the next Kobo sync
+  it shows whole, turned pages (hold the Kobo sideways).
+- Tests: unit 815 passed, installer 823 passed, end-to-end 334 checks / 0 failed, lint clean. On the
+  real CWA v4.0.8 stack: a book on alice's (simulated) Kobo, removed on the portal, is sent to the
+  Kobo at its next sync with IsRemoved; only then does her owner tag come off, and it is never
+  offered to that Kobo again. KCC measured on a landscape test book: 21 halves by default, 11 whole
+  turned pages with -r 1.
+
 ## v6.0.1 (large comics and audiobooks; no credentials in error text)
 - Found on the server the day v6.0.0 went live: The Complete Peanuts v01 (a 339 MB CBR) was refused
   at import, because comics were held to the ebook cap (200 MB). Comics now have `MAX_COMIC_MB`
