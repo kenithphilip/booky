@@ -23,10 +23,11 @@
 </div>
 {% if is_comic %}
 <p class="mut" style="margin:8px 0 0">{% if 'kepub' in b.formats %}Kobo copy ready (colour, fixed layout): it reaches your Kobo on its next sync. The CBZ is for phones and tablets (Panels, Chunky).
+{% elif kobo_ahead is not none %}The Kobo copy is {% if kobo_ahead == 0 %}being made now{% else %}in the queue, {{ kobo_ahead }} comic{{ '' if kobo_ahead == 1 else 's' }} ahead of it (one at a time, a few minutes each; readers take turns){% endif %} — then sync your Kobo.
 {% elif kobo_state and kobo_state.status == 'due' %}The Kobo copy is being made — a few minutes, then sync your Kobo.
 {% elif kobo_state and kobo_state.status == 'failed' %}The Kobo copy could not be made ({{ kobo_state.detail or 'see the admin' }}). The CBZ can still be downloaded.
 {% endif %}</p>
-{% if 'kepub' not in b.formats and not (kobo_state and kobo_state.status == 'due') %}
+{% if 'kepub' not in b.formats and kobo_ahead is none and not (kobo_state and kobo_state.status == 'due') %}
 <form method="post" action="{{ url_for('book_kobo_copy', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
 <button type="submit" class="sec">Make Kobo copy</button>
 <span class="mut">Made automatically for readers whose Kobo syncs; this makes it now.</span></form>{% endif %}

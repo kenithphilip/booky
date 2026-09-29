@@ -220,7 +220,7 @@ def _comics(args):
     if args.what == "kobo-due":
         return {"ok": True, "rows": comics.kobo_due(limit=args.limit)}
     if args.what == "kobo-result":
-        st = db.comic_convert_result(args.calibre_id, args.outcome == "ok", args.reason)
+        st = db.comic_convert_result(args.calibre_id, args.outcome == "ok", args.reason, final=args.outcome == "final")
         db.audit("comic_kobo", None, "host", f"book {args.calibre_id} {args.outcome} {args.reason[:120]}")
         return {"ok": True, "status": st}
     if args.what == "kindle-due":
@@ -401,7 +401,7 @@ def _parser():
     cm.add_parser("kobo-due").add_argument("--limit", type=int, default=1)
     kr = cm.add_parser("kobo-result")
     kr.add_argument("calibre_id", type=int)
-    kr.add_argument("outcome", choices=("ok", "fail"))
+    kr.add_argument("outcome", choices=("ok", "fail", "final"))       # final: another try cannot help
     kr.add_argument("--reason", default="")
     cm.add_parser("kindle-due").add_argument("--limit", type=int, default=1)
     kk = cm.add_parser("kindle-result")

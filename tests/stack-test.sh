@@ -320,7 +320,9 @@ print(rid)
 PY
 )
 mkdir -p "$STACK/library/dropbox/alice"
-cp "$STACK/testfiles/comic.cbz" "$STACK/library/dropbox/alice/E2E Manga v03 (Digital) (e2e).cbz"
+# v6.0.1: named the way the live server's Peanuts came (Shelfmark's 'Author - Title' with no author,
+# a year range after the volume): it must still be matched to the request, as volume 3
+cp "$STACK/testfiles/comic.cbz" "$STACK/library/dropbox/alice/ - E2E Manga v03 - 2019 to 2021 (Digital) (e2e).cbz"
 cbid=""
 for _ in $(seq 1 60); do
   cbid=$(python3 - "$STACK/library/books/metadata.db" <<'PY'

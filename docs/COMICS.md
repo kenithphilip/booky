@@ -61,7 +61,9 @@ Kobo sync, Send to Kindle, family sharing, backups and My books already cover th
 **Scoring** (a release must pass every hard rule, then the best score wins):
 - hard: the series matches; the number is the one requested (or a pack that contains it); a
   chapter release never fills a volume request; the language is the request's (explicit other
-  languages and raws are dropped); the format is CBZ, CBR, CB7, PDF or EPUB; the size is sane.
+  languages and raws are dropped); the format is CBZ, CBR, CB7, PDF or EPUB; the size is sane
+  (one volume up to `MAX_COMIC_MB`, 2 GB by default since v6.0.1: complete colour volumes and
+  omnibuses run to hundreds of MB; before, comics were held to the 200 MB ebook cap).
 - preferred: a single issue/volume over a pack; digital over scan; official publisher names over
   fan groups; Usenet over torrent at equal quality (no seeding needed); more seeders.
 - nothing passes: the request waits and is searched again (1 h, 6 h, then daily, for 30 days).
@@ -72,6 +74,24 @@ From a pack, only the requested volume is imported; the rest of the pack stays o
 7. **Kindle copy.** Made when a comic is sent (button or auto-send), never stored: KCC's
    Send-to-Kindle EPUB for the Colorsoft, at lower image quality if it is over the mail limit,
    split into parts if it still is. The portal mails the parts and deletes them.
+
+**v6.0.1: large comics and several readers at once.**
+- KCC gets every comic under a plain name of the job's own (`comic.cbz`, alone in its folder):
+  a library file whose name began with `-` was read by KCC's 7-Zip as an option ("Extraction
+  failed, install specialized extraction software"); the same bytes under a plain name converted.
+- The Kobo copy is ONE file (`-b 0`: KCC splits past 400 MB by default, and a split copy was
+  refused). Measured with KCC v12.0.0 at the production cap (1536 MB, 1.5 CPUs): a 268-page,
+  368 MB colour volume in 67 s at 1.22 GB peak (a 231 MB Kobo copy); a 700-page, 687 MB one in
+  229 s at 1.18 GB peak (a 490 MB Kobo copy). A Kobo copy over `KCC_KOBO_MAX_MB` (1024) is not
+  made (once, not three times; the admin is told why); readers still download the CBZ. Both
+  settings are in Operations -> Advanced settings -> comics.
+- Queues, so one reader's fifty volumes never keep everyone else waiting: Kobo copies are made one
+  at a time with the readers taking turns (the comic's page says how many are ahead); the dropbox
+  imports one item per reader in turn; a large download (comic or audiobook) starts only when the
+  disk has room beside the downloads already under way, and waits its turn otherwise, keeping the
+  reader's yes.
+- A comic nobody asked for is titled from its release name ("The Complete Peanuts Vol. 1 (2004)"),
+  never with " - " in it (Calibre read "X - Y" in the file name as title and author).
 
 Reading progress comes back from the Kobo (Calibre-Web records it); a Kindle or an iPad never
 reports it. v5.8: **Follow** on a series page puts new issues or volumes (once released) on the

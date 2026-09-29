@@ -66,6 +66,9 @@ def _safe(name, max_bytes=NAME_MAX_BYTES):
     truncates by UTF-8 length so a non-ASCII name cannot overflow NAME_MAX."""
     name = unicodedata.normalize("NFC", name or "")
     name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    # v6.0.1: 'Author - Title' with no author came as ' - Title' (Shelfmark's naming): no leading
+    # or trailing separator in a file or title name
+    name = re.sub(r"^[\s\-\u2013\u2014_.]+|[\s\-\u2013\u2014_]+$", "", name)
     raw = name.encode("utf-8")
     if len(raw) > max_bytes:
         name = raw[:max_bytes].decode("utf-8", "ignore").strip(" .")
@@ -148,7 +151,8 @@ def _auth_for(req, url):
     return None
 
 def _limit_for(kind):
-    return (config.MAX_AUDIO_MB if kind == "audio" else config.MAX_EBOOK_MB) * 1024 * 1024
+    mb = {"audio": config.MAX_AUDIO_MB, "comic": config.MAX_COMIC_MB}.get(kind, config.MAX_EBOOK_MB)
+    return mb * 1024 * 1024
 
 def _fetch(url, dest, req=None):
     """One download attempt: check each hop's target, follow at most 5 redirects by hand
@@ -979,9 +983,9 @@ def ingest_local_file(path, owner, rid=None):
     ext, base = ext.lower(), _safe(stem)
     sniffed = _sniff_ext(path)
     if ext in config.COMIC_EXTS or (not ext and sniffed == "cbr"):
-        if os.path.getsize(path) > _limit_for("ebook"):
-            raise ValueError(f"file is {os.path.getsize(path) >> 20} MB; the limit for this kind is "
-                             f"{_limit_for('ebook') >> 20} MB (MAX_EBOOK_MB)")
+        if os.path.getsize(path) > _limit_for("comic"):     # v6.0.1: comics have their own cap
+            raise ValueError(f"file is {os.path.getsize(path) >> 20} MB; the limit for comics is "
+                             f"{_limit_for('comic') >> 20} MB (MAX_COMIC_MB)")
         return _ingest_comic(path, owner, rid)
     if ext in config.EBOOK_EXTS and sniffed in AUDIO_SNIFFED:
         ext = sniffed          # an .m4b renamed .epub (or mailed as one) is still an audiobook
@@ -1243,6 +1247,9 @@ def scan_dropbox_once(now=None):
         return 0
     if _disk_paused():        # leave what was dropped where it is; it is picked up on resume
         return 0
+    # v6.0.1, a fair queue: the readers take turns, one item each, instead of one reader's whole
+    # folder first (fifty comics dropped by one reader kept everyone else's book waiting behind them)
+    lanes = []
     for dirname in sorted(os.listdir(base)):
         d = os.path.join(base, dirname)
         if not os.path.isdir(d) or dirname.startswith("."):
@@ -1250,10 +1257,18 @@ def scan_dropbox_once(now=None):
         owner = _known_user(dirname)
         if not owner:
             continue
-        for name in sorted(os.listdir(d)):
+        names = [n for n in sorted(os.listdir(d)) if not (n.startswith(".") or n.lower().endswith(PARTIAL))]
+        if names:
+            lanes.append((owner, d, names))
+    for turn in range(max((len(n) for _o, _d, n in lanes), default=0)):
+        for owner, d, names in lanes:
+            if turn >= len(names):
+                continue
+            if turn and _disk_paused():          # a large arrival filled the disk: the rest waits
+                return handled
+            name = names[turn]
             p = os.path.join(d, name)
-            # skip hidden/partial files (uploads in progress, Shelfmark/rsync temp names)
-            if name.startswith(".") or name.lower().endswith(PARTIAL):
+            if not os.path.lexists(p):           # moved or taken meanwhile
                 continue
             if os.path.islink(p):
                 # check BEFORE isdir: a directory symlink is followed by isdir and would never
@@ -1263,12 +1278,12 @@ def scan_dropbox_once(now=None):
             elif os.path.isdir(p):
                 if _settled_dir(p, now):
                     handled += _folder_entry(p, owner, name, d)
-            elif os.path.isfile(p) or os.path.islink(p):
+            elif os.path.isfile(p):
                 if now - os.lstat(p).st_mtime < SETTLE_SECONDS:     # let the write finish
                     continue
                 kind = "audio" if _ext(name) in config.AUDIO_EXTS else "ebook"
-                handled += _handle(p, owner, name, kind, d, name, lambda rid, p=p: _ingest_file_entry(p, owner, rid))
-        _beat("dropbox")
+                handled += _handle(p, owner, name, kind, d, name, lambda rid, p=p, owner=owner: _ingest_file_entry(p, owner, rid))
+            _beat("dropbox")
     return handled
 
 # ---- http requests --------------------------------------------------------------------------

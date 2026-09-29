@@ -71,6 +71,7 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 - `hcwant.py` — v6.0: a reader's Hardcover Want to Read list feeds Get it requests (opt-in;
   the first sync only records the list)
 - `dash.py` — v6.0: the admin dashboard's "What needs you" and the week in numbers
+- `redact.py` — v6.0.1: logins, API keys and tokens out of any error text the portal passes on
 - `static/app.js` — v6.0: the portal's only script (autosubmit filters, filter-as-you-type, copy
   buttons, self-refreshing Requests); every page works without it
 - `templates/hub.html`, `hub_base.html`, `help/*.html` — v6.0: home.<domain>, the start page,

@@ -212,7 +212,7 @@ def test_a_confirmed_audiobook_waits_for_disk_space_without_asking_again(audio_o
     rel = {"source_id": "x", "title": "Andy Weir - Project Hail Mary (Unabridged) [M4B]", "protocol": "usenet", "size_bytes": 3e8}
     db.bookreq_update(rid, status="confirm", candidate=rel)
     room = [False]
-    monkeypatch.setattr(bookreq, "_room_for", lambda r: room[0])
+    monkeypatch.setattr(bookreq, "_room_for", lambda r, **kw: room[0])
     s = Shelf([rel])
     assert bookreq.confirm(rid, s) == "queued"
     assert bookreq.search_once(db.bookreq_get(rid), s) == "queued"

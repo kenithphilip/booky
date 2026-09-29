@@ -67,6 +67,14 @@ def _num(v):
         return None
 
 
+def _span(a, b):
+    """(low, high) of a matched range. v6.0.1: 'v01 - 1950 to 1952' is volume 1 of a book covering
+    1950-1952, not volumes 1 to 1950: an end that is a year far past the start is not a range."""
+    if a is not None and b is not None and 1900 <= b <= 2099 and b - a > 300:
+        b = a
+    return (min(a, b), max(a, b))
+
+
 def parse(title, fmt=None):
     """The parts of a release title. Numbers as floats; ranges as (low, high)."""
     t = title or ""
@@ -79,17 +87,17 @@ def parse(title, fmt=None):
     m = _VOL.search(t)
     if m:
         a = _num(m.group(1)); b = _num(m.group(2)) or a
-        out["volumes"] = (min(a, b), max(a, b))
+        out["volumes"] = _span(a, b)
         first_number_at = min(first_number_at, m.start())
     m = _CH.search(t)
     if m:
         a = _num(m.group(1)); b = _num(m.group(2)) or a
-        out["chapters"] = (min(a, b), max(a, b))
+        out["chapters"] = _span(a, b)
         first_number_at = min(first_number_at, m.start())
     m = _HASH.search(t)
     if m:
         a = _num(m.group(1)); b = _num(m.group(2)) or a
-        out["issues"] = (min(a, b), max(a, b))
+        out["issues"] = _span(a, b)
         first_number_at = min(first_number_at, m.start())
     if not out["issues"] and not out["volumes"] and not out["chapters"]:
         head = t.split("(")[0].split("[")[0]
@@ -187,7 +195,8 @@ def judge(req, release):
     size = release.get("size_bytes") or 0
     if size and size < 512 * 1024:
         return False, 0, "too small to be a comic"
-    if size and not pack and size > 2 * 1024 ** 3:
+    import config
+    if size and not pack and size > config.MAX_COMIC_MB * 1024 ** 2:    # v6.0.1: the import cap, one setting
         return False, 0, "too large for one issue or volume"
     score = 100.0
     if pack:

@@ -239,7 +239,7 @@ def test_a_comic_nobody_requested_still_imports_as_a_comic(family, tmp_path):
     src = tmp_path / "Some Indie Comic 001.cbz"
     _comic_file(src)
     cbz, base, req = comics.prepare_arrival(str(src), "bob", str(tmp_path))
-    assert req is None and base == "Some Indie Comic 001"
+    assert req is None and base == "Some Indie Comic #1"          # v6.0.1: a readable title from the release name
     with zipfile.ZipFile(cbz) as z:
         assert json.loads(z.comment)["ComicBookInfo/1.0"]["tags"] == ["Comics"]
 

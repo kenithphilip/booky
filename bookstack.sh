@@ -3778,7 +3778,8 @@ lockout|AUTHELIA_READERS_2FA|false|bool|Readers need a second factor at the sign
 lockout|AUTHELIA_PASSKEYS|false|bool|Sign in to the gate with a passkey alone (fingerprint/face/PIN counts as both factors; Authelia calls this experimental)
 uploads|MAX_UPLOAD_MB|95|int|Largest file the portal browser form takes (Cloudflare refuses bodies over 100 MB)
 uploads|MAX_EBOOK_MB|200|int|Largest ebook the worker downloads or imports
-uploads|MAX_AUDIO_MB|2048|int|Largest audiobook (a LibriVox zip of a long book runs past 1 GB)
+uploads|MAX_AUDIO_MB|4096|int|Largest audiobook (a 40-hour M4B, a LibriVox zip of a long book); also the largest release Get the audiobook picks
+uploads|MAX_COMIC_MB|2048|int|Largest comic (an omnibus or a complete colour volume); also the largest single volume the comic search picks
 uploads|MAX_PDF_MB|250|int|Largest PDF; bigger ones are parked, because tagging renders them in memory
 uploads|MAX_MAIL_MB|40|int|Largest mailed-in attachment; a message is parsed in memory at ~12x its size, so keep this well under the upload cap
 uploads|KINDLE_MAX_MB|45|int|Largest Send-to-Kindle attachment (Amazon refuses bigger ones)
@@ -3792,6 +3793,8 @@ mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files au
 requests|BOOK_CONFIRM|always|text|Get it for books: always = the reader confirms every copy; sure = a retail EPUB with title, author and language downloads without asking
 requests|COMIC_CONFIRM|always|text|Comic requests: always = the reader confirms every copy (Yes to all per series); sure = the exact issue/volume, digital, in their language, downloads without asking
 requests|BOOK_SEARCH_DAYS|14|int|How long Get it keeps looking for a book before it says Pick in Shelfmark
+comics|KCC_MEMORY|1536m|text|Memory cap of one KCC conversion (1536m held a 700-page colour volume at about 1.2 GB)
+comics|KCC_KOBO_MAX_MB|1024|int|Largest Kobo copy of a comic; a bigger one gets none (readers still download the CBZ)
 disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
 disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
 disk|DISK_RESUME_PCT|80|pct|Disk use they are started again below
@@ -3805,12 +3808,13 @@ adv_value(){ local v; v=$(envget "$1"); printf '%s' "${v:-$2}"; }   # what the s
 step_advanced() {
   local g key def kind help cur new line items=() w s r
   while true; do
-    g=$(whiptail --title "Advanced settings" --menu "Values the stack reads from $ENV_FILE. A key that is not set uses the built-in default, and that is what this screen shows — so the number you see is always the one in force.\n\nEditing docker-compose.yml instead does NOT work: every Deploy and Update rewrites it." 20 88 7 \
+    g=$(whiptail --title "Advanced settings" --menu "Values the stack reads from $ENV_FILE. A key that is not set uses the built-in default, and that is what this screen shows — so the number you see is always the one in force.\n\nEditing docker-compose.yml instead does NOT work: every Deploy and Update rewrites it." 20 88 8 \
       lockout "Login lockout thresholds and session length" \
       uploads "Size ceilings for uploads, imports and Send-to-Kindle" \
       mail    "IMAP intake, alert format, Audiobookshelf library name" \
       requests "Book and comic requests: confirm every copy or only uncertain ones" \
       disk    "Disk watchdog thresholds and the daily disk summary" \
+      comics  "Kobo copies of comics (KCC): memory and the largest Kobo copy" \
       backup  "restic snapshot retention" \
       0       "Back" 3>&1 1>&2 2>&3) || return 0
     [ "$g" = 0 ] && return 0
@@ -3837,8 +3841,12 @@ step_advanced() {
       esac
       if [ "$key" = ALERT_MAIL ]; then case "$new" in high|all|off) ;; *) msg "ALERT_MAIL is high, all or off. Nothing was changed."; continue;; esac; fi
       case "$key" in BOOK_CONFIRM|COMIC_CONFIRM) case "$new" in always|sure) ;; *) msg "$key is always or sure. Nothing was changed."; continue;; esac;; esac
+      [ "$key" = KCC_MEMORY ] && { [[ "$new" =~ ^[0-9]+[mg]$ ]] || { msg "KCC_MEMORY is a size like 1536m or 2g. Nothing was changed."; continue; }; }
       envset "$key" "$new" || { msg "Could not write $ENV_FILE, so $key was NOT changed."; continue; }
       case "$g" in
+        comics) msg "$key is now $new.\n\nscripts/comic-convert.sh reads $ENV_FILE on every run (every 3 minutes), so nothing has to be restarted."
+                [ "$key" = KCC_MEMORY ] && msg "Mind the 4 GB box: KCC runs beside everything else. 1536m held a 700-page colour volume at ~1.2 GB (v6.0.1)."
+                continue;;
         backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;
         disk)   if [ "${key#DISK_REPORT}" != "$key" ]; then
                   install_disk_report

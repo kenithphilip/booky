@@ -50,10 +50,19 @@ if envget("COMICS_ENABLED") != "true" and os.environ.get("COMICS_ENABLED") != "t
 UID = envget("PUID", "1000") or "1000"
 GID = envget("PGID", "1000") or "1000"
 IMG = envget("IMG_KCC") or "ghcr.io/ciromattia/kcc:v12.0.0"
-MEM = envget("KCC_MEMORY") or "1536m"          # KCC measured ~1.5 GiB peak on a 40-page colour issue
+MEM = envget("KCC_MEMORY") or "1536m"          # KCC measured ~1.2 GiB peak on 268- and 700-page colour volumes (v6.0.1)
 CPUS = envget("KCC_CPUS") or "1.5"
 KOBO_PROFILE = envget("KCC_KOBO_PROFILE") or "KoLC"      # Kobo Libra Colour; a Clara Colour shows it scaled
 KINDLE_PROFILE = envget("KCC_KINDLE_PROFILE") or "KCS"   # Kindle Colorsoft
+# v6.0.1: one Kobo book per comic, never split (KCC splits past 400 MB by default and a split copy
+# was refused); a volume whose Kobo copy would be larger than this gets none, and the admin is told why
+try:
+    KOBO_MAX_MB = int(envget("KCC_KOBO_MAX_MB") or "1024")
+except ValueError:
+    KOBO_MAX_MB = 1024
+
+class Final(RuntimeError):
+    """A result another try cannot change (the Kobo copy is too large): recorded once, not retried."""
 
 def run(args, timeout=120):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -107,21 +116,37 @@ def safe_rel(rel):
     return rel and not rel.startswith("/") and ".." not in rel.split("/")
 
 def kcc(src, outdir, profile, fmt, kind, strip, title, extra=()):
-    """One KCC run in a throwaway container: no network, PUID:PGID, capped. [output files]."""
+    """One KCC run in a throwaway container: no network, PUID:PGID, capped. [output files].
+    v6.0.1: KCC sees the comic under a plain name of ours (comic.<ext>, alone in its folder): a
+    library file whose name starts with '-' was read by KCC's 7-Zip as an option ('Extraction
+    failed, install specialized extraction software'), and the folder held every other file of
+    the book too. A hard link where the disk allows it (no copy of a 2 GB omnibus), else a copy."""
     os.makedirs(outdir, exist_ok=True)
     own(outdir)
-    args = ["docker", "run", "--rm", "--network", "none", "--user", f"{UID}:{GID}",
-            "--cpus", CPUS, "--memory", MEM, "--memory-swap", MEM,
-            "-v", f"{os.path.dirname(src)}:/in:ro", "-v", f"{outdir}:/out", IMG,
-            "-p", profile, "--forcecolor", "-f", fmt, "-t", title, "-o", "/out"]
-    if fmt == "EPUB":
-        args.append("--nokepub")
-    if kind == "manga":
-        args.append("-m")
-    if strip:
-        args.append("-w")
-    args += list(extra) + [f"/in/{os.path.basename(src)}"]
-    r = run(args, timeout=1800)
+    indir = outdir.rstrip("/") + "-in"
+    shutil.rmtree(indir, ignore_errors=True)
+    os.makedirs(indir)
+    plain = os.path.join(indir, "comic" + os.path.splitext(src)[1].lower())
+    try:
+        os.link(src, plain)
+    except OSError:
+        shutil.copyfile(src, plain)
+    own(indir)
+    try:
+        args = ["docker", "run", "--rm", "--network", "none", "--user", f"{UID}:{GID}",
+                "--cpus", CPUS, "--memory", MEM, "--memory-swap", MEM,
+                "-v", f"{indir}:/in:ro", "-v", f"{outdir}:/out", IMG,
+                "-p", profile, "--forcecolor", "-f", fmt, "-t", title, "-o", "/out"]
+        if fmt == "EPUB":
+            args.append("--nokepub")
+        if kind == "manga":
+            args.append("-m")
+        if strip:
+            args.append("-w")
+        args += list(extra) + [f"/in/{os.path.basename(plain)}"]
+        r = run(args, timeout=3600)            # a 700-page colour volume took ~4 min; 2 GB, about 12
+    finally:
+        shutil.rmtree(indir, ignore_errors=True)
     made = sorted(glob.glob(os.path.join(outdir, "*.epub")))
     if r.returncode != 0 or not made:
         tail = (r.stderr or r.stdout or "").strip().splitlines()[-3:]
@@ -157,9 +182,18 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         before = book(bid)
         if before is None:
             raise RuntimeError("could not read the book in Calibre")
-        made = kcc(src, out, KOBO_PROFILE, "EPUB", row.get("kind"), row.get("strip"), row.get("title") or "Comic")
+        need = 3 * os.path.getsize(src) + 2 * 1024 ** 3     # the Kobo copy, its copy in the container, the library
+        if shutil.disk_usage(WORK if os.path.isdir(WORK) else STACK).free < need:
+            print(f"comic-convert: book {bid}: not enough free disk for its Kobo copy yet; later")
+            continue                                        # not a failure: tried again next run
+        made = kcc(src, out, KOBO_PROFILE, "EPUB", row.get("kind"), row.get("strip"), row.get("title") or "Comic",
+                   ("-b", "0"))
         if len(made) > 1:
-            raise RuntimeError("KCC split it into several files (over 400 MB): not added")
+            raise RuntimeError("KCC split it into several files although asked not to: not added")
+        mb = os.path.getsize(made[0]) >> 20
+        if mb > KOBO_MAX_MB:
+            raise Final(f"its Kobo copy would be {mb} MB, over KCC_KOBO_MAX_MB ({KOBO_MAX_MB} MB): no Kobo copy; "
+                        f"readers can still download the CBZ")
         name = os.path.splitext(os.path.basename(src))[0] + ".kepub"
         inside = f"/tmp/bookstack-kcc-{bid}.kepub"
         if run(["docker", "cp", made[0], f"calibre-web:{inside}"], timeout=300).returncode != 0:
@@ -183,11 +217,12 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         kobo_ok += 1
     except Exception as e:
         why = str(e)
-        res = admin("comics", "kobo-result", str(bid), "fail", "--reason", why)
+        final = isinstance(e, Final)
+        res = admin("comics", "kobo-result", str(bid), "final" if final else "fail", "--reason", why)
         if res.get("status") == "failed":
             alert("Bookstack: a comic's Kobo copy could not be made",
-                  f"Calibre book {bid} ({row.get('title')}): {why}. Tried three times; readers can still download "
-                  f"the CBZ. Library -> Comics shows the settings.")
+                  f"Calibre book {bid} ({row.get('title')}): {why}." + ("" if final else " Tried three times; readers can "
+                  "still download the CBZ.") + " Library -> Comics shows the settings.")
         kobo_fail += 1
     finally:
         shutil.rmtree(out, ignore_errors=True)

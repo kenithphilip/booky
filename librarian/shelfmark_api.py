@@ -14,9 +14,9 @@ http://127.0.0.1 — so the cookie is carried by hand.
 
 With the Authelia gate on (L05) Shelfmark runs in proxy mode and trusts Remote-User; the portal,
 on the host like Caddy, then names the service account in that header instead of logging in."""
-import threading, time
+import re, threading, time
 import requests
-import config
+import config, redact
 
 TIMEOUT = (3, 10)
 _lock = threading.Lock()
@@ -25,7 +25,10 @@ CACHE_SECONDS = 20
 
 
 class ShelfmarkError(Exception):
-    pass
+    """Its text never carries a credential (v6.0.1): it becomes request notes, alerts and pages."""
+    def __init__(self, *args):
+        import redact
+        super().__init__(*(redact.secrets(a) if isinstance(a, str) else a for a in args))
 
 
 def _proxy():
@@ -149,6 +152,34 @@ def waiting_for_files(status=None):
     return out
 
 
+# v6.0.1: what a failed download's raw error says about Shelfmark's own settings (checked BEFORE
+# the credentials are hidden). The first one was found on the live server: the SABnzbd API key
+# field held SABnzbd's web address, so every Usenet download got 403 Forbidden.
+_SETTING_HINTS = (
+    (re.compile(r"apikey=https?(?:%3A|:)", re.I),
+     "Shelfmark's SABnzbd API key holds a web address, not the key: Shelfmark -> Settings -> Download Clients "
+     "-> SABnzbd -> API Key (SABnzbd -> Config -> General -> Security -> API Key)"),
+)
+
+
+def _hint(raw):
+    for rx, text in _SETTING_HINTS:
+        if raw and rx.search(raw):
+            return f" ({text})"
+    return ""
+
+
+def config_problems(status=None):
+    """Distinct setting problems Shelfmark's failed downloads point at (Self-test warns)."""
+    st = queue_status() if status is None else status
+    out = []
+    for task in (st.get("error") or {}).values():
+        h = _hint(task.get("status_message") if isinstance(task, dict) else None)
+        if h and h[2:-1] not in out:
+            out.append(h[2:-1])
+    return out
+
+
 def failed(status=None):
     """[{task_id, title, author, user, message}] of downloads that ended in an error (a source
     that failed, a stall Shelfmark cancelled): nobody but the reader would otherwise know.
@@ -160,7 +191,7 @@ def failed(status=None):
         if isinstance(task, dict):
             out.append({"task_id": str(task.get("id") or tid), "title": task.get("title") or "Unknown title",
                         "author": task.get("author") or "", "user": task.get("username") or "",
-                        "message": task.get("status_message") or ""})
+                        "message": redact.secrets(task.get("status_message") or "") + _hint(task.get("status_message"))})
     return out
 
 

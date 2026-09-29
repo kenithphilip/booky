@@ -16,7 +16,6 @@ _NARRATOR = re.compile(r"\b(?:narrated|read|performed)\s+by\s+[^\[\](){}]+?(?=\s
 _AUDIO_NOISE = re.compile(r"\b(unabridged|audio\s*book|audiobook|audio|narrated|m4b|m4a|mp3|flac|opus|aac|ogg|\d{2,3}\s*kbps|kbps|"
                           r"vbr|cbr|mono|stereo|chaptered|retail)\b", re.I)
 MIN_SIZE = 15 * 1024 ** 2
-MAX_SIZE = 4 * 1024 ** 3
 
 
 def parse(release):
@@ -67,7 +66,8 @@ def judge(want, release):
     size = release.get("size_bytes") or 0
     if size and size < MIN_SIZE:
         return False, 0, "too small to be an audiobook"
-    if size and size > MAX_SIZE:
+    import config
+    if size and size > config.MAX_AUDIO_MB * 1024 ** 2:      # v6.0.1: the import cap, one setting
         return False, 0, "too large for one audiobook"
     proto = (release.get("protocol") or "").lower()
     seeders = release.get("seeders")

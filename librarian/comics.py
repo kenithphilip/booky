@@ -133,12 +133,14 @@ def search_once(req, shelfmark_api, now=None):
     now = now or time.time()
     rid, owner = req["id"], req["owner"]
     m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
-    if m and config.FAMILY_SHARING:              # arrived for someone else while this one waited
+    if m and (config.FAMILY_SHARING or owner in m["owners"]):   # arrived (for someone else) while this one waited
         if owner not in m["owners"]:
             share.give_ebook(m, owner)
         db.comic_update(rid, status="shared" if owner not in m["owners"] else "done", calibre_id=m["book_id"],
                         detail="already in the family library: added to yours, nothing downloaded")
         return "shared"
+    if (req.get("candidate") or {}).get("_confirmed"):
+        return _queue(req, req["candidate"], shelfmark_api, now)      # confirmed, was waiting for disk space
     req = dict(req, alt_names=_alt_names(req))
     blocked = set(req.get("blocked") or [])
     releases, errors = [], []
@@ -178,6 +180,18 @@ def search_once(req, shelfmark_api, now=None):
 def _queue(req, release, shelfmark_api, now):
     """Hand the chosen release to Shelfmark, as the reader."""
     rid, owner = req["id"], req["owner"]
+    release = {k: v for k, v in release.items() if k != "_confirmed"}
+    import bookreq
+    if not bookreq._room_for(release, comic_id=rid):
+        # v6.0.1: comics may be large now (MAX_COMIC_MB); the reader's yes is kept with the copy
+        # and it downloads once there is room, without asking again; the admin is told once
+        first = not (req.get("candidate") or {}).get("_confirmed")
+        db.comic_update(rid, status="queued", candidate=dict(release, _confirmed=True), next_try=now + 900,
+                        detail="in the queue: it downloads as soon as the disk has room beside the downloads under way (checked every 15 min)")
+        if first:
+            notify.admin("error", {"owner": owner, "title": _title(req), "source": "comics", "seq": notify.seq_id("comic", rid),
+                                   "detail": "a comic waits: not enough free disk space for it"})
+        return "queued"
     try:
         uid = shelfmark_api.user_id(owner)
         if not uid:
@@ -189,7 +203,7 @@ def _queue(req, release, shelfmark_api, now):
         return "queued"
     tried = list(req.get("tried") or []) + [str(release.get("source_id"))]
     db.comic_update(rid, status="downloading", attempts=req.get("attempts") or 0, tried=tried, queued_at=now,
-                    candidate=None, release_title=(release.get("title") or "")[:300], release_id=str(release.get("source_id")),
+                    candidate=None, size_bytes=int(release.get("size_bytes") or 0) or None, release_title=(release.get("title") or "")[:300], release_id=str(release.get("source_id")),
                     detail=f"downloading: {release.get('title')}")
     notify.admin("requested", {"owner": owner, "title": _title(req), "source": "comics", "status": "queued",
                                "detail": release.get("title"), "seq": notify.seq_id("comic", rid)})
@@ -303,6 +317,12 @@ def watch_downloads(shelfmark_api, queue=None, now=None):
     failed_titles = {(f.get("title") or "").strip().lower() for f in (shelfmark_api.failed(queue) if queue else [])}
     n = 0
     for req in db.comic_open(statuses=("downloading",)):
+        # v6.0.1: already in the reader's library by series and number (it arrived under another
+        # name, or the admin fixed its metadata in Calibre-Web): done, never downloaded again
+        m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
+        if m and req["owner"] in m["owners"]:
+            db.comic_update(req["id"], status="done", calibre_id=m["book_id"], detail="in your library")
+            continue
         rel = (req.get("release_title") or "").strip().lower()
         stale = now - (req.get("queued_at") or now) > config.COMIC_ARRIVAL_HOURS * 3600
         if (rel and rel in failed_titles) or stale:
@@ -329,7 +349,8 @@ def prepare_arrival(path, owner, workdir):
         shutil.copyfile(path, cbz)
     else:
         repack_to_cbz(path, cbz, workdir)
-    stem = name.rsplit(".", 1)[0]
+    # v6.0.1: ' - Title' (Shelfmark's 'Author - Title' with no author) is 'Title'
+    stem = re.sub(r"^[\s\-\u2013\u2014_.]+", "", name.rsplit(".", 1)[0]) or name.rsplit(".", 1)[0]
     req, pack_of = match_request(owner, stem)
     if req is None and pack_of is not None:
         return "skip", f"skipped: part of a pack; {_title(pack_of)} was asked for, not this one", pack_of
@@ -346,9 +367,32 @@ def prepare_arrival(path, owner, workdir):
                     "language": info.get("LanguageISO") or "", "pages": page_count(cbz)}
             return "skip", _hold(req, path, problems, meta), req
     strip = looks_like_strip(cbz)
-    write_metadata(cbz, req, stem, strip)
-    base = _title(req) if req else stem
+    base = _title(req) if req else display_title(stem)
+    write_metadata(cbz, req, base, strip)
     return cbz, base, req
+
+
+def display_title(stem):
+    """v6.0.1: a readable Calibre title for a comic nobody asked for, from its release name:
+    'The Complete Peanuts v01 - 1950 to 1952 (2004) (digital) (Son of Ultron-Empire)' ->
+    'The Complete Peanuts Vol. 1 (2004)'. Never ' - ' inside it: Calibre reads 'X - Y' in a file
+    name as title and AUTHOR (the Peanuts got '1950 to 1952 (2004) (digital)...' as its author)."""
+    p = comicrel.parse(stem)
+    starts = [m.start() for rx in (comicrel._VOL, comicrel._CH, comicrel._HASH) for m in [rx.search(stem)] if m]
+    head = stem[:min(starts)] if starts else re.split(r"[(\[]", stem)[0]
+    if not starts and p["issues"]:                       # 'Saga 012 (2013)': the bare number ends the series
+        m = comicrel._BARE.search(re.split(r"[(\[]", stem)[0])
+        head = stem[:m.start()] if m else head
+    series = re.sub(r"\s+[-\u2013\u2014]\s+", ": ", head).strip(" -\u2013\u2014_.:,")
+    series = re.sub(r"\s+", " ", series) or re.sub(r"\s+[-\u2013\u2014]\s+", ": ", stem)
+    num = lambda r: ("%g" % r[0]) if r and r[0] == r[1] else (f"{r[0]:g}-{r[1]:g}" if r else "")
+    if p["volumes"]:
+        series += f" Vol. {num(p['volumes'])}"
+    elif p["chapters"]:
+        series += f" Ch. {num(p['chapters'])}"
+    elif p["issues"]:
+        series += f" #{num(p['issues'])}"
+    return series + (f" ({p['year']})" if p["year"] else "")
 
 
 # ---- the arrival check (v5.9): is the file the comic that was asked for? --------------------------------
@@ -455,6 +499,28 @@ def match_request(owner, stem):
     return None, series_hit
 
 
+def _expand_limit():
+    """How far a comic archive may expand: three times the comic cap (images barely compress, so
+    a real one expands by a few percent; an archive that claims more is refused BEFORE it is
+    unpacked onto the 80 GB disk)."""
+    return config.MAX_COMIC_MB * 1024 * 1024 * 3
+
+
+def _check_room(src, claimed):
+    """Refuse before unpacking: more than _expand_limit(), or more than the disk can take while
+    keeping 2 GiB free (the unpacked pages, the CBZ and the Calibre copy exist at once)."""
+    if claimed > _expand_limit():
+        raise ComicError("the archive expands to more than a comic can be")
+    try:
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(src))).free
+    except OSError:
+        return
+    need = 2 * max(claimed, os.path.getsize(src)) + 2 * 1024 ** 3
+    if free < need:
+        raise ComicError(f"not enough free disk to unpack it ({free >> 30} GB free, {need >> 30} GB needed); "
+                         f"it is kept, and imported when you move it back once there is room")
+
+
 def _unpack(src, out):
     """unar first (every RAR version, 7z; no nested archives), bsdtar if unar is missing."""
     if shutil.which(config.UNAR):
@@ -463,15 +529,28 @@ def _unpack(src, out):
             raise ComicError(f"not a readable comic archive: {(listing.stdout or listing.stderr or '')[-120:]}")
         if len(listing.stdout.splitlines()) > MAX_PAGES + 1:
             raise ComicError("the archive has far more files than a comic")
+        sizes = subprocess.run([config.LSAR, "-j", src], capture_output=True, text=True, timeout=120)
+        try:
+            claimed = sum(int(e.get("XADFileSize") or 0) for e in json.loads(sizes.stdout).get("lsarContents") or [])
+        except (ValueError, AttributeError, TypeError):
+            claimed = 0                          # no JSON listing: the size check after unpacking still runs
+        _check_room(src, claimed)
         return subprocess.run([config.UNAR, "-q", "-f", "-D", "-nr", "-o", out, src],
-                              capture_output=True, text=True, timeout=600)
+                              capture_output=True, text=True, timeout=1800)
     listing = subprocess.run([config.BSDTAR, "-tf", src], capture_output=True, text=True, timeout=120)
     if listing.returncode != 0:
         raise ComicError(f"not a readable comic archive: {(listing.stderr or '')[:120]}")
     if len(listing.stdout.splitlines()) > MAX_PAGES:
         raise ComicError("the archive has far more files than a comic")
+    verbose = subprocess.run([config.BSDTAR, "-tvf", src], capture_output=True, text=True, timeout=120)
+    claimed = 0
+    for line in verbose.stdout.splitlines():     # -rw-r--r--  0 u g  <size> <date> <name>
+        f = line.split()
+        if len(f) > 4 and f[4].isdigit():
+            claimed += int(f[4])
+    _check_room(src, claimed)
     return subprocess.run([config.BSDTAR, "-xf", src, "-C", out, "--no-same-owner", "--no-same-permissions"],
-                          capture_output=True, text=True, timeout=600)
+                          capture_output=True, text=True, timeout=1800)
 
 
 def repack_to_cbz(src, dst, workdir):
@@ -498,7 +577,7 @@ def repack_to_cbz(src, dst, workdir):
             if f.lower().endswith(IMAGE_EXTS) or f == "ComicInfo.xml":
                 total += os.path.getsize(full)
                 pages.append(full)
-    if total > config.MAX_EBOOK_MB * 1024 * 1024 * 4:
+    if total > _expand_limit():
         raise ComicError("the archive expands to more than a comic can be")
     if not any(p.lower().endswith(IMAGE_EXTS) for p in pages):
         raise ComicError("no pages (images) in this archive")
@@ -670,17 +749,16 @@ def uses_kobo(owner):
         return False
 
 
-def kobo_due(now=None, limit=3):
-    """Comics that need their Kobo copy: a CBZ and no KEPUB, and an owner who reads on a Kobo
-    (or a reader asked for it with 'Make Kobo copy'). Not a book a conversion failed for lately."""
+def kobo_queue(now=None):
+    """Every comic waiting for its Kobo copy, in the order they are made (v6.0.1, a fair queue):
+    a reader's 'Make Kobo copy' first, then the readers IN TURN (each one's oldest first), so one
+    reader adding fifty volumes never keeps everyone else's comic waiting behind them. KCC makes one
+    at a time on the 4 GB box (scripts/comic-convert.sh). Not a book a conversion failed for lately."""
     now = now or time.time()
     books = comic_books()
     state = db.comic_convert_state(books.keys())
-    kobo = {}
-    out = []
-    # a reader's 'Make Kobo copy' first, then the oldest
-    order = sorted(books.items(), key=lambda kv: (not (state.get(kv[0]) or {}).get("forced"), kv[0]))
-    for bid, b in order:
+    kobo, forced, lanes = {}, [], {}
+    for bid, b in sorted(books.items()):
         if not b["rel"] or "KEPUB" in b["formats"]:
             continue
         st = state.get(bid)
@@ -688,19 +766,35 @@ def kobo_due(now=None, limit=3):
             continue
         if st and st.get("next_try") and st["next_try"] > now:
             continue
-        forced = bool(st and st.get("forced") and st["status"] == "due")
-        if not forced:
-            wanted = False
-            for o in b["owners"]:
-                if o not in kobo:
-                    kobo[o] = uses_kobo(o)
-                wanted = wanted or kobo[o]
-            if not wanted:
-                continue
-        out.append({"calibre_id": bid, "rel": b["rel"], "title": b["title"], "kind": b["kind"], "strip": b["strip"]})
-        if len(out) >= limit:
-            break
+        row = {"calibre_id": bid, "rel": b["rel"], "title": b["title"], "kind": b["kind"], "strip": b["strip"]}
+        if st and st.get("forced") and st["status"] == "due":
+            forced.append((st.get("updated") or 0, row))
+            continue
+        readers = []
+        for o in b["owners"]:
+            if o not in kobo:
+                kobo[o] = uses_kobo(o)
+            if kobo[o]:
+                readers.append(o)
+        if readers:
+            lanes.setdefault(readers[0], []).append(row)
+    out = [r for _t, r in sorted(forced, key=lambda x: x[0])]
+    for turn in range(max((len(v) for v in lanes.values()), default=0)):   # one from each reader, in turn
+        out += [lanes[o][turn] for o in sorted(lanes) if len(lanes[o]) > turn]
     return out
+
+
+def kobo_due(now=None, limit=3):
+    """The next comics for the host job (kobo_queue's head)."""
+    return kobo_queue(now)[:limit]
+
+
+def kobo_position(book_id, now=None):
+    """How many comics are ahead of this one for a Kobo copy, or None when it is not waiting."""
+    for i, r in enumerate(kobo_queue(now)):
+        if r["calibre_id"] == book_id:
+            return i
+    return None
 
 
 def kindle_request(owner, is_admin, book_id, title):

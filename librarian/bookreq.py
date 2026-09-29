@@ -213,12 +213,12 @@ def _queue(req, release, shelfmark_api, now):
     """Hand the chosen release to Shelfmark, as the reader."""
     rid, owner = req["id"], req["owner"]
     release = {k: v for k, v in release.items() if k != "_confirmed"}
-    if req.get("kind") == "audio" and not _room_for(release):
+    if req.get("kind") == "audio" and not _room_for(release, book_id=rid):
         # the reader's yes is kept with the copy: the next pass downloads it once there is room,
         # without searching or asking again; the admin is told once, not every hour
         first = not (req.get("candidate") or {}).get("_confirmed")
-        db.bookreq_update(rid, status="queued", candidate=dict(release, _confirmed=True), next_try=now + 3600,
-                          detail="waiting for disk space before downloading this audiobook (the admin is told)")
+        db.bookreq_update(rid, status="queued", candidate=dict(release, _confirmed=True), next_try=now + 900,
+                          detail="in the queue: it downloads as soon as the disk has room beside the downloads under way (checked every 15 min)")
         if first:
             notify.admin("error", {"owner": owner, "title": req["title"], "source": "books", "seq": notify.seq_id("book", rid),
                                    "detail": "an audiobook waits: not enough free disk space for it"})
@@ -234,7 +234,7 @@ def _queue(req, release, shelfmark_api, now):
         return "queued"
     tried = list(req.get("tried") or []) + [str(release.get("source_id"))]
     db.bookreq_update(rid, status="downloading", attempts=req.get("attempts") or 0, tried=tried, queued_at=now,
-                      downloaded=None, candidate=None,
+                      downloaded=None, candidate=None, size_bytes=int(release.get("size_bytes") or 0) or None,
                       release_title=(release.get("title") or "")[:300], release_id=str(release.get("source_id")),
                       detail=f"downloading: {release.get('title')}")
     notify.admin("requested", {"owner": owner, "title": req["title"], "author": req.get("author"), "source": "books",
@@ -242,9 +242,10 @@ def _queue(req, release, shelfmark_api, now):
     return "downloading"
 
 
-def _room_for(release):
-    """Enough free disk for an audiobook (v6.0): twice its size plus 2 GiB, never while the disk
-    watchdog has paused imports. The 80 GB box keeps books, audiobooks and images on one disk."""
+def _room_for(release, book_id=None, comic_id=None):
+    """Enough free disk for an audiobook (v6.0) or a comic (v6.0.1): twice its size plus 2 GiB,
+    never while the disk watchdog has paused imports. The 80 GB box keeps books, audiobooks,
+    comics and images on one disk."""
     try:
         import worker
         if worker._disk_paused():
@@ -253,7 +254,8 @@ def _room_for(release):
     except Exception:
         return True
     size = release.get("size_bytes") or 1024 ** 3
-    return free >= 2 * size + 2 * 1024 ** 3
+    # v6.0.1, a queue: what is already downloading keeps its share of the disk
+    return free - db.downloads_in_flight(book_id, comic_id) >= 2 * size + 2 * 1024 ** 3
 
 
 def confirm(rid, shelfmark_api, now=None):

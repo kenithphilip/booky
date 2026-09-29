@@ -200,6 +200,46 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.0.1 (large comics and audiobooks; no credentials in error text)
+- Found on the server the day v6.0.0 went live: The Complete Peanuts v01 (a 339 MB CBR) was refused
+  at import, because comics were held to the ebook cap (200 MB). Comics now have `MAX_COMIC_MB`
+  (2 GB) and audiobooks `MAX_AUDIO_MB` 4 GB (was 2 GB); both caps also bound what the searches
+  pick. A large comic, like an audiobook, waits for disk space (twice its size + 2 GiB) before it
+  downloads, keeping the reader's yes; an archive is sized from its listing and refused BEFORE it
+  is unpacked when it claims more than three times the cap or more than the disk has.
+- "v01 - 1950 to 1952" was read as volumes 1 to 1950 (a pack, skipped): a range whose end is a
+  year far past its start is a year. Names that start with " - " (Shelfmark's "Author - Title"
+  with no author) are cleaned.
+- A failed Usenet download's error quotes the whole SABnzbd URL (login in it) and the Prowlarr link
+  (its API key in it). It reached the admin's alerts as it was: every alert, push, e-mail and
+  Shelfmark error now has logins, API keys and tokens replaced by ***. Shelfmark's OWN page still
+  shows its raw error to whoever requested the download: keep credentials out of the SABnzbd URL
+  where the seedbox allows it.
+- The Peanuts, imported under the 1024 MB stopgap, showed the rest: its title kept the leading
+  "-", Calibre took "1950 to 1952 (2004) (digital)..." as its AUTHOR ("X - Y" in a file name), and
+  KCC failed on the "-" at the start of the file name. Now: a comic nobody asked for is titled
+  "The Complete Peanuts Vol. 1 (2004)"; KCC always gets `comic.cbz`; the Kobo copy is one file
+  (KCC measured on 368 MB / 268 pages and 687 MB / 700 pages at ~1.2 GB of the 1536 MB cap, see
+  docs/COMICS.md); a request whose comic is in the reader's library by series and number is closed
+  (never downloaded again). Queues for several readers: Kobo copies and dropbox imports take the
+  readers in turn; large downloads reserve their disk space and wait their turn.
+- Self-test warns when Shelfmark's failed downloads show its SABnzbd API key holding a web address,
+  and the admin's alert for such a failure says so.
+- Tests: unit 799 passed, installer 823 passed, end-to-end 326 checks / 0 failed (its comic now
+  arrives as " - E2E Manga v03 - 2019 to 2021 (Digital) (e2e).cbz": matched as volume 3, KCC made
+  the Kobo copy under the plain name in 18 s), lint clean. Caddy build, monitoring, Kuma upgrade and
+  seedbox suites are unchanged since v6.0.0 (8 / 41 / 8 / 47 passed).
+- After Deploy:
+  - Operations -> Advanced settings -> uploads: MAX_COMIC_MB 2048, MAX_AUDIO_MB 4096; set
+    MAX_EBOOK_MB back to 200 (raised to 1024 by hand as the Peanuts stopgap).
+  - Advanced settings -> comics: KCC_MEMORY 1536m, KCC_KOBO_MAX_MB 1024.
+  - A parked comic in library/dropbox/<user>/.failed/ goes back with `mv .failed/*Name*.cbr .`.
+  - Calibre book #12 (the Peanuts imported as "- The Complete Peanuts ..."): in Calibre-Web (books.,
+    as admin) Edit metadata -> Title "The Complete Peanuts Vol. 1", Author "Charles M. Schulz",
+    Series "The Complete Peanuts", number 1; keep every tag (Comics, owner:corgibot) -> Save.
+    Calibre renames the files; the next pass closes the comic request as done (series + number),
+    and the Kobo copy is made under the new plain name.
+
 ## Verified locally in v6.0 (home., one sign-in, home page, audiobooks, Want to Read, notifications, dashboard)
 - Unit 771 passed, installer 823 passed, monitoring 41 passed (Kuma 2.5.5-slim), Kuma upgrade 8 passed,
   Caddy build 8 passed (the production Caddyfile with the gate on every site validates), seedbox 47 passed,

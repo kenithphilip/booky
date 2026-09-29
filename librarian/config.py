@@ -55,7 +55,8 @@ INTAKE_TOKEN  = os.environ.get("INTAKE_TOKEN", "")            # bearer token for
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "95"))    # browser upload size cap (Cloudflare Free: 100 MB bodies)
 MAX_UPLOAD_TAILNET_MB = int(os.environ.get("MAX_UPLOAD_TAILNET_MB", "2048") or 2048)   # L18: upload.<domain>, Tailscale only
 MAX_EBOOK_MB  = int(os.environ.get("MAX_EBOOK_MB", "200"))    # worker download caps, per kind ...
-MAX_AUDIO_MB  = int(os.environ.get("MAX_AUDIO_MB", "2048"))   # ... (LibriVox zips of long books run past 1 GB)
+MAX_AUDIO_MB  = int(os.environ.get("MAX_AUDIO_MB", "4096"))   # ... (a 40-hour M4B, a LibriVox zip of a long book)
+MAX_COMIC_MB  = int(os.environ.get("MAX_COMIC_MB", "2048"))   # ... (v6.0.1: an omnibus or a complete volume in colour)
 # pypdf holds a whole PDF (and its clone) in memory while it embeds the owner tag; a 262 MB
 # scan needed more than 384 MB. PDFs above this are parked instead of OOM-killing the portal.
 MAX_PDF_MB    = int(os.environ.get("MAX_PDF_MB", "250"))

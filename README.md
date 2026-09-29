@@ -804,9 +804,14 @@ Four more ways files enter, all owner-mapped and run through the same state mach
   when the receiving server's `Authentication-Results` shows DMARC, DKIM or SPF passing for the
   sender (`IMAP_REQUIRE_AUTH=false` for a local relay).
 A re-dropped file with the name of an earlier failure is imported; a second upload with the
-same name becomes `name (2).ext` instead of overwriting. Size caps: 200 MB ebooks (`MAX_EBOOK_MB`), 2 GB audio
-(`MAX_AUDIO_MB`), PDFs over 250 MB are not tagged (`MAX_PDF_MB`, parked for users) — all
-three in `.env`.
+same name becomes `name (2).ext` instead of overwriting. Size caps: 200 MB ebooks (`MAX_EBOOK_MB`), 4 GB audio
+(`MAX_AUDIO_MB`), 2 GB comics (`MAX_COMIC_MB`, v6.0.1: an omnibus or a complete colour volume runs
+past 300 MB), PDFs over 250 MB are not tagged (`MAX_PDF_MB`, parked for users) — all in `.env`
+(Operations -> Advanced settings -> uploads). The audiobook and comic caps also bound what Get the
+audiobook and the comic search pick, and a large one waits for disk space before it downloads.
+Error text from Shelfmark and the other services is passed on with every login, API key and token
+replaced by `***` (`librarian/redact.py`, v6.0.1): a failed Usenet download quotes the whole
+SABnzbd and Prowlarr URLs.
 Gutenberg can pull from a local mirror; the OPDS source pulls from any catalog you host.
 
 ## Application hardening

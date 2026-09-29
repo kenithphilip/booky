@@ -365,7 +365,8 @@ def init():
         # v6.0: book requests for audiobooks too (kind), and the Audiobookshelf item that arrived
         bcols = {r[1] for r in c.execute("PRAGMA table_info(book_requests)")}
         # ask: always wait for the reader's yes, even with BOOK_CONFIRM=sure (Hardcover Want to Read)
-        for col, typ in (("kind", "TEXT DEFAULT 'ebook'"), ("abs_item", "TEXT"), ("ask", "INTEGER DEFAULT 0")):
+        for col, typ in (("kind", "TEXT DEFAULT 'ebook'"), ("abs_item", "TEXT"), ("ask", "INTEGER DEFAULT 0"),
+                         ("size_bytes", "INTEGER")):            # v6.0.1: the download's size, reserved on the disk
             if col not in bcols:
                 c.execute(f"ALTER TABLE book_requests ADD COLUMN {col} {typ}")
         # v5.9: a reader's Metron account (Western comics read), and what was sent to it
@@ -389,7 +390,8 @@ def init():
         ccols = {r[1] for r in c.execute("PRAGMA table_info(comic_requests)")}
         for col, typ in (("candidate", "TEXT"), ("reasons", "TEXT"), ("blocked", "TEXT DEFAULT '[]'"),
                          ("skip_check", "INTEGER DEFAULT 0"), ("held_path", "TEXT"), ("held_meta", "TEXT"),
-                         ("unit", "TEXT DEFAULT ''")):          # 'chapter', or '' (a volume or an issue, by kind)
+                         ("unit", "TEXT DEFAULT ''"),           # 'chapter', or '' (a volume or an issue, by kind)
+                         ("size_bytes", "INTEGER")):            # v6.0.1: the download's size, reserved on the disk
             if col not in ccols:
                 c.execute(f"ALTER TABLE comic_requests ADD COLUMN {col} {typ}")
         # v5.9: a volume arrived for a reader who has its chapters: which to take out (they decide)
@@ -1765,6 +1767,17 @@ def comic_get(rid):
     with _conn() as c:
         return _comic(c.execute("SELECT * FROM comic_requests WHERE id=?", (rid,)).fetchone())
 
+def downloads_in_flight(exclude_book=None, exclude_comic=None):
+    """Bytes of the large downloads under way (audiobooks, comics): Shelfmark is fetching them,
+    or they have arrived and are not imported yet. v6.0.1: a new one starts only when the disk
+    has room beside these, so two readers' omnibuses never both start on space for one."""
+    with _conn() as c:
+        b = c.execute("SELECT coalesce(sum(size_bytes), 0) FROM book_requests WHERE status='downloading' "
+                      "AND size_bytes IS NOT NULL AND id IS NOT ?", (exclude_book,)).fetchone()[0]
+        m = c.execute("SELECT coalesce(sum(size_bytes), 0) FROM comic_requests WHERE status='downloading' "
+                      "AND size_bytes IS NOT NULL AND id IS NOT ?", (exclude_comic,)).fetchone()[0]
+    return int(b or 0) + int(m or 0)
+
 def comic_update(rid, **f):
     for k in COMIC_JSON:
         if k in f and f[k] is not None:
@@ -1872,12 +1885,13 @@ def comic_convert_force(calibre_id, now=None):
                   "status='due', forced=1, attempts=0, next_try=excluded.next_try, updated=excluded.updated",
                   (calibre_id, now, now))
 
-def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3):
-    """ok: done. A failure is tried again after 1 h, then 6 h, and left 'failed' after three."""
+def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, final=False):
+    """ok: done. A failure is tried again after 1 h, then 6 h, and left 'failed' after three.
+    final (v6.0.1): a failure another try cannot change (too large for a Kobo) is 'failed' at once."""
     now = now or time.time()
     with _lock, _conn() as c:
         r = c.execute("SELECT attempts FROM comic_convert WHERE calibre_id=?", (calibre_id,)).fetchone()
-        attempts = (r["attempts"] if r else 0) + (0 if ok else 1)
+        attempts = max_attempts if (final and not ok) else (r["attempts"] if r else 0) + (0 if ok else 1)
         status = "done" if ok else ("failed" if attempts >= max_attempts else "due")
         nxt = None if ok else now + (3600 if attempts == 1 else 6 * 3600)
         # forced (a reader's 'Make Kobo copy') is spent once the copy is made or given up on

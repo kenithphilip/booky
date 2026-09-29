@@ -288,7 +288,8 @@ services:
       - MAX_MAIL_MB=${MAX_MAIL_MB:-40}
       - GUTENBERG_MIRROR=${GUTENBERG_MIRROR:-}
       - MAX_EBOOK_MB=${MAX_EBOOK_MB:-200}     # worker download caps per kind (SSRF/abuse fence)
-      - MAX_AUDIO_MB=${MAX_AUDIO_MB:-2048}
+      - MAX_AUDIO_MB=${MAX_AUDIO_MB:-4096}
+      - MAX_COMIC_MB=${MAX_COMIC_MB:-2048}    # v6.0.1: comics were held to the ebook cap (200 MB)
       - MAX_PDF_MB=${MAX_PDF_MB:-250}         # PDFs above this are not tagged in memory (parked for users)
       - IMAP_ALLOWED_SENDERS=${IMAP_ALLOWED_SENDERS:-}   # blank = sender must be the user's own e-mail
       - IMAP_HOST=${IMAP_HOST:-}

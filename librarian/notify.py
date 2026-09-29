@@ -79,6 +79,8 @@ def reader(owner, title, text, click=None, tags=None, seq=None, priority="defaul
     if not topic:
         return False
     url = f"{ntfy_base()}/{topic}"
+    import redact                                # v6.0.1: never a credential on a phone
+    title, text = redact.secrets(title or ""), redact.secrets(text or "")
 
     def go():
         try:
@@ -144,6 +146,8 @@ def _webhook(event, req):
     url = config.NOTIFY_WEBHOOK
     if not url:
         return
+    import redact                                # v6.0.1: Shelfmark's errors quote whole URLs, logins and keys
+    req = redact.fields(req)
     body = {"event": event, "title": req.get("title"), "author": req.get("author"), "owner": req.get("owner"),
             "source": req.get("source"), "status": req.get("status"), "detail": req.get("detail")}
     kind = "pending" if event == "requested" and req.get("status") == "pending" else event
@@ -162,7 +166,8 @@ def _webhook(event, req):
         pass
 
 def _mail(event, req):
-    import kindle, cwa                     # late import: kindle owns the SMTP session helper
+    import kindle, cwa, redact             # late import: kindle owns the SMTP session helper
+    req = redact.fields(req)
     if not kindle.configured():
         return
     try:
@@ -205,7 +210,8 @@ def alert(title, text, priority="default", seq=None, tags=None, click=None):
     untagged): webhook + admin mail. Best-effort; returns a list of the channels that took it
     (empty = nobody was told; the reason is printed to stderr). seq: the same value on the
     problem and on its all-clear, so the all-clear replaces the problem on the phone."""
-    import kindle
+    import kindle, redact
+    title, text = redact.secrets(title or ""), redact.secrets(text or "")
     took = []
     if config.NOTIFY_WEBHOOK:
         try:

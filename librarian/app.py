@@ -1041,6 +1041,7 @@ def book_page(book_id):
     return render_template(
         "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
+        kobo_ahead=comics.kobo_position(book_id) if is_comic and "kepub" not in b["formats"] else None,
         # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
         description=b["description"] or work.get("description") or "",
         first_year=work.get("first_publish_year"),

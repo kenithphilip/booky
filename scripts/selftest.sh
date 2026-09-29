@@ -188,6 +188,13 @@ if [ "$(envget COMICS_ENABLED)" = true ]; then
       *) warn "a comic metadata provider did not answer: ${cm:-no reply} (Library -> Comics)";; esac
   fi
 fi
+# v6.0.1: a Shelfmark setting its failed downloads point at (their errors stay listed for an hour)
+if [ "$SCHEDULED" != 1 ]; then
+  if sp=$(docker exec librarian python -c 'import shelfmark_api; print("\n".join(shelfmark_api.config_problems()))' 2>/dev/null); then
+    if [ -n "$sp" ]; then while IFS= read -r l; do [ -n "$l" ] && warn "$l"; done <<< "$sp"
+    else ok "Shelfmark's recent failed downloads point at none of its settings"; fi
+  fi
+fi
 # L14: which certificate the origin lock accepts
 case "$(envget AOP_MODE)" in
   zone) ok "origin lock: only this zone's own Cloudflare client certificate is accepted";;
