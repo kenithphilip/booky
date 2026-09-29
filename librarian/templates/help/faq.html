@@ -1,0 +1,18 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<h3>I asked for a book and it has not arrived</h3>
+<p>Open <a href="{{ cfg.PORTAL_URL }}/status">Requests</a>. <em>Confirm this copy</em> means it waits for your yes; <em>looking</em> means no copy was found yet (it looks again within the hour, then every few hours, then daily); <em>downloading</em> is under way; <em>check this file</em> means what arrived did not look like the book.</p>
+<h3>It is in my library but not on my Kobo</h3>
+<p>Sync the Kobo. Still missing? Devices → Kobo → <strong>Test my link</strong>, and check <em>Only sync the shelves I mark for Kobo</em> is off (or the book is on a Kobo shelf).</p>
+<h3>My Kindle never gets the mail</h3>
+<p>The library's sending address must be on your Amazon approved list (see <a href="{{ url_for('help_page', topic='kindle') }}">Kindle</a>). Devices → Send a test shows whether it works.</p>
+<h3>The wrong book (or edition, or language) arrived</h3>
+<p>Its page → <strong>Wrong book</strong>. It leaves your library and the portal finds another copy, asking you first.</p>
+<h3>Search finds nothing</h3>
+<p>Try the author's surname and one word of the title, or <strong>Pick in Shelfmark</strong>, which searches every source. Very new books often appear a few days after release.</p>
+<h3>Why am I asked to confirm every copy?</h3>
+<p>Release names are only labels someone typed. Showing you the copy first means a wrong edition never lands on your Kobo. The admin can let certain picks go through without asking.</p>
+<h3>Can someone see what I read?</h3>
+<p>No. Each library is private. When you get a book the family already has, it is simply added to yours; the others are not told.</p>
+<h3>Something else is wrong</h3>
+<p>Tell the admin what you did and what you saw; a screenshot of <a href="{{ cfg.PORTAL_URL }}/status">Requests</a> helps.</p>
+{% endblock %}

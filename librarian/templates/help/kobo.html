@@ -1,0 +1,20 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>A Kobo gets your books by itself once it is linked: every book in your library, and every new one, arrives on its next sync. Colour Kobos (Libra Colour, Clara Colour) also get comics as proper fixed-layout books.</p>
+<h3>Link it (once)</h3>
+<ol>
+<li>On the portal open <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> and copy your <strong>Kobo sync link</strong>. Press <strong>Test my link</strong> to check it.</li>
+<li>Connect the Kobo to a computer by USB. Open the <span class="code">.kobo/Kobo/Kobo eReader.conf</span> file on it with a text editor.</li>
+<li>Find the line starting <span class="code">api_endpoint=</span> (in the <span class="code">[OneStoreServices]</span> section) and replace everything after the <span class="code">=</span> with your sync link. Save, eject, and sync the Kobo.</li>
+</ol>
+<p class="mut">While linked, the Kobo store and OverDrive do not work on that Kobo. A brand-new Kobo pairs fine since the library moved to Calibre-Web v4.0.8.</p>
+<h3>Day to day</h3>
+<ul>
+<li><strong>New books</strong> arrive on the next sync (tap the sync icon, or it syncs by itself on Wi-Fi).</li>
+<li><strong>Your place</strong> is saved to the library, so the portal can show "Reading 45 %", and, with a Hardcover token, your Hardcover account too.</li>
+<li><strong>Finished on the Kobo</strong> shows as Read on the portal; <strong>Read</strong> marked on the portal shows as Finished on the Kobo after its next sync.</li>
+<li><strong>Only some books on the Kobo?</strong> Devices → Kobo → <em>Only sync the shelves I mark for Kobo</em>: then only books on shelves you mark for Kobo sync on the library site are sent.</li>
+<li><strong>Removing a book</strong> from your library (its page → Remove) does not delete it from the Kobo: delete it on the Kobo too.</li>
+</ul>
+<h3>Without linking: send one book</h3>
+<p>On the Kobo open the web browser (Settings → Beta features → Web browser) at <span class="code">{{ cfg.PORTAL_URL }}/send</span>. It shows a 4-letter code. On your phone, open the book in <a href="{{ cfg.PORTAL_URL }}/library">My books</a> → <strong>Send to an e-reader</strong> → type the code. The Kobo's page offers the download a few seconds later.</p>
+{% endblock %}

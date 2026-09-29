@@ -200,6 +200,69 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v6.0 (home., one sign-in, home page, audiobooks, Want to Read, notifications, dashboard)
+- Unit 771 passed, installer 823 passed, monitoring 41 passed (Kuma 2.5.5-slim), Kuma upgrade 8 passed,
+  Caddy build 8 passed (the production Caddyfile with the gate on every site validates), seedbox 47 passed,
+  end-to-end 326 checks / 0 failed, lint clean.
+- Synthetic v6.0 journey on the real stack (tests/e2e_driver.py 14c): home. is the production site
+  (gate first, then only the start page; /login, /admin, /send, /intake, downloads -> request.), one
+  sign-in reaches it; with the production Authelia rules a reader passes with a password and an admin
+  with a password alone is stopped on home. and request.; an e-reader gets a code without a login, a
+  book sent to it downloads, Send another book gives a new code that survives the page's refresh; Get
+  the audiobook is stored and shown as an audiobook; phone notifications and Want to Read switch on/off;
+  the admin dashboard and the Help link. The canary journey (scripts/synthetic.py) passed as well.
+- UI/UX pass on a local portal with realistic data (desktop and a 375 px phone): titled placeholder
+  covers, requests that need an answer first, buttons that wrap on a phone, two tiles per row on the
+  start page, a Help link in the nav, the dashboard's Health card given room, reader-facing wording
+  where admin instructions showed, a sign-out that keeps where the reader was going; no console or
+  CSP errors.
+- Authelia 4.39.28 validates the new rules (group:admins two_factor, then one_factor for the rest)
+  and the Audiobookshelf client's custom authorization policy "family" (validate-config).
+- Audiobook picker on real-world names: M4B unabridged beats MP3, "narrated by Ray Porter" is not
+  another book, an EPUB / an abridged copy / a Books 1-3 collection / another title are refused.
+- mutagen 1.48.1 added to the portal (the only new dependency; hash-locked, all other pins as before).
+- Pre-release audit (10 auditors, each finding re-checked by a skeptic): 88 confirmed findings, about 45
+  distinct, all fixed: audiobook Keep for folders, single-file audiobooks checked, arrivals matched to
+  the best request, held files kept on the dropbox mount (a rename, not a copy into /state) and
+  dropped after 14 days, a disk check before an audiobook downloads, audiobook ownership per reader,
+  a rejected copy never handed back on arrival, companion PDFs with audiobooks, Want to Read seeding,
+  Deploy/Update re-render and recreate Authelia (home. would otherwise answer 403 with the gate on),
+  AUTHELIA_READERS_2FA really reaching Authelia, home. restricted to the start page (every other path
+  -> request., where the rate limits, fail2ban, Turnstile and Access apply), the home DNS record never
+  repointing an existing one, admin portal rights through the gate needing the admins group, the Kuma
+  1.x copy made atomically and never overwritten on a retry, pins offered only as upgrades, -slim
+  update checks, per-entry cache retention, cached home-page Audiobookshelf calls, no duplicate pushes,
+  removed accounts' requests closed, and the texts that promised more than the code did.
+- Second audit round (6 reviewers over the fixed tree, every finding re-checked by a refuter): 30
+  confirmed, all fixed. The two that mattered most: the gate on home. never ran (Caddy orders handle
+  before route; the site is now ONE route, proven with `caddy adapt`), and a password-only reader
+  with the Calibre-Web admin role could post the portal's own login form behind the gate to get admin
+  rights (the group rule now holds on every gated request). Also: Install -> Cloudflare repointed an
+  existing home. record (it now goes through the same free-name check, and bookstack's own record
+  carries a comment so a restore still moves it); a taken home. sends every start-page link to
+  request./hub (HOME_URL); gate-sync keeps the admins group in step with Calibre-Web roles every 10
+  minutes; Keep never downloads the book again; an audiobook still downloading is never replaced;
+  a confirmed audiobook waiting for disk space is not offered again; Want to Read never downloads
+  without a yes, records the list the moment it is switched on, and never mistakes an old book for
+  a new one; /send?new=1 no longer makes a code every 5 s; series numbers like 1.05; the ebook and
+  the audiobook shown apart on series pages; Update creates home. too; Kuma skips a home. that is not ours.
+- Upgrading from v5.9.x: readers who had to use a second factor at the sign-in page now sign in with
+  their password (the chosen 6.0 policy); set AUTHELIA_READERS_2FA=true (Advanced settings -> lockout)
+  to keep asking them. Deploy re-renders Authelia and re-syncs its admins group from Calibre-Web roles.
+- On the VPS after Deploy:
+  - Deploy (and Update, and Install -> Cloudflare) creates home.<domain> in Cloudflare when that name
+    is free. A record of another service is left alone: the summary says so and the start page is then
+    https://request.<domain>/hub (every link, Authelia and Kuma follow). Open it: tiles, your setup, guides.
+  - Operations -> Update: answer Yes to the newer pins if it offers any.
+  - With the Authelia gate on (Security -> Authelia): sign in once at home., then open books.,
+    audio., request., shelf.: none asks again. Readers need only their password; admins a second factor.
+  - The portal's home page: Continue reading / listening, Next in your series, Recently added.
+  - A book's search page: Get the audiobook -> confirm on Requests -> it arrives in Audiobookshelf.
+  - Devices: Phone notifications -> Turn on -> subscribe in ntfy -> Send a test.
+  - Devices (with a Hardcover token): Want to Read -> on (the note says how many were already on the
+    list); add a book on Hardcover; within 10 min it waits for your yes on Requests.
+  - Admin: What needs you.
+
 ## Verified locally in v5.9.1 (Kuma 2.x, new Kobos, send to an e-reader, audiobooks to Hardcover)
 - Unit 711 passed, installer 803 passed, monitoring 41 passed on louislam/uptime-kuma:2.5.5-slim,
   Kuma upgrade 8 passed (1.23.17 -> 2.5.5 on the same data: migrated in 38 s, nothing added or

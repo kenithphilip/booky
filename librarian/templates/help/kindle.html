@@ -1,0 +1,20 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>A Kindle cannot sync with the library like a Kobo, so books go to it by Amazon's <em>Send to Kindle</em> e-mail, or through its web browser.</p>
+<h3>Set up Send to Kindle (once)</h3>
+<ol>
+<li>Find your Kindle's address: on amazon.com (or your country's Amazon) → Manage Your Content and Devices → Preferences → Personal Document Settings. It ends in <span class="code">@kindle.com</span>.</li>
+<li>On the same page, add the library's sending address to the <strong>Approved Personal Document E-mail List</strong>. <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> shows which address to approve.</li>
+<li>Enter your Kindle address on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> and press <strong>Send a test</strong>. It arrives within a few minutes if the approval worked.</li>
+</ol>
+<h3>Sending books</h3>
+<ul>
+<li>Any book's page → <strong>Send to Kindle</strong>. The portal fixes the EPUB first so Amazon accepts it.</li>
+<li>Devices → Preferences → <strong>Automatically e-mail every new ebook to my Kindle</strong>: everything that arrives for you goes to the Kindle by itself.</li>
+<li>Comics are converted for the Kindle Colorsoft when they are sent (split into parts if very large).</li>
+<li>Amazon's limit is about 50 MB per mail, and the portal sends at most 20 a day for you.</li>
+</ul>
+<h3>Through the Kindle's browser (no mail, no size limit)</h3>
+<p>On the Kindle open the Experimental Browser at <span class="code">{{ cfg.PORTAL_URL }}/send</span>, then on your phone use <strong>Send to an e-reader</strong> on the book's page with the code it shows. A Kindle's browser only opens AZW3, MOBI, PDF and TXT, never EPUB: on the book's page, pick AZW3 and press <strong>Convert</strong> first when needed.</p>
+<h3>Reading progress</h3>
+<p>A Kindle does not report what you read. Mark books yourself on their page (<strong>Mark: Read · Reading · Unread</strong>), or <em>read up to here</em> on a comic series; your trackers (Hardcover, AniList, Metron) follow.</p>
+{% endblock %}

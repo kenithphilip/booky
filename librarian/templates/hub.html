@@ -1,0 +1,39 @@
+{% extends "hub_base.html" %}{% block body %}
+<h2 style="margin-top:4px">Hello {{ session.user }}</h2>
+<p class="mut">Everything the family library can do, one tap away.{% if cfg.AUTHELIA_ENABLED %} You are signed in everywhere: the sites below do not ask again.{% endif %}
+Bookmark this page: <span class="code">{{ cfg.HOME_URL }}</span></p>
+{% set waiting = waiting_books + waiting_comics %}
+{% if waiting or new %}<div class="flash">{% if waiting %}<strong>{{ waiting }}</strong> waiting for your answer (a copy to confirm, or a file to check): {% if waiting_books %}<a href="{{ cfg.PORTAL_URL }}/status">Requests</a>{% endif %}{% if waiting_books and waiting_comics %} · {% endif %}{% if waiting_comics %}<a href="{{ cfg.PORTAL_URL }}/comics">Comics</a>{% endif %}. {% endif %}
+{% if new %}<strong>{{ new }}</strong> new from what you follow: <a href="{{ cfg.PORTAL_URL }}/">see them</a>.{% endif %}</div>{% endif %}
+
+<div class="tiles">
+<a class="tile" href="{{ cfg.PORTAL_URL }}/"><strong>Library portal</strong><span class="mut">Your home page: what you are reading, new arrivals, search and get books</span></a>
+<a class="tile" href="{{ cfg.PORTAL_URL }}/library"><strong>My books</strong><span class="mut">Everything in your library: download, send to Kindle or an e-reader</span></a>
+<a class="tile" href="{{ cfg.PORTAL_URL }}/audiobooks"><strong>My audiobooks</strong><span class="mut">Download for any player; listen in the app below</span></a>
+<a class="tile" href="{{ cfg.AUDIO_URL }}"><strong>Audiobookshelf</strong><span class="mut">Listen in the browser or the app, with your place kept</span></a>
+<a class="tile" href="{{ cfg.BOOKS_URL }}"><strong>Library site</strong><span class="mut">Calibre-Web: read in the browser, shelves, Kobo settings</span></a>
+{% if cfg.COMICS_ENABLED %}<a class="tile" href="{{ cfg.PORTAL_URL }}/comics"><strong>Comics &amp; manga</strong><span class="mut">Find a series, request volumes or chapters</span></a>{% endif %}
+<a class="tile" href="{{ cfg.PORTAL_URL }}/following"><strong>Following</strong><span class="mut">Series and authors you follow; new releases</span></a>
+<a class="tile" href="{{ cfg.SHELF_URL }}"><strong>Shelfmark</strong><span class="mut">Search every source yourself and pick the exact copy</span></a>
+<a class="tile" href="{{ cfg.PORTAL_URL }}/devices"><strong>Devices &amp; settings</strong><span class="mut">Kobo, Kindle, notifications, Hardcover, AniList, password</span></a>
+<a class="tile" href="{{ cfg.PORTAL_URL }}/status"><strong>Requests</strong><span class="mut">What you asked for and how far it got</span></a>
+{% if cfg.AUTHELIA_ENABLED %}<a class="tile" href="{{ cfg.AUTH_URL }}/settings"><strong>Sign-in settings</strong><span class="mut">Two-factor, passkeys and security keys for the sign-in page</span></a>{% endif %}
+{% if admin %}<a class="tile" href="{{ cfg.PORTAL_URL }}/admin"><strong>Admin dashboard</strong><span class="mut">Health, queues, users, what needs you</span></a>
+<a class="tile" href="{{ cfg.MONITOR_URL }}"><strong>Uptime Kuma</strong><span class="mut">Monitors (over Tailscale only)</span></a>{% endif %}
+</div>
+
+<h2>Your setup</h2>
+<div class="card">
+{% for label, done, hint, url in checklist %}
+<div class="check"><span class="{{ 'ok' if done else 'no' }}">{{ '✓' if done else '○' }}</span>
+<div><strong>{{ label }}</strong>{% if not done %} <span class="mut">· <a href="{{ url }}">{{ hint }}</a></span>{% endif %}</div></div>
+{% endfor %}
+</div>
+
+<h2>Guides</h2>
+<div class="tiles">
+{% for key, title, blurb in topics %}
+<a class="tile" href="{{ url_for('help_page', topic=key) }}"><strong>{{ title }}</strong><span class="mut">{{ blurb }}</span></a>
+{% endfor %}
+</div>
+{% endblock %}

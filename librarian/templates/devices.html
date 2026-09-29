@@ -10,7 +10,7 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <ul style="margin:6px 0;padding-left:18px">
 <li>While linked to this library, the Kobo's own store and OverDrive/Libby stop working on the device.</li>
 <li>Signing out, signing in again or a factory reset rewrites the config file: put the link back afterwards.</li>
-<li>Only EPUB (and KEPUB) books sync to a Kobo; PDFs and comics can be downloaded from My books.</li>
+<li>Books sync as EPUB (or KEPUB); on a colour Kobo, comics sync as fixed-layout Kobo copies ("Make Kobo copy" on a comic's page if one is missing). PDFs are downloaded from My books.</li>
 <li>The first sync of a big library takes minutes; leave the Kobo on Wi-Fi until it finishes.</li>
 </ul></details>
 {% if kobo %}
@@ -28,10 +28,6 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <button type="submit" class="sec">Regenerate link</button> <span class="mut">(the old link stops working; update the device)</span></form>
 <form method="post" style="margin-top:6px">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_prefs">
 <label><input type="checkbox" name="shelves_only" value="1" {{ 'checked' if kstat and kstat.shelves_only }}> Only sync the shelves I mark for Kobo in Calibre-Web (not my whole library)</label><br>
-<label class="mut"><input type="checkbox" name="hardcover_change" value="1"> Set my Hardcover token
-<input type="password" name="hardcover_token" placeholder="{{ 'set — type a new one or leave blank to remove' if kstat and kstat.hardcover else 'hardcover.app → Settings → API' }}" autocomplete="off" style="width:260px"></label>
-<span class="mut">(reading progress from the Kobo is shared with your Hardcover account, when the admin has Hardcover sync on;
-your audiobook listening progress too{% if hc_audio and hc_audio.detail %}: {{ hc_audio.detail }}{% endif %})</span><br>
 <button type="submit" class="sec">Save Kobo options</button></form>
 <p class="mut" style="margin-top:8px">This link is a key in its own right: anyone holding it reads your whole library, and
 <strong>changing your password does not change it</strong>. If the link leaked, or a device carrying it was lost, regenerate it here.</p>
@@ -56,6 +52,53 @@ Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files
 <span class="mut">{% if prefs.last_kindle_test %}last test sent {{ prefs.last_kindle_test }}{% else %}proves the approved-sender step before the first real book{% endif %}</span></form>
 {% endif %}
 {% if not kindle_enabled %}<p class="mut">Sending from this portal is not enabled yet (the admin has not configured outgoing mail). You can still use <em>Send to Kindle</em> inside the <a href="{{ cfg.BOOKS_URL }}" target="_blank" rel="noopener">library site</a>.</p>{% endif %}
+</div>
+
+
+<div class="card">
+<h3>Phone notifications</h3>
+{% if prefs.ntfy_topic %}
+<p>On. In the free <strong>ntfy</strong> app (Android, iPhone) tap <strong>+</strong>, then subscribe to:</p>
+<p>Topic <span class="code">{{ prefs.ntfy_topic }}</span> <button class="sec" data-copy="{{ prefs.ntfy_topic }}" type="button">Copy</button>
+{% if ntfy_base != 'https://ntfy.sh' %}<br><span class="mut">Use another server:</span> <span class="code">{{ ntfy_base }}</span>{% endif %}</p>
+<p class="mut">Or open this on your phone: <a href="{{ ntfy_base }}/{{ prefs.ntfy_topic }}">{{ ntfy_base }}/{{ prefs.ntfy_topic }}</a>.
+You hear when a book, audiobook or comic arrives, when a copy waits for your yes, when a file needs checking, and when something you follow
+comes out. Keep the topic to yourself: anyone who knows it could read these (they name books, nothing else).</p>
+<div class="row">
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="ntfy_test"><button type="submit">Send a test</button></form>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="ntfy_new"><button type="submit" class="sec">New topic</button></form>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="ntfy_off"><button type="submit" class="sec">Turn off</button></form></div>
+{% else %}
+<p class="mut">Hear on your phone when what you asked for has arrived, when a copy waits for your yes, and when something you follow comes out.
+You need the free ntfy app (Android or iPhone).</p>
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="ntfy_on"><button type="submit">Turn on</button></form>
+{% endif %}
+</div>
+
+<div class="card">
+<h3>Hardcover</h3>
+<p class="mut">With your token from hardcover.app → Settings → API: your Kobo and KOReader reading progress{% if cfg.AUDIO_URL %} and your
+audiobook listening{% endif %} reach your Hardcover account, and your Want to Read list can feed this library (below).
+{% if hc_audio and hc_audio.detail %}Audiobooks: {{ hc_audio.detail }}.{% endif %}</p>
+<form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="hardcover">
+<input type="password" name="hardcover_token" placeholder="{{ 'set: type a new one, or leave empty and save to remove it' if kstat and kstat.hardcover else 'paste your Hardcover token' }}" autocomplete="off" style="flex:1;min-width:220px">
+<button type="submit" class="sec">Save token</button></form>
+</div>
+
+<div class="card">
+<h3>Hardcover "Want to Read"</h3>
+{% if not (kstat and kstat.hardcover) %}<p class="mut">Set your Hardcover token (above) first: books you add to your Want to Read list on Hardcover can then become requests here.</p>
+{% else %}
+<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="hcwant">
+<p><label><input type="checkbox" name="hc_want" value="1" {{ 'checked' if prefs.hc_want }}> Books I add to my Want to Read list on Hardcover become requests here</label>
+<select name="hc_want_kind" style="width:auto">{% for v, l in (('ebook', 'as ebooks'), ('audio', 'as audiobooks'), ('both', 'as both')) %}<option value="{{ v }}" {{ 'selected' if prefs.hc_want_kind == v }}>{{ l }}</option>{% endfor %}</select></p>
+<p class="mut">Checked every 10 minutes. A book the family has is added to yours with nothing downloaded; otherwise the copy found waits for your
+yes on Requests, like any Get it. Switching this on requests nothing that is already on the list.</p>
+<button type="submit">Save</button></form>
+{% if hcwant_note %}<p class="mut">{{ hcwant_note }}</p>{% endif %}
+{% if prefs.hc_want and hcwant_backlog %}<form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="hcwant_backlog">
+<button type="submit" class="sec">Get the {{ hcwant_backlog }} already on my list{% if hcwant_backlog > 20 %} (20 at a time){% endif %}</button></form>{% endif %}
+{% endif %}
 </div>
 
 {% if anilist_ok %}

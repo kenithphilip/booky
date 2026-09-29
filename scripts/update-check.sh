@@ -34,8 +34,10 @@ def newest(image):
     else:
         repo = img if "/" in img else "library/" + img
         tags = [t["name"] for t in get(f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&ordering=last_updated")["results"]]
-    vt = [t for t in tags if re.fullmatch(r"v?\d+(\.\d+){1,3}", t)]
-    key = lambda t: tuple(int(x) for x in t.lstrip("v").split("."))
+    suffix = (re.fullmatch(r"v?\d+(?:\.\d+){1,3}(-[a-z]+)?", image.split(":", 1)[1] if ":" in image else "") or [None, None])[1] or ""
+    # only tags of the same kind: a "-slim" pin is compared with "-slim" releases (v6.0, Kuma)
+    vt = [t for t in tags if re.fullmatch(r"v?\d+(\.\d+){1,3}" + re.escape(suffix), t)]
+    key = lambda t: tuple(int(x) for x in t[: len(t) - len(suffix)].lstrip("v").split("."))
     return max(vt, key=key) if vt else None
 out, changed = [], False
 for k, image in sorted(pins.items()):
@@ -44,9 +46,9 @@ for k, image in sorted(pins.items()):
         new = newest(image)
     except Exception:
         continue
-    if not new or not re.fullmatch(r"v?\d+(\.\d+){1,3}", cur):
+    if not new or not re.fullmatch(r"v?\d+(\.\d+){1,3}(-[a-z]+)?", cur):
         continue                       # floating tags (:1, :latest) follow their line already
-    key = lambda t: tuple(int(x) for x in t.lstrip("v").split("."))
+    key = lambda t: tuple(int(x) for x in re.sub(r"-[a-z]+$", "", t).lstrip("v").split("."))
     if key(new) > key(cur) and seen.get(k) != new:
         out.append(f"{k}: {image} -> {new}")
         seen[k] = new; changed = True

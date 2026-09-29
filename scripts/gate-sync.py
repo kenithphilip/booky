@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """gate-sync.py — carry portal password changes (and logins the portal's /admin creates) into
-the Authelia gate's user file (L05). Host side, root, standard library only.
+the Authelia gate's user file (L05), and keep its admins group in step with Calibre-Web's admin
+roles (v6.0). Host side, root, standard library only.
 
 The portal never writes Authelia's file: it queues a PBKDF2-SHA512 hash (never the password) in
 librarian.db and touches librarian/state/gate-sync.flag. The bookstack-gate-sync.path unit runs
@@ -66,6 +67,37 @@ def apply(text, row):
     return text, "ok", "gate login created"
 
 
+def sync_groups(text, admins):
+    """(new text, changed names): each gate login's 'admins' group follows its Calibre-Web admin
+    role (v6.0: Authelia asks the admins group for a second factor, readers only a password; the
+    portal grants admin rights only with both). Pure: the unit tests drive it directly."""
+    changed = []
+    def fix(m):
+        name, body = m.group(1), m.group(2)
+        groups = re.findall(r"(?m)^      - (\S+)\s*$", body)
+        want = [g for g in groups if g != "admins"] + (["admins"] if name in admins else [])
+        if "users" not in want:
+            want.insert(0, "users")
+        if want == groups:
+            return m.group(0)
+        changed.append(name)
+        body = re.sub(r"(?ms)^    groups:\n(?:      - .*\n?)*", "", body)
+        body = body if body.endswith("\n") or not body else body + "\n"
+        return "  %s:\n%s    groups:\n%s" % (name, body, "".join("      - %s\n" % g for g in want))
+    out = re.sub(r"(?m)^  ([A-Za-z0-9._-]+):[ \t]*\n((?:    .*\n?)*)", fix, text)
+    return out, changed
+
+
+def calibre_admins():
+    """Names with Calibre-Web's admin role, or None when the portal cannot say (never guess)."""
+    r = subprocess.run(["docker", "exec", "-i", LIBRARIAN, "python", "-m", "cwa", "list"],
+                       capture_output=True, text=True, timeout=60)
+    try:
+        return {u["name"] for u in json.loads(r.stdout) if u.get("is_admin")} if r.returncode == 0 else None
+    except (ValueError, TypeError, KeyError):
+        return None
+
+
 def write(path, text):
     st = os.stat(path) if os.path.exists(path) else None
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".users.")
@@ -88,8 +120,6 @@ def main():
         print(f"gate-sync: cannot read the queue: {ans.get('error')}", file=sys.stderr)
         return 1
     rows = ans.get("rows") or []
-    if not rows:
-        return 0
     try:
         text = open(USERS, encoding="utf-8").read()
     except OSError:
@@ -99,6 +129,15 @@ def main():
         text, outcome, detail = apply(text, row)
         changed |= outcome == "ok"
         results.append((row["user"], outcome, detail))
+    # v6.0: a promotion or demotion in Calibre-Web's own UI reaches Authelia's admins group within
+    # the 10-minute timer, not only at the next Deploy (until then a new admin signed in with a
+    # password alone; the portal already refused them admin rights, Calibre-Web did not)
+    admins = calibre_admins()
+    if admins is not None and os.path.exists(USERS):
+        text, moved = sync_groups(text, admins)
+        if moved:
+            changed = True
+            print(f"gate-sync: admins group follows Calibre-Web for {' '.join(moved)}")
     if changed:
         write(USERS, text)
         try:

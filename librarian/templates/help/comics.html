@@ -1,0 +1,22 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>Comics and manga live in your library like books. They reach your devices the same way: the Kobo sync (as colour fixed-layout books on a colour Kobo), Send to Kindle, or a CBZ download for an iPad.</p>
+<h3>Getting volumes or issues</h3>
+<ol>
+<li><a href="{{ cfg.PORTAL_URL }}/comics">Comics</a> → search a series (Manga, or Comics for Western titles) → open it.</li>
+<li>Tick the volumes or issues you want and choose the language (and reading direction for manga) → <strong>Request</strong>.</li>
+<li>Each copy found is shown to you on Comics to confirm; <strong>Yes to all</strong> takes every copy offered in one series at once.</li>
+<li>Arrivals are checked (series, number, language, a sensible number of pages) before they go into your library; a file that does not match is held for you.</li>
+</ol>
+<h3>Following a series</h3>
+<ul>
+<li><strong>Follow volumes</strong>: each new volume shows under New for you.</li>
+<li><strong>Follow chapters, then volumes</strong> (manga): each new chapter shows up as soon as it is out, and is downloaded when a copy exists. Chapters go into their own series (e.g. <em>One Piece (chapters)</em>). When the volume that collects them is in your library, Comics offers to remove those chapters (they are pre-ticked; nothing is removed until you say so).</li>
+</ul>
+<h3>Reading</h3>
+<ul>
+<li><strong>Kobo:</strong> a Kobo copy is made automatically when you read on a Kobo; <strong>Make Kobo copy</strong> on the comic's page if not.</li>
+<li><strong>Kindle:</strong> Send to Kindle on its page (converted for the Colorsoft on the way).</li>
+<li><strong>iPad:</strong> download the CBZ into Panels or Chunky.</li>
+<li><strong>Wrong comic?</strong> Its page → <strong>Wrong comic</strong>.</li>
+</ul>
+{% endblock %}

@@ -287,6 +287,15 @@ def init():
         pcols = {r[1] for r in c.execute("PRAGMA table_info(prefs)")}
         if "language" not in pcols:
             c.execute("ALTER TABLE prefs ADD COLUMN language TEXT")
+        # v6.0: phone notifications (a private ntfy topic) and the Hardcover Want to Read sync
+        for col, typ in (("ntfy_topic", "TEXT"), ("hc_want", "INTEGER DEFAULT 0"), ("hc_want_kind", "TEXT"),
+                         ("hc_want_seeded", "REAL"),      # when the list was last recorded without requesting
+                         ("hc_want_after", "INTEGER")):   # the newest list entry (user_book id) recorded then
+            if col not in pcols:
+                c.execute(f"ALTER TABLE prefs ADD COLUMN {col} {typ}")
+        c.execute("""CREATE TABLE IF NOT EXISTS hc_want_seen(
+            owner TEXT NOT NULL, book_id INTEGER NOT NULL, at REAL, requested INTEGER DEFAULT 0,
+            title TEXT, author TEXT, PRIMARY KEY(owner, book_id))""")
         c.execute("""CREATE TABLE IF NOT EXISTS meta_provider_state(
             provider TEXT PRIMARY KEY,
             failures INTEGER DEFAULT 0, opened_at REAL, retry_after REAL,
@@ -296,6 +305,8 @@ def init():
         # comics (docs/COMICS.md): what the metadata providers said (a day), the readers' requests,
         # which Calibre books have their Kobo copy, and Kindle jobs that need a comic converted first
         c.execute("""CREATE TABLE IF NOT EXISTS http_cache(key TEXT PRIMARY KEY, data TEXT NOT NULL, at REAL NOT NULL)""")
+        if "keep" not in {r[1] for r in c.execute("PRAGMA table_info(http_cache)")}:
+            c.execute("ALTER TABLE http_cache ADD COLUMN keep REAL")       # v6.0: days this entry is kept
         c.execute("""CREATE TABLE IF NOT EXISTS comic_requests(
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
             provider TEXT NOT NULL, series_id TEXT NOT NULL, series_name TEXT NOT NULL,
@@ -351,6 +362,12 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS anilist_progress(
             owner TEXT NOT NULL, media_id INTEGER NOT NULL, volumes INTEGER NOT NULL, at REAL,
             PRIMARY KEY(owner, media_id))""")
+        # v6.0: book requests for audiobooks too (kind), and the Audiobookshelf item that arrived
+        bcols = {r[1] for r in c.execute("PRAGMA table_info(book_requests)")}
+        # ask: always wait for the reader's yes, even with BOOK_CONFIRM=sure (Hardcover Want to Read)
+        for col, typ in (("kind", "TEXT DEFAULT 'ebook'"), ("abs_item", "TEXT"), ("ask", "INTEGER DEFAULT 0")):
+            if col not in bcols:
+                c.execute(f"ALTER TABLE book_requests ADD COLUMN {col} {typ}")
         # v5.9: a reader's Metron account (Western comics read), and what was sent to it
         c.execute("""CREATE TABLE IF NOT EXISTS metron_link(
             owner TEXT PRIMARY KEY, username TEXT NOT NULL, secret TEXT NOT NULL,
@@ -406,10 +423,13 @@ def cache_get(key, max_age):
     return json.loads(r["data"])
 
 def cache_put(key, data, keep_days=14):
+    """v6.0: each entry keeps its own retention (keep_days): trimming the whole table by the
+    caller's retention dropped every 30-day Hardcover answer and 365-day note after 14 days."""
     now = time.time()
     with _lock, _conn() as c:
-        c.execute("INSERT OR REPLACE INTO http_cache(key, data, at) VALUES(?,?,?)", (key, json.dumps(data), now))
-        c.execute("DELETE FROM http_cache WHERE at < ?", (now - keep_days * 86400,))
+        c.execute("INSERT OR REPLACE INTO http_cache(key, data, at, keep) VALUES(?,?,?,?)",
+                  (key, json.dumps(data), now, float(keep_days)))
+        c.execute("DELETE FROM http_cache WHERE at < ? - coalesce(keep, 14) * 86400", (now,))
 
 def cache_clear_prefix(prefix):
     with _lock, _conn() as c:
@@ -425,7 +445,47 @@ def get_prefs(owner):
     return {"preferred_format": fmt, "auto_kindle": bool(d.get("auto_kindle")),
             "notify_email": bool(d.get("notify_email")), "last_kindle_test": d.get("last_kindle_test"),
             # the language this reader reads in: copies in another language are never taken
-            "language": d.get("language") or config.BOOK_LANGUAGE}
+            "language": d.get("language") or config.BOOK_LANGUAGE,
+            # v6.0
+            "ntfy_topic": d.get("ntfy_topic") or "", "hc_want": bool(d.get("hc_want")),
+            "hc_want_kind": d.get("hc_want_kind") if d.get("hc_want_kind") in ("ebook", "audio", "both") else "ebook",
+            "hc_want_seeded": d.get("hc_want_seeded")}
+
+def set_prefs_v6(owner, **f):
+    """v6.0 reader settings: ntfy_topic, hc_want, hc_want_kind (kept apart from set_prefs so its
+    callers and their defaults stay exactly as they were)."""
+    f = {k: v for k, v in f.items() if k in ("ntfy_topic", "hc_want", "hc_want_kind", "hc_want_seeded", "hc_want_after")}
+    if not f:
+        return
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO prefs(owner, updated) VALUES(?,?)", (owner, time.time()))
+        c.execute(f"UPDATE prefs SET {', '.join(f'{k}=?' for k in f)}, updated=? WHERE owner=?", (*f.values(), time.time(), owner))
+
+def prefs_with(col):
+    """[(owner, value)] of readers with a v6.0 setting on (ntfy_topic set, hc_want on)."""
+    if col not in ("ntfy_topic", "hc_want"):
+        return []
+    with _conn() as c:
+        return [(r[0], r[1]) for r in c.execute(f"SELECT owner, {col} FROM prefs WHERE {col} IS NOT NULL AND {col} != '' AND {col} != 0")]
+
+def hc_want_after(owner):
+    """The newest Want to Read entry (Hardcover user_book id) that was on the list when it was recorded."""
+    with _conn() as c:
+        r = c.execute("SELECT hc_want_after FROM prefs WHERE owner=?", (owner,)).fetchone()
+    return (r[0] or 0) if r else 0
+
+def hc_want_seen(owner):
+    with _conn() as c:
+        return {r[0] for r in c.execute("SELECT book_id FROM hc_want_seen WHERE owner=?", (owner,))}
+
+def hc_want_mark(owner, book_id, title, author, requested, now=None):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO hc_want_seen(owner, book_id, at, requested, title, author) VALUES(?,?,?,?,?,?)",
+                  (owner, int(book_id), now or time.time(), 1 if requested else 0, (title or "")[:300], (author or "")[:200]))
+
+def hc_want_unrequested(owner):
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM hc_want_seen WHERE owner=? AND requested=0 ORDER BY at", (owner,))]
 
 def set_prefs(owner, preferred_format=None, auto_kindle=None, notify_email=None, last_kindle_test=None,
               language=None):
@@ -1938,7 +1998,7 @@ def notices_since(since):
 
 # ---- one-tap book requests (v5.8.3, bookreq.py) --------------------------------------------------
 BOOK_OPEN = ("queued", "pending", "confirm", "downloading", "held")
-BOOK_FIELDS = ("title", "author", "series", "language", "hardcover_id", "notice_id")
+BOOK_FIELDS = ("title", "author", "series", "language", "hardcover_id", "notice_id", "kind", "ask")
 
 BOOK_JSON = {"tried": [], "blocked": [], "reasons": [], "candidate": None, "held_meta": None}
 
@@ -1964,8 +2024,9 @@ def bookreq_add(owner, fields, now=None):
     f = {k: fields.get(k) for k in BOOK_FIELDS if fields.get(k) is not None}
     with _lock, _conn() as c:
         r = c.execute(f"SELECT id FROM book_requests WHERE owner=? AND lower(title)=lower(?) "
-                      f"AND lower(coalesce(author,''))=lower(?) AND status IN ({','.join('?' * len(BOOK_OPEN))})",
-                      (owner, f.get("title") or "", f.get("author") or "", *BOOK_OPEN)).fetchone()
+                      f"AND lower(coalesce(author,''))=lower(?) AND coalesce(kind,'ebook')=? "
+                      f"AND status IN ({','.join('?' * len(BOOK_OPEN))})",
+                      (owner, f.get("title") or "", f.get("author") or "", f.get("kind") or "ebook", *BOOK_OPEN)).fetchone()
         if r:
             return r["id"], False
         cols = ", ".join(f)
@@ -2017,6 +2078,12 @@ def bookreq_for_book(owner, calibre_id):
     with _conn() as c:
         return _bookreq(c.execute("SELECT * FROM book_requests WHERE owner=? AND calibre_id=? AND status='done' "
                                   "ORDER BY id DESC", (owner, calibre_id)).fetchone())
+
+def bookreq_for_audio(owner, item_id):
+    """This reader's delivered audiobook request for one Audiobookshelf item ('Wrong audiobook')."""
+    with _conn() as c:
+        return _bookreq(c.execute("SELECT * FROM book_requests WHERE owner=? AND abs_item=? AND status='done' "
+                                  "ORDER BY id DESC", (owner, item_id)).fetchone())
 
 def bookreq_waiting(owner):
     """How many of this reader's books wait for them: a copy to confirm, or a file to check."""

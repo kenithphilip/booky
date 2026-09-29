@@ -49,20 +49,50 @@ def _search_sql(q):
     return ("AND (lower(b.title) LIKE ? OR EXISTS (SELECT 1 FROM books_authors_link al JOIN authors a "
             "ON a.id=al.author WHERE al.book=b.id AND lower(a.name) LIKE ?))", (like, like))
 
-def count_for(owner, is_admin=False, q=""):
+COMIC_TAGS = ("Comics", "Manga", "Manhwa", "Manhua")
+SORTS = {"added": "b.timestamp DESC, b.id DESC", "title": "b.sort COLLATE NOCASE, b.id",
+         "author": "b.author_sort COLLATE NOCASE, b.sort COLLATE NOCASE",
+         "series": "(SELECT s.sort FROM books_series_link l JOIN series s ON s.id=l.series WHERE l.book=b.id) IS NULL, "
+                   "(SELECT s.sort FROM books_series_link l JOIN series s ON s.id=l.series WHERE l.book=b.id) COLLATE NOCASE, "
+                   "b.series_index, b.sort COLLATE NOCASE"}
+
+def _filter_sql(kind=None, only=None, exclude=None):
+    """v6.0 My books filters: comics or books only, and a set of ids to keep or to leave out
+    (the reading-status filters, from Calibre-Web's reading state)."""
+    sql, params = "", []
+    if kind in ("comics", "books"):
+        marks = ",".join("?" * len(COMIC_TAGS))
+        sql += (" AND " if kind == "comics" else " AND NOT ") + (
+            f"EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=b.id AND t.name IN ({marks}))")
+        params += COMIC_TAGS
+    if only is not None:
+        ids = list(only)[:30000] or [-1]      # SQLite takes 32766 host parameters
+        sql += f" AND b.id IN ({','.join('?' * len(ids))})"
+        params += ids
+    if exclude:
+        ids = list(exclude)[:30000]
+        sql += f" AND b.id NOT IN ({','.join('?' * len(ids))})"
+        params += ids
+    return sql, tuple(params)
+
+def count_for(owner, is_admin=False, q="", kind=None, only=None, exclude=None):
     scope, params = _scope_sql(owner, is_admin)
     search, sparams = _search_sql(q)
+    filt, fparams = _filter_sql(kind, only, exclude)
     try:
         with _conn() as c:
-            return c.execute(f"SELECT COUNT(*) FROM books b WHERE 1=1 {scope} {search}", (*params, *sparams)).fetchone()[0]
+            return c.execute(f"SELECT COUNT(*) FROM books b WHERE 1=1 {scope} {search} {filt}",
+                             (*params, *sparams, *fparams)).fetchone()[0]
     except Exception:
         return 0
 
-def books_for(owner, is_admin=False, limit=PAGE, offset=0, q=""):
-    """[{id,title,author,formats:[...],added}] visible to this user, newest first; `q` filters
-    on title/author, `offset` pages through big libraries."""
+def books_for(owner, is_admin=False, limit=PAGE, offset=0, q="", kind=None, only=None, exclude=None, sort="added"):
+    """[{id,title,author,formats:[...],added,series,index}] visible to this user, newest first
+    (or by `sort`); `q` filters on title/author, `offset` pages through big libraries."""
     scope, params = _scope_sql(owner, is_admin)
     search, sparams = _search_sql(q)
+    filt, fparams = _filter_sql(kind, only, exclude)
+    order = SORTS.get(sort, SORTS["added"])
     try:
         with _conn() as c:
             rows = c.execute(f"""
@@ -71,9 +101,11 @@ def books_for(owner, is_admin=False, limit=PAGE, offset=0, q=""):
                           JOIN authors a ON a.id=al.author WHERE al.book=b.id) AS author,
                        (SELECT group_concat(lower(d.format)) FROM data d WHERE d.book=b.id) AS formats,
                        (SELECT group_concat(t.name) FROM books_tags_link l JOIN tags t ON t.id=l.tag
-                          WHERE l.book=b.id AND t.name LIKE ?) AS owners
-                FROM books b WHERE 1=1 {scope} {search} ORDER BY b.timestamp DESC, b.id DESC LIMIT ? OFFSET ?""",
-                (f"{config.OWNER_PREFIX}%", *params, *sparams, limit, max(0, offset))).fetchall()
+                          WHERE l.book=b.id AND t.name LIKE ?) AS owners,
+                       (SELECT s.name FROM books_series_link l JOIN series s ON s.id=l.series WHERE l.book=b.id) AS series,
+                       b.series_index
+                FROM books b WHERE 1=1 {scope} {search} {filt} ORDER BY {order} LIMIT ? OFFSET ?""",
+                (f"{config.OWNER_PREFIX}%", *params, *sparams, *fparams, limit, max(0, offset))).fetchall()
     except Exception:
         return []
     out = []
@@ -81,8 +113,21 @@ def books_for(owner, is_admin=False, limit=PAGE, offset=0, q=""):
         fmts = sorted(set((r[4] or "").split(","))) if r[4] else []
         out.append({"id": r[0], "title": r[1], "added": (r[2] or "")[:10], "author": r[3] or "Unknown",
                     "formats": [f for f in fmts if f],
-                    "owners": [o[len(config.OWNER_PREFIX):] for o in (r[5] or "").split(",") if o]})
+                    "owners": [o[len(config.OWNER_PREFIX):] for o in (r[5] or "").split(",") if o],
+                    "series": r[6], "index": r[7]})
     return out
+
+def title_of(owner, book_id, is_admin=False):
+    """(title, author) of a book this user may see, or None (a placeholder cover's text)."""
+    scope, params = _scope_sql(owner, is_admin)
+    try:
+        with _conn() as c:
+            r = c.execute(f"SELECT b.title, (SELECT group_concat(a.name, ' & ') FROM books_authors_link l "
+                          f"JOIN authors a ON a.id = l.author WHERE l.book = b.id) FROM books b WHERE b.id=? {scope}",
+                          (book_id, *params)).fetchone()
+    except Exception:
+        return None
+    return (r[0] or "", r[1] or "") if r else None
 
 def visible(owner, book_id, is_admin=False):
     """True if this user may see the book at all (regardless of formats)."""

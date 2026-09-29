@@ -35,7 +35,10 @@
 <button type="submit">Keep looking for it</button></form>
 {% if can_get %}<form method="post" action="{{ url_for('book_request') }}">{{ csrf_field() }}
 <input type="hidden" name="title" value="{{ w.title }}"><input type="hidden" name="author" value="{{ w.author }}">
-<button type="submit" title="The portal finds a copy through Shelfmark (EPUB first, your language) and it arrives in your library">Get it through Shelfmark</button></form>{% endif %}
+<button type="submit" title="The portal finds a copy through Shelfmark (EPUB first, your language) and it arrives in your library">Get it through Shelfmark</button></form>
+<form method="post" action="{{ url_for('book_request') }}">{{ csrf_field() }}
+<input type="hidden" name="title" value="{{ w.title }}"><input type="hidden" name="author" value="{{ w.author }}"><input type="hidden" name="kind" value="audio">
+<button type="submit" class="sec" title="The portal finds the audiobook (M4B first, unabridged), you confirm it, and it arrives in your audiobooks">Get the audiobook</button></form>{% endif %}
 {% if shelf %}<a class="btn sec" href="{{ shelf }}" target="_blank" rel="noopener">Pick in Shelfmark</a>{% endif %}
 {% if shelf_audio %}<a class="btn sec" href="{{ shelf_audio }}" target="_blank" rel="noopener">…audiobook in Shelfmark</a>{% endif %}
 </div>

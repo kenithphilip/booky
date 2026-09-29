@@ -1,4 +1,4 @@
-# mfdata.in private library — hardened, per-user, self-serve (v5)
+# mfdata.in private library — hardened, per-user, self-serve (v6)
 
 A private book/audiobook library on one small VPS. **Admins** install and run everything from
 one menu (`bookstack.sh`). **Users** only ever see the portal: they sign in, search, request
@@ -228,7 +228,8 @@ For your own writing you don't need a tracker: the **OPDS source** (Library → 
 
 | Address | Who reaches it | Layers in front |
 |---|---|---|
-| request / books / audio / shelf .mfdata.in | Your users, anywhere | Cloudflare DDoS+WAF+bot → mTLS-locked origin → **(optional) Authelia SSO+2FA** → per-user app login |
+| home.mfdata.in (v6.0 start page: /hub, /help, /static only; every other path redirects to request.) | Your users, anywhere | Cloudflare → mTLS-locked origin → **(optional) Authelia sign-in** → portal login |
+| request / books / audio / shelf .mfdata.in | Your users, anywhere | Cloudflare DDoS+WAF+bot → mTLS-locked origin → **(optional) Authelia SSO (admins: 2FA always; readers: 2FA with AUTHELIA_READERS_2FA)** → per-user app login |
 | auth.mfdata.in | Users (only when Authelia on) | The SSO portal itself |
 | monitor .mfdata.in | You, from your other Tailscale devices | Caddy aborts any client outside the tailnet → app login |
 | dl .mfdata.in (only with Torrents on) | You, from your other Tailscale devices | tailnet-only → password gate → qBittorrent login |
@@ -249,11 +250,13 @@ from Cloudflare's `CF-Connecting-IP` only, so rate limits, lockouts, fail2ban an
 trail see the real client and cannot be fooled by a forged `X-Forwarded-For`. Every container binds 127.0.0.1
 with `no-new-privileges`. No anonymous browsing, no self-registration, no third-party
 scripts, no telemetry. In the portal: CSRF tokens on every form, HttpOnly/Secure/Lax
-sessions that expire after 12 h, a strict Content-Security-Policy (no scripts at all),
+sessions that expire after 12 h, a strict Content-Security-Policy (script-src 'self': the portal's one
+first-party script, static/app.js, never inline or third-party code),
 brute-force lockout per user+IP and per IP, a daily request quota, an audit trail, and
 tag-scoped path-confined downloads. At Caddy: login, download and intake rate limits per
 real client IP; optionally fail2ban bans repeat offenders at Cloudflare. Authelia adds
-SSO + TOTP/passkey 2FA in front of everything but the device endpoints.
+SSO in front of everything but the device endpoints: a second factor (TOTP, passkey, security
+key) for admins always, for readers when AUTHELIA_READERS_2FA=true.
 
 ## Per-user isolation
 One library, per-user **visibility** (not separate storage — admin sees all files):
@@ -599,6 +602,51 @@ size, indexer, why; **Yes to all** per series); every arrival is checked against
 an issue, 5 for a chapter) and held when it does not match (**Keep it anyway** / **Not it**);
 **Wrong comic** on a delivered comic's page. `COMIC_CONFIRM=sure` (Advanced settings → requests)
 skips the question only for the exact digital issue or volume in the reader's language.
+
+## 6.0: one address, one sign-in, and a home for every reader
+
+**home.<domain>** (`templates/hub.html`, `templates/help/`) is the one address the family needs:
+tiles for every site (the portal, My books, My audiobooks, Audiobookshelf, the library site,
+Comics, Following, Shelfmark, Devices, Requests; for admins the dashboard and Uptime Kuma), a
+setup checklist per reader (Kobo linked, Kindle address, notifications, Hardcover), and 13 guides
+with how-tos and answers (getting started, Kobo, Kindle, phone and tablet, audiobooks, getting a
+book, comics, following, reading status and trackers, notifications, account and security, FAQ,
+admin). The sites themselves stay where they are. Behind the Authelia gate it is where the ONE
+sign-in happens: its cookie covers every subdomain. **Admins always need a second factor;
+readers sign in with their password** (`AUTHELIA_READERS_2FA=true` asks it of them too; the
+Audiobookshelf sign-in follows the same rule). Deploy creates its DNS record.
+
+**The portal's home page** (`librarian/home.py`) is now each reader's own: what they are reading
+(the Kobo, KOReader, marks), what they are listening to (Audiobookshelf, with time left), the
+next book in each series they are reading, and what arrived lately, with search on top.
+
+**My books**: a cover grid or a list, filters (unread, reading, finished; books or comics), and
+sorting (recently added, title, author, series order), all in the address, so a filtered view can
+be bookmarked.
+
+**Get the audiobook** (`librarian/audiorel.py`): the book safeguards for audiobooks. The portal
+searches Shelfmark's audiobook categories, prefers M4B and unabridged (a narrator in the name is
+not "another book"), asks the reader to confirm, and checks what arrives: its tags and its LENGTH
+against Hardcover's for the book (read with mutagen, nothing decoded), so an abridged or partial
+copy is held. **Wrong audiobook** on My audiobooks. The family's copy is shared first.
+
+**Hardcover "Want to Read"** (`librarian/hcwant.py`, opt-in on Devices): books a reader adds to
+their Want to Read list on Hardcover become Get it requests (ebook, audiobook or both), each
+waiting for their yes (always: a Want to Read pick never downloads by itself, even with
+`BOOK_CONFIRM=sure`). Turning it on records the list as it is at that moment and requests nothing
+already on it; Devices offers to.
+
+**Phone notifications for readers** (Devices, the free ntfy app): a private topic per reader on
+ntfy.sh, or the server named in `READER_NTFY_URL` (Advanced settings -> mail): a book, audiobook or comic arrived, a copy waits for your
+yes, a file needs checking, something you follow came out.
+
+**The admin dashboard** opens with **What needs you** (approvals in the portal and Shelfmark,
+held files, copies nobody confirmed, failed imports, stuck downloads, followed names failing,
+tracker connections refused, worker health) and the week in numbers.
+
+The portal now runs its own script (`static/app.js`, CSP `script-src 'self'`, never inline or
+third-party): filters apply at once, typing filters My books as you go, Copy buttons, and
+Requests refreshes itself while something is being looked for or downloaded.
 
 **Send to an e-reader** (v5.9.1, `librarian/sendcode.py`): on the Kobo or Kindle, open its web
 browser at `request.<domain>/send`; it shows a 4-character code (no login on an e-ink keyboard).

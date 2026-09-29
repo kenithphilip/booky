@@ -152,6 +152,25 @@ def editions(book_id):
     return out
 
 
+def audio_seconds(book_id):
+    """The length of the book's most-read audiobook edition, in seconds (v6.0: the audiobook
+    arrival check); None when Hardcover does not know. Cached 30 days."""
+    import db
+    ck = f"hardcover:audiosec:{book_id}"
+    hit = db.cache_get(ck, 30 * 86400)
+    if hit is not None:
+        return hit or None
+    try:
+        d = _q("query A($b: Int!) { editions(where: {book_id: {_eq: $b}, reading_format_id: {_eq: 2}, audio_seconds: {_gt: 0}}, "
+               "order_by: {users_count: desc_nulls_last}, limit: 1) { audio_seconds } }", {"b": int(book_id)})
+    except (HardcoverError, ValueError):
+        return None
+    e = d.get("editions") or []
+    secs = int(e[0]["audio_seconds"]) if e and e[0].get("audio_seconds") else 0
+    db.cache_put(ck, secs, keep_days=30)
+    return secs or None
+
+
 PAGE_CACHE = 6 * 3600
 
 

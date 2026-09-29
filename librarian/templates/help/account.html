@@ -1,0 +1,17 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<h3>Your password</h3>
+<p>Change it on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> → Account. It changes it for the portal, the library site, Shelfmark{% if abs_linked %}, Audiobookshelf{% endif %}{% if cfg.AUTHELIA_ENABLED %} and the sign-in page{% endif %} at once.</p>
+{% if cfg.AUTHELIA_ENABLED %}
+<h3>The sign-in page</h3>
+<p>One sign-in covers every site for your session. {% if admin %}As an admin you need a second factor: set it up at <a href="{{ cfg.AUTH_URL }}/settings">sign-in settings</a> (an authenticator app, a passkey or a security key).{% elif cfg.AUTHELIA_READERS_2FA %}You need a second factor too: set it up at <a href="{{ cfg.AUTH_URL }}/settings">sign-in settings</a> (an authenticator app, a passkey or a security key).{% else %}Readers sign in with their password alone{% if cfg.AUTHELIA_PASSKEYS %}, or a passkey registered at <a href="{{ cfg.AUTH_URL }}/settings">sign-in settings</a>{% endif %}. Keep that password to yourself: it opens every site.{% endif %}</p>
+<p><a class="btn sec" href="{{ cfg.AUTH_URL }}/logout">Sign out everywhere</a> ends the session on this browser for every site.</p>
+{% endif %}
+<h3>A lost phone or tablet</h3>
+<ol>
+<li>Change your password (Devices → Account).</li>
+<li>Audiobookshelf: account settings → <em>Log out all devices</em>.</li>
+<li>A lost Kobo: Devices → Kobo → <strong>Regenerate link</strong> (the old one stops working).</li>
+</ol>
+<h3>Privacy</h3>
+<p>Your library is yours: nobody else sees which books you have or read. {% if cfg.FAMILY_SHARING %}When you look up a book someone in the family has, the portal can say "in the family library" (never who has it); getting it adds that one copy to your library too.{% else %}Each reader's copies are their own.{% endif %}</p>
+{% endblock %}

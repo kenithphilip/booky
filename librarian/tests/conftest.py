@@ -145,6 +145,9 @@ def fresh_env(monkeypatch):
     monkeypatch.setattr(bookmeta.requests, "get", _offline)
     for c in (bookmeta._SEARCH, bookmeta._RECORD, bookmeta._COPIES):
         c.clear()
+    import share, home                            # v6.0 caches: nothing carried from one test to the next
+    share._ABS_ITEMS.update(items=None, at=0.0)
+    home._CACHE.clear()
     _reset_dirs()
     make_cwa_db(config.CWA_DB)
     make_calibre_db(config.CALIBRE_DB)

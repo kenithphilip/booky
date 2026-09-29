@@ -1,0 +1,9 @@
+{% extends "hub_base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('hub') }}">← Start</a></p>
+<div class="guide">
+<h2 style="margin-top:4px">{{ topic[1] }}</h2>
+{% block guide %}{% endblock %}
+</div>
+<h2>Other guides</h2>
+<p class="mut">{% for key, title, blurb in topics if key != topic[0] and (key != 'admin' or admin) %}<a href="{{ url_for('help_page', topic=key) }}">{{ title }}</a>{% if not loop.last %} · {% endif %}{% endfor %}</p>
+{% endblock %}

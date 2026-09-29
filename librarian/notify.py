@@ -49,6 +49,51 @@ def send(event, req):
         return
     _webhook(event, req)
     threading.Thread(target=_mail, args=(event, req), daemon=True).start()
+    # v6.0: and the reader's own phone, if they turned it on. Not for what they dropped in
+    # themselves (an rsync of 40 books is not 40 pushes), and Get it / comic arrivals, which also
+    # land through the dropbox, are announced once by bookreq / comics themselves
+    if event in USER_EVENTS and not (req.get("source") == "dropbox" and event in ("done", "denied", "needs-tag")):
+        by = f" by {req['author']}" if req.get("author") else ""
+        reader(req.get("owner"), f"{req.get('title')}", f"\"{req.get('title')}\"{by} {USER_EVENTS[event]}.",
+               click=portal_url("/library" if event == "done" else "/status"), tags=TAGS.get(event),
+               seq=seq_id("req", req["id"]) if req.get("id") else None)
+
+
+# ---- v6.0: the reader's own phone (a private ntfy topic, Devices -> Phone notifications) ---------------
+def ntfy_base():
+    """The ntfy server readers subscribe on: READER_NTFY_URL (Advanced settings), else ntfy.sh.
+    Not the admin's own alert server by default: that one may be reachable only over Tailscale,
+    or need a login the family does not have."""
+    return config.READER_NTFY_URL or "https://ntfy.sh"
+
+
+def reader(owner, title, text, click=None, tags=None, seq=None, priority="default"):
+    """Push to one reader's topic, in the background; nothing when they have none. Never raises."""
+    if not owner or owner in config.CANARY_USERS:
+        return False
+    try:
+        import db
+        topic = db.get_prefs(owner).get("ntfy_topic")
+    except Exception:
+        return False
+    if not topic:
+        return False
+    url = f"{ntfy_base()}/{topic}"
+
+    def go():
+        try:
+            hdr = {"Title": _latin1(title, 200), "Priority": priority, "Content-Type": "text/plain; charset=utf-8"}
+            if tags:
+                hdr["Tags"] = _latin1(tags)
+            if click:
+                hdr["Click"] = _latin1(click)
+            if seq:
+                hdr["Sequence-ID"] = seq_id(seq)
+            urllib.request.urlopen(urllib.request.Request(url, data=text.encode("utf-8"), headers=hdr), timeout=8)
+        except Exception:
+            pass
+    threading.Thread(target=go, daemon=True).start()
+    return True
 
 def admin(event, req):
     """The admin's notification only (the webhook): for what the portal sees happen elsewhere,

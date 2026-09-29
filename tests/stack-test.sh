@@ -129,7 +129,9 @@ compose config -q || { echo "compose files do not render"; exit 1; }
 envset ABS_OIDC_SECRET e2e-abs-oidc-secret-0123456789abcdef; envset AUTHELIA_OIDC_HMAC e2e-oidc-hmac-0123456789abcdef0123456789abcdef
 ( umask 077; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out authelia/oidc-jwks.pem 2>/dev/null )
 render_authelia_config >/dev/null 2>&1; grep -q "client_id: 'audiobookshelf'" authelia/configuration.yml || { echo "render_authelia_config did not render the OIDC client"; exit 1; }
-# one factor for the harness: the driver signs in with a password, it cannot enrol TOTP
+# one factor for the harness: the driver signs in with a password, it cannot enrol TOTP. The rules
+# as rendered are kept beside it: section 14c swaps them in to prove admins DO need a second factor
+cp authelia/configuration.yml authelia/configuration.production.yml.keep
 sed -i.bak -e "s|policy: two_factor|policy: one_factor|" -e "s|policy: 'two_factor'|policy: 'one_factor'|" authelia/configuration.yml && rm -f authelia/configuration.yml.bak
 # Authelia's OpenID endpoints only work over https, and Audiobookshelf's server calls them: a
 # throwaway CA and a certificate for auth.example.test, served by the gate, trusted by ABS
@@ -177,6 +179,7 @@ http://request.example.test {
 http://auth.example.test {
 	reverse_proxy authelia:9091
 }
+# @HOME_SITE@
 EOF
 # Give the test gate the SAME books. route that 403s CWA's unauthenticated admin-job endpoints
 # (convert-library, epub-fixer, cwa-logs, cwa-internal, /reconnect), copied from the production
@@ -197,6 +200,20 @@ open(p, "w").write(s.replace(marker, "\t" + block.replace("\n", "\n") + marker, 
 print("   gate: copied the CWA admin-jobs 403 route from the production template")
 PY
 
+# v6.0: the start page, as the production template writes it (its ONE route: gate, then the start
+# page or the redirect to request.), with only the addresses changed for this network
+python3 - caddy-test/Caddyfile "$REPO/caddy/Caddyfile.template" <<'PY'
+import sys, re
+p, tpl_path = sys.argv[1], sys.argv[2]
+s, tpl = open(p).read(), open(tpl_path).read()
+m = re.search(r"\nhome\.@@DOMAIN@@ \{\n.*?\n(\troute \{\n.*?\n\t\})\n\}\n", tpl, re.S)
+if not m:
+    sys.exit("could not find home.'s route in caddy/Caddyfile.template")
+route = (m.group(1).replace("127.0.0.1:8090", "librarian:8090")
+         .replace("https://request.@@DOMAIN@@", "http://request.example.test").replace("@@DOMAIN@@", "example.test"))
+open(p, "w").write(s.replace("# @HOME_SITE@", "http://home.example.test {\n" + route + "\n}", 1))
+print("   gate: home. site copied from the production template")
+PY
 python3 "$REPO/authelia/inject-gate.py" caddy-test/Caddyfile authelia/caddy-gate.snippet || { echo "inject-gate.py failed"; exit 1; }
 python3 - caddy-test/Caddyfile <<'PY'
 import sys, re

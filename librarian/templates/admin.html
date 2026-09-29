@@ -5,11 +5,18 @@ lets you add a user. Everything that changes the stack — passwords, removals, 
 mail, backups, updates, lockouts, parked files, the request queue — lives in the admin tools on the server
 (<code>bookstack.sh</code> over SSH, on the tailnet once <em>Lock SSH</em> has been run). Secrets and root actions
 stay on the box rather than behind a browser session.</p>
-<div class="grid">
-<div class="card"><h3>Queue</h3>
+<div class="card"><h3 style="margin-top:0">What needs you</h3>
+{% if not needs and health.ok %}<p class="st-done" style="margin:0">Nothing. Every queue is moving and the stack is healthy.</p>{% endif %}
+{% if not health.ok %}<div class="check"><span class="no">!</span><div class="st-error">The portal's worker is degraded: {{ health.problems|join(', ') }}</div></div>{% endif %}
+{% for sev, text, link in needs %}<div class="check"><span class="{{ 'no' if sev != 'info' else 'mut' }}">{{ '!' if sev == 'bad' else '●' if sev == 'act' else '·' }}</span>
+<div class="{{ 'st-error' if sev == 'bad' else '' }}">{% if link %}<a href="{{ link }}">{{ text }}</a>{% else %}{{ text }}{% endif %}</div></div>{% endfor %}
+<p class="mut" style="margin:8px 0 0">This week: <strong>{{ week.arrived }}</strong> arrived, <strong>{{ week.shared }}</strong> given from the family library (nothing downloaded),
+<strong>{{ week.requests }}</strong> requests, <strong>{{ week.readers }}</strong> people active.{% if cfg.MONITOR_URL %} Monitors: <a href="{{ cfg.MONITOR_URL }}">Uptime Kuma</a> (Tailscale).{% endif %}</p></div>
+<div class="row" style="align-items:stretch;margin:10px 0">
+<div class="card" style="flex:1 1 220px;margin:0"><h3>Queue</h3>
 <div class="mut">pending <strong class="st-pending">{{ counts.pending }}</strong> · active <strong>{{ counts.queued + counts.downloading + counts.retrying + counts.importing + counts.tagging }}</strong> · done <strong class="st-done">{{ counts.done }}</strong> · needs tag <strong class="st-needs-tag">{{ counts.needs_tag }}</strong> · failed <strong class="st-error">{{ counts.error }}</strong></div>
 <p><a href="{{ url_for('status') }}">Open the queue</a></p></div>
-<div class="card"><h3>Health</h3>
+<div class="card" style="flex:3 1 340px;margin:0"><h3>Health</h3>
 <div class="mut">Worker: <strong class="{{ 'st-done' if health.ok else 'st-error' }}">{{ 'healthy' if health.ok else 'DEGRADED — ' + health.problems|join(', ') }}</strong>
 · ingest backlog <strong>{{ health.ingest_pending }}</strong>{% if health.ingest_oldest_s > 900 %} <span class="st-error">(oldest {{ (health.ingest_oldest_s // 60)|int }} min — CWA import stuck?)</span>{% endif %}<br>
 Calibre-Web: <strong class="{{ 'st-done' if health.cwa == 'ok' else 'st-error' }}">{{ 'answering' if health.cwa == 'ok' else health.cwa }}</strong><br>
@@ -85,7 +92,8 @@ Portal build: <strong>{{ health.version }}</strong> <span class="mut">(compare w
 <label style="flex:1;min-width:160px">Password<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
 <label class="mut"><input type="checkbox" name="admin" value="1"> admin</label>
 <button type="submit">Create</button></form>
-<p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.{% if authelia %} Their login on the sign-in page in front of the sites (Authelia) is created with the same password; they set up 2FA the first time they sign in.{% endif %}</p>
+<p class="mut">New users are restricted to their own books automatically. Give them the portal address and their password; they set up their own devices under <em>Devices</em>.{% if authelia %} Their login on the sign-in page in front of the sites (Authelia) is created with the same password.
+Readers sign in with it alone{% if cfg.AUTHELIA_READERS_2FA %} plus a second factor they set up the first time{% endif %}; admins always set up a second factor the first time.{% endif %}</p>
 <p class="mut">Everything else about an account lives in the admin tools on the server (<code>bookstack.sh</code> → <em>Users</em>):
 <strong>4</strong> reset a Kobo link, <strong>5</strong> reset a password, <strong>6</strong> remove a user.</p>
 </div>

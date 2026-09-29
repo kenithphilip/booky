@@ -1,0 +1,16 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<h3>Listening</h3>
+<ul>
+<li><strong>Android:</strong> the Audiobookshelf app, server <span class="code">{{ cfg.AUDIO_URL }}</span>, your library user name and password.</li>
+<li><strong>iPhone / iPad:</strong> there is no official app yet (only a test version). ShelfPlayer, SoundLeaf and AudioBooth work well: same address and login.</li>
+<li><strong>Browser:</strong> <a href="{{ cfg.AUDIO_URL }}">Audiobookshelf</a> plays in any browser and keeps your place between devices.</li>
+<li><strong>Any other player:</strong> <a href="{{ cfg.PORTAL_URL }}/audiobooks">My audiobooks</a> → Download: one file, or a ZIP of the folder.</li>
+</ul>
+<h3>Getting audiobooks</h3>
+<p>Search on the <a href="{{ cfg.PORTAL_URL }}/">portal</a>; on a book's page choose <strong>Get the audiobook</strong> (series and author pages under Following have an <strong>Audiobook</strong> button too). The portal finds a copy (M4B first, unabridged, your language) and shows it to you to confirm. What arrives is checked before it goes into your audiobooks: its title, and, when Hardcover knows the book's audiobook length, its length, so an abridged or partial copy is held for you to decide. (A download that arrives as a ZIP is checked once unpacked by name only.) <a href="{{ cfg.SHELF_URL }}">Shelfmark</a> lets you pick one yourself.</p>
+<p class="mut">A very large audiobook can stall on the way; if Requests says the download failed, the portal tries another copy, and the admin can also press Retry for it in Shelfmark.</p>
+<h3>Hardcover</h3>
+<p>With your Hardcover token set on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a>, what you listen to shows on Hardcover as Currently Reading, then Read, with the minutes listened, within about 10 minutes.</p>
+<h3>A lost phone</h3>
+<p>On <a href="{{ cfg.AUDIO_URL }}">Audiobookshelf</a> open your account settings and use <em>Log out all devices</em>, then change your password on Devices.</p>
+{% endblock %}

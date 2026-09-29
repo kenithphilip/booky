@@ -135,7 +135,11 @@ def sync_owner(owner, token, b, abs_user_id):
         if row.get("matched") == "":
             continue                             # looked for once and not on Hardcover
         if not row.get("book_id"):
-            book_id, edition_id, how = match(b, absapi.item_meta(item), token)
+            try:
+                meta = absapi.item_meta(item)
+            except absapi.AbsError:
+                continue                         # one unreadable item never stops the reader's sync
+            book_id, edition_id, how = match(b, meta, token)
             if not book_id:
                 db.hc_audio_put(owner, item, matched="", last_update=p.get("lastUpdate"))
                 continue

@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block nav %}<nav class="row">{% if session.user %}
+<a href="{{ url_for('hub') }}" class="{{ 'active' if request.endpoint == 'hub' }}">Start</a>
+<a href="{{ url_for('help_page', topic='getting-started') }}" class="{{ 'active' if request.endpoint == 'help_page' and topic and topic[0] != 'faq' }}">Guides</a>
+<a href="{{ url_for('help_page', topic='faq') }}" class="{{ 'active' if topic and topic[0] == 'faq' }}">Questions</a>
+<a href="{{ cfg.PORTAL_URL }}/">Library portal ↗</a>
+<span class="mut">{{ session.user }}{% if session.admin %} · admin{% endif %}</span>
+{% if cfg.AUTHELIA_ENABLED %}<a class="btn sec" href="{{ cfg.AUTH_URL }}/logout">Sign out everywhere</a>{% else %}
+<form method="post" action="{{ url_for('logout') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Log out</button></form>{% endif %}
+{% endif %}</nav>{% endblock %}

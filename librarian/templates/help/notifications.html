@@ -1,0 +1,12 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>You can hear about what you asked for without checking the portal: when a book or comic has arrived, when a copy is waiting for your yes, when something is held for you to check, and when something you follow came out.</p>
+<h3>On your phone (recommended)</h3>
+<ol>
+<li>Install the free <strong>ntfy</strong> app (Android or iPhone).</li>
+<li>On <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> → <strong>Phone notifications</strong> → Turn on. You get your own private topic.</li>
+<li>In ntfy, tap <strong>+</strong> and subscribe to that topic (Devices shows it, and the server when it is not ntfy.sh). Or open the subscribe link on your phone.</li>
+</ol>
+<p class="mut">Anyone who knows your topic name could read your notifications (they only name books), so keep it to yourself; Devices can give you a new one.</p>
+<h3>By mail</h3>
+<p>Devices → <strong>E-mail me</strong> when a request is ready or denied; followed series send one short digest.</p>
+{% endblock %}

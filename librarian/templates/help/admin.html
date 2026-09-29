@@ -1,0 +1,12 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<ul>
+<li><a href="{{ cfg.PORTAL_URL }}/admin"><strong>Admin dashboard</strong></a>: health, disk, every queue (requests, confirms, held files, downloads, failures), approvals, users, recent activity.</li>
+<li><a href="{{ cfg.MONITOR_URL }}"><strong>Uptime Kuma</strong></a> (over Tailscale): every site and job, with alerts to your ntfy.</li>
+<li><strong>The server menu:</strong> <span class="code">sudo bash /root/bookstack/bookstack.sh</span>. Deploy after checking out a new version; Operations → Update for new image versions; Operations → Self-test; Security → Authelia for the sign-in page.</li>
+<li><strong>Adding a reader:</strong> Admin dashboard → Add user. With the sign-in page on, their sign-in login is created with the same password.</li>
+<li><strong>Sign-in policy:</strong> admins always need a second factor (their Calibre-Web admin role, mirrored into the sign-in page's admins group on every Deploy); Operations → Advanced settings → lockout → <span class="code">AUTHELIA_READERS_2FA</span> asks it of readers too, and <span class="code">AUTHELIA_PASSKEYS</span> lets a passkey alone sign in. Deploy and Update apply the rules by themselves.</li>
+<li><strong>The start page's address:</strong> Deploy creates <span class="code">home.</span> in Cloudflare only when that name is free. If another service already uses it, it is left alone and the start page is at <span class="code">request.…/hub</span> instead (every link follows); move that service to another name and Deploy again to use <span class="code">home.</span>.</li>
+<li><strong>Promoting an admin:</strong> give them the admin role in Calibre-Web (or Users in the server menu); within 10 minutes the sign-in page asks them for a second factor too, and only then does the portal give them admin rights.</li>
+<li><strong>Readers' phone notifications</strong> use ntfy.sh unless Operations → Advanced settings → mail → <span class="code">READER_NTFY_URL</span> names another server the phones can reach.</li>
+</ul>
+{% endblock %}

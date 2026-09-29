@@ -1,0 +1,48 @@
+{% extends "base.html" %}{% block body %}
+{% set bw = books_waiting() %}{% set cw = comics_waiting() %}{% if bw or cw %}
+<div class="card">{% if bw %}<strong>{{ bw }} book{{ 's' if bw != 1 }} waiting for your answer</strong>: <a href="{{ url_for('status') }}">answer on Requests</a>.{% endif %}
+{% if cw %}<strong>{{ cw }} comic{{ 's' if cw != 1 }} waiting for your answer</strong>: <a href="{{ url_for('comics_page') }}">answer on Comics</a>.{% endif %}
+<span class="mut">A copy to confirm before it downloads, or a file that did not look like what you asked for.</span></div>
+{% endif %}
+<form method="get" class="row" style="margin-bottom:6px">
+<input type="text" name="q" placeholder="Find a book: title or author…" style="flex:1">
+<button type="submit">Search</button><span class="busy">Searching…</span></form>
+
+{% set nf = new_for_you() %}{% if nf %}
+<div class="card"><h3 style="margin-top:0">New for you</h3>
+{% with notices=nf %}{% include "_notices.html" %}{% endwith %}
+<p class="mut" style="margin:6px 0 0">From what you <a href="{{ url_for('following') }}">follow</a>.</p></div>
+{% endif %}
+
+{% if h.reading %}<h2>Continue reading</h2>
+<div class="shelf">{% for b in h.reading %}<a href="{{ url_for('book_page', book_id=b.id) }}">
+<img src="{{ url_for('book_cover', book_id=b.id, ph=1) }}" alt="" loading="lazy">
+<div class="t">{{ b.title }}</div>{% if b.pct %}<div class="bar"><i style="width:{{ b.pct }}%"></i></div><span class="mut">{{ b.pct }} %</span>{% endif %}</a>{% endfor %}</div>{% endif %}
+
+{% if h.listening %}<h2>Continue listening</h2>
+<div class="shelf">{% for a in h.listening %}<a href="{{ cfg.AUDIO_URL }}/item/{{ a.id }}">
+<img src="{{ url_for('audiobook_cover', item_id=a.id) }}" alt="" loading="lazy">
+<div class="t">{{ a.title }}</div><div class="bar"><i style="width:{{ a.pct }}%"></i></div>
+<span class="mut">{{ a.pct }} %{% if a.left_min %} · {{ a.left_min // 60 }} h {{ a.left_min % 60 }} min left{% endif %}</span></a>{% endfor %}</div>{% endif %}
+
+{% if h.next %}<h2>Next in your series</h2>
+<div class="shelf">{% for b in h.next %}<a href="{{ url_for('book_page', book_id=b.id) }}">
+<img src="{{ url_for('book_cover', book_id=b.id, ph=1) }}" alt="" loading="lazy">
+<div class="t">{{ b.title }}</div><span class="mut">{{ b.series }} #{{ b.index | num }}</span></a>{% endfor %}</div>{% endif %}
+
+{% if h.recent %}<h2>Recently added <a class="mut" href="{{ url_for('my_library') }}" style="font-size:13px;font-weight:normal">· all my books</a></h2>
+<div class="shelf">{% for b in h.recent %}<a href="{{ url_for('book_page', book_id=b.id) }}">
+<img src="{{ url_for('book_cover', book_id=b.id, ph=1) }}" alt="" loading="lazy">
+<div class="t">{{ b.title }}</div><span class="mut">{{ b.author }}</span></a>{% endfor %}</div>
+{% else %}
+<div class="card"><h3 style="margin-top:0">Start here</h3>
+<ul class="mut" style="margin:0;padding-left:18px">
+<li><strong>Search</strong> above for a book and open it to request it: free copies come from {% for s in sources %}{{ source_label(s) }}{{ ', ' if not loop.last }}{% endfor %}, others through the library's sources. It arrives in <a href="{{ url_for('my_library') }}">My books</a> and on your devices.</li>
+<li><strong>Link a device</strong> once under <a href="{{ url_for('devices') }}">Devices</a> (Kobo, Kindle, phone apps); audiobooks are in <a href="{{ url_for('my_audiobooks') }}">My audiobooks</a>.</li>
+<li><strong>Upload</strong> a book you own under <a href="{{ url_for('upload') }}">Upload</a>.</li>
+{% set box = mail_intake(session.user) %}{% if box %}<li><strong>E-mail</strong> a book to <span class="code">{{ box }}</span> from your own registered address and it is added for you.</li>{% endif %}
+{% if cfg.HOME_URL %}<li>Guides and answers: <a href="{{ cfg.HOME_URL }}">{{ cfg.HOME_URL }}</a>.</li>{% endif %}
+</ul></div>
+{% endif %}
+<p class="mut" style="margin-top:18px">Searching the free catalogues directly: <a href="{{ url_for('index', mode='catalogs') }}">catalogue search</a>{% if cfg.SHELF_URL %} · <a href="{{ cfg.SHELF_URL }}" target="_blank" rel="noopener">Shelfmark</a>{% endif %}</p>
+{% endblock %}

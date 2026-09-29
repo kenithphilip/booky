@@ -163,10 +163,12 @@ def test_the_kobo_card_shows_status_tests_the_link_and_saves_options(client, use
     monkeypatch.setattr(_r, "get", lambda url, **k: seen.append(url) or R())
     r = post(client, "/devices", action="kobo_test")
     assert b"Your Kobo link works" in r.data and seen[0].endswith("/v1/initialization") and "/kobo/" in seen[0]
-    post(client, "/devices", action="kobo_prefs", shelves_only="1", hardcover_change="1", hardcover_token="hc_pat_x")
+    post(client, "/devices", action="kobo_prefs", shelves_only="1")
+    post(client, "/devices", action="hardcover", hardcover_token="hc_pat_x")      # v6.0: its own card
     st = cwa.kobo_status("alice")
     assert st["shelves_only"] and st["hardcover"]
-    post(client, "/devices", action="kobo_prefs", hardcover_change="1", hardcover_token="")
+    post(client, "/devices", action="kobo_prefs")
+    post(client, "/devices", action="hardcover", hardcover_token="")
     st = cwa.kobo_status("alice")
     assert not st["shelves_only"] and not st["hardcover"], "unticked = off; a blank token removes it (NULL, the column is UNIQUE)"
 
@@ -174,7 +176,7 @@ def test_the_kobo_card_shows_status_tests_the_link_and_saves_options(client, use
 # ---- L17: optional Turnstile on the portal login ----------------------------------------------
 def test_without_turnstile_the_login_page_runs_no_script(client):
     r = client.get("/login")
-    assert "script-src 'none'" in r.headers["Content-Security-Policy"] and b"challenges.cloudflare.com" not in r.data
+    assert "script-src 'self';" in r.headers["Content-Security-Policy"] and b"challenges.cloudflare.com" not in r.data
 
 
 def test_turnstile_on_login_only_and_verified_server_side(client, users, monkeypatch):
@@ -182,7 +184,7 @@ def test_turnstile_on_login_only_and_verified_server_side(client, users, monkeyp
     from conftest import csrf_of
     monkeypatch.setattr(config, "TURNSTILE_SITEKEY", "0x4AAA"); monkeypatch.setattr(config, "TURNSTILE_SECRET", "sec")
     r = client.get("/login")
-    assert b'data-sitekey="0x4AAA"' in r.data and "script-src https://challenges.cloudflare.com" in r.headers["Content-Security-Policy"]
+    assert b'data-sitekey="0x4AAA"' in r.data and "script-src 'self' https://challenges.cloudflare.com" in r.headers["Content-Security-Policy"]
 
     class A:
         def __init__(self, ok): self.ok = ok
@@ -193,7 +195,7 @@ def test_turnstile_on_login_only_and_verified_server_side(client, users, monkeyp
     monkeypatch.setattr(_r, "post", lambda *a, **k: A(True))
     r = client.post("/login", data={"username": "alice", "password": users["alice"], "csrf": csrf_of(client)})
     assert r.status_code == 302
-    assert "script-src 'none'" in client.get("/status").headers["Content-Security-Policy"], "every other page keeps no scripts"
+    assert "script-src 'self';" in client.get("/status").headers["Content-Security-Policy"], "every other page runs only the portal's own script (v6.0)"
 
 
 def test_cloudflare_unreachable_does_not_lock_the_family_out(client, users, monkeypatch):

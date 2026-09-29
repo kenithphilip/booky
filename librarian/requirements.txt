@@ -3,3 +3,5 @@ requests>=2.32.4
 lxml>=6.1
 gunicorn>=23.0.0
 pypdf>=6
+# v6.0: audiobook length and tags on arrival (Get it for audiobooks), pure Python
+mutagen>=1.47

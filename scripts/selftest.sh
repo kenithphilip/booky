@@ -438,7 +438,8 @@ fi
 
 echo "== Public reachability (via Cloudflare)"
 if [ -n "$D" ]; then
-  for h in books audio request shelf; do
+  # home.: the v6.0 start page, unless that name belongs to another service (HOME_URL is then set)
+  for h in $([ -z "$(envget HOME_URL)" ] && echo home) books audio request shelf; do
     c=$(code "https://$h.$D/")
     case "$c" in 200|302|301|401) ok "https://$h.$D -> $c";; *) bad "https://$h.$D -> $c";; esac
   done

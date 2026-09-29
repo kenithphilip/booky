@@ -37,6 +37,8 @@ BYPASS = {
     "request": "/intake /send /send/file",
     # Shelfmark: nothing bypassed
     "shelf": "",
+    # v6.0 home. (the start page): nothing bypassed, it is where people sign in
+    "home": "",
 }
 
 

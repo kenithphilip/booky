@@ -1,0 +1,13 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<h3>Reading books</h3>
+<ul>
+<li><strong>In the browser:</strong> open the <a href="{{ cfg.BOOKS_URL }}">library site</a> and press Read on a book.</li>
+<li><strong>In a reading app</strong> (KOReader, Moon+ Reader, Thorium, Readest, Panels, Chunky...): add an OPDS catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the slash at the end) with your library user name and password.</li>
+<li><strong>Downloading:</strong> <a href="{{ cfg.PORTAL_URL }}/library">My books</a> → Download, in the format you choose on Devices (EPUB, KEPUB, PDF...).</li>
+<li><strong>KOReader progress:</strong> KOReader's built-in progress sync does not work with this library; Devices explains the plugin that does.</li>
+</ul>
+<h3>Comics on an iPad or phone</h3>
+<p>Download the CBZ from the comic's page and open it in Panels or Chunky (iPad), or any comic reader. Or add the OPDS catalog above in Panels or Chunky and browse your comics there.</p>
+<h3>Mark what you read</h3>
+<p>Apps on a phone or iPad do not report your progress to the library: mark books Read on their page in the portal.</p>
+{% endblock %}

@@ -263,12 +263,16 @@ services:
       - FAMILY_SHARING=${FAMILY_SHARING:-true}            # a book the family has is shared, not downloaded again
       - LIBRARY_RELEASE_DAYS=${LIBRARY_RELEASE_DAYS:-7}   # a book no reader has any more is deleted after this (0 = never)
       - NOTIFY_WEBHOOK=${NOTIFY_WEBHOOK:-}
+      - READER_NTFY_URL=${READER_NTFY_URL:-}   # v6.0 readers' phone notifications; empty = https://ntfy.sh (never the admin's own alert server)
+      - HOME_URL=${HOME_URL:-}                 # v6.0 the start page; empty = https://home.<domain> (bookstack.sh sets request./hub when home. is taken)
       - NOTIFY_WEBHOOK_FORMAT=${NOTIFY_WEBHOOK_FORMAT:-auto}   # auto = ntfy style when the URL host contains 'ntfy'
       - BOOK_CONFIRM=${BOOK_CONFIRM:-always}   # Get it (books): always = the reader confirms each copy | sure = only uncertain ones
       - BOOK_SEARCH_DAYS=${BOOK_SEARCH_DAYS:-14}
       - COMIC_CONFIRM=${COMIC_CONFIRM:-always}   # comic requests: always = the reader confirms each copy | sure = only uncertain ones
       - ALERT_MAIL=${ALERT_MAIL:-high}   # which server alerts ALSO reach ADMIN_EMAIL: high (problems only) | all | off
       - AUTHELIA_ENABLED=${AUTHELIA_ENABLED:-false}           # portal hides self-service user creation when the gate is on
+      - AUTHELIA_READERS_2FA=${AUTHELIA_READERS_2FA:-false}   # v6.0: the portal's texts follow the sign-in policy
+      - AUTHELIA_PASSKEYS=${AUTHELIA_PASSKEYS:-false}
       - TORRENTS_ENABLED=${TORRENTS_ENABLED:-false}           # shows the qBittorrent admin link
       - EPHEMERA_ENABLED=${EPHEMERA_ENABLED:-false}          # shows the Ephemera admin link
       - DEDUPE_WARN=${DEDUPE_WARN:-true}

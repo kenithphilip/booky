@@ -9,7 +9,7 @@ Comics and manga: use the Follow button on a series in <a href="{{ url_for('comi
 {% if new %}<h3>New for you</h3>{% include "_notices.html" %}{% endif %}
 
 <h3>Follow a book series or an author</h3>
-{% if not books_ok %}<div class="flash">Following books needs the admin's Hardcover key (installer: Library → Metadata sources). Comics and manga work without it.</div>{% else %}
+{% if not books_ok %}<div class="flash">Following books needs the library's Hardcover key, which {% if admin %}you set in the server menu: Library → Metadata sources{% else %}the admin sets up (ask them){% endif %}. Comics and manga work without it.</div>{% else %}
 <form method="get" class="row">
 <input type="text" name="q" value="{{ q }}" placeholder="Series or author, e.g. Discworld or Brandon Sanderson" style="flex:1;min-width:220px">
 <select name="kind" style="width:auto"><option value="Series" {{ 'selected' if kind == 'Series' }}>Book series</option><option value="Author" {{ 'selected' if kind == 'Author' }}>Author</option></select>

@@ -24,10 +24,14 @@ if config.TRUST_PROXY:
     # x_for=1 turns it into request.remote_addr for the lockout, the audit trail and /healthz.
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'none'; "
-       "form-action 'self'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'")
+# v6.0: the portal's own script file only (static/app.js), never inline code or a third party
+CSP = ("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+       "form-action 'self'" + (f" https://auth.{config.DOMAIN}" if config.AUTHELIA_ENABLED and config.DOMAIN else "") +
+       "; frame-ancestors 'none'; base-uri 'self'; object-src 'none'")
+# (form-action: Chrome applies it to the redirect after a POST, so Log out's hop to the sign-in
+# page's /logout needs its host; nothing else is allowed)
 # the login page with Turnstile on (L17): Cloudflare's challenge script and frame, nothing else
-CSP_TURNSTILE = CSP.replace("script-src 'none'", "script-src https://challenges.cloudflare.com") + \
+CSP_TURNSTILE = CSP.replace("script-src 'self'", "script-src 'self' https://challenges.cloudflare.com") + \
     "; frame-src https://challenges.cloudflare.com; connect-src 'self' https://challenges.cloudflare.com"
 REVALIDATE_SECONDS = 60      # how often a logged-in session is checked against the account
 ENRICH_DEADLINE = 6          # seconds the search page waits for covers/blurbs before rendering
@@ -72,12 +76,24 @@ def _friendly_detail(detail, is_admin=False):
         return d.split(" (moved to")[0].split(" (could not")[0]
     return d
 
+@app.template_filter("num")
+def _num(x):
+    """A series position or chapter number: 3.0 -> '3', 1.05 -> '1.05' (not '15'), 'x' as it is."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return "" if x is None else str(x)
+    return str(int(f)) if f == int(f) else ("%.4f" % f).rstrip("0").rstrip(".")
+
 @app.template_filter("ago_or_in")
-def _ago_or_in(ts, now=None):
-    """'in 3 h' / '5 min ago' for a Unix time — a reader cares how long, not the timestamp."""
+def _ago_or_in(ts, now=None, past=None):
+    """'in 3 h' / '5 min ago' for a Unix time — a reader cares how long, not the timestamp.
+    past: what a time already gone says instead (a next look that is due: 'any minute now')."""
     if not ts:
         return ""
     d = float(ts) - (now or time.time())
+    if d <= 0 and past:
+        return past
     a = abs(d)
     n = (f"{int(a // 86400)} d" if a >= 86400 else f"{int(a // 3600)} h" if a >= 3600
          else f"{max(1, int(a // 60))} min")
@@ -152,16 +168,28 @@ def _gate_sso():
     sent = request.headers.get("X-Bookstack-Gate", "")
     if not who or not sent or not hmac.compare_digest(sent, config.GATE_SECRET):
         return None
+    groups = {g.strip() for g in request.headers.get("Remote-Groups", "").split(",") if g.strip()}
     if session.get("user") == who:
+        # the group rule holds on EVERY gated request, not only when this session was made: a
+        # password-only reader who also posts the portal's own /login form (Calibre-Web admin
+        # role, not in Authelia's admins group) must not come out of it with admin rights
+        session["sso"], session["gate_admin"] = True, "admins" in groups
+        if session.get("admin") and "admins" not in groups:
+            session["admin"] = False
         return None
     r = auth.fingerprint(who)
     if not r or r is auth.UNAVAILABLE:
         if session.get("user"):              # the gate says someone else: never keep the old identity
             session.clear()
         return None
+    # v6.0: admins sign in with a second factor and readers with a password alone (the Authelia
+    # rule keys on its "admins" group). So the portal's admin rights through the gate need BOTH the
+    # Calibre-Web admin role AND that group: a reader promoted in Calibre-Web alone never gets an
+    # admin session with a password only (Deploy re-syncs the group from the roles).
     session.clear()
     session.permanent = True
-    session["user"], session["admin"] = who, r[1]
+    session["user"], session["admin"] = who, bool(r[1] and "admins" in groups)
+    session["gate_admin"] = "admins" in groups
     session["fp"], session["chk"], session["sso"] = r[0], time.time(), True
     _csrf_token()
     _audit("login_sso", "via the Authelia gate", user=who)
@@ -179,8 +207,9 @@ def _revalidate_session():
     if r is None or r[0] != session.get("fp"):
         _audit("session_revoked", "account changed or removed")
         session.clear()
-        return redirect(url_for("login"))
-    session["admin"], session["chk"] = r[1], time.time()
+        return redirect(url_for("login", next=request.full_path.rstrip("?")) if request.method == "GET" else url_for("login"))
+    session["admin"] = bool(r[1] and (session.get("gate_admin") if session.get("sso") else True))
+    session["chk"] = time.time()
     return None
 
 @app.after_request
@@ -268,7 +297,9 @@ def _login_page(status=200, headers=None):
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if session.get("user") and request.method == "GET":
-        return redirect(url_for("index"))     # already signed in: the form would only confuse
+        # already signed in: the form would only confuse. Where it was going still counts (home.'s
+        # start page sends a reader without a session there here with next=/hub)
+        return redirect(_safe_next(request.args.get("next")))
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         wait = db.locked_for(username, _ip())
@@ -353,6 +384,9 @@ def index():
                 w["dupe"] = _in_library(seen, w)
             bookmeta.prefetch(works, lang)
             return render_template("books.html", q=q, works=works, shelf=_shelf_link(q=q))
+    if not q and mode != "catalogs":             # v6.0: the reader's home page
+        import home
+        return render_template("home.html", h=home.build(session["user"]), sources=fetchers.enabled_sources())
     return _catalog_search(q)
 
 def _shelf_link(q=None, title=None, author=None, isbn=None, kind="ebook"):
@@ -770,7 +804,9 @@ def status():
     for w in looking:
         c = w.get("candidate") or {}
         w["cand_host"] = urlsplit(c.get("download_url") or "").hostname or ""
-    book_reqs = db.bookreq_list(None if is_admin else session["user"])
+    # what waits for the reader's answer first, then what is under way, then the rest (newest first within)
+    order = {"confirm": 0, "held": 1, "pending": 2, "downloading": 3, "queued": 4, "not-found": 5}
+    book_reqs = sorted(db.bookreq_list(None if is_admin else session["user"]), key=lambda b: order.get(b["status"], 6))
     return render_template("status.html", rows=rows, pending=pending, failed=failed,
                            admin=is_admin, looking=looking, kindle_sends=kindle_sends,
                            shelf_pending=shelf_pending, shelf_error=shelf_error, book_reqs=book_reqs)
@@ -948,18 +984,33 @@ def my_library():
     user, is_admin = session["user"], session.get("admin", False)
     q = request.args.get("q", "").strip()[:100]
     page = max(0, request.args.get("page", 0, type=int) or 0)
+    # v6.0: filters and sorting, all in the address (bookmarkable, and no script needed)
+    status = request.args.get("status", "")
+    status = status if status in ("unread", "reading", "read") else ""
+    kind = request.args.get("kind", "")
+    kind = kind if kind in ("books", "comics") else ""
+    sort = request.args.get("sort", "added")
+    sort = sort if sort in library.SORTS else "added"
+    view = "list" if request.args.get("view") == "list" else "grid"
     prefs = db.get_prefs(user)
-    books = library.books_for(user, is_admin, offset=page * library.PAGE, q=q)
-    total = library.count_for(user, is_admin, q=q)
+    state = cwa.reading_state(user)
+    only = exclude = None
+    if status in ("reading", "read"):
+        only = [bid for bid, st in state.items() if st.get("status") == status]
+    elif status == "unread":
+        exclude = [bid for bid, st in state.items() if st.get("status") in ("reading", "read")]
+    books = library.books_for(user, is_admin, offset=page * library.PAGE, q=q, kind=kind or None,
+                              only=only, exclude=exclude, sort=sort)
+    total = library.count_for(user, is_admin, q=q, kind=kind or None, only=only, exclude=exclude)
     # removed by this reader a moment ago: gone for them now, the host job catches up in minutes
     books = [x for x in books if not db.untag_pending(x["id"], user)]
-    state = cwa.reading_state(user)
     for b in books:
         b["best"] = library.best_format(b, prefs["preferred_format"])
         b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
         b["reading"] = state.get(b["id"])
     u = _cwa_user(user)
     return render_template("library.html", books=books, prefs=prefs, admin=is_admin,
+                           status=status, kind=kind, sort=sort, view=view,
                            kindle_mail=u.get("kindle_mail") or "", q=q, page=page, total=total,
                            first=page * library.PAGE + 1, last=page * library.PAGE + len(books),
                            more=(page + 1) * library.PAGE < total)
@@ -1084,6 +1135,8 @@ def book_convert(book_id):
 def book_cover(book_id):
     p = library.cover_path(session["user"], book_id, session.get("admin", False))
     if not p:
+        if request.args.get("ph"):               # the home page's shelves: a quiet placeholder, not a broken image
+            return _placeholder_cover(*(library.title_of(session["user"], book_id, session.get("admin", False)) or ()))
         abort(404)
     resp = send_file(p, mimetype="image/jpeg")
     resp.headers["Cache-Control"] = "private, max-age=86400"   # a cover does not change hourly
@@ -1252,7 +1305,7 @@ def comic_series(provider, sid):
     have, books, state = {}, {}, cwa.reading_state(user)
     for it in items:
         m = comics.find_in_library(info["name"], it["number"], info["kind"])
-        if m:
+        if m and (user in m["owners"] or config.FAMILY_SHARING):
             have[it["number"]] = "yours" if user in m["owners"] else "family"
             if user in m["owners"]:
                 books[it["number"]] = m["book_id"]
@@ -1349,6 +1402,67 @@ def comic_confirm_all(provider, sid):
     return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
                     else url_for("comics_page"))
 
+# ---- v6.0: home.<domain>, the family's start page and guides (templates/hub.html, help/*) ---------
+HELP_TOPICS = [
+    ("getting-started", "Getting started", "The sites, your one sign-in, and where things are"),
+    ("kobo", "Reading on a Kobo", "Link it once; books and comics arrive by themselves"),
+    ("kindle", "Reading on a Kindle", "Send to Kindle, automatic sending, and the browser route"),
+    ("phone-tablet", "Phone, tablet, computer", "Reading apps, comics on an iPad, downloads"),
+    ("audiobooks", "Audiobooks", "The Audiobookshelf app, iPhone apps, downloads, Hardcover"),
+    ("requesting", "Getting a book", "Search, Get it, confirming the copy, Keep looking"),
+    ("comics", "Comics and manga", "Requesting volumes, chapters, reading direction, devices"),
+    ("following", "Following series and authors", "New for you, and one tap to get what came out"),
+    ("reading-status", "Reading status and trackers", "Read marks, Hardcover, AniList, Metron"),
+    ("notifications", "Notifications", "Mail and phone notifications for what you asked for"),
+    ("account", "Your account and security", "Password, the sign-in page, a lost device"),
+    ("faq", "Questions and answers", "When something did not arrive, or is not right"),
+    ("admin", "For the admin", "The dashboard, the server menu, what to check"),
+]
+
+def _setup_checklist(user):
+    """What a reader has set up, for the start page: [(label, done, hint, url)]."""
+    out = []
+    try:
+        ks = cwa.kobo_status(user)
+    except Exception:
+        ks = {}
+    u = _cwa_user(user)
+    prefs = db.get_prefs(user)
+    portal = config.PORTAL_URL or ""
+    out.append(("Kobo linked (if you have one)", bool(ks.get("books_on_device") or ks.get("last_reading")),
+                "Devices -> Kobo: copy your sync link into the Kobo once", f"{portal}/devices"))
+    out.append(("Kindle address (if you have one)", bool(u.get("kindle_mail")), "Devices -> Kindle: your @kindle.com address", f"{portal}/devices"))
+    out.append(("Notifications", bool(prefs.get("notify_email") or prefs.get("ntfy_topic")),
+                "Devices -> Notifications: mail or the ntfy app on your phone", f"{portal}/devices"))
+    out.append(("Hardcover (optional)", bool(ks.get("hardcover")), "Devices: your Hardcover token, for reading progress", f"{portal}/devices"))
+    return out
+
+@app.route("/hub")
+@login_required
+def hub():
+    """The start page on home.<domain>: every site one tap away, a setup checklist, the guides."""
+    user, is_admin = session["user"], session.get("admin", False)
+    return render_template("hub.html", topics=_topics(is_admin),
+                           checklist=_setup_checklist(user), admin=is_admin,
+                           waiting_books=db.bookreq_waiting(user),
+                           waiting_comics=db.comic_waiting(user) if config.COMICS_ENABLED else 0,
+                           new=len(db.notices(user)))
+
+def _topics(is_admin):
+    """The guides this reader can use: the admin guide for admins, the comics guide only while
+    comics are on (its pages 404 otherwise)."""
+    return [t for t in HELP_TOPICS if (t[0] != "admin" or is_admin) and (t[0] != "comics" or config.COMICS_ENABLED)]
+
+@app.route("/help/<topic>")
+@login_required
+def help_page(topic):
+    is_admin = session.get("admin", False)
+    names = {t[0]: t for t in _topics(is_admin)}
+    if topic not in names:
+        abort(404)
+    return render_template(f"help/{topic}.html", topic=names[topic], topics=_topics(is_admin), admin=is_admin,
+                           abs_linked=absapi.configured())
+
 # ---- v5.9.1: send a book to an e-reader's browser with a short code (sendcode.py) -----------------
 SEND_COOKIE = "send_secret"
 _SEND_TRIES = {}
@@ -1359,11 +1473,18 @@ def send_page():
     import sendcode
     r = sendcode.page_state(request.cookies.get(SEND_COOKIE))
     fresh = None
-    if r is None or (r.get("fetched") and request.args.get("new")):
+    new = bool(request.args.get("new"))
+    # ?new=1 ('Send another book', 'Get a new code') replaces a code that already has its book
+    # (downloaded, gone, or not wanted any more); a code still waiting for a book is kept
+    if r is None or (new and r.get("book_id")):
         code, secret = sendcode.new_code(request.headers.get("User-Agent"))
         r, fresh = db.send_code_get(code), secret
-    f = sendcode.file_for(r) if r.get("book_id") else None
-    resp = Response(render_template("send.html", r=r, f=f, device=r["device"], life=sendcode.CODE_LIFE // 60))
+    if new:
+        # back to plain /send: the page's 5-second refresh must not ask for yet another code
+        resp = redirect(url_for("send_page"))
+    else:
+        f = sendcode.file_for(r) if r.get("book_id") else None
+        resp = Response(render_template("send.html", r=r, f=f, device=r["device"], life=sendcode.CODE_LIFE // 60))
     if fresh:
         resp.set_cookie(SEND_COOKIE, fresh, max_age=sendcode.CODE_LIFE + sendcode.FETCH_LIFE, httponly=True,
                         secure=config.COOKIE_SECURE, samesite="Lax", path="/send")
@@ -1468,7 +1589,7 @@ def following():
     results, error = [], None
     if q:
         if not hardcover.configured():
-            error = "Following books needs the admin's Hardcover key (Library -> Metadata sources)."
+            error = "Following books needs the library's Hardcover key (the admin sets it: Library -> Metadata sources)."
         else:
             try:
                 results = hardcover.search(q, kind)
@@ -1476,6 +1597,7 @@ def following():
                 error = str(e)
     return render_template("following.html", q=q, kind=kind, results=results, error=error,
                            follows=db.follow_list(user), books_ok=hardcover.configured(),
+                           admin=session.get("admin", False),
                            notices=db.notices(user, ("new", "requested"), 100))
 
 @app.route("/follow", methods=["POST"])
@@ -1538,6 +1660,11 @@ def notice_action(nid, action):
     return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
                     else url_for("index"))
 
+REQUEST_SAID_AUDIO = {"queued": "Requested: the portal is looking for the audiobook and will ask you to confirm it before it downloads (Requests shows how far it got).",
+                      "shared": "The family has this audiobook: added to your audiobooks, nothing downloaded.",
+                      "owned": "You have this audiobook already.", "exists": "Already requested.",
+                      "pending": "Requested; waiting for the admin's approval."}
+
 REQUEST_SAID = {"queued": "Requested: the portal is looking for a copy and will ask you to confirm it before it downloads (Requests shows how far it got).",
                 "shared": "It was in the family library: added to yours, nothing downloaded.",
                 "owned": "You have it already.", "exists": "Already requested.",
@@ -1559,14 +1686,15 @@ def _book_rows(user, books):
     """Each book with where it stands for this reader: in their library (with a link), in the
     family's (Get it adds it to theirs, no download), requested, or not out yet."""
     index = dedupe.Index(None, is_admin=True, force=True)
-    asked = {}
+    asked = {}                                   # the ebook and the audiobook are separate requests
     for r in db.bookreq_list(user, limit=500, closed_days=3650):          # newest first
-        asked.setdefault((r["title"].lower(), (r.get("author") or "").lower()), r)
+        asked.setdefault((r["title"].lower(), (r.get("author") or "").lower(), r.get("kind") or "ebook"), r)
     today = datetime.date.today().isoformat()
     rows = []
     for b in books:
+        key = (b["title"].lower(), (b.get("author") or "").lower())
         row = dict(b, lib=None, book_id=None, out=not b.get("date") or str(b["date"])[:10] <= today,
-                   req=asked.get((b["title"].lower(), (b.get("author") or "").lower())))
+                   req=asked.get(key + ("ebook",)), areq=asked.get(key + ("audio",)))
         m = index.match(b["title"], b.get("author") or "")
         if m and m["how"] in share.STRONG:
             try:
@@ -1575,7 +1703,7 @@ def _book_rows(user, books):
                 owners = []
             if user in owners:
                 row.update(lib="yours", book_id=m["book_id"])
-            elif owners:
+            elif owners and config.FAMILY_SHARING:      # only then is "Add to mine" true (and shown at all)
                 row["lib"] = "family"
         rows.append(row)
     return rows
@@ -1584,7 +1712,7 @@ def _hardcover_page(what, hid):
     if not re.fullmatch(r"\d{1,12}", hid or ""):
         abort(404)
     if not hardcover.configured():
-        flash("Book series and authors need the admin's Hardcover key (Library -> Metadata sources).")
+        flash("Book series and authors need the library's Hardcover key (the admin sets it: Library -> Metadata sources).")
         return None
     try:
         return hardcover.cached(what, hid)
@@ -1635,15 +1763,16 @@ def book_request():
     author = (request.form.get("author") or "").strip()[:200]
     series = (request.form.get("series") or "").strip()[:200] or None
     hid = request.form.get("hardcover_id") or None
+    kind = "audio" if request.form.get("kind") == "audio" else "ebook"     # v6.0: Get the audiobook
     if not title or (hid and not re.fullmatch(r"\d{1,12}", hid)) or not _can_get():
         abort(400)
     try:
-        rid, what = bookreq.request(user, title, author, series=series, hardcover_id=hid)
+        rid, what = bookreq.request(user, title, author, series=series, hardcover_id=hid, kind=kind)
     except bookreq.BookRequestError as e:
         flash(str(e))
         return redirect(_back(url_for("status")))
-    _audit("book_request", f"{title} by {author or '?'} ({what}, #{rid})")
-    flash(REQUEST_SAID.get(what, "Requested."))
+    _audit("book_request", f"{title} by {author or '?'} ({kind}, {what}, #{rid})")
+    flash((REQUEST_SAID_AUDIO if kind == "audio" else REQUEST_SAID).get(what, "Requested."))
     return redirect(_back(url_for("status")))
 
 @app.route("/books/requests/<int:rid>/<action>", methods=["POST"])
@@ -1657,14 +1786,15 @@ def book_request_action(rid, action):
         abort(404)
     try:
         if action == "yes" and r["owner"] == user and r["status"] == "confirm":
-            said = {"downloading": "Downloading it now: it arrives in your library, checked first.",
-                    }.get(bookreq.confirm(rid, shelfmark_api), "Shelfmark did not take it; the portal looks again shortly.")
+            where = "your audiobooks" if r.get("kind") == "audio" else "your library"
+            said = {"downloading": f"Downloading it now: it arrives in {where}, checked first.",
+                    }.get(bookreq.confirm(rid, shelfmark_api), "Not downloading yet (see the request's note); the portal looks again shortly.")
         elif action == "no" and r["owner"] == user and r["status"] in ("confirm", "held"):
             bookreq.reject(rid)
             said = "Not that one: it will not be offered again. Looking for another copy."
         elif action == "keep" and r["owner"] == user and r["status"] == "held":
             bookreq.keep(rid)
-            said = "Kept: it is being added to your library."
+            said = "Kept: it is being added to " + ("your audiobooks." if r.get("kind") == "audio" else "your library.")
         elif action == "cancel" and r["status"] in ("queued", "pending", "confirm", "held", "not-found"):
             bookreq._drop_held(r)
             db.bookreq_update(rid, status="cancelled", candidate=None, held_path=None, detail="cancelled")
@@ -1778,7 +1908,82 @@ def my_audiobooks():
             error = f"Audiobookshelf did not answer ({str(e)[:100]})"
     else:
         error = "Audiobookshelf is not set up yet"
+    for it in items:                             # v6.0: from Get the audiobook -> Wrong audiobook is offered
+        it["got_it"] = bool(db.bookreq_for_audio(user, it["id"]))
     return render_template("audiobooks.html", items=items, error=error)
+
+PLACEHOLDER_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 300"><rect width="200" height="300" fill="#181b22"/>'
+                   '<path d="M70 110h60v80H70z" fill="none" stroke="#3a3f4a" stroke-width="6"/></svg>')
+
+_PH_COLOURS = ("#2b3a55", "#3d2b55", "#553a2b", "#2b5546", "#55412b", "#2b4a55", "#4a2b3a", "#3a4a2b")
+
+def _wrap(text, width, lines):
+    out, cur = [], ""
+    for w in text.split():
+        if cur and len(cur) + 1 + len(w) > width:
+            out.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+        if len(out) == lines:
+            break
+    if cur and len(out) < lines:
+        out.append(cur)
+    if len(out) == lines and " ".join(out) != " ".join(text.split()):
+        out[-1] = out[-1][:width - 1].rstrip() + "…"
+    return [l if len(l) <= width else l[:width - 1] + "…" for l in out]
+
+def _placeholder_cover(title=None, author=None):
+    """No cover: a plain one with the book's title and author in its own colour, so a shelf of
+    them is still easy to scan (the plain icon when the title is unknown)."""
+    if title:
+        from xml.sax.saxutils import escape
+        import zlib
+        bg = _PH_COLOURS[zlib.crc32(title.encode()) % len(_PH_COLOURS)]
+        tl = _wrap(title, 13, 5)
+        y0 = 120 - 14 * (len(tl) - 1)
+        text = "".join(f'<text x="100" y="{y0 + 30 * i}" text-anchor="middle" font-size="22" font-weight="bold" '
+                       f'fill="#eef0f4" font-family="Georgia, serif">{escape(line)}</text>' for i, line in enumerate(tl))
+        au = _wrap(author or "", 18, 2)
+        text += "".join(f'<text x="100" y="{250 + 20 * i}" text-anchor="middle" font-size="15" fill="#c9ccd4" '
+                        f'font-family="Georgia, serif">{escape(line)}</text>' for i, line in enumerate(au))
+        svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 300"><rect width="200" height="300" fill="{bg}"/>'
+               f'<rect x="10" y="10" width="180" height="280" fill="none" stroke="#ffffff22" stroke-width="2"/>{text}</svg>')
+    else:
+        svg = PLACEHOLDER_SVG
+    resp = Response(svg, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "private, max-age=86400"
+    return resp
+
+@app.route("/audiobooks/<item_id>/cover")
+@login_required
+def audiobook_cover(item_id):
+    """An audiobook's cover for the home page, only for a reader who has it (v6.0)."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", item_id or "") or not absapi.configured():
+        abort(404)
+    try:
+        got = absapi.item_cover(item_id, session["user"], session.get("admin", False))
+    except Exception:
+        got = None
+    if not got:
+        return _placeholder_cover()
+    resp = Response(got[0], mimetype=got[1] if got[1].startswith("image/") else "image/jpeg")
+    resp.headers["Cache-Control"] = "private, max-age=86400"
+    return resp
+
+@app.route("/audiobooks/<item_id>/wrong", methods=["POST"])
+@login_required
+def audiobook_wrong(item_id):
+    """'Wrong audiobook' (v6.0) on My audiobooks, for one that came from Get the audiobook."""
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,64}", item_id or ""):
+        abort(404)
+    try:
+        bookreq.wrong_audiobook(session["user"], item_id)
+    except (bookreq.BookRequestError, absapi.AbsError):
+        abort(404)
+    _audit("audiobook_wrong", item_id)
+    flash("Thanks: it is taken out of your audiobooks, that copy will not be offered again, and the portal is "
+          "looking for another one (asking you first).")
+    return redirect(url_for("status"))
 
 @app.route("/audiobooks/<item_id>/download")
 @login_required
@@ -1891,6 +2096,48 @@ def devices():
                           "save your Kindle address above.")
                 else:
                     flash("Preferences saved.")
+            elif action in ("ntfy_on", "ntfy_new"):            # v6.0: phone notifications
+                db.set_prefs_v6(user, ntfy_topic="lib-" + secrets.token_urlsafe(12).replace("_", "x").replace("-", "y").lower())
+                _audit("ntfy_" + ("on" if action == "ntfy_on" else "new"))
+                flash("Phone notifications are on: subscribe to your topic in the ntfy app (below)."
+                      if action == "ntfy_on" else "New topic made: subscribe to it in ntfy; the old one gets nothing any more.")
+            elif action == "ntfy_off":
+                db.set_prefs_v6(user, ntfy_topic="")
+                _audit("ntfy_off"); flash("Phone notifications are off.")
+            elif action == "ntfy_test":
+                ok = notify.reader(user, "Library: test", "Phone notifications work. You will hear when a book arrives, "
+                                   "when a copy waits for your yes, and when something you follow comes out.",
+                                   click=notify.portal_url("/"), tags="books")
+                flash("Test sent: it should appear in ntfy within seconds." if ok else "Turn phone notifications on first.")
+            elif action == "hcwant":                           # v6.0: Hardcover Want to Read
+                kind = request.form.get("hc_want_kind")
+                on = request.form.get("hc_want") == "1"
+                was = db.get_prefs(user)["hc_want"]
+                db.set_prefs_v6(user, hc_want=1 if on else 0,
+                                hc_want_kind=kind if kind in ("ebook", "audio", "both") else "ebook")
+                recorded = None
+                if on and not was:
+                    # switched on: the list as it is NOW is recorded (never requested), here rather
+                    # than at the worker's next pass, so a book added a minute later already counts
+                    db.set_prefs_v6(user, hc_want_seeded=None)
+                    import hcwant
+                    try:
+                        token = cwa.hardcover_tokens().get(user)
+                        if token:
+                            hcwant.sync_owner(user, token, db.get_prefs(user)["hc_want_kind"])
+                            recorded = True
+                    except Exception as e:                        # Hardcover down: the worker records it
+                        app.logger.info("Want to Read: first record for %s deferred: %s", user, e)
+                _audit("hcwant", request.form.get("hc_want") or "0")
+                flash(("Saved. Your list as it is now was recorded; books you add from now on are requested "
+                       "(checked every 10 minutes)." if recorded else
+                       "Saved. Your Want to Read list is checked every 10 minutes.") if on
+                      else "Saved: your Want to Read list no longer makes requests.")
+            elif action == "hcwant_backlog":
+                import hcwant
+                made, err = hcwant.request_backlog(user, db.get_prefs(user)["hc_want_kind"])
+                flash((f"{made} requested from your Want to Read list: confirm the copies on Requests." if made else
+                       "Nothing new to request from your list.") + (f" Stopped: {err}." if err else ""))
             elif action == "kobo":
                 cwa.kobo_url(user, create=True); _audit("kobo_link"); flash("Your Kobo sync link is ready.")
             elif action == "kobo_reset":
@@ -1898,10 +2145,18 @@ def devices():
             elif action == "kobo_test":
                 flash(_kobo_link_test(user))
             elif action == "kobo_prefs":
-                cwa.set_kobo_prefs(user, shelves_only=request.form.get("shelves_only") == "1",
-                                   hardcover_token=request.form.get("hardcover_token") if request.form.get("hardcover_change") == "1" else None)
+                cwa.set_kobo_prefs(user, shelves_only=request.form.get("shelves_only") == "1")
                 _audit("kobo_prefs")
                 flash("Kobo options saved.")
+            elif action == "hardcover":                        # v6.0: its own card, Kobo or not
+                tok = (request.form.get("hardcover_token") or "").strip()
+                try:
+                    cwa.set_kobo_prefs(user, hardcover_token=tok)
+                except sqlite3.IntegrityError:
+                    flash("That Hardcover token is already saved for another reader: use your own.")
+                else:
+                    _audit("hardcover_token", "set" if tok else "cleared")
+                    flash("Hardcover token saved." if tok else "Hardcover token removed.")
             elif action == "password":
                 cur, new, rep = request.form.get("current", ""), request.form.get("new", ""), request.form.get("repeat", "")
                 ok = auth.verify(user, cur)
@@ -1966,14 +2221,16 @@ def devices():
     if prefs["last_kindle_test"]:
         prefs["last_kindle_test"] = datetime.datetime.fromtimestamp(prefs["last_kindle_test"]).strftime("%Y-%m-%d %H:%M")
     try:
-        kstat = cwa.kobo_status(user) if kobo else None
+        kstat = cwa.kobo_status(user)            # its Hardcover flag matters without a Kobo too (v6.0)
     except Exception:
         kstat = None
     return render_template("devices.html", u=u, prefs=prefs, kobo=kobo, kstat=kstat,
                            kobo_on=kobo_on, formats=config.FORMATS, kosync=config.KOSYNC_ENABLED,
                            abs_linked=absapi.configured(), anilist_ok=anilist.configured(),
                            anilist_link=db.anilist_get(user), metron_link=db.metron_get(user),
-                           hc_audio=db.hc_audio_state(user))
+                           hc_audio=db.hc_audio_state(user), ntfy_base=notify.ntfy_base(),
+                           hcwant_note=__import__("hcwant").note(user),
+                           hcwant_backlog=len(db.hc_want_unrequested(user)))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])
@@ -2030,7 +2287,9 @@ def admin():
             if config.AUTHELIA_ENABLED:
                 # the gate's own login, same password; the host writes it into Authelia's file
                 db.gate_queue(u["name"], pw, email=email, display=u["name"], admin=bool(u["role"] & 1))
-                note += " Their sign-in page login (Authelia, same password; 2FA is set up at first sign-in) is ready within a minute."
+                second = bool(u["role"] & 1) or config.AUTHELIA_READERS_2FA
+                note += (" Their sign-in page login (Authelia, same password" + ("; a second factor is set up at first sign-in"
+                         if second else "; readers need only the password") + ") is ready within a minute.")
             _audit("user_add", u["name"] + (" (admin)" if u["role"] & 1 else ""))
             flash(f"User {u['name']} created" + ("" if u["role"] & 1 else f" (isolated to {cwa.owner_tag(u['name'])})") + "." + note)
         except cwa.CwaError as e:
@@ -2062,7 +2321,9 @@ def admin():
     audit_rows = db.audit_recent(100)
     for a in audit_rows:
         a["when"] = datetime.datetime.fromtimestamp(a["ts"]).strftime("%Y-%m-%d %H:%M")
+    import dash                                  # v6.0: what needs the admin, across every queue
     return render_template("admin.html", links=config.admin_links(), counts=counts,
+                           needs=dash.needs(), week=dash.week(),
                            wanted_counts=db.wanted_counts(),
                            catalogs=__import__("catalogs").all_catalogs(include_disabled=True),
                            users=users, disk=disk, kobo_on=kobo_on, audit=audit_rows, needs_tag=needs_tag,

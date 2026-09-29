@@ -55,7 +55,7 @@ out=$(cfg '{}' | boot); rc=$?
 echo "     $out" | cut -c1-300
 check "first run exits 0" '[ "$rc" = 0 ]'
 check "admin account created on first run" '[ "$(printf %s "$out" | field "d[\"setup\"]")" = created ]'
-check "9 core + push monitors added (5 core, caddy, public, 2 push)" '[ "$(printf %s "$out" | field "len(d[\"added\"])")" = 9 ]'
+check "10 core + push monitors added (5 core, caddy, public, home, 2 push)" '[ "$(printf %s "$out" | field "len(d[\"added\"])")" = 10 ]'
 check "one notification (webhook)" '[ "$(printf %s "$out" | field "d[\"notifications\"]")" = "[%s]" ] || printf %s "$out" | field "d[\"notifications\"]" | grep -q "bookstack: webhook"'
 check "maintenance cron = 04:25 daily" '[ "$(printf %s "$out" | field "d[\"maintenance\"]")" = "25 4 * * *" ]'
 
@@ -115,11 +115,11 @@ sf(){ printf %s "$state" | python3 -c "import sys,json; d=json.load(sys.stdin); 
 check "history kept 30 days" '[ "$(sf "d[\"keep\"]")" = 30 ]'
 check "primary base URL = https://monitor.example.test" '[ "$(sf "d[\"base\"]")" = https://monitor.example.test ]'
 check "trustProxy on (Caddy in front)" '[ "$(sf "d[\"proxy\"]")" = True ]'
-check "9 managed + 1 own monitor" '[ "$(sf "d[\"n\"]")" = 10 ]'
+check "10 managed + 1 own monitor" '[ "$(sf "d[\"n\"]")" = 11 ]'
 check "drifted monitor restored (60 s, /login, active)" '[ "$(sf "d[\"cw\"]")" = "[60, '"'"'http://127.0.0.1:8083/login'"'"', True]" ]'
 check "every managed monitor carries exactly 1 notification" '[ "$(sf "d[\"notif\"]")" = "[1]" ]'
 check "one maintenance window, cron strategy, 25 min" 'sf "d[\"maint\"]" | grep -q "cron.*25 4 \* \* \*.*25"'
-check "maintenance covers the 9 managed monitors" '[ "$(sf "d[\"maint_monitors\"]")" = 9 ]'
+check "maintenance covers the 10 managed monitors" '[ "$(sf "d[\"maint_monitors\"]")" = 10 ]'
 
 echo "== push URLs"
 pr=$(docker run --rm --network "$NET" curlimages/curl:8.11.1 -s "http://bsmon-kuma:3001/api/push/$TOK_DISK?status=up&msg=OK&ping=" 2>/dev/null)
@@ -138,7 +138,7 @@ echo "== e-mail channel (SMTP) added next to the webhook"
 out=$(cfg '{}' correct-horse-battery-staple-42 1 | boot); rc=$?
 check "smtp run exits 0" '[ "$rc" = 0 ]'
 check "  two notifications now" 'printf %s "$out" | field "d[\"notifications\"]" | grep -q "bookstack: e-mail"'
-check "  every managed monitor re-attached (9 updated for notifications)" '[ "$(printf %s "$out" | field "sum(1 for u in d[\"updated\"] if \"notifications\" in u)")" = 9 ]'
+check "  every managed monitor re-attached (10 updated for notifications)" '[ "$(printf %s "$out" | field "sum(1 for u in d[\"updated\"] if \"notifications\" in u)")" = 10 ]'
 docker run --rm --network "$NET" curlimages/curl:8.11.1 -s "http://bsmon-kuma:3001/api/push/$TOK_DISK?status=down&msg=disk%20watchdog%20test" >/dev/null 2>&1
 mail=""; for _ in $(seq 1 30); do
   mail=$(docker run --rm --network "$NET" python:3.12-slim python -c '

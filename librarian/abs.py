@@ -118,20 +118,35 @@ def progress(user_id, token=None):
     """[mediaProgress] of one ABS user (admin API, GET /api/users/:id; ABS 2.36.1 UserController.
     findOne): libraryItemId, mediaItemType, duration, progress 0-1, currentTime s, isFinished,
     startedAt / finishedAt / lastUpdate in ms. Podcast episodes are left out."""
-    r = _req("GET", f"/api/users/{user_id}", token=token)
+    r = _req("GET", f"/api/users/{user_id}", token=token, timeout=8)
     if r.status_code != 200:
         raise AbsError(f"could not read ABS user {user_id}: {r.status_code}")
     return [p for p in (_json(r).get("mediaProgress") or []) if p.get("mediaItemType", "book") == "book" and not p.get("episodeId")]
 
 def item_meta(item_id, token=None):
     """{title, author, asin, isbn, duration} of one library item."""
-    r = _req("GET", f"/api/items/{item_id}", token=token, params={"expanded": 1})
+    r = _req("GET", f"/api/items/{item_id}", token=token, params={"expanded": 1}, timeout=8)
     if r.status_code != 200:
         raise AbsError(f"could not read ABS item {item_id}: {r.status_code}")
     m = _json(r).get("media") or {}
     md = m.get("metadata") or {}
     return {"title": md.get("title") or "", "author": md.get("authorName") or "", "asin": md.get("asin") or "",
             "isbn": md.get("isbn") or "", "duration": m.get("duration")}
+
+def item_cover(item_id, owner, is_admin=False, token=None):
+    """(bytes, content type) of an item's cover, only when the reader may see the item (their
+    owner tag, or an admin); None otherwise. Short timeouts: a slow Audiobookshelf must not hold
+    the portal's few threads for a picture."""
+    r = _req("GET", f"/api/items/{item_id}", token=token, timeout=5)
+    if r.status_code != 200:
+        return None
+    tags = ((_json(r).get("media") or {}).get("tags") or [])
+    if not is_admin and owner_tag(owner) not in tags:
+        return None
+    c = _req("GET", f"/api/items/{item_id}/cover", token=token, params={"width": 300}, timeout=5)
+    if c.status_code != 200 or not c.content:
+        return None
+    return c.content, c.headers.get("Content-Type", "image/jpeg")
 
 def ensure_user(name, password=None, token=None):
     """Create the ABS account for a library user, or align an existing one with the
@@ -239,6 +254,17 @@ def tag_item(item_id, tag, token=None):
     r = _req("PATCH", f"/api/items/{item_id}/media", token=token, json={"tags": sorted(set(tags + [tag]))})
     if r.status_code != 200:
         raise AbsError(f"could not tag ABS item: {r.status_code} {r.text[:120]}")
+    return True
+
+def untag_item(item_id, tag, token=None):
+    """Take one tag off an item (v6.0: 'Wrong audiobook' takes it out of that reader's audiobooks)."""
+    r = _req("GET", f"/api/items/{item_id}", token=token)
+    tags = list(((_json(r).get("media") or {}).get("tags") or [])) if r.status_code == 200 else []
+    if tag not in tags:
+        return False
+    r = _req("PATCH", f"/api/items/{item_id}/media", token=token, json={"tags": sorted(t for t in tags if t != tag)})
+    if r.status_code != 200:
+        raise AbsError(f"could not untag ABS item: {r.status_code} {r.text[:120]}")
     return True
 
 def tag_folder(folder, owner, attempts=None, delay=5, sleep=time.sleep):

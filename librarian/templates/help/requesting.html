@@ -1,0 +1,23 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>Search on the <a href="{{ cfg.PORTAL_URL }}/">portal</a> for a title or an author and open the book. Its page offers, depending on what exists:</p>
+<ul>
+<li><strong>Request</strong> on a free copy (Project Gutenberg, Standard Ebooks, Internet Archive, LibriVox): it arrives within minutes.</li>
+<li><strong>Get it</strong>: the portal looks for a copy on the library's download sources. It picks the right title and author, one book (no box sets or abridged copies), EPUB first, in your language, and <strong>shows it to you before anything downloads</strong>: the release name, its size, where it is from and why it was chosen. <strong>Yes, that one</strong> downloads it; <strong>Not it</strong> never offers that release again and looks for another. Audiobooks: <strong>Get the audiobook</strong>, the same way.</li>
+<li><strong>Pick in Shelfmark</strong>: Shelfmark opens already searching for the book and you choose the copy yourself.</li>
+<li><strong>Keep looking</strong>: for a book no free catalogue has yet; it checks again on a schedule and requests it when it appears.</li>
+</ul>
+<h3>After you say yes</h3>
+<ol>
+<li>The download runs (usually minutes; large ones longer). <a href="{{ cfg.PORTAL_URL }}/status">Requests</a> shows how far it got.</li>
+<li>When the file arrives it is <strong>checked</strong>: the title, author, language and ISBN inside it must match the book you asked for. If it does not, it is held for you instead of going into your library: <strong>Keep it anyway</strong> or <strong>Not it: find another</strong>.</li>
+<li>It lands in your library, then on your Kobo at its next sync, or your Kindle if you send it (or automatically).</li>
+</ol>
+<h3>When something is not right</h3>
+<ul>
+<li><strong>Wrong book arrived?</strong> Its page → <em>Not the book you asked for?</em> → <strong>Wrong book</strong>. It leaves your library, that copy is never offered again, and the portal looks for another (asking you first).</li>
+<li><strong>Not found</strong> after a few days: the sources name it differently. Try <strong>Pick in Shelfmark</strong>.</li>
+<li><strong>Waiting for approval:</strong> the admin approves requests on this library; you are told when it goes ahead.</li>
+</ul>
+<h3>Things the family already has</h3>
+<p>When a book (or comic) is in someone else's library, it shows as <em>in the family library</em>: <strong>Add to mine</strong> puts it in yours at once, nothing is downloaded.</p>
+{% endblock %}

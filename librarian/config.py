@@ -24,6 +24,9 @@ OWNER_PREFIX = os.environ.get("OWNER_PREFIX", "owner:")         # tag namespace 
 # uploads, dropbox or /intake), so it added friction without protecting anything.
 APPROVALS_REQUIRED = _bool("APPROVALS_REQUIRED", False)  # non-admin catalog requests wait for admin approval
 NOTIFY_WEBHOOK     = os.environ.get("NOTIFY_WEBHOOK", "")  # POST on new request / approval / completion / alert
+# v6.0: readers' own phone notifications (ntfy topics). Default: https://ntfy.sh, never the admin's
+# own alert server (it may be Tailscale-only or need a login). A topic is random and private to one reader.
+READER_NTFY_URL = (os.environ.get("READER_NTFY_URL") or "").rstrip("/")
 # "json" (generic webhook), "ntfy" (plain-text body + Title/Priority headers) or "auto" (ntfy
 # when the host name contains "ntfy", which is what the installer's Alerts step suggests).
 NOTIFY_WEBHOOK_FORMAT = os.environ.get("NOTIFY_WEBHOOK_FORMAT", "auto").lower()
@@ -186,6 +189,8 @@ TRUST_PROXY     = _bool("TRUST_PROXY", True)      # Caddy is the only thing in f
 ADMIN_EMAIL     = os.environ.get("ADMIN_EMAIL", "")
 KOSYNC_ENABLED  = _bool("KOSYNC_ENABLED", False)  # set by the TUI when CWA's KOReader sync is on
 AUTHELIA_ENABLED = _bool("AUTHELIA_ENABLED", False)
+AUTHELIA_READERS_2FA = _bool("AUTHELIA_READERS_2FA", False)   # v6.0: shown in the portal's wording only
+AUTHELIA_PASSKEYS = _bool("AUTHELIA_PASSKEYS", False)
 # L05: with the gate on, Caddy adds X-Bookstack-Gate: <GATE_SECRET> to requests Authelia let
 # through (and strips any the client sent). Only then is Remote-User trusted: one login.
 GATE_SECRET = os.environ.get("GATE_SECRET", "")  # users are then managed in the TUI only (Authelia has its own user file)
@@ -198,6 +203,9 @@ BOOKS_URL   = os.environ.get("BOOKS_URL")   or (f"https://books.{DOMAIN}"   if D
 AUDIO_URL   = os.environ.get("AUDIO_URL")   or (f"https://audio.{DOMAIN}"   if DOMAIN else "")
 SHELF_URL   = os.environ.get("SHELF_URL")   or (f"https://shelf.{DOMAIN}"   if DOMAIN else "")
 PORTAL_URL  = os.environ.get("PORTAL_URL")  or (f"https://request.{DOMAIN}" if DOMAIN else "")
+HOME_URL    = os.environ.get("HOME_URL")    or (f"https://home.{DOMAIN}"    if DOMAIN else "")     # v6.0 start page
+AUTH_URL    = os.environ.get("AUTH_URL")    or (f"https://auth.{DOMAIN}"    if DOMAIN else "")
+MONITOR_URL = os.environ.get("MONITOR_URL") or (f"https://monitor.{DOMAIN}" if DOMAIN else "")
 def admin_links():
     """Shown on the admin dashboard; tailnet-only ones are labelled as such."""
     d = DOMAIN

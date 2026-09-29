@@ -2,7 +2,8 @@
 <p class="mut"><a href="{{ url_for('my_library') }}">← {{ 'All books' if admin else 'My books' }}</a></p>
 <div class="card"><div class="row" style="align-items:flex-start;gap:16px">
 {% if b.has_cover %}<img src="{{ url_for('book_cover', book_id=b.id) }}" alt="" style="width:120px;height:auto;border-radius:4px">
-{% elif provider_cover %}<img src="{{ url_for('cover', u=provider_cover) }}" alt="" style="width:120px;height:auto;border-radius:4px" title="Cover from Open Library; it is being added to the library for your devices">{% endif %}
+{% elif provider_cover %}<img src="{{ url_for('cover', u=provider_cover) }}" alt="" style="width:120px;height:auto;border-radius:4px" title="Cover from Open Library; it is being added to the library for your devices">
+{% else %}<img src="{{ url_for('book_cover', book_id=b.id, ph=1) }}" alt="" style="width:120px;height:auto;border-radius:4px">{% endif %}
 <div style="flex:1">
 <h2 style="margin-top:0">{{ b.title }}{% if state %} <span class="badge">{{ reading(state) }}</span>{% endif %}</h2>
 <div class="row" style="gap:4px;margin:-4px 0 8px"><span class="mut" title="For what your device does not report: a Kindle, an iPad. Your Kobo reports by itself.">Mark:</span>

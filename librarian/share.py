@@ -59,32 +59,66 @@ def find_ebook(title, author="", identifiers=()):
     return dict(m, owners=owners) if owners else None
 
 
-def find_audiobook(title, author=""):
-    """{"item_id", "how", "owners"} for the one Audiobookshelf item with the same title AND an
-    overlapping author (an audiobook's name is all there is to go on), else None."""
+def audiobook_owned_by(title, author, owner, exclude=()):
+    """The reader's own audiobook of this title and author ({"item_id", "how", "owners"}), else None;
+    looked up with family sharing off too (v6.0: Get it for audiobooks). Only items carrying their
+    owner tag count, so another reader's copy of the same title never hides theirs; `exclude`:
+    item ids the reader said were the wrong audiobook."""
+    return _audiobook_match(title, author, owner=owner, exclude=exclude)
+
+
+def find_audiobook(title, author="", exclude=()):
+    """{"item_id", "how", "owners"} for an Audiobookshelf item with the same title AND an
+    overlapping author (an audiobook's name is all there is to go on) that someone owns, else None."""
+    if not config.FAMILY_SHARING:
+        return None
+    return _audiobook_match(title, author, exclude=exclude)
+
+
+_ABS_ITEMS = {"at": 0.0, "items": None}
+ABS_ITEMS_TTL = 60
+
+
+def _abs_items():
+    """The Audiobookshelf library's items (with their tags), read at most once a minute: the
+    worker asks for every downloading audiobook request each pass (v6.0)."""
+    import time
+    now = time.time()
+    if _ABS_ITEMS["items"] is not None and now - _ABS_ITEMS["at"] < ABS_ITEMS_TTL:
+        return _ABS_ITEMS["items"]
+    lib_id, _ = absapi.ensure_library()
+    r = absapi._req("GET", f"/api/libraries/{lib_id}/items", params={"limit": 0})
+    if r.status_code != 200:
+        raise absapi.AbsError(f"Audiobookshelf answered HTTP {r.status_code}")
+    _ABS_ITEMS.update(items=absapi._json(r).get("results", []), at=now)
+    return _ABS_ITEMS["items"]
+
+
+def _audiobook_match(title, author="", owner=None, exclude=()):
     want_t, want_a = dedupe.norm_title(title or ""), dedupe.author_tokens(author or "")
-    if not (config.FAMILY_SHARING and want_t and want_a and absapi.configured()):
+    if not (want_t and want_a and absapi.configured()):
         return None
     try:
-        lib_id, _ = absapi.ensure_library()
-        r = absapi._req("GET", f"/api/libraries/{lib_id}/items", params={"limit": 0})
-        if r.status_code != 200:
-            return None
-        hits = []
-        for it in absapi._json(r).get("results", []):
-            md = (it.get("media") or {}).get("metadata") or {}
-            if dedupe.norm_title(md.get("title") or "") == want_t \
-                    and want_a & dedupe.author_tokens(md.get("authorName") or ""):
-                hits.append(it["id"])
-        if len(hits) != 1:
-            return None                      # none, or two candidates: never guess between them
-        full = absapi._json(absapi._req("GET", f"/api/items/{hits[0]}"))
+        items = _abs_items()
     except Exception as e:                   # ABS down: download as usual rather than fail
         log.warning("family sharing: Audiobookshelf lookup failed: %s", e)
         return None
-    tags = ((full.get("media") or {}).get("tags") or [])
-    owners = sorted(t[len(config.OWNER_PREFIX):] for t in tags if t.startswith(config.OWNER_PREFIX))
-    return {"item_id": hits[0], "how": "title+author", "owners": owners} if owners else None
+    hits = []
+    for it in items:
+        media = it.get("media") or {}
+        md = media.get("metadata") or {}
+        if it.get("id") in exclude:
+            continue
+        if dedupe.norm_title(md.get("title") or "") == want_t and want_a & dedupe.author_tokens(md.get("authorName") or ""):
+            owners = sorted(t[len(config.OWNER_PREFIX):] for t in (media.get("tags") or []) if t.startswith(config.OWNER_PREFIX))
+            hits.append({"item_id": it["id"], "how": "title+author", "owners": owners})
+    if owner:
+        mine = [h for h in hits if owner in h["owners"]]
+        return mine[0] if mine else None
+    owned = [h for h in hits if h["owners"]]
+    if not owned:
+        return None                          # an untagged item is someone's import still under way
+    return max(owned, key=lambda h: len(h["owners"]))   # copies of the same book: the most shared one
 
 
 def give_ebook(match, owner, rid=None, now=None):
@@ -99,3 +133,4 @@ def give_audiobook(match, owner):
     """Tag the existing Audiobookshelf item for this reader, now."""
     if owner not in match["owners"]:
         absapi.tag_item(match["item_id"], absapi.owner_tag(owner))
+        _ABS_ITEMS["at"] = 0.0                   # the next lookup sees the new owner

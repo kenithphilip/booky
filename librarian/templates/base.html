@@ -13,11 +13,11 @@ input,button,select{font:inherit}input[type=text],input[type=password],input[typ
 border-radius:8px;border:1px solid var(--line);background:#0c0e12;color:var(--fg)}
 button,.btn{padding:9px 14px;border:0;border-radius:8px;background:var(--acc);color:#fff;cursor:pointer;display:inline-block}
 button.sec,.btn.sec{background:#3a3f4a}button.danger{background:#7a2b2b}
-.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.mut{color:var(--mut);font-size:13px}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.row>.row{max-width:100%}.mut{color:var(--mut);font-size:13px}
 .badge{font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:20px;color:var(--mut)}
 .flash{background:#1c2740;border:1px solid #2b3d63;padding:10px 12px;border-radius:8px;margin:10px 0}
 table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-code,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#0c0e12;padding:2px 6px;border-radius:6px;word-break:break-all}
+code,.code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:#0c0e12;padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
 h2{font-size:18px;margin:18px 0 8px}h3{font-size:15px;margin:12px 0 6px}
 .st-done{color:var(--ok)}.st-error{color:var(--bad)}.st-needs-tag{color:var(--warn)}.st-queued,.st-importing,.st-tagging,.st-pending,.st-retrying,.st-downloading{color:var(--warn)}.st-denied{color:#c98a8a}.st-dismissed{color:#6b7280}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px}
@@ -25,11 +25,23 @@ nav a{padding:4px 2px}nav a.active{border-bottom:2px solid var(--acc)}
 /* CSS-only "working on it": the clicked button keeps focus while the browser loads the next
    page (the CSP forbids scripts, so there is nothing else to hang a spinner on) */
 .busy{display:none;color:var(--mut);font-size:13px}
+/* v6.0 start page (home.) and guides */
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:12px}
+.tile{display:block;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;color:var(--fg)}
+.tile:hover{border-color:var(--acc)}.tile strong{display:block;font-size:16px;margin-bottom:4px}.tile .mut{display:block}
+.guide h2{margin-top:22px}.guide p,.guide li{max-width:72ch}.guide ol,.guide ul{padding-left:20px}
+.check{display:flex;gap:10px;align-items:baseline;padding:4px 0}.check .ok{color:var(--ok)}.check .no{color:var(--warn)}
+/* v6.0 home page shelves */
+.shelf{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:12px}
+.shelf a{color:var(--fg);display:block}.shelf img,.shelf .nocover{width:100%;aspect-ratio:2/3;object-fit:cover;border-radius:6px;border:1px solid var(--line);background:#0c0e12}
+.shelf .t{font-size:13px;line-height:1.3;margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+@media (max-width:520px){.tiles{grid-template-columns:1fr 1fr;gap:8px}.shelf{grid-template-columns:repeat(3,1fr);gap:8px}}
+.bar{height:4px;background:var(--line);border-radius:2px;margin-top:4px}.bar>i{display:block;height:4px;background:var(--acc);border-radius:2px}
 button:focus ~ .busy,button:active ~ .busy{display:inline}
-</style></head><body>
-<header><strong>{{ cfg.DOMAIN or 'Library' }}</strong>
-<nav class="row">{% if session.user %}
-<a href="{{url_for('index')}}" class="{{ 'active' if request.endpoint=='index' }}">Search</a>
+</style></head><body{% block bodyattrs %}{% endblock %}>
+<header>{% block brand %}<strong>{% if cfg.HOME_URL %}<a href="{{ cfg.HOME_URL }}" style="color:inherit" title="Start page: every site, guides and answers">{{ cfg.DOMAIN or 'Library' }}</a>{% else %}{{ cfg.DOMAIN or 'Library' }}{% endif %}</strong>{% endblock %}
+{% block nav %}<nav class="row">{% if session.user %}
+<a href="{{url_for('index')}}" class="{{ 'active' if request.endpoint=='index' }}">Home</a>
 {% set bw = books_waiting() %}<a href="{{url_for('status')}}" class="{{ 'active' if request.endpoint=='status' }}"{% if bw %} title="{{ bw }} waiting for your answer"{% endif %}>Requests{% if bw %} ({{ bw }}){% endif %}</a>
 <a href="{{url_for('my_library')}}" class="{{ 'active' if request.endpoint=='my_library' }}">My books</a>
 {% if cfg.COMICS_ENABLED %}{% set cw = comics_waiting() %}<a href="{{url_for('comics_page')}}" class="{{ 'active' if request.endpoint in ('comics_page', 'comic_series') }}">Comics{% if cw %} ({{ cw }}){% endif %}</a>{% endif %}
@@ -38,9 +50,12 @@ button:focus ~ .busy,button:active ~ .busy{display:inline}
 <a href="{{url_for('upload')}}" class="{{ 'active' if request.endpoint=='upload' }}">Upload</a>
 <a href="{{url_for('devices')}}" class="{{ 'active' if request.endpoint=='devices' }}">Devices</a>
 {% if session.admin %}<a href="{{url_for('admin')}}" class="{{ 'active' if request.endpoint=='admin' }}">Admin</a>{% endif %}
+<a href="{{ url_for('hub') }}" title="Every site, how-to guides and answers">Help</a>
 <span class="mut">{{session.user}}{% if session.admin %} · admin{% endif %}</span>
-<form method="post" action="{{url_for('logout')}}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Log out</button></form>
-{% endif %}</nav></header>
+{% if cfg.AUTHELIA_ENABLED and session.sso %}<a class="btn sec" href="{{ cfg.AUTH_URL }}/logout">Log out</a>{% else %}
+<form method="post" action="{{url_for('logout')}}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Log out</button></form>{% endif %}
+{% endif %}</nav>{% endblock %}</header>
 <div class="wrap">
 {% with m=get_flashed_messages() %}{% for x in m %}<div class="flash">{{x}}</div>{% endfor %}{% endwith %}
-{% block body %}{% endblock %}</div></body></html>
+{% block body %}{% endblock %}</div>
+<script src="{{ url_for('static', filename='app.js') }}" defer></script></body></html>

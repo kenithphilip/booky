@@ -236,7 +236,7 @@ def test_kepub_download_and_koreader_instructions(client, users, monkeypatch):
     """F26/F60/C12."""
     add_calibre_book(1, "Kobo Book", "Ann", tags=["owner:alice"], formats=("epub", "kepub"))
     login(client, "alice", users["alice"])
-    assert b"/download/1/kepub" in client.get("/library").data
+    assert b"/download/1/kepub" in client.get("/library?view=list").data
     r = client.get("/download/1/kepub")
     assert r.status_code == 200 and r.mimetype == "application/kepub+zip" and "Kobo Book - Ann.kepub.epub" in r.headers["Content-Disposition"]
     monkeypatch.setattr(config, "KOSYNC_ENABLED", True)
@@ -255,7 +255,7 @@ def test_library_download_is_isolated(client, users):
     add_calibre_book(1, "Alice Book", "Ann Author", tags=["owner:alice"], formats=("epub", "pdf"))
     add_calibre_book(2, "Bob Book", "Bo Writer", tags=["owner:bob"])
     login(client, "alice", users["alice"])
-    r = client.get("/library"); assert b"Alice Book" in r.data and b"Bob Book" not in r.data
+    r = client.get("/library?view=list"); assert b"Alice Book" in r.data and b"Bob Book" not in r.data
     assert b"/download/1/epub" in r.data and b"/download/1/pdf" in r.data and b"Send to Kindle" not in r.data
     r = client.get("/download/1/epub")
     assert r.status_code == 200 and r.headers["Content-Disposition"].startswith("attachment") and "Alice Book - Ann Author.epub" in r.headers["Content-Disposition"]
@@ -264,9 +264,9 @@ def test_library_download_is_isolated(client, users):
     assert client.get("/download/1/azw3").status_code == 404
     assert client.get("/download/999/epub").status_code == 404
     db.set_prefs("alice", preferred_format="pdf")
-    assert b"Download pdf" in client.get("/library").data
+    assert b"Download pdf" in client.get("/library?view=list").data
     post(client, "/logout"); login(client, "admin", users["admin"])
-    r = client.get("/library"); assert b"Alice Book" in r.data and b"Bob Book" in r.data and b"All books" in r.data
+    r = client.get("/library?view=list"); assert b"Alice Book" in r.data and b"Bob Book" in r.data and b"All books" in r.data
     assert client.get("/download/2/epub").status_code == 200
 
 def test_send_to_kindle_only_mails_formats_amazon_accepts(client, users, monkeypatch):
@@ -280,7 +280,7 @@ def test_send_to_kindle_only_mails_formats_amazon_accepts(client, users, monkeyp
     r = post(client, "/kindle/1"); assert b"Devices page first" in r.data and sent == []
     cwa.set_kindle_mail("alice", "alice@kindle.com")
     db.set_prefs("alice", preferred_format="azw3")
-    r = client.get("/library"); assert r.data.count(b"Send to Kindle") == 1 and b"no Kindle format yet" in r.data
+    r = client.get("/library?view=list"); assert r.data.count(b"Send to Kindle") == 1 and b"no Kindle format yet" in r.data
     r = post(client, "/kindle/1", format="azw3")            # pref/format azw3 -> the EPUB goes out
     assert b"on its way" in r.data and sent == [], "queued: the worker mails it (L21), not the web request"
     import worker
@@ -405,7 +405,7 @@ def test_cover_proxy_caps_size_type_and_redirects(client, users, monkeypatch):
 
 def test_security_headers_and_persistent_session(client, users):
     r = client.get("/login")
-    assert "script-src 'none'" in r.headers["Content-Security-Policy"] and "frame-ancestors 'none'" in r.headers["Content-Security-Policy"]
+    assert "script-src 'self';" in r.headers["Content-Security-Policy"] and "frame-ancestors 'none'" in r.headers["Content-Security-Policy"]
     assert r.headers["X-Frame-Options"] == "DENY" and r.headers["Referrer-Policy"] == "same-origin"
     r = login(client, "alice", users["alice"])
     sc = r.headers.get("Set-Cookie", "")

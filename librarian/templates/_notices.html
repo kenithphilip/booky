@@ -1,17 +1,16 @@
 <table>
 {% for n in (notices if notices is defined else new_for_you()) if n.status == 'new' %}
 <tr><td>{% if n.follow_id %}<a href="{{ url_for('follow_page', fid=n.follow_id) }}"><strong>{{ n.title }}</strong></a>{% else %}<strong>{{ n.title }}</strong>{% endif %}{% if n.detail %} <span class="mut">· {{ n.detail }}</span>{% endif %}</td>
-<td style="text-align:right;white-space:nowrap">
+<td style="text-align:right"><div class="row" style="justify-content:flex-end;gap:6px">
 {% if n.item.type == 'comic' %}
 <form method="post" action="{{ url_for('notice_action', nid=n.id, action='request') }}" style="display:inline">{{ csrf_field() }}
 <button type="submit">Request</button></form>
 {% else %}
 {% if can_get_books() %}<form method="post" action="{{ url_for('notice_action', nid=n.id, action='request') }}" style="display:inline">{{ csrf_field() }}
 <button type="submit" title="The portal finds a copy and Shelfmark downloads it into your library">Get it</button></form>{% endif %}
-<form method="post" action="{{ url_for('notice_action', nid=n.id, action='shelfmark') }}" style="display:inline">{{ csrf_field() }}
-<button type="submit" class="sec" title="Open Shelfmark searching for it, and choose the copy yourself">Pick in Shelfmark</button></form>
+{% if cfg.SHELF_URL %}<a class="btn sec" href="{{ shelf_search(n.item.title or n.title, n.item.author or '') }}" target="_blank" rel="noopener" title="Open Shelfmark searching for it, and choose the copy yourself">Pick in Shelfmark</a>{% endif %}
 {% endif %}
 <form method="post" action="{{ url_for('notice_action', nid=n.id, action='dismiss') }}" style="display:inline">{{ csrf_field() }}
-<button type="submit" class="sec">Dismiss</button></form></td></tr>
+<button type="submit" class="sec">Dismiss</button></form></div></td></tr>
 {% endfor %}
 </table>

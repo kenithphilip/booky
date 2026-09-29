@@ -64,6 +64,17 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   the author's surname, no packs/abridged/summaries, EPUB first and no PDF, the reader's language
 - `templates/book_list.html` — a book series' or an author's books (Hardcover, cached 6 h) with
   what the reader and the family have, Get it / Add to mine / Pick
+- `home.py` — v6.0: a reader's home page: reading (Calibre-Web state), listening (Audiobookshelf
+  progress), next in each series they read, recently added; each part on its own
+- `audiorel.py` — v6.0: which release is the audiobook asked for (the book rules, audio formats,
+  M4B and unabridged preferred, narrators taken out of the name before the title check)
+- `hcwant.py` — v6.0: a reader's Hardcover Want to Read list feeds Get it requests (opt-in;
+  the first sync only records the list)
+- `dash.py` — v6.0: the admin dashboard's "What needs you" and the week in numbers
+- `static/app.js` — v6.0: the portal's only script (autosubmit filters, filter-as-you-type, copy
+  buttons, self-refreshing Requests); every page works without it
+- `templates/hub.html`, `hub_base.html`, `help/*.html` — v6.0: home.<domain>, the start page,
+  setup checklist and the 13 guides; `home.html` — the portal's home page
 - `sendcode.py` — v5.9.1: send a book to an e-reader's own browser with a 4-character code
   (/send, no login; the book only reaches the browser holding the code's secret cookie)
 - `hcaudio.py` — v5.9.1: Audiobookshelf listening progress to each reader's own Hardcover

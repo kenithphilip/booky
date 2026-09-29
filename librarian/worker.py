@@ -407,6 +407,9 @@ def _family_copy(owner, rid, meta, src=None, ext=None):
     m = share.find_ebook(meta.get("title"), meta.get("author") or "", meta.get("identifiers") or ())
     if not m:
         return None
+    import bookreq
+    if m["book_id"] in bookreq.rejected_for(owner)[0]:
+        return None                              # the copy this reader called the wrong book: import the new one
     job = db.replace_live(m["book_id"])
     if job and job["status"] == "open" and _stage_better_copy(job, src, ext, rid, owner):
         if owner in m["owners"]:
@@ -425,7 +428,9 @@ def _family_audio(owner, base):
     parts = [x.strip() for x in re.split(r"\s+[-\u2013\u2014]\s+", _strip_name_tail(base), maxsplit=1)]
     if len(parts) != 2 or not all(parts):
         return None
-    m = share.find_audiobook(parts[1], parts[0]) or share.find_audiobook(parts[0], parts[1])
+    import bookreq
+    ex = bookreq.rejected_for(owner)[1]          # never the audiobook this reader called the wrong one
+    m = share.find_audiobook(parts[1], parts[0], exclude=ex) or share.find_audiobook(parts[0], parts[1], exclude=ex)
     if not m:
         return None
     if owner in m["owners"]:
@@ -1058,7 +1063,7 @@ def _classify_dir(path):
     """What a settled dropbox folder is: 'audio' (audio files and no ebook files: one
     audiobook), 'ebooks' (ebook files and no audio: each is imported on its own), 'mixed' or
     'nothing' (parked for the admin). A .txt next to audio is read as notes, not a book."""
-    audio = ebooks = texts = 0
+    audio = ebooks = texts = companions = 0
     for root, _dirs, names in os.walk(path):
         for n in names:
             e = _ext(n)
@@ -1073,7 +1078,12 @@ def _classify_dir(path):
                 texts += 1
             elif e in config.EBOOK_EXTS:
                 ebooks += 1
+                companions += e in ("pdf", "epub")
     if audio:
+        # v6.0: an audiobook release often carries its companion PDF (the Audible supplement) or
+        # an EPUB of the text: one or two of those beside the audio are part of the audiobook
+        if ebooks and ebooks == companions and companions <= 2:
+            return "audio"
         return "mixed" if ebooks else "audio"
     return "ebooks" if ebooks or texts else "nothing"
 
@@ -1206,8 +1216,12 @@ def _folder_entry(p, owner, name, box):
     except Exception as e:                      # a symlink inside: refuse the whole folder
         return _handle(p, owner, name, "audio", box, name, lambda rid, e=e: (_ for _ in ()).throw(e))
     if kind == "audio":
-        return _handle(p, owner, name, "audio", box, name,
-                       lambda rid: (_beat("dropbox"), _place_audio_dir(p, owner, _safe(name), rid))[1])
+        import bookreq
+        def place(rid):
+            _beat("dropbox")
+            held = bookreq.check_audio_arrival(p, owner)   # v6.0: a Get the audiobook download that is not the book
+            return held or _place_audio_dir(p, owner, _safe(name), rid)
+        return _handle(p, owner, name, "audio", box, name, place)
     if kind == "ebooks":
         return _ebook_folder(p, owner, name, box)
     why = ("has both audio and ebook files: put the audiobook and the ebooks in separate folders"
@@ -1745,6 +1759,8 @@ def housekeeping_once(now=None):
         cwa.checkpoint_passive()
         _guarded(check_password_drift)
         _guarded(fail_orphaned_pending)
+        _guarded(close_orphaned_requests)
+        _guarded(expire_held, now)
         _guarded(db.candidate_purge)
 
 ENRICH_EVERY = 120          # seconds between enrichment passes
@@ -2128,6 +2144,11 @@ def follows_once(now=None):
         hcaudio.sync_once()
     except Exception as e:                       # nor Hardcover (audiobook progress, v5.9.1)
         log.warning("Hardcover audiobook sync: %s", e)
+    try:
+        import hcwant
+        hcwant.sync_once()
+    except Exception as e:                       # nor the Want to Read list (v6.0)
+        log.warning("Hardcover Want to Read: %s", e)
     return n
 
 def _offer_shared_swaps(now):
@@ -2372,6 +2393,46 @@ def fail_orphaned_pending():
             _finish(r["id"], "error", f"the account '{r['owner']}' was removed while this was waiting for approval")
             failed += 1
     return failed
+
+def close_orphaned_requests():
+    """v6.0: a removed account's Get it / comic requests stop searching and pushing: cancelled,
+    their held files dropped, their phone topic and Want to Read sync switched off."""
+    import bookreq
+    closed = 0
+    owners = {r["owner"] for r in db.bookreq_open()} | {r["owner"] for r in db.comic_open()}
+    for owner in owners:
+        if not _owner_gone(owner):
+            continue
+        for r in db.bookreq_open(owner=owner):
+            bookreq._drop_held(r)
+            db.bookreq_update(r["id"], status="cancelled", candidate=None, held_path=None, detail="the account was removed")
+            closed += 1
+        for r in db.comic_open(owner):
+            comics.drop_held(r)
+            db.comic_update(r["id"], status="cancelled", candidate=None, held_path=None, detail="the account was removed")
+            closed += 1
+        db.set_prefs_v6(owner, ntfy_topic="", hc_want=0)
+    return closed
+
+def expire_held(now=None):
+    """v6.0: an arrival held for a reader's check is not kept for ever on the 80 GB disk: after
+    HELD_DAYS without an answer it is dropped and the request is looked for again."""
+    import bookreq
+    now = now or time.time()
+    n = 0
+    for r in db.bookreq_open(statuses=("held",)):
+        if now - (r.get("updated") or now) > bookreq.HELD_DAYS * 86400:
+            bookreq._drop_held(r)
+            db.bookreq_update(r["id"], status="queued", next_try=now, held_path=None,
+                              detail=f"the held file waited {bookreq.HELD_DAYS} days without an answer: looking for another copy")
+            n += 1
+    for r in db.comic_open(statuses=("held",)):
+        if now - (r.get("updated") or now) > bookreq.HELD_DAYS * 86400:
+            comics.drop_held(r)
+            db.comic_update(r["id"], status="queued", next_try=now, held_path=None,
+                            detail=f"the held file waited {bookreq.HELD_DAYS} days without an answer: looking for another copy")
+            n += 1
+    return n
 
 def _loop(name, fn, every):
     _beat(name)

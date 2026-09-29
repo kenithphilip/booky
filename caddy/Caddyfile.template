@@ -420,6 +420,39 @@ request.@@DOMAIN@@ {
 	}
 }
 
+# ---- PUBLIC: home. — the family's start page (v6.0) --------------------------
+# One address to remember: tiles for every site, a setup checklist per reader, guides and FAQs.
+# Served by the portal (its /hub and /help pages); every link on it goes to the real sites
+# (request., books., audio., shelf.), which stay where they are. Behind the Authelia gate it is
+# also where the ONE sign-in happens: the gate's session cookie covers every subdomain.
+home.@@DOMAIN@@ {
+	bind @@BIND_IP@@
+	import public_tls
+	import hardening
+	# ONE route{}: Caddy runs handle{} BEFORE route{} (its directive order), so a gate route
+	# beside these handles would never run. Inside a route everything runs in the order written:
+	# the gate first, then the start page or the redirect.
+	route {
+		rewrite / /hub
+		# @AUTHELIA_GATE:home@
+		# ONLY the start page, the guides and the portal's script are served here. Everything else
+		# (the login form, downloads, /send, /intake, /admin...) goes to request., where its rate
+		# limits, fail2ban, Turnstile and any Cloudflare Access rule apply: home. never becomes a
+		# second, less protected door to the portal. Without the gate, /hub's login redirect lands
+		# on request./login?next=/hub, which comes back to request./hub (the same page).
+		@startpage path /hub /help/* /static/*
+		handle @startpage {
+			reverse_proxy 127.0.0.1:8090 {
+				header_up X-Forwarded-For {client_ip}
+				header_up X-Real-IP {client_ip}
+			}
+		}
+		handle {
+			redir https://request.@@DOMAIN@@{uri} 302
+		}
+	}
+}
+
 # ---- PUBLIC: Shelfmark search/download UI (through Cloudflare) --------------
 # Logs in with Calibre-Web accounts; downloads land in the user's dropbox.
 

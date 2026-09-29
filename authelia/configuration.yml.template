@@ -74,20 +74,31 @@ access_control:
         - '^/intake(\?.*)?$'
         # send-to-e-reader: the e-reader's browser shows a code; the book needs that browser's cookie
         - '^/send(/file)?(\?.*)?$'
-    # everything else on the public apps requires login + 2FA at Authelia first
+    # everything else on the public apps requires a login at Authelia first. v6.0: a second factor
+    # for admins always; for readers only with AUTHELIA_READERS_2FA=true (bookstack.sh renders
+    # @@READER_POLICY@@ as two_factor or one_factor). First matching rule wins: admins first.
     - domain:
+        - 'home.@@DOMAIN@@'
         - 'books.@@DOMAIN@@'
         - 'audio.@@DOMAIN@@'
         - 'request.@@DOMAIN@@'
         - 'shelf.@@DOMAIN@@'
+      subject: 'group:admins'
       policy: two_factor
+    - domain:
+        - 'home.@@DOMAIN@@'
+        - 'books.@@DOMAIN@@'
+        - 'audio.@@DOMAIN@@'
+        - 'request.@@DOMAIN@@'
+        - 'shelf.@@DOMAIN@@'
+      policy: @@READER_POLICY@@
 
 session:
   name: authelia_session
   cookies:
     - domain: '@@DOMAIN@@'
       authelia_url: 'https://auth.@@DOMAIN@@'
-      default_redirection_url: 'https://books.@@DOMAIN@@'
+      default_redirection_url: 'https://home.@@DOMAIN@@'
       expiration: '4h'
       inactivity: '30m'
 

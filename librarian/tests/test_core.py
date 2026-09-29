@@ -66,7 +66,8 @@ def test_a_job_interrupted_by_two_restarts_is_not_requeued_forever():
 
 def test_prefs_defaults_and_validation():
     assert db.get_prefs("alice") == {"preferred_format": "epub", "auto_kindle": False, "notify_email": False,
-                                     "last_kindle_test": None, "language": "en"}
+                                     "last_kindle_test": None, "language": "en",
+                                     "ntfy_topic": "", "hc_want": False, "hc_want_kind": "ebook", "hc_want_seeded": None}   # v6.0
     db.set_prefs("alice", preferred_format="azw3", auto_kindle=True)
     assert db.get_prefs("alice")["preferred_format"] == "azw3" and db.get_prefs("alice")["auto_kindle"] is True
     db.set_prefs("alice", notify_email=True)
@@ -426,7 +427,10 @@ def test_folder_of_ebooks_is_imported_book_by_book_not_as_an_audiobook(users):
 def test_mixed_and_bookless_folders_are_parked_with_a_clear_message(users):
     base = os.path.join(config.DROPBOX_DIR, "alice")
     mixed = os.path.join(base, "Mixed"); os.makedirs(mixed)
-    open(os.path.join(mixed, "01.mp3"), "wb").write(b"ID3"); make_epub(os.path.join(mixed, "book.epub"))
+    # v6.0: one or two PDF/EPUB companions beside the audio are part of an audiobook; three ebooks are not
+    open(os.path.join(mixed, "01.mp3"), "wb").write(b"ID3")
+    for i in range(3):
+        make_epub(os.path.join(mixed, f"book{i}.epub"))
     junk = os.path.join(base, "Photos"); os.makedirs(junk)
     open(os.path.join(junk, "a.jpg"), "wb").write(b"jpg"); open(os.path.join(junk, "b.heic"), "wb").write(b"x")
     notes = os.path.join(base, "Audio with notes"); os.makedirs(notes)

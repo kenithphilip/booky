@@ -170,6 +170,8 @@ def search_once(req, shelfmark_api, now=None):
         return _queue(dict(req, attempts=attempts), best, shelfmark_api, now)
     db.comic_update(rid, status="confirm", attempts=attempts, candidate=best, reasons=comicrel.explain(req, best),
                     detail="found a copy: is it the one you want?")
+    notify.reader(owner, f"Found: {req['series_name']}", f"Copies of {req['series_name']} are waiting for your yes (Yes to all on Comics).",
+                  click=notify.portal_url("/comics"), tags="question", seq=f"comicconf-{owner}-{req['provider']}-{req['series_id']}")
     return "confirm"
 
 
@@ -408,12 +410,16 @@ def verify_arrival(req, cbz, stem, info=None):
 
 def _hold(req, path, problems, meta):
     """Keep a copy of the arrived file aside for the reader; the caller removes the original."""
-    held = os.path.join(HELD_DIR, str(req["id"]))
+    # v6.0: in the reader's own dropbox under a dot-name the scanner skips (not in /state's backup)
+    held = os.path.join(config.DROPBOX_DIR, req["owner"], f".held-comic-{int(req['id'])}")
+    shutil.rmtree(held, ignore_errors=True)
     os.makedirs(held, exist_ok=True)
     dest = os.path.join(held, os.path.basename(path))
     shutil.copyfile(path, dest)
     db.comic_update(req["id"], status="held", held_path=dest, held_meta=meta,
                     detail="the file that came does not look like this one: " + "; ".join(problems))
+    notify.reader(req["owner"], f"Check: {_title(req)}", f"What arrived for {_title(req)} does not look like it: " + "; ".join(problems),
+                  click=notify.portal_url("/comics"), tags="warning", seq=f"comic-{req['id']}")
     notify.admin("error", {"owner": req["owner"], "title": _title(req), "source": "comics",
                            "detail": "held for the reader to check: " + "; ".join(problems),
                            "seq": notify.seq_id("comic", req["id"])})
@@ -619,6 +625,8 @@ def arrived(req, note):
     """The file of a request was handed to Calibre-Web."""
     if req:
         db.comic_update(req["id"], status="done", detail=note[:300])
+        notify.reader(req["owner"], _title(req), f"{_title(req)} is in your library.", click=notify.portal_url("/comics"),
+                      tags="books", seq=f"comicdone-{req['owner']}-{req['provider']}-{req['series_id']}")
         notify.admin("done", {"owner": req["owner"], "title": _title(req), "source": "comics", "status": "done",
                               "seq": notify.seq_id("comic", req["id"])})
 

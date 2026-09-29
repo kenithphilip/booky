@@ -131,9 +131,16 @@ def check(f, now=None):
 
 def run_once(now=None, limit=10):
     now = now or time.time()
-    total = 0
+    total, by_owner = 0, {}
     for f in db.follow_due(now, limit):
-        total += check(f, now)
+        n = check(f, now)
+        total += n
+        if n:
+            by_owner[f["owner"]] = by_owner.get(f["owner"], 0) + n
+    for owner, n in by_owner.items():            # v6.0: one push per reader, the newest titles in it
+        titles = [x["title"] for x in db.notices(owner)[:3]]
+        notify.reader(owner, f"{n} new for you", "New from what you follow: " + "; ".join(titles) + ("…" if n > 3 else ""),
+                      click=notify.portal_url("/"), tags="sparkles", seq=f"follows-{owner}")
     if total:
         mail_digests()
     admin_summary(now)
@@ -141,13 +148,14 @@ def run_once(now=None, limit=10):
 
 
 # ---- one tap ---------------------------------------------------------------------------------------
-def shelfmark_search_url(title, author):
-    """Shelfmark, already searching for this book (the reader picks the copy there)."""
+def shelfmark_search_url(title, author, kind="ebook"):
+    """Shelfmark, already searching for this book (the reader picks the copy there); kind 'audio'
+    searches its audiobooks."""
     from urllib.parse import urlencode
     base = (config.SHELF_URL or "").rstrip("/")
     if not base:
         return None
-    p = {"content_type": "ebook", "q": title}
+    p = {"content_type": "audiobook" if kind == "audio" else "ebook", "q": title}
     if author:
         p["author"] = author
     return f"{base}/?{urlencode(p)}"

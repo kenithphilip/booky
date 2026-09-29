@@ -1,4 +1,4 @@
-{% extends "base.html" %}{% block body %}
+{% extends "base.html" %}{% block bodyattrs %}{% if book_reqs and book_reqs|selectattr("status", "in", ["queued", "downloading"])|list %} data-refresh="30"{% endif %}{% endblock %}{% block body %}
 {% if admin and pending %}
 <h2>Pending approval</h2>
 {% for r in pending %}
@@ -50,7 +50,7 @@
 {% endif %}
 
 {% if book_reqs %}
-<h2>Books found for you through Shelfmark</h2>
+<h2>Get it: books and audiobooks being found for you</h2>
 <p class="mut">Get it: the portal looks for a copy on the indexers (the right title and author, one book, EPUB first, your language)
 and shows it to you here. Nothing downloads until you say <strong>Yes, that one</strong>{% if cfg.BOOK_CONFIRM == 'sure' %} (a retail EPUB whose
 name has the title, the author and your language is downloaded without asking){% endif %}. When the file arrives it is checked
@@ -59,17 +59,18 @@ within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }
 {% for b in book_reqs %}
 {% set st_class = 'done' if b.status in ('done', 'owned', 'shared') else 'error' if b.status in ('not-found', 'held') else 'pending' if b.status == 'confirm' else b.status %}
 <div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
-<div style="flex:1"><strong>{% if b.calibre_id and b.status in ('done', 'owned', 'shared') %}<a href="{{ url_for('book_page', book_id=b.calibre_id) }}">{{ b.title }}</a>{% else %}{{ b.title }}{% endif %}</strong>{% if b.author %} <span class="mut">— {{ b.author }}</span>{% endif %}
-<span class="badge st-{{ st_class }}">{{ {'queued': 'looking', 'pending': 'waiting for approval', 'confirm': 'confirm this copy', 'downloading': 'downloading', 'held': 'check this file', 'done': 'in your library', 'owned': 'already yours', 'shared': 'from the family library', 'not-found': 'not found', 'cancelled': 'cancelled'}.get(b.status, b.status) }}</span>
+<div style="flex:1"><strong>{% if b.kind != 'audio' and b.calibre_id and b.status in ('done', 'owned', 'shared') %}<a href="{{ url_for('book_page', book_id=b.calibre_id) }}">{{ b.title }}</a>{% else %}{{ b.title }}{% endif %}</strong>{% if b.author %} <span class="mut">— {{ b.author }}</span>{% endif %}
+{% if b.kind == 'audio' %}<span class="badge">audiobook</span>{% endif %}
+<span class="badge st-{{ st_class }}">{{ {'queued': 'looking', 'pending': 'waiting for approval', 'confirm': 'confirm this copy', 'downloading': 'downloading', 'held': 'check this file', 'done': 'in your audiobooks' if b.kind == 'audio' else 'in your library', 'owned': 'already yours', 'shared': 'from the family library', 'not-found': 'not found', 'cancelled': 'cancelled'}.get(b.status, b.status) }}</span>
 {% if admin %}<span class="mut">for {{ b.owner }}</span>{% endif %}<br>
-<span class="mut">{{ b.detail or '' }}{% if b.status == 'queued' and b.next_try %} · next look {{ b.next_try | ago_or_in }}{% endif %}</span>
+<span class="mut">{{ b.detail or '' }}{% if b.status == 'queued' and b.next_try %} · next look {{ b.next_try | ago_or_in(past='any minute now') }}{% endif %}</span>
 {% if b.status == 'confirm' and b.candidate %}{% set c = b.candidate %}
 <div style="margin-top:6px">Found: <strong class="code">{{ c.title }}</strong><br>
 <span class="mut">{% if c.size_bytes %}{{ (c.size_bytes / 1048576) | round(1) }} MB · {% endif %}{% if c.indexer %}from {{ c.indexer }} · {% endif %}{{ b.reasons | join(' · ') }}</span></div>
 {% endif %}
 {% if b.status == 'held' and b.held_meta %}{% set h = b.held_meta %}
-<div style="margin-top:6px">The file <span class="code">{{ h.file }}</span> says it is: <strong>{{ h.title or 'no title inside' }}</strong>{% if h.author %} by {{ h.author }}{% endif %}{% if h.language %} · language {{ h.language }}{% endif %} · {{ (h.format or '?') | upper }}.
-<br><span class="mut">It has not been added to your library. Keep it if it is the book after all (an edition with another title, say).</span></div>
+<div style="margin-top:6px">The file <span class="code">{{ h.file }}</span> says it is: <strong>{{ h.title or 'no title inside' }}</strong>{% if h.author %} by {{ h.author }}{% endif %}{% if h.language %} · language {{ h.language }}{% endif %} · {{ (h.format or '?') | upper }}{% if h.hours %} · {{ h.hours }} h{% endif %}.
+<br><span class="mut">It has not been added to your {{ 'audiobooks' if b.kind == 'audio' else 'library' }}. Keep it if it is the {{ 'audiobook' if b.kind == 'audio' else 'book' }} after all (an edition with another title, say).</span></div>
 {% endif %}</div>
 <div class="row" style="flex:none">
 {% if b.status == 'confirm' and b.owner == session.user %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='yes') }}">{{ csrf_field() }}<button type="submit">Yes, that one</button></form>
@@ -78,7 +79,7 @@ within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }
 <form method="post" action="{{ url_for('book_request_action', rid=b.id, action='no') }}">{{ csrf_field() }}<button type="submit">Not it: find another</button></form>{% endif %}
 {% if admin and b.status == 'pending' %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='approve') }}">{{ csrf_field() }}<button type="submit">Approve</button></form>{% endif %}
 {% if b.status in ('not-found', 'cancelled') %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='retry') }}">{{ csrf_field() }}<button type="submit" class="sec">Look again</button></form>{% endif %}
-{% if b.status in ('not-found', 'confirm') and cfg.SHELF_URL %}<a class="btn sec" href="{{ shelf_search(b.title, b.author) }}" target="_blank" rel="noopener">Pick in Shelfmark</a>{% endif %}
+{% if b.status in ('not-found', 'confirm') and cfg.SHELF_URL %}<a class="btn sec" href="{{ shelf_search(b.title, b.author, b.kind) }}" target="_blank" rel="noopener">Pick in Shelfmark</a>{% endif %}
 {% if b.status in ('queued', 'pending', 'confirm', 'held', 'not-found') %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='cancel') }}">{{ csrf_field() }}<button type="submit" class="sec">Cancel</button></form>{% endif %}
 </div></div></div>
 {% endfor %}
@@ -94,7 +95,7 @@ within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }
 <span class="badge">{{ 'audiobook' if w.kind == 'audio' else 'ebook' }}</span>
 <span class="badge st-{{ w.status }}">{{ {'looking': 'looking', 'candidate': 'possible match', 'found': 'found', 'cancelled': 'cancelled', 'expired': 'gave up'}.get(w.status, w.status) }}</span>
 {% if admin %}<span class="mut">for {{ w.owner }}</span>{% endif %}<br>
-<span class="mut">{{ w.detail or 'waiting for its first look' }}{% if w.status in ('looking', 'candidate') and w.next_check %} · next look {{ w.next_check | ago_or_in }}{% endif %}</span>
+<span class="mut">{{ w.detail or 'waiting for its first look' }}{% if w.status in ('looking', 'candidate') and w.next_check %} · next look {{ w.next_check | ago_or_in(past='any minute now') }}{% endif %}</span>
 {% if w.status == 'candidate' and w.candidate %}
 <div style="margin-top:6px">Found: <strong>{{ w.candidate.title }}</strong> <span class="mut">— {{ w.candidate.author or 'no author given' }} · {{ source_label(w.candidate.source) }} · from <span class="code">{{ w.cand_host }}</span></span>
 {% if w.reasons %}<br><span class="mut" style="font-size:12px">Why: {{ w.reasons | join('; ') }}</span>{% endif %}</div>
@@ -118,8 +119,9 @@ within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }
 <td class="mut">{{ k.detail or '' }}</td><td class="mut">{{ k.updated | ago_or_in }}</td></tr>{% endfor %}
 </table></div>{% endif %}
 
-<h2>{{ 'All requests' if admin else 'My requests' }}</h2>
-<p class="mut">Finished books appear under <a href="{{ url_for('my_library') }}">My books</a> and on your linked devices.</p>
+{% if rows or not (book_reqs or looking) %}
+<h2>{{ 'All uploads and catalogue requests' if admin else 'Uploads and catalogue requests' }}</h2>
+<p class="mut">Free-catalogue requests and the files you upload or drop in. Finished books appear under <a href="{{ url_for('my_library') }}">My books</a> and on your linked devices.</p>
 <div class="card"><table>
 <tr><th>Title</th>{% if admin %}<th>Owner</th>{% endif %}<th>Source</th><th>Status</th><th>Detail</th><th></th></tr>
 {% for r in rows %}<tr><td>{{r.title}}</td>{% if admin %}<td>{{r.owner}}</td>{% endif %}
@@ -127,4 +129,4 @@ within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }
 <td class="mut">{{ friendly_detail(r.detail, admin) }}</td>
 <td>{% if r.can_dismiss %}<form method="post" action="{{ url_for('dismiss', rid=r.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Clear</button></form>{% endif %}</td></tr>{% endfor %}
 {% if not rows %}<tr><td colspan="6" class="mut">Nothing yet.</td></tr>{% endif %}
-</table></div>{% endblock %}
+</table></div>{% endif %}{% endblock %}

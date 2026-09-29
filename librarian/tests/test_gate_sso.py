@@ -37,9 +37,17 @@ def test_the_gate_signs_the_reader_in(client, gate):
 
 
 def test_admin_rights_come_from_calibre_web_not_the_header(client, gate):
-    client.get("/status", headers=hdr("admin"))
+    # v6.0: through the gate, admin needs BOTH the Calibre-Web role and Authelia's admins group
+    # (the group is what makes Authelia ask admins for a second factor)
+    client.get("/status", headers={**hdr("admin"), "Remote-Groups": "users,admins"})
     with client.session_transaction() as s:
         assert s["admin"] is True
+    client.get("/logout")
+    with client.session_transaction() as s:
+        s.clear()
+    client.get("/status", headers=hdr("admin"))
+    with client.session_transaction() as s:
+        assert s["user"] == "admin" and s["admin"] is False, "a Calibre-Web admin outside the admins group signed in with one factor"
     client.get("/status", headers={**hdr("bob"), "Remote-Groups": "admins"})
     with client.session_transaction() as s:
         assert s["user"] == "bob" and s["admin"] is False
@@ -160,6 +168,28 @@ def test_the_host_reports_back(users, capsys):
     assert db.gate_pending() == []
 
 
+def test_the_portal_login_form_behind_the_gate_keeps_the_group_rule(client, gate):
+    """A Calibre-Web admin outside Authelia's admins group got in with a password alone; posting
+    the portal's own /login form (same user, their password) must not make them an admin."""
+    client.get("/status", headers=hdr("admin"))
+    with client.session_transaction() as s:
+        tok = s["csrf"]
+    client.post("/login", data={"username": "admin", "password": "adminpass1", "csrf": tok}, headers=hdr("admin"))
+    client.get("/status", headers=hdr("admin"))
+    with client.session_transaction() as s:
+        assert s["user"] == "admin" and s["admin"] is False
+    assert client.get("/admin", headers=hdr("admin")).status_code in (302, 403)
+    client.get("/status", headers={**hdr("admin"), "Remote-Groups": "users,admins"})
+    with client.session_transaction() as s:
+        assert s["gate_admin"] is True
+
+def test_a_signed_in_reader_is_sent_on_to_next(client):
+    login(client, "bob", "bobpass1")
+    r = client.get("/login?next=/hub")
+    assert r.status_code == 302 and r.headers["Location"].endswith("/hub")
+    assert client.get("/login?next=//evil.example").headers["Location"].endswith("/")
+
+
 def _sync():
     spec = importlib.util.spec_from_file_location("gate_sync", os.path.join(ROOT, "scripts", "gate-sync.py"))
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -268,3 +298,14 @@ def test_audiobookshelf_must_confirm_the_switch(monkeypatch):
     with pytest.raises(absapi.AbsError, match="did not switch"):
         absapi.set_oidc(True)
     assert calls == [("PATCH", "/api/auth-settings"), ("GET", "/api/auth-settings")]
+
+
+def test_gate_sync_keeps_the_admins_group_in_step_with_calibre_web():
+    gs = _sync()
+    text = ("users:\n  alice:\n    displayname: \"Alice\"\n    password: \"$argon2id$x\"\n    groups:\n      - users\n"
+            "  bob:\n    displayname: \"Bob\"\n    password: \"$argon2id$y\"\n    groups:\n      - users\n      - admins\n")
+    out, moved = gs.sync_groups(text, {"alice"})
+    assert sorted(moved) == ["alice", "bob"]
+    assert "  alice:\n    displayname: \"Alice\"\n    password: \"$argon2id$x\"\n    groups:\n      - users\n      - admins\n" in out
+    assert "  bob:\n    displayname: \"Bob\"\n    password: \"$argon2id$y\"\n    groups:\n      - users\n" in out and out.count("admins") == 1
+    assert gs.sync_groups(out, {"alice"}) == (out, []), "nothing to change: the file is not rewritten"

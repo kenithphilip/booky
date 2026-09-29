@@ -463,7 +463,7 @@ envset CF_API_TOKEN cf-token-123; envset TZ UTC
 reset "example.test" "admin@example.test" "UTC" "cf-token-123" "yes"; step_configure >/dev/null
 
 echo "== Authelia gate + users"
-inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 4 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && grep -qE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile"' "gate injected into 4 vhosts (shelf without a bypass matcher)"
+inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 5 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && [ "$(grep -cE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile")" = 2 ]' "gate injected into 5 vhosts (shelf and home. without a bypass matcher)"
 expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$|/send$|/send/file$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
 render_caddyfile; expect '! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "re-render removes the gate (disable path)"
 envset AUTHELIA_ENABLED true; reset "example.test" "admin@example.test" "UTC" "" "yes"; step_configure >/dev/null
@@ -1961,7 +1961,7 @@ envset NOTIFY_WEBHOOK "https://ntfy.sh/bookstack-x"; envset SMTP_HOST ""; envset
 kc=$(RESTIC_ENV_PATH="$T/no-restic.env" kuma_config)
 kq(){ printf '%s' "$kc" | python3 -c "import sys,json; d=json.load(sys.stdin); print($1)"; }
 expect '[ "$(kq "sorted(d[\"push\"])")" = "['"'"'disk'"'"', '"'"'selftest'"'"']" ]' "push monitors only for jobs scheduled here (selftest timer + disk cron; no cfips/metapush cron yet)"
-expect '[ "$(kq "d[\"features\"]")" = "{'"'"'torrents'"'"': True, '"'"'ephemera'"'"': True, '"'"'authelia'"'"': False, '"'"'flaresolverr'"'"': True}" ]' "features follow .env; Ephemera implies the FlareSolverr monitor"
+expect '[ "$(kq "d[\"features\"]")" = "{'"'"'torrents'"'"': True, '"'"'ephemera'"'"': True, '"'"'authelia'"'"': False, '"'"'flaresolverr'"'"': True, '"'"'home'"'"': True}" ]' "features follow .env; Ephemera implies the FlareSolverr monitor"
 expect '[ "$(kq "d[\"reboot_time\"]")" = 03:10 ] && [ "$(kq "d[\"password\"]")" = "$kp1" ] && [ "$(kq "d[\"notify\"][\"smtp\"]")" = None ]' "the reboot window follows unattended-upgrades' own time; no SMTP -> no e-mail channel"
 envset SMTP_HOST smtp.example.test; envset SMTP_FROM lib@example.test; envset ADMIN_EMAIL me@example.test
 kwh=$(envget NOTIFY_WEBHOOK); envset NOTIFY_WEBHOOK https://ntfy.sh/family-topic; envset ALERT_MAIL ""
@@ -2569,4 +2569,54 @@ for id in L01 L02 L03 L04 L05 L06 L07 L08 L09 L10 L11 L12 L13 L14 L15 L16 L17 L1
     ok "$id status '$d' agrees with the code"
   fi
 done
+echo "== v6.0: the start page, one sign-in, the pins offer"
+envset DOMAIN example.test; render_caddyfile; cf="$STACK_DIR/caddy/Caddyfile"
+expect 'grep -q "^home.example.test {" "$cf" && awk "/^home.example.test \{/,/^\}/" "$cf" | grep -q "rewrite / /hub" && awk "/^home.example.test \{/,/^\}/" "$cf" | grep -qF "@startpage path /hub /help/* /static/*" && awk "/^home.example.test \{/,/^\}/" "$cf" | grep -qF "redir https://request.example.test{uri} 302"' "home. serves only the start page and guides; anything else goes to the portal"
+envset AUTHELIA_READERS_2FA false; envset AUTHELIA_PASSKEYS false; render_authelia_config; ac="$STACK_DIR/authelia/configuration.yml"
+expect '! grep -q "@@READER_POLICY@@" "$ac" && [ "$(grep -n "group:admins" "$ac" | head -1 | cut -d: -f1)" -lt "$(grep -n "policy: one_factor" "$ac" | tail -1 | cut -d: -f1)" ] && grep -A1 "group:admins" "$ac" | grep -q "policy: two_factor"' "admins get a second factor, and their rule comes before the readers' password-only one"
+expect 'grep -q "home.example.test" "$ac" && grep -q "default_redirection_url: '"'"'https://home.example.test'"'"'" "$ac" && ! grep -q "^webauthn:" "$ac"' "the sign-in page knows home. and sends people there after signing in; passkeys stay off by default"
+envset AUTHELIA_READERS_2FA true; envset AUTHELIA_PASSKEYS true; render_authelia_config
+expect '! grep -q "policy: one_factor$" <(sed -n "/access_control:/,/^[a-z]/p" "$ac" | grep -v "bypass") && grep -q "enable_passkey_login: true" "$ac"' "AUTHELIA_READERS_2FA=true asks readers for a second factor too; AUTHELIA_PASSKEYS adds passkey sign-in"
+envset ABS_OIDC_SECRET oidc-secret-for-test; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$STACK_DIR/authelia/oidc-jwks.pem" 2>/dev/null
+envset AUTHELIA_READERS_2FA false; envset AUTHELIA_PASSKEYS false; render_authelia_config
+expect 'grep -q "authorization_policies:" "$ac" && grep -q "authorization_policy: '"'"'family'"'"'" "$ac" && ! grep -q "oidc-secret-for-test" "$ac"' "Audiobookshelf sign-in follows the same admin/reader rule (a named OIDC policy), with only a digest of its secret"
+rm -f "$STACK_DIR/authelia/oidc-jwks.pem"; envset ABS_OIDC_SECRET ""
+expect 'declare -f step_deploy | grep -q gate_refresh && declare -f step_update | grep -q gate_refresh && declare -f gate_refresh | grep -q "force-recreate authelia" && declare -f gate_refresh | grep -q authelia_sync_admin_groups' "Deploy and Update re-render the sign-in rules and restart Authelia (it does not reload access_control)"
+expect 'pin_newer "louislam/uptime-kuma:1.23.16" "louislam/uptime-kuma:2.5.5-slim" && ! pin_newer "caddy:2.10.2" "caddy:2.10.0" && ! pin_newer "caddy:2.10.2" "caddy:2.10.2" && pin_newer "x/y:v4.0.7" "x/y:v4.0.8" && ! pin_newer "x/y:v4.0.8" "x/y:v4.0.7" && pin_newer "x/y:1.0" "z/y:1.0"' "the pins offer lists only upgrades (never a downgrade); a pin moved to another image is always offered"
+# Kuma 1 -> 2: a complete copy first, never replaced by a retry; restored only from a complete copy
+rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data"; echo v1 > "$STACK_DIR/kuma/data/kuma.db"
+kuma_v2_prepare "louislam/uptime-kuma:1.23.16" "louislam/uptime-kuma:2.5.5-slim"
+expect '[ -f "$STACK_DIR/kuma/data.v1/.bookstack-complete" ] && grep -q v1 "$STACK_DIR/kuma/data.v1/kuma.db" && [ -f "$STACK_DIR/$KUMA_MIG_REL" ] && kuma_migrating' "before the first 2.x start: a complete 1.x copy and the migration marker"
+echo v2 > "$STACK_DIR/kuma/data/kuma.db"; kuma_v2_prepare "louislam/uptime-kuma:1.23.16" "louislam/uptime-kuma:2.5.5-slim"
+expect 'grep -q v1 "$STACK_DIR/kuma/data.v1/kuma.db"' "a retried update never replaces the 1.x copy with migrated data"
+touch -d "2 days ago" "$STACK_DIR/$KUMA_MIG_REL" 2>/dev/null || touch -t "$(date -d "2 days ago" +%Y%m%d%H%M 2>/dev/null || date -v-2d +%Y%m%d%H%M)" "$STACK_DIR/$KUMA_MIG_REL"
+expect '! kuma_migrating' "a day-old marker is not a migration in progress (heal.sh and the update gate look at Kuma again)"
+( img(){ echo "louislam/uptime-kuma:1.23.16"; }; kuma_v1_restore )
+expect 'grep -q v1 "$STACK_DIR/kuma/data/kuma.db" && [ ! -e "$STACK_DIR/kuma/data.v1" ] && [ ! -f "$STACK_DIR/$KUMA_MIG_REL" ]' "a rollback to 1.x puts the complete copy back"
+rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data"
+# home.<domain> on an older zone: created only when free, never repointed from another service
+envset PUBLIC_IP 203.0.113.5; envset HOME_URL ""
+( cf_zone(){ ZONE=z; }; cf(){ echo '{"result":[]}'; }; cf_dns(){ echo "cf_dns $*" >> "$LOG"; }; : > "$LOG"; home_dns; [ -z "$HOME_DNS_NOTE" ] && seen "cf_dns home 203.0.113.5 true bookstack: start page" && [ -z "$(envget HOME_URL)" ] ); rc=$?
+expect '[ $rc = 0 ]' "a free home. name gets its proxied A record, tagged as bookstack's own"
+( cf_zone(){ ZONE=z; }; cf(){ echo '{"result":[{"type":"A","content":"198.51.100.7"}]}'; }; cf_dns(){ echo "cf_dns $*" >> "$LOG"; }; : > "$LOG"; home_dns; ! seen "cf_dns home" && echo "$HOME_DNS_NOTE" | grep -q "already points elsewhere" ); rc=$?
+expect '[ $rc = 0 ] && [ "$(envget HOME_URL)" = "https://request.example.test/hub" ]' "a home. record of another service (Home Assistant, a NAS) is left alone, and every start-page link goes to request./hub instead"
+render_authelia_config; KC_WAIT=1 kuma_config > "$T/kc.json"
+expect 'grep -q "default_redirection_url: '"'"'https://request.example.test/hub'"'"'" "$ac" && python3 -c "import json,sys; sys.exit(0 if json.load(open(\"$T/kc.json\"))[\"features\"][\"home\"] is False else 1)"' "then Authelia sends people to request./hub after sign-in, and Kuma gets no home. monitor"
+( cf_zone(){ ZONE=z; }; cf(){ echo '{"result":[{"type":"A","content":"198.51.100.7","comment":"bookstack: start page"}]}'; }; cf_dns(){ echo "cf_dns $*" >> "$LOG"; }; : > "$LOG"; home_dns; seen "cf_dns home 203.0.113.5 true" && [ -z "$HOME_DNS_NOTE" ] && [ -z "$(envget HOME_URL)" ] ); rc=$?
+expect '[ $rc = 0 ]' "bookstack's own home. record (its comment) still follows the server after a restore onto a new one"
+( cf_zone(){ ZONE=z; }; cf(){ echo '{"result":[{"type":"CNAME","content":"nas.example.net"}]}'; }; cf_dns(){ echo "cf_dns $*" >> "$LOG"; }; : > "$LOG"; home_dns; ! seen "cf_dns home" ); rc=$?
+expect '[ $rc = 0 ]' "a CNAME on home. is someone else's too"
+envset HOME_URL ""; render_authelia_config; KC_WAIT=1 kuma_config > "$T/kc.json"
+expect 'grep -q "default_redirection_url: '"'"'https://home.example.test'"'"'" "$ac" && python3 -c "import json,sys; sys.exit(0 if json.load(open(\"$T/kc.json\"))[\"features\"][\"home\"] is True else 1)"' "with home. in use: Authelia sends people to it, and Kuma watches it"
+( cf_zone(){ return 1; }; home_dns; echo "$HOME_DNS_NOTE" | grep -q "add an A record" ); rc=$?
+expect '[ $rc = 0 ]' "no Cloudflare access: the note says what to add by hand"
+expect 'declare -f step_cloudflare | grep -q "local public=\"books audio request shelf\"" && declare -f step_cloudflare | grep -q home_dns && declare -f step_update | grep -q home_dns' "Install -> Cloudflare never repoints home. through the plain list: it goes through home_dns, as Deploy and Update do"
+expect 'awk "/^home.example.test \{/,/^\}/" "$cf" | grep -n "" | grep -E "route \{|@startpage path" | head -1 | grep -q "route {"' "home.'s gate and its handlers sit in ONE route (Caddy runs handle before route: a separate gate route never ran)"
+# a v5.9.1 copy (no completeness flag: it touched the marker only after cp -a) still rolls back
+rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data" "$STACK_DIR/kuma/data.v1"; echo v1 > "$STACK_DIR/kuma/data.v1/kuma.db"; echo v2 > "$STACK_DIR/kuma/data/kuma.db"; touch "$STACK_DIR/$KUMA_MIG_REL"
+( img(){ echo "louislam/uptime-kuma:1.23.16"; }; kuma_v1_restore )
+expect 'grep -q v1 "$STACK_DIR/kuma/data/kuma.db"' "a rollback also restores the 1.x copy an earlier (v5.9.1) update made"
+rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data"
+envset AUTHELIA_READERS_2FA ""; envset AUTHELIA_PASSKEYS ""
+
 echo; echo "TUI RESULT: $pass passed, $fails failed"; exit $fails

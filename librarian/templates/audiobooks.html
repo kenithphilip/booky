@@ -9,7 +9,11 @@ a single file as it is, a folder of files as one ZIP.</p>
 {% for it in items %}
 <tr><td><strong>{{ it.title }}</strong>{% if it.author %} <span class="mut">· {{ it.author }}</span>{% endif %}</td>
 <td class="mut" style="white-space:nowrap">{% if it.size %}{{ '%.0f' % (it.size / 1048576) }} MB{% endif %}</td>
-<td><a class="btn sec" href="{{ url_for('audiobook_download', item_id=it.id) }}">Download</a></td></tr>
+<td><a class="btn sec" href="{{ url_for('audiobook_download', item_id=it.id) }}">Download</a>
+{% if it.got_it %}<details style="display:inline-block"><summary class="mut">Wrong?</summary>
+<form method="post" action="{{ url_for('audiobook_wrong', item_id=it.id) }}">{{ csrf_field() }}
+<span class="mut" style="display:block;white-space:normal;max-width:32ch">Takes it out of your audiobooks; that copy is never offered again and another is found (asking you first).</span>
+<button type="submit" class="danger">Wrong audiobook</button></form></details>{% endif %}</td></tr>
 {% endfor %}
 </table>
 {% endblock %}

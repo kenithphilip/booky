@@ -55,6 +55,7 @@ def test_find_audiobook_needs_title_and_author_and_one_item(monkeypatch):
     monkeypatch.setattr(absapi, "ensure_library", lambda **k: ("lib", "x"))
     monkeypatch.setattr(absapi, "_req", lambda m, path, **k: R({"results": list(items.values())} if path.endswith("/items") else items[path.rsplit("/", 1)[1]]))
     monkeypatch.setattr(absapi, "_json", lambda r: r.body)
+    share._ABS_ITEMS.update(items=None, at=0.0)
     m = share.find_audiobook("The Hobbit: 75th Anniversary Edition", "Tolkien")
     assert m == {"item_id": "i1", "how": "title+author", "owners": ["alice"]}
     assert share.find_audiobook("The Hobbit", "") is None, "an audiobook's name is all there is: both halves must agree"
@@ -113,7 +114,7 @@ def test_a_mobi_arrival_is_shared_by_its_own_metadata(users, tmp_path):
 
 def test_an_audiobook_arrival_the_family_has_is_not_added_again(users, monkeypatch, tmp_path):
     given = []
-    monkeypatch.setattr(share, "find_audiobook", lambda t, a: {"item_id": "i1", "how": "title+author", "owners": ["alice"]}
+    monkeypatch.setattr(share, "find_audiobook", lambda t, a, exclude=(): {"item_id": "i1", "how": "title+author", "owners": ["alice"]}
                         if (t, a) == ("The Hobbit", "J. R. R. Tolkien") else None)
     monkeypatch.setattr(share, "give_audiobook", lambda m, owner: given.append((m["item_id"], owner)))
     z = tmp_path / "J. R. R. Tolkien - The Hobbit.zip"
@@ -125,7 +126,7 @@ def test_an_audiobook_arrival_the_family_has_is_not_added_again(users, monkeypat
 
 
 def test_an_audiobook_folder_arrival_is_merged_and_the_folder_leaves(users, monkeypatch, tmp_path):
-    monkeypatch.setattr(share, "find_audiobook", lambda t, a: {"item_id": "i1", "how": "title+author", "owners": ["alice"]})
+    monkeypatch.setattr(share, "find_audiobook", lambda t, a, exclude=(): {"item_id": "i1", "how": "title+author", "owners": ["alice"]})
     monkeypatch.setattr(share, "give_audiobook", lambda m, owner: None)
     d = tmp_path / "Tolkien - The Hobbit"; d.mkdir(); (d / "01.mp3").write_bytes(b"ID3")
     note = worker._place_audio_dir(str(d), "bob", "Tolkien - The Hobbit", 5)
@@ -192,7 +193,7 @@ def test_the_gate_tells_a_reader_they_already_have_it(shelf):
 
 def test_the_gate_shares_audiobooks_through_audiobookshelf(shelf, monkeypatch):
     given = []
-    monkeypatch.setattr(share, "find_audiobook", lambda t, a: {"item_id": "i1", "how": "title+author", "owners": ["alice"]})
+    monkeypatch.setattr(share, "find_audiobook", lambda t, a, exclude=(): {"item_id": "i1", "how": "title+author", "owners": ["alice"]})
     monkeypatch.setattr(share, "give_audiobook", lambda m, owner: given.append(owner))
     shelf["rows"] = [_req(1, "bob", "The Hobbit", "Tolkien", kind="audiobook")]
     worker.shelfmark_gate_once()

@@ -311,7 +311,7 @@ def test_a_followed_name_opens_its_books_with_what_the_reader_has(shelf_on, monk
     home = shelf_on.get("/").get_data(as_text=True)
     assert "1 book waiting for your answer" in home and "Requests (1)" in home
     status = shelf_on.get("/status").get_data(as_text=True)
-    assert "Books found for you through Shelfmark" in status and "Frank Herbert - Children of Dune epub" in status
+    assert "Get it: books and audiobooks being found for you" in status and "Frank Herbert - Children of Dune epub" in status
     assert "Yes, that one" in status and "NZBgeek" in status and "3.0 MB" in status
     queued = []
     monkeypatch.setattr(shelfmark_api, "user_id", lambda name: 12)

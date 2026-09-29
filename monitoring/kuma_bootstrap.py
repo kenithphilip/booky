@@ -90,6 +90,11 @@ def desired_monitors(cfg):
         out.append(_http("public", f"Public path via Cloudflare (request.{d})",
                          f"https://request.{d}/healthz", interval=300, retryInterval=120,
                          maxretries=1, timeout=30))
+    if d and f.get("home", True):
+        # v6.0: the start page everyone is told to bookmark (its DNS record, certificate, gate rule).
+        # Not when home.<domain> belongs to another service (bookstack.sh home_dns, HOME_URL)
+        out.append(_http("home", f"Start page via Cloudflare (home.{d})",
+                         f"https://home.{d}/", interval=600, retryInterval=120, maxretries=1, timeout=30))
     if f.get("authelia"):
         out.append(_http("authelia", "Authelia (auth.) - health", "http://127.0.0.1:9091/api/health"))
     if f.get("torrents"):

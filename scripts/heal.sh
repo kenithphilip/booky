@@ -27,7 +27,7 @@ put(){ { grep -vE "^$1=" "$STATE" 2>/dev/null || true; echo "$1=$2"; } > "$STATE
 for c in $HEAL; do
   # Uptime Kuma 1 -> 2 migrates its database on first start; a restart then leaves it half
   # migrated and unable to start (bookstack.sh kuma_v2_prepare sets this marker)
-  [ "$c" = uptime-kuma ] && [ -f "$STACK_DIR/kuma/data/.bookstack-migrating" ] && continue
+  [ "$c" = uptime-kuma ] && [ -n "$(find "$STACK_DIR/kuma/data/.bookstack-migrating" -mmin -1440 2>/dev/null)" ] && continue
   st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null || true)
   if [ "$st" != unhealthy ]; then
     put "seen_$c" 0

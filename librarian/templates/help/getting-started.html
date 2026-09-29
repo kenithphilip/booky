@@ -1,0 +1,26 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>The family library is a few sites that work together. You only need to remember this one:
+<span class="code">{{ cfg.HOME_URL }}</span>. Everything else is linked from here.</p>
+<h3>The sites</h3>
+<ul>
+<li><strong>Library portal</strong> (<span class="code">{{ cfg.PORTAL_URL }}</span>): your home page. What you are reading, what arrived, search, getting books, comics, following series, your devices and settings.</li>
+<li><strong>Library site</strong> (<span class="code">{{ cfg.BOOKS_URL }}</span>): Calibre-Web, where the books live. Read in the browser, make shelves, and it is what your Kobo syncs with.</li>
+<li><strong>Audiobookshelf</strong> (<span class="code">{{ cfg.AUDIO_URL }}</span>): audiobooks, in the browser or its app, and it remembers where you are.</li>
+<li><strong>Shelfmark</strong> (<span class="code">{{ cfg.SHELF_URL }}</span>): for when you want to choose the exact copy of a book yourself.</li>
+</ul>
+<h3>Signing in</h3>
+{% if cfg.AUTHELIA_ENABLED %}
+<p>You sign in once, on the sign-in page, with your library user name and password{% if admin %} and, because you are an admin, a second factor (an authenticator app, a passkey or a security key){% endif %}. After that every site above lets you straight in for the rest of the session. Your session ends after a while of not using it; signing in again is one page.</p>
+{% else %}
+<p>Each site asks for the same library user name and password. (When the admin turns on the sign-in page, one sign-in will cover them all.)</p>
+{% endif %}
+<p>Apps and devices sign in on their own: your Kobo uses its sync link, reading apps use your library login, the Audiobookshelf app its own sign-in. None of them need the sign-in page.</p>
+<h3>Your books are yours</h3>
+<p>Everyone has their own library. You see only books you asked for, uploaded, or added from the family library. When you ask for a book someone in the family already has, it is simply added to yours: nothing is downloaded twice.</p>
+<h3>First steps</h3>
+<ol>
+<li>Open <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> and set up what you read on: a Kobo, a Kindle, or an app.</li>
+<li>Turn on notifications there, so you hear when something you asked for has arrived.</li>
+<li>Search for a book on the <a href="{{ cfg.PORTAL_URL }}/">portal</a> and press <strong>Get it</strong> (see <a href="{{ url_for('help_page', topic='requesting') }}">Getting a book</a>).</li>
+</ol>
+{% endblock %}

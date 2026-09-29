@@ -1,23 +1,42 @@
 {% extends "base.html" %}{% block body %}
+{% set f = dict(q=q, status=status, kind=kind, sort=sort, view=view) %}
 <h2>{{ 'All books' if admin else 'My books' }}</h2>
-<p class="mut">Your ebooks. Preferred format: <strong>{{ prefs.preferred_format }}</strong> (change on <a href="{{ url_for('devices') }}">Devices</a>).
-Kobo owners: just tap Sync on the device.{% if cfg.AUDIO_URL %} Audiobooks are in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a>.{% endif %}</p>
-<form method="get" class="row" style="margin-bottom:6px"><input type="text" name="q" value="{{ q }}" placeholder="Find a title or author…" style="flex:1"><button type="submit" class="sec">Find</button></form>
-{% if total %}<p class="mut">Showing {{ first }}–{{ last }} of {{ total }}{% if q %} matching “{{ q }}”{% endif %}.
-{% if page > 0 %}<a href="{{ url_for('my_library', q=q, page=page - 1) }}">← newer</a>{% endif %}
-{% if more %}<a href="{{ url_for('my_library', q=q, page=page + 1) }}">older →</a>{% endif %}</p>{% endif %}
-{% if not books and q %}<div class="card mut">No book matches “{{ q }}”.</div>
-{% elif not books %}<div class="card mut">No <em>ebooks</em> here yet. Request or upload a book and it shows up here after import (usually under a minute).
-{% if cfg.AUDIO_URL %}<br>Audiobooks are not listed here: they live in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a> (same username and password).{% endif %}</div>{% endif %}
+<p class="mut">Preferred download format: <strong>{{ prefs.preferred_format }}</strong> (<a href="{{ url_for('devices') }}">Devices</a>).
+Kobo: just sync the device.{% if cfg.AUDIO_URL %} Audiobooks: <a href="{{ url_for('my_audiobooks') }}">My audiobooks</a>.{% endif %}</p>
+<form method="get" class="row" style="margin-bottom:6px" data-autosubmit>
+<input type="text" name="q" value="{{ q }}" placeholder="Find a title or author…" style="flex:2;min-width:180px" data-filter=".bookitem">
+<select name="status" style="width:auto"><option value="">Any status</option>
+{% for v, l in (('unread', 'Unread'), ('reading', 'Reading'), ('read', 'Finished')) %}<option value="{{ v }}" {{ 'selected' if status == v }}>{{ l }}</option>{% endfor %}</select>
+{% if cfg.COMICS_ENABLED %}<select name="kind" style="width:auto"><option value="">Books and comics</option>
+<option value="books" {{ 'selected' if kind == 'books' }}>Books only</option><option value="comics" {{ 'selected' if kind == 'comics' }}>Comics only</option></select>{% endif %}
+<select name="sort" style="width:auto">{% for v, l in (('added', 'Recently added'), ('title', 'Title'), ('author', 'Author'), ('series', 'Series order')) %}<option value="{{ v }}" {{ 'selected' if sort == v }}>{{ l }}</option>{% endfor %}</select>
+<select name="view" style="width:auto"><option value="grid" {{ 'selected' if view == 'grid' }}>Covers</option><option value="list" {{ 'selected' if view == 'list' }}>List</option></select>
+<button type="submit" class="sec">Show</button></form>
+{% if total %}<p class="mut">{{ first }}–{{ last }} of {{ total }}{% if q %} matching “{{ q }}”{% endif %}.
+{% if page > 0 %}<a href="{{ url_for('my_library', page=page - 1, **f) }}">← previous</a>{% endif %}
+{% if more %}<a href="{{ url_for('my_library', page=page + 1, **f) }}">next →</a>{% endif %}</p>{% endif %}
+{% if not books and (q or status or kind) %}<div class="card mut">Nothing matches these filters. <a href="{{ url_for('my_library') }}">Show everything</a>.</div>
+{% elif not books %}<div class="card mut">No <em>ebooks</em> here yet. Get or upload a book and it shows up here after import (usually under a minute).
+{% if cfg.AUDIO_URL %}<br>Audiobooks are not listed here: they are under <a href="{{ url_for('my_audiobooks') }}">My audiobooks</a> and in <a href="{{ cfg.AUDIO_URL }}" target="_blank" rel="noopener">Audiobookshelf</a> (same username and password).{% endif %}</div>{% endif %}
+
+{% if view == 'grid' %}
+<div class="shelf">{% for b in books %}<a class="bookitem" href="{{ url_for('book_page', book_id=b.id) }}" data-text="{{ (b.title ~ ' ' ~ b.author ~ ' ' ~ (b.series or ''))|lower }}">
+<img src="{{ url_for('book_cover', book_id=b.id, ph=1) }}" alt="" loading="lazy">
+<div class="t">{{ b.title }}</div>
+<span class="mut">{% if sort == 'series' and b.series %}{{ b.series }} #{{ b.index | num }}{% else %}{{ b.author }}{% endif %}</span>
+{% if b.reading %}<br><span class="badge">{{ reading(b.reading) }}</span>{% endif %}</a>{% endfor %}</div>
+{% else %}
 {% for b in books %}
-<div class="card"><div class="row" style="justify-content:space-between">
-<div><a href="{{ url_for('book_page', book_id=b.id) }}"><strong>{{ b.title }}</strong></a>{% if b.reading %} <span class="badge">{{ reading(b.reading) }}</span>{% endif %}<br><span class="mut">{{ b.author }} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>
+<div class="card bookitem" data-text="{{ (b.title ~ ' ' ~ b.author ~ ' ' ~ (b.series or ''))|lower }}"><div class="row" style="justify-content:space-between">
+<div><a href="{{ url_for('book_page', book_id=b.id) }}"><strong>{{ b.title }}</strong></a>{% if b.reading %} <span class="badge">{{ reading(b.reading) }}</span>{% endif %}<br>
+<span class="mut">{{ b.author }}{% if b.series %} · {{ b.series }} #{{ b.index | num }}{% endif %} · added {{ b.added }}{% if admin and b.owners %} · {{ b.owners|join(', ') }}{% endif %}</span></div>
 <div class="row">
 {% if b.best %}<a class="btn" href="{{ url_for('download', book_id=b.id, fmt=b.best) }}">Download {{ b.best }}</a>{% endif %}
-{% for f in b.formats if f != b.best %}<a class="btn sec" href="{{ url_for('download', book_id=b.id, fmt=f) }}">{{ f }}</a>{% endfor %}
+{% for fm in b.formats if fm != b.best %}<a class="btn sec" href="{{ url_for('download', book_id=b.id, fmt=fm) }}">{{ fm }}</a>{% endfor %}
 {% if kindle_enabled and kindle_mail and b.kindle_ok %}
 <form method="post" action="{{ url_for('send_kindle', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Send to Kindle</button></form>
 {% elif kindle_enabled and kindle_mail %}<span class="mut" title="Amazon accepts EPUB or PDF by mail">no Kindle format yet</span>{% endif %}
 </div></div></div>
 {% endfor %}
+{% endif %}
 {% endblock %}

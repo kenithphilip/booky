@@ -30,7 +30,7 @@ and on your devices: your Kobo on its next sync, your Kindle by mail (Send to Ki
 <div class="card"><strong>{{ sw.series_name }} Vol. {{ sw.volume }} is in your library.</strong>
 {% if sw.known %}It holds the ticked chapters (MangaDex): take them out of your library?{% else %}MangaDex does not say which chapters it holds: tick the ones it replaces.{% endif %}
 <form method="post" action="{{ url_for('comic_swap', sid=sw.id) }}">{{ csrf_field() }}
-<div class="row" style="flex-wrap:wrap;gap:10px;margin:6px 0">{% for c in sw.chapters %}<label><input type="checkbox" name="book" value="{{ c.book_id }}" {{ 'checked' if c.tick }}> Ch. {{ c.number | string | replace('.0', '') }}</label>{% endfor %}</div>
+<div class="row" style="flex-wrap:wrap;gap:10px;margin:6px 0">{% for c in sw.chapters %}<label><input type="checkbox" name="book" value="{{ c.book_id }}" {{ 'checked' if c.tick }}> Ch. {{ c.number | num }}</label>{% endfor %}</div>
 <button type="submit" name="action" value="remove">Remove the ticked chapters</button>
 <button type="submit" name="action" value="keep" class="sec">Keep them all</button></form></div>
 {% endfor %}
@@ -56,7 +56,7 @@ Each file is checked when it arrives (series, number, language, pages) before it
   {'queued': 'looking', 'downloading': 'downloading', 'done': 'in your library', 'shared': 'from the family library',
    'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled', 'pending': 'waiting for approval',
    'confirm': 'confirm this copy', 'held': 'check this file'}.get(r.status, r.status) }}</td>
-<td style="white-space:nowrap">
+<td>
 {% if r.status == 'confirm' and r.owner == session.user %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='yes') }}" style="display:inline">{{ csrf_field() }}<button type="submit">Yes, that one</button></form>
 <form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='no') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Not it</button></form>{% endif %}
 {% if r.status == 'held' and r.owner == session.user %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='keep') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Keep it anyway</button></form>

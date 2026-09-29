@@ -1,0 +1,13 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>The library knows what you are reading from the Kobo (and KOReader, and the library site's own reader). Everything else you can mark yourself.</p>
+<ul>
+<li><strong>Mark a book:</strong> its page → <strong>Mark: Read · Reading · Unread</strong>. It shows on the portal, on your Kobo after its next sync, and reaches your trackers.</li>
+<li><strong>A comic series:</strong> <em>read up to here</em> next to a volume marks it and every earlier one you have.</li>
+</ul>
+<h3>Trackers (all optional, on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a>)</h3>
+<ul>
+<li><strong>Hardcover</strong> (books and audiobooks): paste a token from hardcover.app → Settings → API. Kobo and KOReader progress go there, and so does your audiobook listening.</li>
+<li><strong>AniList</strong> (manga): Connect AniList; manga volumes you finish count as read there. The number only goes up.</li>
+<li><strong>Metron</strong> (Western comics): your Metron user name and API key; issues you finish are marked read in your Metron collection.</li>
+</ul>
+{% endblock %}

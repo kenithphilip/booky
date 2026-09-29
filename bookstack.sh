@@ -763,10 +763,10 @@ step_configure() {
 # ---------- 4. cloudflare ----------
 CF_FAILS=""   # what the current Cloudflare run could not do; listed instead of claiming success
 cf_fail(){ CF_FAILS="$CF_FAILS\n  - $1"; }
-cf_dns() { # name ip proxied
+cf_dns() { # name ip proxied [comment]
   local id body
   id=$(cf GET "/zones/$ZONE/dns_records?type=A&name=$1.$DOMAIN" | jq -r '.result[0].id // empty') || { cf_fail "DNS $1: lookup failed"; return 1; }
-  body=$(jq -nc --arg n "$1.$DOMAIN" --arg ip "$2" --argjson p "$3" '{type:"A",name:$n,content:$ip,ttl:1,proxied:$p}')
+  body=$(jq -nc --arg n "$1.$DOMAIN" --arg ip "$2" --argjson p "$3" --arg c "${4:-}" '{type:"A",name:$n,content:$ip,ttl:1,proxied:$p} + (if $c != "" then {comment:$c} else {} end)')
   if [ -n "$id" ]; then cf PUT "/zones/$ZONE/dns_records/$id" --data "$body" >/dev/null || { cf_fail "DNS $1.$DOMAIN -> $2"; return 1; }
   else cf POST "/zones/$ZONE/dns_records" --data "$body" >/dev/null || { cf_fail "DNS $1.$DOMAIN -> $2"; return 1; }; fi
 }
@@ -793,7 +793,7 @@ cf_ruleset_rule() { # phase description rule-json: upsert ONE rule (matched by d
 }
 cf_cache_rule() { # never let the edge cache a book/audio response and serve it to another user
   local d="$1" rule
-  rule=$(jq -nc --arg e "(http.host in {\"books.$d\" \"audio.$d\" \"request.$d\" \"shelf.$d\"})" \
+  rule=$(jq -nc --arg e "(http.host in {\"home.$d\" \"books.$d\" \"audio.$d\" \"request.$d\" \"shelf.$d\"})" \
     '{action:"set_cache_settings",action_parameters:{cache:false},expression:$e,description:"bookstack no-cache",enabled:true}')
   cf_ruleset_rule http_request_cache_settings "bookstack no-cache" "$rule"
 }
@@ -808,6 +808,8 @@ step_cloudflare() {
   cf_zone || { msg "Zone $(envget DOMAIN) not found with this token."; return 1; }
   CF_FAILS=""
   local h pub ts; pub=$(envget PUBLIC_IP); ts=$(envget TAILSCALE_IP)
+  # home. is not in this list: it is created only when free (home_dns), never repointed from
+  # someone else's service (Home Assistant, a NAS); the record bookstack made carries a comment
   local public="books audio request shelf" private="monitor upload" privnote=""
   # auth. only exists while Authelia runs; published unconditionally it is a public hostname that
   # 502s and renews a certificate forever for a service nothing listens on.
@@ -822,6 +824,7 @@ step_cloudflare() {
   fi
   for h in $public; do cf_dns "$h" "$pub" true; done
   for h in $private; do cf_dns "$h" "$ts" false; done
+  local cff="$CF_FAILS"; home_dns; CF_FAILS="$cff"
   cf_dns_delete aria    # AriaNg/aria2 were removed from the stack
 
   cf_setting ssl strict
@@ -835,7 +838,7 @@ step_cloudflare() {
   cf_setting browser_check off
   cf_setting opportunistic_encryption on
   cf_setting automatic_https_rewrites on
-  # Content rewriting breaks the portal (script-src 'none' CSP): obfuscated e-mails and injected JS.
+  # Content rewriting breaks the portal (strict script-src 'self' CSP): obfuscated e-mails and injected JS.
   cf_setting email_obfuscation off
   cf_setting rocket_loader off
   cf_setting cache_level basic
@@ -861,6 +864,7 @@ step_cloudflare() {
   cf_setting_check tls_client_auth on
   for h in $public; do cf_dns_check "$h" "$pub" true; done
   for h in $private; do cf_dns_check "$h" "$ts" false; done
+  [ -z "$(envget HOME_URL)" ] && [ -z "$HOME_DNS_NOTE" ] && cf_dns_check home "$pub" true
   if [ -n "$CF_FAILS" ]; then
     big "Cloudflare: NOT fully configured" "These items failed:$CF_FAILS
 
@@ -1108,6 +1112,7 @@ step_deploy() {
   # the checkout this script runs from is what gets deployed (code, templates, scripts)
   make_dirs; copy_code_trees
   render_caddy_all || return 1
+  home_dns                                   # v6.0: the start page's record, only when the name is free
   own_data_dirs
   write_shelfmark_metadata_env || true
   clear; echo "Building images and starting containers (first run takes a few minutes)..."
@@ -1126,7 +1131,7 @@ step_deploy() {
     msg "Calibre-Web did not create app.db in time. Check 'Logs -> calibre-web', then run Deploy again."; return 1
   fi
   compose up -d librarian shelfmark || { msg "The portal or Shelfmark failed to start. Operations -> Logs shows why."; return 1; }
-  [ "$(envget AUTHELIA_ENABLED)" = "true" ] && { composeA up -d authelia || { msg "Authelia failed to start."; return 1; }; }
+  [ "$(envget AUTHELIA_ENABLED)" = "true" ] && { gate_refresh || { msg "Authelia did not come back with the new sign-in rules (Operations -> Logs -> authelia)."; return 1; }; }
   solver_on && { compose up -d flaresolverr || echo "(FlareSolverr did not start; see Operations -> Logs)"; }
   [ "$(envget EPHEMERA_ENABLED)" = "true" ] && { composeE up -d ephemera || echo "(Ephemera did not start; see Operations -> Logs)"; }
   echo "Waiting for the portal..."; wait_for http://127.0.0.1:8090/healthz 45 || true
@@ -1168,7 +1173,9 @@ step_deploy() {
   # read AFTER the ABS branch above: on a fresh install step_abs_setup asks for this name a few
   # seconds earlier in this same Deploy, and this summary is the screen the admin copies from
   ru=$(envget ABS_ROOT_USER); absnote="Audiobookshelf: root user '${ru:-root}' (Library -> Audiobookshelf re-runs setup)"
+  [ -n "$HOME_DNS_NOTE" ] && msg "Start page: $HOME_DNS_NOTE."
   big "Stack is up" "Public (your users):
+  $(hu=$(envget HOME_URL); printf '%-20s' "${hu:-https://home.$d}") START HERE: every site, guides and answers$([ "$(envget AUTHELIA_ENABLED)" = true ] && printf ', one sign-in')
   https://request.$d   the portal: search, request, upload, My books, Devices
   https://books.$d     the library (Kobo/OPDS/Send-to-Kindle also live here)
   https://audio.$d     audiobooks
@@ -1983,7 +1990,7 @@ Start?" || return 0
   if yesno "Set up alerts now (phone notification when a backup fails or the disk fills)? Strongly recommended."; then step_alerts || true; fi
   step_fail2ban || true
   # L17: the strongest single protection for internet-facing logins, offered while it is cheap
-  if [ "$(envget AUTHELIA_ENABLED)" != true ] && yesno "Put single sign-on with two-factor authentication (Authelia) in front of the public sites now? Recommended: a leaked family password alone then opens nothing.\n\n(Kobo, OPDS and KOReader keep working: devices bypass the gate.)"; then
+  if [ "$(envget AUTHELIA_ENABLED)" != true ] && yesno "Put single sign-on (Authelia) in front of the public sites now? One sign-in for every site; admins sign in with a second factor, readers with their password (Advanced settings can ask readers for a second factor too).\n\n(Kobo, OPDS and KOReader keep working: devices bypass the gate.)"; then
     step_authelia || true
   fi
   while yesno "Add a user now? (creates an isolated library account + Kobo link)"; do step_user_add || break; done
@@ -2026,7 +2033,7 @@ step_user_add() {
   out=$(printf '%s' "$pw" | lib add-user "$u" --email "$em" --password-stdin $role 2>&1) || { msg "Could not create user:\n\n$out"; return 1; }
   install -d -o 1000 -g 1000 "$STACK_DIR/library/dropbox/$u"
   kobo=$(printf '%s' "$out" | json 'd.get("kobo_url","")')
-  if [ "$(envget AUTHELIA_ENABLED)" = "true" ]; then authelia_add_user "$u" "$u" "$em" "$pw" && anote="Authelia SSO account created with the same password (enrol 2FA at first login)." || anote="Authelia user could NOT be added — use Security -> Authelia add user."; else anote="(Authelia is off; enable it under Security for SSO + 2FA.)"; fi
+  if [ "$(envget AUTHELIA_ENABLED)" = "true" ]; then authelia_add_user "$u" "$u" "$em" "$pw" && { authelia_sync_admin_groups >/dev/null 2>&1 || true; } && anote="Authelia SSO account created with the same password$([ -n "$role" ] || [ "$(envget AUTHELIA_READERS_2FA)" = true ] && printf ' (a second factor is set up at first sign-in)')." || anote="Authelia user could NOT be added — use Security -> Authelia add user."; else anote="(Authelia is off; enable it under Security for SSO + 2FA.)"; fi
   if abs_ready; then
     if [ -n "$role" ]; then absnote="Audiobookshelf: admins use the ABS root account (Library -> Audiobookshelf)."
     elif printf '%s' "$pw" | absctl ensure-user "$u" --password-stdin >/dev/null 2>&1; then absnote="Audiobookshelf account created with the same password; sees only audiobooks tagged owner:$u."
@@ -2278,7 +2285,7 @@ step_abs_scan() {
 step_mail() {
   h=$(ask "SMTP host (blank disables Send-to-Kindle from the portal):" "$(envget SMTP_HOST)")
   if [ -z "$h" ]; then envset SMTP_HOST ""; restart_portal_ok || true
-    if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d authelia >/dev/null 2>&1 || true; fi
+    if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d --force-recreate authelia >/dev/null 2>&1 || true; fi
     msg "Portal mail disabled."; return 0; fi
   local dp; dp=$(envget SMTP_PORT)
   p=$(ask "SMTP port:" "${dp:-587}") || return 1; [ -n "$p" ] || p=587
@@ -2293,7 +2300,7 @@ step_mail() {
   envset SMTP_HOST "$h"; envset SMTP_PORT "$p"; envset SMTP_SECURITY "$sec"; envset SMTP_USER "$u"; envset SMTP_PASS "$pw"; envset SMTP_FROM "$from"
   restart_portal_ok || true; wait_for http://127.0.0.1:8090/healthz 30 || true
   # Authelia mails enrolment / reset codes through the same SMTP (C9)
-  if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d authelia >/dev/null 2>&1 || true; fi
+  if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d --force-recreate authelia >/dev/null 2>&1 || true; fi
   if t=$(ask "Send a test mail to (blank to skip):" "$(envget ADMIN_EMAIL)") && [ -n "$t" ]; then
     out=$(docker exec -i librarian python -m kindle test "$t" 2>&1) && msg "Mail works: $out\n\nAlso set the same SMTP in Calibre-Web (Admin -> Edit e-mail server settings) if you want its own Send-to-Kindle button; run Security -> Mail auth for SPF/DMARC." || msg "Test failed:\n$out"
   fi
@@ -2546,6 +2553,7 @@ kuma_config() { # the bootstrap's JSON input on stdout — secrets included, so 
   [ -f "$ETC/systemd/system/bookstack-canary.timer" ] && pk=$(envget KUMA_PUSH_CANARY)
   KC_USER="$(envget KUMA_USER)" KC_PASS="$(envget KUMA_PASS)" KC_DOMAIN="$(envget DOMAIN)" KC_BIND="$bind" \
   KC_TOR="$(envget TORRENTS_ENABLED)" KC_EPH="$(envget EPHEMERA_ENABLED)" KC_AUTH="$(envget AUTHELIA_ENABLED)" \
+  KC_HOME="$([ -z "$(envget HOME_URL)" ] && echo true)" \
   KC_FS="$(solver_on && echo true)" KC_REBOOT="$(kuma_reboot_time)" KC_SMA="$(envget SHELFMARK_AUTH_METHOD)" \
   KC_PS="$ps" KC_PD="$pd" KC_PM="$pm" KC_PC="$pc" KC_PB="$pb" KC_PK="$pk" \
   KC_HOOK="$(envget NOTIFY_WEBHOOK)" KC_FMT="$(envget NOTIFY_WEBHOOK_FORMAT)" KC_TO="$({ [ "$(adv_value ALERT_MAIL high)" = all ] || [ -z "$(envget NOTIFY_WEBHOOK)" ]; } && envget ADMIN_EMAIL)" \
@@ -2560,7 +2568,8 @@ smtp = {"host": e("KC_SH"), "port": e("KC_SP") or "587", "security": e("KC_SS") 
 print(json.dumps({"url": "http://127.0.0.1:3001", "wait": int(e("KC_WAIT") or 90), "user": e("KC_USER"), "password": e("KC_PASS"),
   "domain": e("KC_DOMAIN"), "bind_ip": e("KC_BIND"), "reboot_time": e("KC_REBOOT"),
   "shelfmark_auth": e("KC_SMA") or "cwa",
-  "features": {"torrents": on("KC_TOR"), "ephemera": on("KC_EPH"), "authelia": on("KC_AUTH"), "flaresolverr": on("KC_FS")},
+  "features": {"torrents": on("KC_TOR"), "ephemera": on("KC_EPH"), "authelia": on("KC_AUTH"), "flaresolverr": on("KC_FS"),
+               "home": on("KC_HOME")},
   "push": {k: e(v) for k, v in (("selftest", "KC_PS"), ("disk", "KC_PD"), ("metapush", "KC_PM"),
                                 ("cfips", "KC_PC"), ("backup", "KC_PB"), ("canary", "KC_PK")) if e(v)},
   "notify": {"webhook": e("KC_HOOK"), "format": e("KC_FMT") or "auto", "to": e("KC_TO"), "smtp": smtp}}))'
@@ -2670,7 +2679,10 @@ step_restore_test() {
 # ---------- 18-20. Authelia ----------
 render_authelia_config(){ # configuration.yml from the template; an SMTP notifier replaces the file one when mail is set (C9)
   local out="$STACK_DIR/authelia/configuration.yml"
-  sed "s|@@DOMAIN@@|$(envget DOMAIN)|g" "$STACK_DIR/authelia/configuration.yml.template" > "$out.new" || return 1
+  local rpol=one_factor; [ "$(envget AUTHELIA_READERS_2FA)" = true ] && rpol=two_factor   # v6.0: admins always two_factor
+  local hu; hu=$(envget HOME_URL)            # v6.0: home.<domain> taken by another service -> request./hub
+  sed -e "s|default_redirection_url: 'https://home.@@DOMAIN@@'|default_redirection_url: '${hu:-https://home.@@DOMAIN@@}'|" \
+      -e "s|@@DOMAIN@@|$(envget DOMAIN)|g" -e "s|@@READER_POLICY@@|$rpol|g" "$STACK_DIR/authelia/configuration.yml.template" > "$out.new" || return 1
   # the password never lands in the file: X_AUTHELIA_CONFIG_FILTERS=template expands
   # {{ env "BOOKSTACK_SMTP_PASS" }} (= SMTP_PASS) at start-up. (AUTHELIA_NOTIFIER_SMTP_PASSWORD is
   # deliberately unused: Authelia 4.39 refuses to start when it is set next to a filesystem notifier.)
@@ -2709,9 +2721,9 @@ PYN
   fi
   # L05: the OpenID Connect provider for Audiobookshelf, once its secrets exist (gate_sso_on)
   if [ -n "$(envget ABS_OIDC_SECRET)" ] && [ -s "$STACK_DIR/authelia/oidc-jwks.pem" ]; then
-    python3 - "$out.new" "$(envget DOMAIN)" "$(envget ABS_OIDC_SECRET)" <<'PYO' || { rm -f "$out.new"; return 1; }
+    python3 - "$out.new" "$(envget DOMAIN)" "$(envget ABS_OIDC_SECRET)" "$rpol" <<'PYO' || { rm -f "$out.new"; return 1; }
 import sys, base64, hashlib, os
-f, dom, secret = sys.argv[1:4]
+f, dom, secret, rpol = sys.argv[1:5]
 ab64 = lambda b: base64.b64encode(b).decode().rstrip("=").replace("+", ".")
 salt = os.urandom(16)
 digest = "$pbkdf2-sha512$310000$%s$%s" % (ab64(salt), ab64(hashlib.pbkdf2_hmac("sha512", secret.encode(), salt, 310000, 64)))
@@ -2725,12 +2737,19 @@ block = f"""identity_providers:
         algorithm: 'RS256'
         use: 'sig'
         key: {{{{ secret "/config/oidc-jwks.pem" | mindent 10 "|" | msquote }}}}
+    # v6.0: the same rule as the sites: admins always two_factor, readers per AUTHELIA_READERS_2FA
+    authorization_policies:
+      family:
+        default_policy: '{rpol}'
+        rules:
+          - policy: 'two_factor'
+            subject: 'group:admins'
     clients:
       - client_id: 'audiobookshelf'
         client_name: 'Audiobookshelf'
         client_secret: '{digest}'
         public: false
-        authorization_policy: 'two_factor'
+        authorization_policy: 'family'
         consent_mode: 'implicit'
         redirect_uris:
           - 'https://audio.{dom}/auth/openid/callback'
@@ -2753,7 +2772,7 @@ authelia_user_count(){ grep -cE '^  [A-Za-z0-9._-]+:[[:space:]]*$' "$STACK_DIR/a
 authelia_healthy(){ wait_for http://127.0.0.1:9091/api/health "${1:-30}"; }   # 2 s per try
 step_authelia() {
   need DOMAIN PUBLIC_IP || return 1
-  yesno "Enable self-hosted SSO + 2FA (Authelia) in front of books / audio / request / shelf?\n\nAt least one Authelia user is created first, and the gate goes live only once Authelia answers its health check. e-reader (/kobo) and OPDS paths are bypassed so devices keep working.\n\nReversible instantly with 'Authelia: disable'. Proceed?" || return 1
+  yesno "Enable self-hosted single sign-on (Authelia) in front of home / books / audio / request / shelf?\n\nOne sign-in for every site: admins with a second factor, readers with their password (Advanced settings -> lockout -> AUTHELIA_READERS_2FA asks readers for one too).\n\nAt least one Authelia user is created first, and the gate goes live only once Authelia answers its health check. e-reader (/kobo) and OPDS paths are bypassed so devices keep working.\n\nReversible instantly with 'Authelia: disable'. Proceed?" || return 1
   envdefault AUTHELIA_SESSION_SECRET "$(openssl rand -hex 32)"
   envdefault AUTHELIA_STORAGE_ENCRYPTION_KEY "$(openssl rand -hex 32)"
   envdefault AUTHELIA_JWT_SECRET "$(openssl rand -hex 32)"
@@ -2801,7 +2820,7 @@ step_authelia() {
   local mailnote="Enrolment and reset codes are e-mailed through your SMTP server (Library -> Mail)."
   [ -n "$(envget SMTP_HOST)" ] || mailnote="No SMTP is configured, so enrolment/reset codes are NOT e-mailed: they are written to $STACK_DIR/authelia/notification.txt on this server (read it with: cat $STACK_DIR/authelia/notification.txt). Set up Library -> Mail to e-mail them instead."
   monitoring_refresh
-  msg "Authelia enabled and the gate is live.$pnote\n\nTEST NOW: open https://books.$(envget DOMAIN) — you should meet the Authelia login before the app.\n\nUsers log in at https://auth.$(envget DOMAIN) and enrol TOTP or a passkey on first login. $mailnote\n\nIf anything misbehaves, 'Authelia: disable' removes the gate immediately."
+  msg "Authelia enabled and the gate is live.$pnote\n\nTEST NOW: open https://books.$(envget DOMAIN) — you should meet the Authelia login before the app.\n\nUsers sign in at https://auth.$(envget DOMAIN); $([ "$(envget AUTHELIA_READERS_2FA)" = true ] && printf 'everyone sets up' || printf 'admins set up') a second factor (TOTP or a passkey) at their first sign-in. $mailnote\n\nIf anything misbehaves, 'Authelia: disable' removes the gate immediately."
 }
 step_authelia_off() {
   envset AUTHELIA_ENABLED false
@@ -2858,6 +2877,9 @@ remove_gate_sync_units(){
 }
 # Authelia's "admins" group mirrors who is an admin in Calibre-Web: Shelfmark (proxy mode) takes
 # admin rights from that group and from nothing else.
+authelia_is_admin(){ # name: Calibre-Web gives them the admin role (Authelia's admins group follows it)
+  users_json | python3 -c 'import sys, json; sys.exit(0 if any(x.get("name") == sys.argv[1] and x.get("is_admin") for x in json.load(sys.stdin)) else 1)' "$1" 2>/dev/null
+}
 authelia_sync_admin_groups(){
   local f="$STACK_DIR/authelia/users_database.yml" admins
   [ -f "$f" ] || return 0
@@ -2880,6 +2902,40 @@ if s2 != s:
     open(f, "w").write(s2)
 PYG
   chown 1000:1000 "$f" 2>/dev/null || true
+}
+# v6.0: the sign-in gate after new code arrives (Deploy / Update): Authelia's configuration.yml is
+# rendered from the template the checkout just brought (copy_code_trees never copies the rendered
+# file), its admins group follows Calibre-Web's admin roles, and it is RECREATED, because Authelia
+# re-reads users_database.yml by itself but never configuration.yml. Without this an upgraded
+# install kept the old rules: no home.<domain> entry (default deny: 403 on the start page).
+gate_refresh(){
+  [ "$(envget AUTHELIA_ENABLED)" = true ] || return 0
+  authelia_sync_admin_groups >/dev/null 2>&1 || true
+  render_authelia_config || return 1
+  composeA up -d --force-recreate authelia >/dev/null 2>&1 || return 1
+  authelia_healthy 60
+}
+# v6.0: home.<domain>, the start page. Created only when the name is FREE: 'home' is a common name
+# (Home Assistant, a NAS) and a record bookstack did not make is never repointed. Bookstack's own
+# record carries a comment, so a restore onto a new server still moves it. When the name is
+# someone else's, HOME_URL points every link to the start page (portal header, Authelia after
+# sign-in, Kuma, Self-test) at request.<domain>/hub instead, the same page.
+HOME_DNS_NOTE=""
+HOME_DNS_TAG="bookstack: start page"
+home_dns(){
+  HOME_DNS_NOTE=""
+  local d ip rec typ con com; d=$(envget DOMAIN); ip=$(envget PUBLIC_IP)
+  [ -n "$ip" ] && cf_zone 2>/dev/null || { HOME_DNS_NOTE="home.$d: no Cloudflare access from here; add an A record (proxied) to $ip by hand"; return 0; }
+  rec=$(cf GET "/zones/$ZONE/dns_records?name=home.$d" 2>/dev/null | jq -r '.result[0] // empty | [.type, .content, (.comment // "")] | @tsv' 2>/dev/null)
+  IFS=$'\t' read -r typ con com <<< "$rec"
+  if [ -z "$typ" ] || { [ "$typ" = A ] && { [ "$con" = "$ip" ] || [ "$com" = "$HOME_DNS_TAG" ]; }; }; then
+    CF_FAILS=""
+    if cf_dns home "$ip" true "$HOME_DNS_TAG"; then envset HOME_URL ""
+    else HOME_DNS_NOTE="home.$d: the DNS record could not be created (${CF_FAILS//\\n/ }); add it by hand"; fi
+  else
+    envset HOME_URL "https://request.$d/hub"
+    HOME_DNS_NOTE="home.$d already points elsewhere ($typ $con) and was left alone. The start page is at https://request.$d/hub instead (every link uses that). To use home.$d for it, move that service to another name and run Deploy"
+  fi
 }
 gate_sso_on(){
   local rc=0
@@ -3003,7 +3059,7 @@ step_authelia_user() {
   [ -z "$em" ] || valid_email "$em" || { msg "'$em' is not an e-mail address."; return 1; }
   pw=$(askpw2 "Password:") || return 1
   clear; echo "Hashing password..."
-  authelia_add_user "$u" "$dn" "$em" "$pw" && msg "User '$u' added/updated. They sign in at https://auth.$(envget DOMAIN) and enrol 2FA on first login." || msg "Could not add/update '$u' (password hashing failed, or a NEW login needs an e-mail address)."
+  authelia_add_user "$u" "$dn" "$em" "$pw" && { authelia_sync_admin_groups >/dev/null 2>&1 || true; } && msg "User '$u' added/updated. They sign in at https://auth.$(envget DOMAIN)$( { authelia_is_admin "$u" || [ "$(envget AUTHELIA_READERS_2FA)" = true ]; } && printf ' and set up a second factor at their first sign-in')." || msg "Could not add/update '$u' (password hashing failed, or a NEW login needs an e-mail address)."
 }
 
 # ---------- 21. Intake & dropboxes ----------
@@ -3429,19 +3485,33 @@ stack_up_all() { # (re)start every enabled service with the tags in .env
 # rollback to 1.x puts the copy back; a successful update drops it.
 KUMA_MIG_REL=kuma/data/.bookstack-migrating
 kuma_major(){ case "${1##*:}" in 1|1.*) echo 1;; 2|2.*) echo 2;; *) echo "";; esac; }
-kuma_migrating(){ [ -f "$STACK_DIR/$KUMA_MIG_REL" ]; }
+# a marker older than a day is not a migration in progress (a failed bootstrap left it): it must
+# not keep heal.sh and the update gate away from Kuma for ever
+kuma_migrating(){ [ -n "$(find "$STACK_DIR/$KUMA_MIG_REL" -mmin -1440 2>/dev/null)" ]; }
 kuma_v2_prepare(){ # old-image new-image
   [ "$(kuma_major "$1")" = 1 ] && [ "$(kuma_major "$2")" = 2 ] || return 0
   [ -f "$STACK_DIR/kuma/data/kuma.db" ] || return 0            # a fresh 2.x starts empty: nothing to migrate
+  # the FIRST copy is the only 1.x one: a retried update (the data may already be migrated) never
+  # replaces it, and a copy is only ever used once it is complete
+  [ -f "$STACK_DIR/kuma/data.v1/.bookstack-complete" ] && return 0
+  [ -f "$STACK_DIR/$KUMA_MIG_REL" ] && return 0
   compose stop uptime-kuma >/dev/null 2>&1 || true
-  rm -rf "$STACK_DIR/kuma/data.v1"
-  cp -a "$STACK_DIR/kuma/data" "$STACK_DIR/kuma/data.v1" || { echo "could not copy kuma/data"; return 1; }
+  rm -rf "$STACK_DIR/kuma/data.v1.tmp"
+  if ! cp -a "$STACK_DIR/kuma/data" "$STACK_DIR/kuma/data.v1.tmp"; then
+    rm -rf "$STACK_DIR/kuma/data.v1.tmp"; echo "could not copy kuma/data (disk full?)"; return 1
+  fi
+  touch "$STACK_DIR/kuma/data.v1.tmp/.bookstack-complete"
+  rm -rf "$STACK_DIR/kuma/data.v1" && mv "$STACK_DIR/kuma/data.v1.tmp" "$STACK_DIR/kuma/data.v1" || return 1
   touch "$STACK_DIR/$KUMA_MIG_REL"
 }
-kuma_v1_restore(){ # after a rollback: a 1.x image back on the copy it can still open
-  [ "$(kuma_major "$(img IMG_KUMA)")" = 1 ] && [ -d "$STACK_DIR/kuma/data.v1" ] || return 0
+kuma_v1_restore(){ # after a rollback: a 1.x image back on the COMPLETE copy it can still open
+  [ "$(kuma_major "$(img IMG_KUMA)")" = 1 ] || return 0
+  [ -f "$STACK_DIR/$KUMA_MIG_REL" ] || return 0                 # kuma/data was never handed to 2.x: it is still 1.x
+  # complete: flagged (v6.0), or made by v5.9.1, which touched the marker only after its cp -a succeeded
+  [ -f "$STACK_DIR/kuma/data.v1/.bookstack-complete" ] || [ -f "$STACK_DIR/kuma/data.v1/kuma.db" ] || return 0
   compose stop uptime-kuma >/dev/null 2>&1 || true
-  rm -rf "$STACK_DIR/kuma/data" && mv "$STACK_DIR/kuma/data.v1" "$STACK_DIR/kuma/data"
+  rm -rf "$STACK_DIR/kuma/data" && mv "$STACK_DIR/kuma/data.v1" "$STACK_DIR/kuma/data" \
+    && rm -f "$STACK_DIR/kuma/data/.bookstack-complete" "$STACK_DIR/$KUMA_MIG_REL"
 }
 wait_healthy() { # seconds: every container that HAS a healthcheck reports healthy
   local i c st all
@@ -3462,6 +3532,8 @@ latest_tag() {
   python3 - "$1" <<'PY' 2>/dev/null || echo "?"
 import sys, json, re, urllib.request
 img = sys.argv[1].split(":")[0]
+cur = sys.argv[1].split(":", 1)[1] if ":" in sys.argv[1] else ""
+suffix = (re.fullmatch(r"v?\d+(?:\.\d+){1,3}(-[a-z]+)?", cur) or [None, None])[1] or ""
 if img.startswith("lscr.io/"): img = "ghcr.io/" + img[len("lscr.io/"):]
 def get(url, hdr={}):
     return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=15))
@@ -3472,8 +3544,8 @@ if img.startswith("ghcr.io/"):
 else:
     repo = img if "/" in img else "library/" + img
     tags = [t["name"] for t in get(f"https://hub.docker.com/v2/repositories/{repo}/tags?page_size=100&ordering=last_updated")["results"]]
-vt = [t for t in tags if re.fullmatch(r"v?\d+(\.\d+){1,3}", t)]
-key = lambda t: tuple(int(x) for x in t.lstrip("v").split("."))
+vt = [t for t in tags if re.fullmatch(r"v?\d+(\.\d+){1,3}" + re.escape(suffix), t)]   # a -slim pin: -slim releases
+key = lambda t: tuple(int(x) for x in t[: len(t) - len(suffix)].lstrip("v").split("."))
 print(max(vt, key=key) if vt else "?")
 PY
 }
@@ -3510,6 +3582,25 @@ tag_images() { # from to: bookstack/{caddy,librarian}:from -> :to (a rebuilt :la
   local i; for i in $BUILT_IMAGES; do docker image inspect "$i:$1" >/dev/null 2>&1 && docker image tag "$i:$1" "$i:$2"; done; return 0
 }
 UPDATE_MARKER_REL=.update-in-progress   # set by update_failed, cleared on a clean update or rollback
+# pin_newer current default: true when the default is a NEWER version of the same image (numeric
+# comparison, any -suffix such as -slim kept apart), or when the current tag is not a version at all
+# (:1, :latest): an image the admin already moved past this bookstack's pin is never downgraded
+pin_newer(){
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+cur, new = sys.argv[1], sys.argv[2]
+if cur.split(":")[0] != new.split(":")[0]:
+    sys.exit(0)
+ver = lambda t: re.fullmatch(r"v?(\d+(?:\.\d+)*)(-.+)?", t.split(":", 1)[1] if ":" in t else "")
+a, b = ver(cur), ver(new)
+if not a:
+    sys.exit(0)
+if not b:
+    sys.exit(1)
+key = lambda m: tuple(int(x) for x in m.group(1).split("."))
+sys.exit(0 if key(b) > key(a) or (key(b) == key(a) and (b.group(2) or "") != (a.group(2) or "")) else 1)
+PY
+}
 step_update() {
   local k cur new changed="" f="$(restic_env)" mark="$STACK_DIR/$UPDATE_MARKER_REL" keep=0
   # "investigate, then retry" is the most natural thing to do after a failed update — and it used
@@ -3535,12 +3626,12 @@ step_update() {
   local rec="" kv d
   for kv in $IMG_DEFAULTS; do
     k=${kv%%=*}; d=${kv#*=}; cur=$(img "$k")
-    [ "$cur" != "$d" ] && rec="$rec\n  $k: $cur -> $d"
+    [ "$cur" != "$d" ] && pin_newer "$cur" "$d" && rec="$rec\n  $k: $cur -> $d"
   done
   if [ -n "$rec" ] && yesno "This version of bookstack pins other images than the server runs:$rec\n\nMove to them? (No = keep the current ones; you can still type tags next)"; then
     for kv in $IMG_DEFAULTS; do
       k=${kv%%=*}; d=${kv#*=}; cur=$(img "$k")
-      [ "$cur" != "$d" ] && { envset "$k" "$d"; changed="$changed\n  $k: $cur -> $d"; }
+      [ "$cur" != "$d" ] && pin_newer "$cur" "$d" && { envset "$k" "$d"; changed="$changed\n  $k: $cur -> $d"; }
     done
   fi
   if yesno "Change image versions? (No = re-pull the current tags and rebuild caddy/librarian; Yes = type a new tag per image, Cancel keeps one)"; then
@@ -3559,6 +3650,9 @@ step_update() {
   # host-side units the update may be introducing: an existing install that only ever runs
   # Operations -> Update would otherwise never pick up a new one (idempotent, so it is free)
   install_postboot_unit
+  # v6.0: the start page's DNS record on an install that only ever runs Update (never fatal; the
+  # note is in the final message). Before the containers start: it may set HOME_URL for the portal
+  [ -n "$(envget CF_API_TOKEN)" ] && home_dns
   render_caddy_all || { update_failed "the new Caddyfile could not be rendered"; return 1; }
   # the rebuilt images carry this checkout's version (J03); Self-test compares it with .version
   pull_kcc
@@ -3568,6 +3662,7 @@ step_update() {
     update_failed "pull/build/start failed"; return 1
   fi
   apply_caddy >/dev/null 2>&1 || true
+  gate_refresh || { update_failed "Authelia did not come back with the new sign-in rules"; return 1; }
   echo "Restarting Caddy so it loads Cloudflare's address list afresh..."
   caddy_restart_verified || caddy_cf_warn
   # (e) health gate: container health checks + the local endpoints this update could break
@@ -3582,8 +3677,8 @@ step_update() {
   kuma_migrating || rm -rf "$STACK_DIR/kuma/data.v1"   # the 1.x copy goes once 2.x has migrated
   docker system prune -f --filter until=72h >/dev/null 2>&1 || true
   # new code may carry new monitors or scheduled jobs (the timer wrapper is regenerated too)
-  install_selftest_timer; setup_monitoring >/dev/null 2>&1 || true
-  msg "Updated and healthy (deployed $(deployed_version)).$([ -n "$changed" ] && printf '\n\nNew tags:%b' "$changed")$([ "$st" != 0 ] && printf '\n\nThe full self-test reports %s failure(s) unrelated to the update gate: Operations -> Self-test.' "$st")"
+  install_selftest_timer; local monrc=0; setup_monitoring >/dev/null 2>&1 || monrc=$?
+  msg "Updated and healthy (deployed $(deployed_version)).$([ -n "$changed" ] && printf '\n\nNew tags:%b' "$changed")$([ "$monrc" != 0 ] && printf '\n\nMonitoring was NOT reconfigured: %s (Operations -> Monitoring)' "$MON_NOTE")$([ -n "$HOME_DNS_NOTE" ] && printf '\n\nStart page: %s.' "$HOME_DNS_NOTE")$([ "$st" != 0 ] && printf '\n\nThe full self-test reports %s failure(s) unrelated to the update gate: Operations -> Self-test.' "$st")"
 }
 rollback_images() { # restore the IMG_* values saved by step_update
   [ -f "$STACK_DIR/.env.images.prev" ] || return 0
@@ -3679,6 +3774,7 @@ lockout|LOCKOUT_WINDOW|900|int|Seconds those failures are counted over
 lockout|LOCKOUT_SECONDS|900|int|How long a lockout lasts, in seconds
 lockout|LOCKOUT_IP_FAILS|20|int|Wrong passwords from ONE address across all accounts before the address is locked
 lockout|SESSION_HOURS|12|int|How long a portal login stays signed in, in hours
+lockout|AUTHELIA_READERS_2FA|false|bool|Readers need a second factor at the sign-in gate too (admins always do)
 lockout|AUTHELIA_PASSKEYS|false|bool|Sign in to the gate with a passkey alone (fingerprint/face/PIN counts as both factors; Authelia calls this experimental)
 uploads|MAX_UPLOAD_MB|95|int|Largest file the portal browser form takes (Cloudflare refuses bodies over 100 MB)
 uploads|MAX_EBOOK_MB|200|int|Largest ebook the worker downloads or imports
@@ -3690,6 +3786,7 @@ mail|IMAP_PORT|0|int|IMAP port; 0 = the default for the mode (993 implicit TLS, 
 mail|IMAP_SSL|true|bool|true = implicit TLS on 993; false = STARTTLS on 143, for a local relay
 mail|IMAP_FOLDER|INBOX|text|Mailbox the e-mail-to-library poller reads
 mail|NOTIFY_WEBHOOK_FORMAT|auto|text|How alerts are posted: auto (ntfy style for an ntfy host), ntfy or json
+mail|READER_NTFY_URL||text|ntfy server for the readers phone notifications (empty = https://ntfy.sh; reachable from their phones)
 mail|ALERT_MAIL|high|text|Server alerts also e-mailed: high (problems only), all (incl. monitor up/down), off
 mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files audiobooks into
 requests|BOOK_CONFIRM|always|text|Get it for books: always = the reader confirms every copy; sure = a retail EPUB with title, author and language downloads without asking
@@ -3754,10 +3851,11 @@ step_advanced() {
                   || msg "WARNING: the thresholds now read warn=$w stop=$s resume=$r. They only work as resume < stop and warn <= stop — otherwise the watchdog either stops the downloaders before it ever warns you, or never starts them again."
                 if restart_portal; then msg "$key is now $new.\n\nThe hourly watchdog reads $ENV_FILE when it runs, and the portal was recreated so its own copy of the thresholds matches."
                 else msg "$key is now $new in $ENV_FILE and the hourly watchdog will use it, but the portal could NOT be restarted, so the portal still pauses its imports at the OLD threshold (Operations -> Logs -> librarian)."; fi;;
-        lockout) if [ "$key" = AUTHELIA_PASSKEYS ]; then
+        lockout) if [ "$key" = AUTHELIA_PASSKEYS ] || [ "$key" = AUTHELIA_READERS_2FA ]; then
+                  [ "$key" = AUTHELIA_READERS_2FA ] && { restart_portal >/dev/null 2>&1 || true; }   # its texts follow the policy
                   if [ "$(envget AUTHELIA_ENABLED)" = true ]; then
                     if render_authelia_config && composeA up -d --force-recreate authelia >/dev/null 2>&1 && authelia_healthy 60; then
-                      msg "$key is now $new and Authelia was restarted.$([ "$new" = true ] && printf '\n\nEach person adds a passkey once: sign in at https://auth.%s, open Settings -> Two-Factor Authentication -> WebAuthn, and register it. A security key registered before may need registering again, as a passkey.' "$(envget DOMAIN)")"
+                      msg "$key is now $new and Authelia was restarted.$([ "$key" = AUTHELIA_PASSKEYS ] && [ "$new" = true ] && printf '\n\nEach person adds a passkey once: sign in at https://auth.%s, open Settings -> Two-Factor Authentication -> WebAuthn, and register it. A security key registered before may need registering again, as a passkey.' "$(envget DOMAIN)")$([ "$key" = AUTHELIA_READERS_2FA ] && [ "$new" = true ] && printf '\n\nReaders are asked to set up a second factor at their next sign-in.')"
                     else msg "$key is now $new, but Authelia did not come back healthy: Operations -> Logs -> authelia (setting it back to the previous value restores it)."; fi
                   else msg "$key is now $new. It takes effect when the sign-in gate (Authelia) is switched on."; fi
                   continue
@@ -4189,12 +4287,12 @@ menu_security() {
   done
 }
 # L17: Cloudflare Turnstile on the portal login. Off by default: it is the one page that may then
-# load Cloudflare's challenge script (every other page keeps script-src 'none').
+# load Cloudflare's challenge script (every other page keeps script-src 'self': the portal's own file only).
 step_turnstile() {
   local sk sec ans
   if [ -n "$(envget TURNSTILE_SITEKEY)" ] && yesno "The Turnstile bot check is ON for the portal login.\n\nTurn it off?"; then
     envset TURNSTILE_SITEKEY ""; envset TURNSTILE_SECRET ""
-    restart_portal_ok && msg "Turnstile is off; the login page is back to no scripts at all."; return 0
+    restart_portal_ok && msg "Turnstile is off; the login page runs only the portal's own script again."; return 0
   fi
   sk=$(ask "Turnstile SITE key (Cloudflare dashboard -> Turnstile -> Add widget, domain request.$(envget DOMAIN), mode Managed):" "") || return 0
   [ -n "$sk" ] || return 0
