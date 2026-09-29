@@ -49,6 +49,41 @@
 {% endfor %}
 {% endif %}
 
+{% if book_reqs %}
+<h2>Books found for you through Shelfmark</h2>
+<p class="mut">Get it: the portal looks for a copy on the indexers (the right title and author, one book, EPUB first, your language)
+and shows it to you here. Nothing downloads until you say <strong>Yes, that one</strong>{% if cfg.BOOK_CONFIRM == 'sure' %} (a retail EPUB whose
+name has the title, the author and your language is downloaded without asking){% endif %}. When the file arrives it is checked
+against the book (its own title, author, language, ISBN) before it goes into your library. Nothing found yet: it looks again
+within the hour, then every few hours, then daily, for {{ cfg.BOOK_SEARCH_DAYS }} days.</p>
+{% for b in book_reqs %}
+{% set st_class = 'done' if b.status in ('done', 'owned', 'shared') else 'error' if b.status in ('not-found', 'held') else 'pending' if b.status == 'confirm' else b.status %}
+<div class="card"><div class="row" style="justify-content:space-between;align-items:flex-start">
+<div style="flex:1"><strong>{% if b.calibre_id and b.status in ('done', 'owned', 'shared') %}<a href="{{ url_for('book_page', book_id=b.calibre_id) }}">{{ b.title }}</a>{% else %}{{ b.title }}{% endif %}</strong>{% if b.author %} <span class="mut">— {{ b.author }}</span>{% endif %}
+<span class="badge st-{{ st_class }}">{{ {'queued': 'looking', 'pending': 'waiting for approval', 'confirm': 'confirm this copy', 'downloading': 'downloading', 'held': 'check this file', 'done': 'in your library', 'owned': 'already yours', 'shared': 'from the family library', 'not-found': 'not found', 'cancelled': 'cancelled'}.get(b.status, b.status) }}</span>
+{% if admin %}<span class="mut">for {{ b.owner }}</span>{% endif %}<br>
+<span class="mut">{{ b.detail or '' }}{% if b.status == 'queued' and b.next_try %} · next look {{ b.next_try | ago_or_in }}{% endif %}</span>
+{% if b.status == 'confirm' and b.candidate %}{% set c = b.candidate %}
+<div style="margin-top:6px">Found: <strong class="code">{{ c.title }}</strong><br>
+<span class="mut">{% if c.size_bytes %}{{ (c.size_bytes / 1048576) | round(1) }} MB · {% endif %}{% if c.indexer %}from {{ c.indexer }} · {% endif %}{{ b.reasons | join(' · ') }}</span></div>
+{% endif %}
+{% if b.status == 'held' and b.held_meta %}{% set h = b.held_meta %}
+<div style="margin-top:6px">The file <span class="code">{{ h.file }}</span> says it is: <strong>{{ h.title or 'no title inside' }}</strong>{% if h.author %} by {{ h.author }}{% endif %}{% if h.language %} · language {{ h.language }}{% endif %} · {{ (h.format or '?') | upper }}.
+<br><span class="mut">It has not been added to your library. Keep it if it is the book after all (an edition with another title, say).</span></div>
+{% endif %}</div>
+<div class="row" style="flex:none">
+{% if b.status == 'confirm' and b.owner == session.user %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='yes') }}">{{ csrf_field() }}<button type="submit">Yes, that one</button></form>
+<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='no') }}">{{ csrf_field() }}<button type="submit" class="sec">Not it</button></form>{% endif %}
+{% if b.status == 'held' and b.owner == session.user %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='keep') }}">{{ csrf_field() }}<button type="submit" class="sec">Keep it anyway</button></form>
+<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='no') }}">{{ csrf_field() }}<button type="submit">Not it: find another</button></form>{% endif %}
+{% if admin and b.status == 'pending' %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='approve') }}">{{ csrf_field() }}<button type="submit">Approve</button></form>{% endif %}
+{% if b.status in ('not-found', 'cancelled') %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='retry') }}">{{ csrf_field() }}<button type="submit" class="sec">Look again</button></form>{% endif %}
+{% if b.status in ('not-found', 'confirm') and cfg.SHELF_URL %}<a class="btn sec" href="{{ shelf_search(b.title, b.author) }}" target="_blank" rel="noopener">Pick in Shelfmark</a>{% endif %}
+{% if b.status in ('queued', 'pending', 'confirm', 'held', 'not-found') %}<form method="post" action="{{ url_for('book_request_action', rid=b.id, action='cancel') }}">{{ csrf_field() }}<button type="submit" class="sec">Cancel</button></form>{% endif %}
+</div></div></div>
+{% endfor %}
+{% endif %}
+
 {% if looking %}
 <h2>Still looking</h2>
 <p class="mut">Books no catalog had yet. They are checked again within the hour, then every few hours, then daily, for

@@ -36,8 +36,11 @@ def configured():
 
 
 def _login():
-    r = requests.post(f"{config.SHELFMARK_API}/api/auth/login", timeout=TIMEOUT,
-                      json={"username": config.SHELFMARK_SVC_USER, "password": config.SHELFMARK_SVC_PASS})
+    try:
+        r = requests.post(f"{config.SHELFMARK_API}/api/auth/login", timeout=TIMEOUT,
+                          json={"username": config.SHELFMARK_SVC_USER, "password": config.SHELFMARK_SVC_PASS})
+    except requests.RequestException as e:       # Shelfmark down: said on the page, never a crash
+        raise ShelfmarkError(f"Shelfmark did not answer ({type(e).__name__})") from e
     if r.status_code != 200:
         raise ShelfmarkError(f"Shelfmark refused the portal's service login (HTTP {r.status_code})")
     cookie = next((f"{c.name}={c.value}" for c in r.cookies), None)
@@ -185,12 +188,13 @@ def user_id(username):
     return None
 
 
-def search_releases(query, content_type="ebook"):
+def search_releases(query, content_type="ebook", book_id="comic"):
     """[release] Shelfmark's Prowlarr search finds for free text (category Books 7000, which
-    includes Comics 7030). Each release is the dict Shelfmark itself sends back to queue it."""
+    includes Comics 7030). Each release is the dict Shelfmark itself sends back to queue it.
+    Books (bookreq.py) use the same search with book_id 'book'."""
     if not configured():
         raise ShelfmarkError("the portal has no Shelfmark login")
-    params = {"provider": "manual", "book_id": "comic", "manual_query": query, "title": query,
+    params = {"provider": "manual", "book_id": book_id, "manual_query": query, "title": query,
               "source": "prowlarr", "content_type": content_type}
     try:
         r = _call("GET", "/api/releases", params=params, timeout=SEARCH_TIMEOUT)

@@ -1,4 +1,8 @@
 {% extends "base.html" %}{% block body %}
+{% if not q %}{% set bw = books_waiting() %}{% if bw %}
+<div class="card"><strong>{{ bw }} book{{ 's' if bw != 1 }} waiting for your answer</strong>: a copy to confirm before it downloads, or a
+file that did not look like the book. <a href="{{ url_for('status') }}">Answer on Requests</a>.</div>
+{% endif %}{% endif %}
 {% if not q %}{% set nf = new_for_you() %}{% if nf %}
 <div class="card"><h3 style="margin-top:0">New for you</h3>
 {% with notices=nf %}{% include "_notices.html" %}{% endwith %}

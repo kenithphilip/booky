@@ -53,7 +53,17 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   (an owner whose Kobo syncs, or 'Make Kobo copy'), Kindle jobs that need a Kindle copy first
 - `follows.py` — v5.8: follow a comic/manga series, a book series or an author; the daily check
   (first check records what is out, then what came out since becomes a notice); one tap (a comic
-  request, or Shelfmark already searching for a book); mail digests; the admin's daily count
+  request, a book request through bookreq.py, or Pick in Shelfmark); mail digests; the admin's
+  daily count
+- `bookreq.py` — v5.8.3: one-tap book requests: the family copy first, approvals, Shelfmark's
+  Prowlarr search scored by bookrel.py, the copy CONFIRMED by the reader (BOOK_CONFIRM), queued in
+  Shelfmark as the reader; the arrived file CHECKED before the import (title, author, language,
+  ISBN against Hardcover's editions, format) and held when it is not the book; 'Wrong book';
+  a failed or missing download tries the next release
+- `bookrel.py` — which release is the book asked for: the title as a phrase with nothing left over,
+  the author's surname, no packs/abridged/summaries, EPUB first and no PDF, the reader's language
+- `templates/book_list.html` — a book series' or an author's books (Hardcover, cached 6 h) with
+  what the reader and the family have, Get it / Add to mine / Pick
 - `hardcover.py` — book series and authors from Hardcover (needs HARDCOVER_API_KEY):
   search(Series|Author), a series' books, an author's books; no compilations or duplicates;
   `python -m hardcover` checks the key and the queries

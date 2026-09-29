@@ -7,12 +7,13 @@ Calibre-Web's own Hardcover provider (cps/metadata_provider/hardcover.py) and Ha
 docs: search(query, query_type: "Series" | "Author"), series.book_series { position book },
 books.release_date / compilation / canonical_id. Compilations (omnibuses, box sets) and
 duplicate records are left out."""
-import datetime, json
+import datetime, json, time
 import requests
 import config
 
 URL = "https://api.hardcover.app/v1/graphql"
-TIMEOUT = (5, 30)
+TIMEOUT = (10, 30)
+RETRY_SLEEP = 3              # one more try when the connection itself failed (a ConnectTimeout, live 2026-09-29)
 
 
 class HardcoverError(Exception):
@@ -27,12 +28,18 @@ def _q(query, variables):
     if not configured():
         raise HardcoverError("no Hardcover API key (Library -> Metadata sources)")
     token = config.HARDCOVER_API_KEY.replace("Bearer ", "").strip()
-    try:
-        r = requests.post(URL, json={"query": query, "variables": variables}, timeout=TIMEOUT,
-                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-                                   "User-Agent": "bookstack-librarian (self-hosted family library)"})
-    except requests.RequestException as e:
-        raise HardcoverError(f"Hardcover did not answer ({type(e).__name__})") from e
+    for attempt in (1, 2):
+        try:
+            r = requests.post(URL, json={"query": query, "variables": variables}, timeout=TIMEOUT,
+                              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                                       "User-Agent": "bookstack-librarian (self-hosted family library)"})
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt == 2:
+                raise HardcoverError(f"Hardcover did not answer ({type(e).__name__})") from e
+            time.sleep(RETRY_SLEEP)
+        except requests.RequestException as e:
+            raise HardcoverError(f"Hardcover did not answer ({type(e).__name__})") from e
     if r.status_code in (401, 403):
         raise HardcoverError(f"Hardcover refused the API key (HTTP {r.status_code})")
     if r.status_code == 429:
@@ -112,6 +119,51 @@ def author_books(author_id, limit=60):
            {"id": int(author_id), "n": limit, "t": datetime.date.today().isoformat(), "r": AUTHOR_MIN_READERS})
     a = (d.get("authors") or [{}])
     return (a[0].get("name") if a else "") or "", [_book(b) for b in d.get("books") or [] if (b.get("title") or "").strip()]
+
+
+def editions(book_id):
+    """[{isbns: [...], language: 'en'}] of one book's editions (measured 2026-09-29: editions.
+    isbn_13 / isbn_10 / language.code2). The arrival check uses them: a file whose ISBN is one of
+    the book's editions in the reader's language is the book, whatever title its file carries.
+    Cached 30 days; [] when Hardcover cannot say."""
+    import db
+    ck = f"hardcover:editions:{book_id}"
+    hit = db.cache_get(ck, 30 * 86400)
+    if hit is not None:
+        return hit
+    try:
+        d = _q("query E($id: Int!) { editions(where: {book_id: {_eq: $id}}, limit: 200) { isbn_13 isbn_10 language { code2 } } }",
+               {"id": int(book_id)})
+    except (HardcoverError, ValueError):
+        return []
+    out = [{"isbns": [i for i in (e.get("isbn_13"), e.get("isbn_10")) if i],
+            "language": ((e.get("language") or {}).get("code2") or "").lower()} for e in d.get("editions") or []]
+    out = [e for e in out if e["isbns"]]
+    db.cache_put(ck, out, keep_days=30)
+    return out
+
+
+PAGE_CACHE = 6 * 3600
+
+
+def cached(what, key):
+    """For the portal's pages: [name, completed, books] of a series or [name, books] of an author,
+    from the portal's cache (6 h), or its last answer when Hardcover is down. The daily follow
+    checks ask Hardcover itself."""
+    import db
+    ck = f"hardcover:{what}:{key}"
+    hit = db.cache_get(ck, PAGE_CACHE)
+    if hit is not None:
+        return hit
+    try:
+        val = list(series_books(key) if what == "series" else author_books(key))
+    except HardcoverError:
+        old = db.cache_get(ck, None)
+        if old is not None:
+            return old
+        raise
+    db.cache_put(ck, val, keep_days=30)
+    return val
 
 
 def check():

@@ -4,19 +4,20 @@ A reader follows a comic or manga series (comicmeta: Metron, ComicVine, MangaUpd
 series or an author (hardcover.py). Once a day each follow is checked: what is OUT now (released,
 not merely announced) and was not out at the last check becomes a NOTICE on the reader's "New for
 you" list, with one tap to request it: a comic or a manga volume through the Comics flow, a book
-by opening Shelfmark already searching for it (the reader picks the copy, family sharing applies).
+through bookreq.py (v5.8.3: the portal picks the copy and Shelfmark downloads it as the reader;
+"Pick in Shelfmark" still opens Shelfmark searching for it, to choose by hand).
 Nothing downloads by itself. The first check only records what is already out, so following a
 long series never floods anyone.
 
 Readers who asked for mail (Devices) get one digest per check; the admin's ntfy gets a daily count."""
 import datetime, logging, random, time
-from urllib.parse import quote
 import config, db, comicmeta, hardcover, notify
 
 log = logging.getLogger("follows")
 
 DAY = 86400
 FAILED_RETRY = 6 * 3600
+FIRST_RETRY = 1800          # a FIRST check that failed: again in half an hour, not six
 KINDS = ("comic", "book-series", "author")
 
 
@@ -62,7 +63,8 @@ def _book(b, series_name=None):
     return {"title": b["title"] + (f" ({series_name}{pos})" if series_name else ""),
             "detail": f"by {b['author']}" + (f", out {b['date']}" if b.get("date") else "") if b.get("author") else
                       (f"out {b['date']}" if b.get("date") else ""),
-            "item": {"type": "book", "title": b["title"], "author": b.get("author") or ""}}
+            "item": {"type": "book", "title": b["title"], "author": b.get("author") or "",
+                     "series": series_name or "", "hardcover_id": b.get("id")}}
 
 
 def _book_series_items(f):
@@ -86,7 +88,8 @@ def check(f, now=None):
     try:
         current = CHECKERS[f["kind"]](f)
     except (comicmeta.MetaError, hardcover.HardcoverError, KeyError, ValueError) as e:
-        db.follow_retry(f["id"], now + FAILED_RETRY, f"could not check: {str(e)[:200]}")
+        db.follow_retry(f["id"], now + (FAILED_RETRY if f.get("checked") else FIRST_RETRY),
+                        f"could not check: {str(e)[:200]}")
         return 0
     known = f.get("known")
     new = 0
@@ -115,13 +118,20 @@ def run_once(now=None, limit=10):
 
 # ---- one tap ---------------------------------------------------------------------------------------
 def shelfmark_search_url(title, author):
-    base = f"https://shelf.{config.DOMAIN}" if config.DOMAIN else "/"
-    return f"{base}/#q={quote(title)}" + (f"&author={quote(author)}" if author else "")
+    """Shelfmark, already searching for this book (the reader picks the copy there)."""
+    from urllib.parse import urlencode
+    base = (config.SHELF_URL or "").rstrip("/")
+    if not base:
+        return None
+    p = {"content_type": "ebook", "q": title}
+    if author:
+        p["author"] = author
+    return f"{base}/?{urlencode(p)}"
 
 
 def act(owner, nid, action):
-    """'request' (a comic: queued through the Comics flow; a book: the Shelfmark search to open)
-    or 'dismiss'. Returns (what, url_or_None)."""
+    """'request' (a comic through the Comics flow, a book through bookreq.py), 'shelfmark' (a
+    book: the Shelfmark search to open, to pick by hand) or 'dismiss'. Returns (what, url_or_None)."""
     n = db.notice_get(nid)
     if not n or n["owner"] != owner:
         raise FollowError("no such notice")
@@ -137,8 +147,15 @@ def act(owner, nid, action):
         _rid, what = comics.request(owner, info, item, it.get("language"))
         db.notice_set(nid, "requested")
         return what, None
+    title, author = it.get("title") or n["title"], it.get("author") or ""
+    if action == "shelfmark":
+        db.notice_set(nid, "requested")
+        return "shelfmark", shelfmark_search_url(title, author)
+    import bookreq
+    _rid, what = bookreq.request(owner, title, author, series=it.get("series") or None,
+                                 hardcover_id=it.get("hardcover_id"), notice_id=nid)
     db.notice_set(nid, "requested")
-    return "shelfmark", shelfmark_search_url(it.get("title") or n["title"], it.get("author") or "")
+    return what, None
 
 
 # ---- telling people ---------------------------------------------------------------------------------

@@ -324,6 +324,24 @@ def init():
             status TEXT NOT NULL DEFAULT 'new',   -- new | requested | dismissed
             mailed INTEGER DEFAULT 0, created REAL, updated REAL,
             UNIQUE(owner, follow_id, item_key))""")
+        # v5.8.3: one-tap book requests, searched and queued through Shelfmark like comics (bookreq.py)
+        c.execute("""CREATE TABLE IF NOT EXISTS book_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
+            title TEXT NOT NULL, author TEXT, series TEXT, language TEXT NOT NULL DEFAULT 'en',
+            hardcover_id TEXT, notice_id INTEGER,
+            -- queued | pending | confirm (a copy found, the reader decides) | downloading | held (the file
+            -- that came does not look like the book) | done | shared | owned | not-found | cancelled
+            status TEXT NOT NULL DEFAULT 'queued',
+            detail TEXT, tried TEXT DEFAULT '[]', release_title TEXT, release_id TEXT,
+            attempts INTEGER DEFAULT 0, next_try REAL, queued_at REAL, calibre_id INTEGER,
+            downloaded REAL,                         -- Shelfmark reported the download complete
+            candidate TEXT,                          -- the release offered to confirm (JSON, as Shelfmark sent it)
+            reasons TEXT,                            -- why it was chosen (JSON list)
+            blocked TEXT DEFAULT '[]',               -- release names and Calibre books the reader said were not it
+            skip_check INTEGER DEFAULT 0,            -- 'Keep it anyway': the arrival is not checked again
+            held_path TEXT, held_meta TEXT,          -- the held file, and what it said it was
+            created REAL, updated REAL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS book_requests_owner ON book_requests(owner, status)")
         c.execute("""CREATE TABLE IF NOT EXISTS anilist(
             owner TEXT PRIMARY KEY, token TEXT NOT NULL, al_user_id INTEGER, al_name TEXT,
             connected REAL, detail TEXT)""")
@@ -1836,6 +1854,99 @@ def notices_mailed(ids):
 def notices_since(since):
     with _conn() as c:
         return c.execute("SELECT COUNT(*), COUNT(DISTINCT owner) FROM notices WHERE created >= ?", (since,)).fetchone()
+
+# ---- one-tap book requests (v5.8.3, bookreq.py) --------------------------------------------------
+BOOK_OPEN = ("queued", "pending", "confirm", "downloading", "held")
+BOOK_FIELDS = ("title", "author", "series", "language", "hardcover_id", "notice_id")
+
+BOOK_JSON = {"tried": [], "blocked": [], "reasons": [], "candidate": None, "held_meta": None}
+
+def _bookreq(r):
+    if not r:
+        return None
+    d = dict(r)
+    for k, empty in BOOK_JSON.items():
+        d[k] = json.loads(d[k]) if d.get(k) else empty
+    return d
+
+def bookreq_find_open(owner, title, author):
+    """This reader's open request for the same book (title and author, as asked), or None."""
+    with _conn() as c:
+        return _bookreq(c.execute(
+            f"SELECT * FROM book_requests WHERE owner=? AND lower(title)=lower(?) AND lower(coalesce(author,''))=lower(?) "
+            f"AND status IN ({','.join('?' * len(BOOK_OPEN))}) ORDER BY id DESC",
+            (owner, title, author or "", *BOOK_OPEN)).fetchone())
+
+def bookreq_add(owner, fields, now=None):
+    """(id, created?): an open request for the same book is returned instead of a second."""
+    now = now or time.time()
+    f = {k: fields.get(k) for k in BOOK_FIELDS if fields.get(k) is not None}
+    with _lock, _conn() as c:
+        r = c.execute(f"SELECT id FROM book_requests WHERE owner=? AND lower(title)=lower(?) "
+                      f"AND lower(coalesce(author,''))=lower(?) AND status IN ({','.join('?' * len(BOOK_OPEN))})",
+                      (owner, f.get("title") or "", f.get("author") or "", *BOOK_OPEN)).fetchone()
+        if r:
+            return r["id"], False
+        cols = ", ".join(f)
+        rid = c.execute(f"INSERT INTO book_requests(owner, {cols}, status, next_try, created, updated) "
+                        f"VALUES(?, {','.join('?' * len(f))}, 'queued', ?, ?, ?)",
+                        (owner, *f.values(), now, now, now)).lastrowid
+        return rid, True
+
+def bookreq_get(rid):
+    with _conn() as c:
+        return _bookreq(c.execute("SELECT * FROM book_requests WHERE id=?", (rid,)).fetchone())
+
+def bookreq_update(rid, **f):
+    for k in BOOK_JSON:
+        if k in f and f[k] is not None:
+            f[k] = json.dumps(f[k])
+    f["updated"] = time.time()
+    with _lock, _conn() as c:
+        c.execute(f"UPDATE book_requests SET {', '.join(f'{k}=?' for k in f)} WHERE id=?", (*f.values(), rid))
+
+def bookreq_due(now, limit=2):
+    with _conn() as c:
+        return [_bookreq(r) for r in c.execute(
+            "SELECT * FROM book_requests WHERE status='queued' AND (next_try IS NULL OR next_try <= ?) "
+            "ORDER BY next_try, id LIMIT ?", (now, limit))]
+
+def bookreq_open(statuses=BOOK_OPEN, owner=None):
+    sql = f"SELECT * FROM book_requests WHERE status IN ({','.join('?' * len(statuses))})"
+    args = list(statuses)
+    if owner:
+        sql += " AND owner=?"
+        args.append(owner)
+    with _conn() as c:
+        return [_bookreq(r) for r in c.execute(sql + " ORDER BY id", args)]
+
+def bookreq_list(owner=None, limit=100, closed_days=30, now=None):
+    """Open requests and those closed in the last month; everyone's when owner is None (admin)."""
+    now = now or time.time()
+    sql = f"SELECT * FROM book_requests WHERE (status IN ({','.join('?' * len(BOOK_OPEN))}) OR updated >= ?)"
+    args = [*BOOK_OPEN, now - closed_days * 86400]
+    if owner:
+        sql += " AND owner=?"
+        args.append(owner)
+    with _conn() as c:
+        return [_bookreq(r) for r in c.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))]
+
+def bookreq_for_book(owner, calibre_id):
+    """This reader's delivered request for one Calibre book (for 'Wrong book'), or None."""
+    with _conn() as c:
+        return _bookreq(c.execute("SELECT * FROM book_requests WHERE owner=? AND calibre_id=? AND status='done' "
+                                  "ORDER BY id DESC", (owner, calibre_id)).fetchone())
+
+def bookreq_waiting(owner):
+    """How many of this reader's books wait for them: a copy to confirm, or a file to check."""
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM book_requests WHERE owner=? AND status IN ('confirm','held')",
+                         (owner,)).fetchone()[0]
+
+def bookreq_count_open(owner):
+    with _conn() as c:
+        return c.execute(f"SELECT COUNT(*) FROM book_requests WHERE owner=? AND status IN "
+                         f"({','.join('?' * len(BOOK_OPEN))})", (owner, *BOOK_OPEN)).fetchone()[0]
 
 # ---- AniList (v5.8, anilist.py) ------------------------------------------------------------------
 def anilist_get(owner):

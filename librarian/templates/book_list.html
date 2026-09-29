@@ -1,0 +1,43 @@
+{% extends "base.html" %}{% block body %}
+<p class="mut"><a href="{{ url_for('following') }}">← Following</a></p>
+<div class="card">
+<h2 style="margin-top:0">{{ name }}</h2>
+<p class="mut">{{ 'Book series' if kind == 'book-series' else 'Author' }}{% if sub %} · {{ sub }}{% endif %}</p>
+<div class="row" style="margin:6px 0">
+{% if followed %}<form method="post" action="{{ url_for('follow_stop', fid=followed.id) }}">{{ csrf_field() }}<input type="hidden" name="back" value="{{ request.path }}">
+<button type="submit" class="sec">Following ✓ — stop</button></form>
+{% else %}<form method="post" action="{{ url_for('follow_add') }}">{{ csrf_field() }}
+<input type="hidden" name="kind" value="{{ kind }}"><input type="hidden" name="provider" value="hardcover"><input type="hidden" name="key" value="{{ hid }}">
+<input type="hidden" name="name" value="{{ name }}"><input type="hidden" name="back" value="{{ request.path }}">
+<button type="submit" class="sec">Follow</button></form>{% endif %}
+<span class="mut">New books show up under New for you.</span></div>
+{% if can_get %}<p class="mut" style="margin:0"><strong>Get it</strong>: the portal finds a copy (EPUB first, your language) and shows it to you on
+Requests; once you confirm it, Shelfmark downloads it and the file is checked before it goes into your library.
+<strong>Pick</strong>: choose the copy yourself in Shelfmark.</p>{% endif %}
+</div>
+
+{% if not rows %}<p class="mut">Hardcover lists no books here yet.</p>{% endif %}
+<table>
+{% for b in rows %}
+<tr><td style="width:40px" class="mut">{% if b.position not in (None, '') %}#{{ b.position | string | replace('.0', '') }}{% endif %}</td>
+<td>{% if b.lib == 'yours' %}<a href="{{ url_for('book_page', book_id=b.book_id) }}"><strong>{{ b.title }}</strong></a>{% else %}<strong>{{ b.title }}</strong>{% endif %}
+{% if kind == 'book-series' and b.author %} <span class="mut">· {{ b.author }}</span>{% endif %}
+{% if b.date %} <span class="mut">· {{ b.date[:4] if b.out else 'coming ' ~ b.date }}</span>{% endif %}</td>
+<td style="text-align:right;white-space:nowrap">
+{% if b.lib == 'yours' %}<span class="st-done">in your library</span>
+{% elif b.req and b.req.status in ('confirm', 'held') %}<a href="{{ url_for('status') }}" class="st-pending">{{ 'a copy found: confirm it' if b.req.status == 'confirm' else 'check the file that came' }}</a>
+{% elif b.req and b.req.status in ('queued', 'pending', 'downloading') %}<span class="st-{{ b.req.status }}">{{ {'queued': 'looking for a copy', 'pending': 'waiting for approval', 'downloading': 'downloading'}[b.req.status] }}</span>
+{% elif not b.out %}<span class="mut">not out yet</span>
+{% else %}
+{% if b.lib == 'family' %}<span class="mut">in the family library ·</span>{% endif %}
+{% if can_get %}<form method="post" action="{{ url_for('book_request') }}" style="display:inline">{{ csrf_field() }}
+<input type="hidden" name="title" value="{{ b.title }}"><input type="hidden" name="author" value="{{ b.author }}">
+<input type="hidden" name="series" value="{{ series or '' }}"><input type="hidden" name="hardcover_id" value="{{ b.id }}">
+<input type="hidden" name="back" value="{{ request.path }}"><button type="submit">{{ 'Add to mine' if b.lib == 'family' else 'Get it' }}</button></form>{% endif %}
+{% if b.lib != 'family' and cfg.SHELF_URL %}<a class="btn sec" href="{{ shelf_search(b.title, b.author) }}" target="_blank" rel="noopener">Pick</a>{% endif %}
+{% if b.req and b.req.status == 'not-found' %}<div class="mut" style="font-size:12px">not found last time: try Pick</div>{% endif %}
+{% endif %}</td></tr>
+{% endfor %}
+</table>
+<p class="mut" style="font-size:12px">Book information from <a href="https://hardcover.app/{{ 'series' if kind == 'book-series' else 'authors' }}" target="_blank" rel="noopener">Hardcover</a>.</p>
+{% endblock %}

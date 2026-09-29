@@ -9,6 +9,11 @@ issue or volume arrives on the reader's own devices, the same way books do.
 | Kindle (Colorsoft) | Send-to-Kindle mail, like books (auto-send if the reader turned it on): a KCC "Send to Kindle" EPUB, made when it is sent, never stored |
 | Phone / iPad | My books → Download: the CBZ (Panels, Chunky, KOReader) or the KEPUB |
 
+**Where comics live.** In the same Calibre-Web library as the books, tagged Comics / Manga /
+Manhwa / Manhua, with the series and number set and the reader's owner tag. Shelfmark only
+downloads them; it is not a library. So no separate comic server (Komga, Kavita) is needed: the
+Kobo sync, Send to Kindle, family sharing, backups and My books already cover them.
+
 ## The path of one request (built on Shelfmark, like books)
 
 1. **Metadata.** Western comics: Metron (free account; its API key is sent as a Bearer token),

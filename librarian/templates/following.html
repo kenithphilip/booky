@@ -2,7 +2,8 @@
 <h2>Following</h2>
 <p class="mut">Follow a series or an author: when something new comes out it shows up under <strong>New for you</strong> on the
 home page{% if cfg.SMTP_HOST %} (and by mail, if you turned mail on under Devices){% endif %}, with one tap to get it.
-Nothing downloads by itself. Comics and manga: use the Follow button on a series in <a href="{{ url_for('comics_page') }}">Comics</a>.</p>
+Nothing downloads by itself. Open a name to see every book or volume, which ones you have, and get the missing ones.
+Comics and manga: use the Follow button on a series in <a href="{{ url_for('comics_page') }}">Comics</a>.</p>
 
 {% set new = notices | selectattr('status', 'equalto', 'new') | list %}
 {% if new %}<h3>New for you</h3>{% include "_notices.html" %}{% endif %}
@@ -17,7 +18,7 @@ Nothing downloads by itself. Comics and manga: use the Follow button on a series
 {% if error %}<div class="flash">{{ error }}</div>{% endif %}
 {% for r in results %}
 <div class="card row" style="justify-content:space-between">
-<div><strong>{{ r.name }}</strong>{% if r.author %} <span class="mut">· {{ r.author }}</span>{% endif %}{% if r.books_count %} <span class="mut">· {{ r.books_count }} books</span>{% endif %}
+<div><a href="{{ url_for('books_series' if kind == 'Series' else 'books_author', hid=r.id) }}"><strong>{{ r.name }}</strong></a>{% if r.author %} <span class="mut">· {{ r.author }}</span>{% endif %}{% if r.books_count %} <span class="mut">· {{ r.books_count }} books</span>{% endif %}
 {% if r.books %}<div class="mut">{{ r.books[:4] | join(' · ') }}</div>{% endif %}</div>
 <form method="post" action="{{ url_for('follow_add') }}">{{ csrf_field() }}
 <input type="hidden" name="kind" value="{{ 'book-series' if kind == 'Series' else 'author' }}"><input type="hidden" name="provider" value="hardcover">
@@ -30,8 +31,9 @@ Nothing downloads by itself. Comics and manga: use the Follow button on a series
 {% if not follows %}<p class="mut">Nothing yet.</p>{% endif %}
 <table>
 {% for f in follows %}
-<tr><td><strong>{{ f.name }}</strong> <span class="mut">· {{ {'comic': 'comic / manga series', 'book-series': 'book series', 'author': 'author'}[f.kind] }}</span>
-<div class="mut">{% if f.checked %}checked {{ f.detail or '' }}{% else %}first check within minutes{% endif %}</div></td>
+<tr><td><a href="{{ url_for('follow_page', fid=f.id) }}"><strong>{{ f.name }}</strong></a> <span class="mut">· {{ {'comic': 'comic / manga series', 'book-series': 'book series', 'author': 'author'}[f.kind] }}</span>
+<div class="mut">{% if f.detail and f.detail.startswith('could not check') %}<span class="st-error">{{ f.detail }}</span> · trying again {{ ago_or_in(f.next_check) }}{% if f.checked %} (last good check {{ ago_or_in(f.checked) }}){% endif %}
+{% elif f.checked %}checked {{ ago_or_in(f.checked) }} · {{ f.detail or '' }}{% else %}first check within minutes{% endif %}</div></td>
 <td style="text-align:right"><form method="post" action="{{ url_for('follow_stop', fid=f.id) }}">{{ csrf_field() }}<button class="sec" type="submit">Stop following</button></form></td></tr>
 {% endfor %}
 </table>

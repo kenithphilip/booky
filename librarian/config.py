@@ -280,3 +280,13 @@ BSDTAR = os.environ.get("BSDTAR", "bsdtar")
 # https://request.<domain>/anilist/callback). Readers connect their own accounts on Devices.
 ANILIST_CLIENT_ID = os.environ.get("ANILIST_CLIENT_ID", "")
 ANILIST_CLIENT_SECRET = os.environ.get("ANILIST_CLIENT_SECRET", "")
+# --- v5.8.3: one-tap book requests (bookreq.py): chosen by the portal, downloaded by Shelfmark ----
+BOOK_SEARCH_DAYS = int(os.environ.get("BOOK_SEARCH_DAYS", "14") or 14)
+BOOK_MAX_OPEN_PER_USER = int(os.environ.get("BOOK_MAX_OPEN_PER_USER", "20") or 20)
+BOOK_ARRIVAL_HOURS = int(os.environ.get("BOOK_ARRIVAL_HOURS", "24") or 24)
+# always: the reader confirms every copy the portal found before it downloads (the default).
+# sure: a certain pick (title + author in the name, a retail EPUB, the reader's language) downloads
+# without asking; anything less, and anything after the reader turned one down, still asks.
+BOOK_CONFIRM = (os.environ.get("BOOK_CONFIRM") or "always").lower()
+if BOOK_CONFIRM not in ("always", "sure"):
+    BOOK_CONFIRM = "always"

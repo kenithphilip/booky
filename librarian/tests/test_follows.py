@@ -58,13 +58,14 @@ def test_book_series_and_authors_come_from_hardcover(users, monkeypatch):
     books.append({"id": "3", "title": "Future Book", "date": FUTURE, "position": 3, "author": "Terry Pratchett"})
     follows.check(db.follow_get(fid))
     (n,) = db.notices("bob")
-    assert n["title"] == "The Light Fantastic (Discworld #2)" and n["item"] == {"type": "book", "title": "The Light Fantastic", "author": "Terry Pratchett"}
+    assert n["title"] == "The Light Fantastic (Discworld #2)" and n["item"] == {
+        "type": "book", "title": "The Light Fantastic", "author": "Terry Pratchett", "series": "Discworld", "hardcover_id": "2"}
 
-def test_a_book_notice_opens_shelfmark_already_searching_for_it(users, monkeypatch):
+def test_pick_in_shelfmark_opens_it_already_searching_for_the_book(users, monkeypatch):
     fid, _ = db.follow_add("bob", "author", "hardcover", "9", "Terry Pratchett")
     nid = db.notice_add("bob", fid, "2", "The Light Fantastic", "", {"type": "book", "title": "The Light Fantastic", "author": "Terry Pratchett"})
-    what, url = follows.act("bob", nid, "request")
-    assert url == "https://shelf.example.test/#q=The%20Light%20Fantastic&author=Terry%20Pratchett"
+    what, url = follows.act("bob", nid, "shelfmark")
+    assert url == "https://shelf.example.test/?content_type=ebook&q=The+Light+Fantastic&author=Terry+Pratchett"
     assert db.notice_get(nid)["status"] == "requested"
     with pytest.raises(follows.FollowError):
         follows.act("alice", nid, "dismiss")
@@ -105,9 +106,11 @@ def test_new_for_you_on_the_home_page_and_its_buttons(client, monkeypatch):
     nid = db.notice_add("bob", fid, "2", "The Light Fantastic", "by Terry Pratchett", {"type": "book", "title": "The Light Fantastic", "author": "Terry Pratchett"})
     login(client, "bob", "bobpass1")
     home = client.get("/").get_data(as_text=True)
-    assert "New for you" in home and "The Light Fantastic" in home and "Find in Shelfmark" in home and "Following (1)" in home
-    r = client.post(f"/notices/{nid}/request", data={"csrf": _csrf(client)})
-    assert r.status_code == 302 and r.headers["Location"].startswith("https://shelf.example.test/#q=The%20Light")
+    assert "New for you" in home and "The Light Fantastic" in home and "Pick in Shelfmark" in home and "Following (1)" in home
+    assert f'href="/following/{fid}"' in home, "the name opens what it belongs to"
+    assert "Get it" not in home, "no one-tap without the portal's Shelfmark login"
+    r = client.post(f"/notices/{nid}/shelfmark", data={"csrf": _csrf(client)})
+    assert r.status_code == 302 and r.headers["Location"].startswith("https://shelf.example.test/?content_type=ebook&q=The+Light")
     assert "New for you" not in client.get("/").get_data(as_text=True)
 
 def _csrf(client):
@@ -276,3 +279,31 @@ def test_an_authors_books_are_asked_for_released_and_read_ones_only(monkeypatch)
     assert name == "Brandon Sanderson" and books[0]["title"] == "Wind and Truth"
     assert asked["t"] == datetime.date.today().isoformat() and asked["r"] == hardcover.AUTHOR_MIN_READERS
     assert "release_date: {_lte: $t}" in asked["query"] and "users_count: {_gte: $r}" in asked["query"]
+
+
+def test_a_first_check_that_fails_is_shown_and_tried_again_soon(client, monkeypatch):
+    monkeypatch.setattr(config, "HARDCOVER_API_KEY", "hc_pat_x")
+    def down(aid, limit=60):
+        raise hardcover.HardcoverError("Hardcover did not answer (ConnectTimeout)")
+    monkeypatch.setattr(hardcover, "author_books", down)
+    fid, _ = follows.follow("bob", "author", "hardcover", "9", "Jeffrey Archer")
+    follows.check(db.follow_get(fid), now=1000.0)
+    assert db.follow_get(fid)["next_check"] == 1000.0 + follows.FIRST_RETRY, "half an hour, not six"
+    login(client, "bob", "bobpass1")
+    page = client.get("/following").get_data(as_text=True)
+    assert "could not check: Hardcover did not answer (ConnectTimeout)" in page and "first check within minutes" not in page
+
+def test_hardcover_is_asked_once_more_when_the_connection_failed(monkeypatch):
+    monkeypatch.setattr(config, "HARDCOVER_API_KEY", "hc_pat_x")
+    monkeypatch.setattr(hardcover, "RETRY_SLEEP", 0)
+    calls = []
+    class R:
+        status_code = 200
+        def json(self): return {"data": {"search": {"results": {"hits": []}}}}
+    def post(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise hardcover.requests.ConnectTimeout("slow")
+        return R()
+    monkeypatch.setattr(hardcover.requests, "post", post)
+    assert hardcover.search("Jeffrey Archer", "Author") == [] and len(calls) == 2

@@ -33,10 +33,14 @@
 <input type="hidden" name="work_key" value="{{ w.key }}">
 <select name="kind"><option value="ebook">Ebook</option><option value="audio">Audiobook</option></select>
 <button type="submit">Keep looking for it</button></form>
-{% if shelf %}<a class="btn sec" href="{{ shelf }}" target="_blank" rel="noopener">Search more sources in Shelfmark</a>{% endif %}
+{% if can_get %}<form method="post" action="{{ url_for('book_request') }}">{{ csrf_field() }}
+<input type="hidden" name="title" value="{{ w.title }}"><input type="hidden" name="author" value="{{ w.author }}">
+<button type="submit" title="The portal finds a copy through Shelfmark (EPUB first, your language) and it arrives in your library">Get it through Shelfmark</button></form>{% endif %}
+{% if shelf %}<a class="btn sec" href="{{ shelf }}" target="_blank" rel="noopener">Pick in Shelfmark</a>{% endif %}
 {% if shelf_audio %}<a class="btn sec" href="{{ shelf_audio }}" target="_blank" rel="noopener">…audiobook in Shelfmark</a>{% endif %}
 </div>
-<p class="mut" style="margin:6px 0 0">Keep looking checks this book's catalogue links and the catalogues again on a schedule, and requests an exact match when one appears.</p></div>
+<p class="mut" style="margin:6px 0 0">Keep looking checks this book's catalogue links and the catalogues again on a schedule, and requests an exact match when one appears.{% if can_get %}
+Get it through Shelfmark lets the portal choose a copy from your indexers; Pick in Shelfmark lets you choose it.{% endif %}</p></div>
 
 {% if refused %}<details class="card"><summary>{{ refused|length }} cop{{ 'y' if refused|length == 1 else 'ies' }} found that did not match</summary>
 {% for c in refused %}<p class="mut">{{ c.title }} — {{ c.author or '?' }} · {{ c.detail }}: {{ c.match.reasons | join('; ') }}</p>{% endfor %}

@@ -200,6 +200,30 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.8.3 (clickable follows, Get it for books with three safeguards, Hardcover retry)
+- Unit 676 passed, installer 801 passed, end-to-end 288 checks / 0 failed. Book releases judged on 15 real-world spellings (scene
+  names, "by", subtitles, series in brackets, initials): Dune Messiah is never Dune, a Stormlight
+  1-5 pack, an M4B, a PDF, a summary and a French copy are refused.
+- The safeguards, each tested: nothing downloads before the reader confirms (BOOK_CONFIRM=always,
+  the default); 'Not it' blocks that release name from every indexer; a file whose inside says
+  Dune Messiah, Brian Herbert or French is held, not imported, while an ISBN of an English edition
+  (Hardcover's editions, measured 2026-09-29: isbn_13 / isbn_10 / language.code2) is accepted
+  under any title; 'Wrong book' removes the owner tag and the wrong copy never counts as "already
+  yours" again; a Shelfmark download that completed is never replaced by a second one.
+- Found while testing: the admin's Requests page crashed when Shelfmark was down and the portal
+  signs in with a password (its login was not guarded); it now says so on the page.
+- The first Jeffrey Archer check on the VPS died on a ConnectTimeout to Hardcover (IPv4 fine, no
+  IPv6 record): Hardcover is asked once more after 3 s with a 10 s connect timeout, a failed FIRST
+  check is retried in 30 min (not 6 h), and Following shows the failure and the next try.
+- On the VPS after Deploy:
+  - Following: every name is a link. A book series or an author lists its books with Get it /
+    Add to mine / Pick; a comic series opens its Comics page.
+  - Get it on one book you do not have: within a minute or two Requests (with a count in the
+    menu) shows the copy found; Yes, that one → downloading → checked → in your library.
+    Shelfmark's queue shows it under the reader's name.
+  - Not found after a few looks usually means the indexers name it differently: Pick in Shelfmark.
+  - Optional: Advanced settings → requests → BOOK_CONFIRM=sure once the picks have proven right.
+
 ## Verified locally in v5.8.1 (Hardcover against the real API)
 - With the owner's key: `{ me }` answers only as `Authorization: Bearer <hc_pat_...>` (the bare
   token is HTTP 400); search(Series|Author), series(...).book_series and books(where: ...) all

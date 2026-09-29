@@ -535,10 +535,39 @@ one arrives like a book:
 **Following** page, from Hardcover: needs the admin's free Hardcover key under Library → Metadata
 sources). Once a day each is checked; what has come OUT since (released, not merely announced)
 shows on the reader's **New for you** list at the top of the portal, with one tap:
-**Request** for a comic or manga volume, **Find in Shelfmark** for a book (Shelfmark opens already
-searching for it; the reader picks the copy). Nothing downloads by itself, and following a long
+**Request** for a comic or manga volume, **Get it** for a book (v5.8.3, below), or **Pick in
+Shelfmark** to choose a book's copy by hand. Nothing downloads by itself, and following a long
 series never floods anyone: the first check only records what is already out. Readers who turned
 mail on (Devices) get one digest; the admin's ntfy gets a daily count.
+
+Every followed name opens its page: a comic series its volumes, a book series or an author (v5.8.3)
+every book in order with release dates, which ones the reader has (linked), which ones the family
+has (**Add to mine**, no download), which are requested and which are not out yet.
+
+**Get it** (v5.8.3, `librarian/bookreq.py`): the portal does for a book what it does for a comic,
+with three safeguards because a book's copies vary far more:
+- **The family copy first**, then Shelfmark's own Prowlarr search, scored by `bookrel.py` (the
+  title as a phrase with nothing left over that makes it another book, the author's surname, a
+  single book: no packs, box sets, abridged copies or summaries; EPUB > AZW3 > MOBI, no PDF; the
+  reader's language; Usenet or a seeded torrent).
+- **1. The reader confirms the copy.** Requests shows what was found (release name, size,
+  indexer, why) and nothing downloads until **Yes, that one**; **Not it** never offers that
+  release name again, from any indexer. Advanced settings → requests → `BOOK_CONFIRM=sure`
+  lets a certain pick (title and author in the name, a retail EPUB, the reader's language)
+  download without asking; never after the reader turned one down.
+- The chosen release is queued in Shelfmark as the reader, so the download, the seeding and the
+  delivery are Shelfmark's.
+- **2. The file is checked before the import**: its own title, author, language and ISBN (from
+  inside the EPUB/MOBI/AZW3) and its format. An ISBN that is one of the book's editions in the
+  reader's language (Hardcover) settles it. A file that does not match is **held**, not imported:
+  the reader sees what it says it is and chooses **Keep it anyway** or **Not it: find another**.
+- **3. Wrong book** on a delivered book's page takes it out of the reader's library, never counts
+  that copy or release again, tells the admin, and looks again (asking first).
+
+Nothing right: it looks again (1 h, 6 h, then daily, 14 days) and then says to Pick in Shelfmark.
+A download that failed or never arrived tries the next release (asking first). Requests shows
+each one, with a count in the menu while something waits for the reader; approvals apply as for
+any request. Also on a book's page (Search): **Get it through Shelfmark** next to **Pick in Shelfmark**.
 
 **Reading status** comes from Calibre-Web itself (the Kobo's Finished / Reading and page position,
 KOReader, the web reader): My books, a book's page and a comic series show Read / Reading 45 %,

@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta, follows, hardcover, anilist
+import comics, comicmeta, follows, hardcover, anilist, bookreq, share
 import abs as absapi
 
 app = Flask(__name__)
@@ -91,6 +91,10 @@ def _inject():
             "mail_intake": _mail_intake_address,
             # v5.8: what turned up for this reader (New for you), counted for the nav
             "new_for_you": lambda: db.notices(session["user"]) if session.get("user") else [],
+            "ago_or_in": _ago_or_in, "shelf_search": follows.shelfmark_search_url,
+            "can_get_books": _can_get,
+            # v5.8.3: copies to confirm and held files, waiting for this reader
+            "books_waiting": lambda: db.bookreq_waiting(session["user"]) if session.get("user") else 0,
             "reading": _reading_badge}
 
 def _reading_badge(state):
@@ -424,7 +428,8 @@ def work_page(key):
     return render_template("work.html", w=w, offer=offer, refused=refused, lang=lang,
                            shelf=_shelf_link(title=w["title"], author=w["author"],
                                              isbn=(w["isbns"] or [None])[0]),
-                           shelf_audio=_shelf_link(title=w["title"], author=w["author"], kind="audio"))
+                           shelf_audio=_shelf_link(title=w["title"], author=w["author"], kind="audio"),
+                           can_get=_can_get())
 
 @app.route("/writer/<key>")
 @login_required
@@ -764,9 +769,10 @@ def status():
     for w in looking:
         c = w.get("candidate") or {}
         w["cand_host"] = urlsplit(c.get("download_url") or "").hostname or ""
+    book_reqs = db.bookreq_list(None if is_admin else session["user"])
     return render_template("status.html", rows=rows, pending=pending, failed=failed,
                            admin=is_admin, looking=looking, kindle_sends=kindle_sends,
-                           shelf_pending=shelf_pending, shelf_error=shelf_error)
+                           shelf_pending=shelf_pending, shelf_error=shelf_error, book_reqs=book_reqs)
 
 @app.route("/shelfmark/<int:req_id>/<action>", methods=["POST"])
 @admin_required
@@ -994,7 +1000,8 @@ def book_page(book_id):
         convert_to=[f for f in config.CONVERT_TARGETS if f not in b["formats"]]
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
         converting=db.convert_for_book(book_id),
-        replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS)
+        replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS,
+        got_it=db.bookreq_for_book(user, book_id))
 
 @app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
 @login_required
@@ -1365,24 +1372,185 @@ def follow_stop(fid):
 @login_required
 def notice_action(nid, action):
     user = session["user"]
-    if action not in ("request", "dismiss"):
+    if action not in ("request", "shelfmark", "dismiss"):
         abort(400)
     try:
         what, url = follows.act(user, nid, action)
     except follows.FollowError:
         abort(404)
-    except (comics.ComicError, comicmeta.MetaError) as e:
+    except (comics.ComicError, comicmeta.MetaError, bookreq.BookRequestError) as e:
         flash(str(e))
         return redirect(url_for("index"))
     _audit(f"notice_{action}", f"#{nid} {what}")
     if url:
-        return redirect(url)                       # a book: Shelfmark, already searching for it
+        return redirect(url)                       # Pick in Shelfmark: already searching for it
     if action == "request":
-        flash({"queued": "Requested.", "shared": "It was in the family library: added to yours.",
-               "owned": "You have it already.", "exists": "Already requested.",
-               "pending": "Requested; waiting for the admin's approval."}.get(what, "Requested."))
+        flash(REQUEST_SAID.get(what, "Requested."))
     return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
                     else url_for("index"))
+
+REQUEST_SAID = {"queued": "Requested: the portal is looking for a copy and will ask you to confirm it before it downloads (Requests shows how far it got).",
+                "shared": "It was in the family library: added to yours, nothing downloaded.",
+                "owned": "You have it already.", "exists": "Already requested.",
+                "pending": "Requested; waiting for the admin's approval."}
+
+# ---- a book series or an author, book by book; one-tap book requests (v5.8.3, bookreq.py) ------
+@app.route("/following/<int:fid>")
+@login_required
+def follow_page(fid):
+    """What a followed name opens: a comic series' page, or a book series' / author's books."""
+    f = db.follow_get(fid)
+    if not f or f["owner"] != session["user"]:
+        abort(404)
+    if f["kind"] == "comic":
+        return redirect(url_for("comic_series", provider=f["provider"], sid=f["key"]))
+    return redirect(url_for("books_series" if f["kind"] == "book-series" else "books_author", hid=f["key"]))
+
+def _book_rows(user, books):
+    """Each book with where it stands for this reader: in their library (with a link), in the
+    family's (Get it adds it to theirs, no download), requested, or not out yet."""
+    index = dedupe.Index(None, is_admin=True, force=True)
+    asked = {}
+    for r in db.bookreq_list(user, limit=500, closed_days=3650):          # newest first
+        asked.setdefault((r["title"].lower(), (r.get("author") or "").lower()), r)
+    today = datetime.date.today().isoformat()
+    rows = []
+    for b in books:
+        row = dict(b, lib=None, book_id=None, out=not b.get("date") or str(b["date"])[:10] <= today,
+                   req=asked.get((b["title"].lower(), (b.get("author") or "").lower())))
+        m = index.match(b["title"], b.get("author") or "")
+        if m and m["how"] in share.STRONG:
+            try:
+                owners = share._owners_of_book(m["book_id"])
+            except sqlite3.Error:
+                owners = []
+            if user in owners:
+                row.update(lib="yours", book_id=m["book_id"])
+            elif owners:
+                row["lib"] = "family"
+        rows.append(row)
+    return rows
+
+def _hardcover_page(what, hid):
+    if not re.fullmatch(r"\d{1,12}", hid or ""):
+        abort(404)
+    if not hardcover.configured():
+        flash("Book series and authors need the admin's Hardcover key (Library -> Metadata sources).")
+        return None
+    try:
+        return hardcover.cached(what, hid)
+    except hardcover.HardcoverError as e:
+        flash(f"Could not read this from Hardcover: {e}")
+        return None
+
+@app.route("/books/series/<hid>")
+@login_required
+def books_series(hid):
+    got = _hardcover_page("series", hid)
+    if not got:
+        return redirect(url_for("following"))
+    name, done, books = got
+    user = session["user"]
+    authors = list(dict.fromkeys(b["author"] for b in books if b.get("author")))
+    return render_template("book_list.html", kind="book-series", hid=hid, name=name or "Series",
+                           sub=", ".join(authors[:3]) + (" · complete" if done else ""),
+                           rows=_book_rows(user, books), series=name,
+                           followed=db.follow_find(user, "book-series", "hardcover", hid), can_get=_can_get())
+
+@app.route("/books/author/<hid>")
+@login_required
+def books_author(hid):
+    got = _hardcover_page("author", hid)
+    if not got:
+        return redirect(url_for("following"))
+    name, books = got
+    user = session["user"]
+    return render_template("book_list.html", kind="author", hid=hid, name=name or "Author",
+                           sub=f"{len(books)} books, newest first", rows=_book_rows(user, books), series=None,
+                           followed=db.follow_find(user, "author", "hardcover", hid), can_get=_can_get())
+
+def _can_get():
+    import shelfmark_api
+    return shelfmark_api.configured()
+
+def _back(default):
+    back = request.form.get("back") or ""
+    return back if back.startswith("/") and not back.startswith("//") else default
+
+@app.route("/books/request", methods=["POST"])
+@login_required
+def book_request():
+    """Get it: the portal finds a copy through Shelfmark and Shelfmark downloads it as the reader."""
+    user = session["user"]
+    title = (request.form.get("title") or "").strip()[:300]
+    author = (request.form.get("author") or "").strip()[:200]
+    series = (request.form.get("series") or "").strip()[:200] or None
+    hid = request.form.get("hardcover_id") or None
+    if not title or (hid and not re.fullmatch(r"\d{1,12}", hid)) or not _can_get():
+        abort(400)
+    try:
+        rid, what = bookreq.request(user, title, author, series=series, hardcover_id=hid)
+    except bookreq.BookRequestError as e:
+        flash(str(e))
+        return redirect(_back(url_for("status")))
+    _audit("book_request", f"{title} by {author or '?'} ({what}, #{rid})")
+    flash(REQUEST_SAID.get(what, "Requested."))
+    return redirect(_back(url_for("status")))
+
+@app.route("/books/requests/<int:rid>/<action>", methods=["POST"])
+@login_required
+def book_request_action(rid, action):
+    """yes / no (a copy offered, or a held file), keep (a held file anyway), cancel, retry, approve."""
+    import shelfmark_api
+    user, is_admin = session["user"], session.get("admin", False)
+    r = db.bookreq_get(rid)
+    if not r or (r["owner"] != user and not is_admin):
+        abort(404)
+    try:
+        if action == "yes" and r["owner"] == user and r["status"] == "confirm":
+            said = {"downloading": "Downloading it now: it arrives in your library, checked first.",
+                    }.get(bookreq.confirm(rid, shelfmark_api), "Shelfmark did not take it; the portal looks again shortly.")
+        elif action == "no" and r["owner"] == user and r["status"] in ("confirm", "held"):
+            bookreq.reject(rid)
+            said = "Not that one: it will not be offered again. Looking for another copy."
+        elif action == "keep" and r["owner"] == user and r["status"] == "held":
+            bookreq.keep(rid)
+            said = "Kept: it is being added to your library."
+        elif action == "cancel" and r["status"] in ("queued", "pending", "confirm", "held", "not-found"):
+            bookreq._drop_held(r)
+            db.bookreq_update(rid, status="cancelled", candidate=None, held_path=None, detail="cancelled")
+            said = None
+        elif action == "retry" and r["status"] in ("not-found", "cancelled"):
+            db.bookreq_update(rid, status="queued", next_try=time.time(), attempts=0, created=time.time(), detail="looking again")
+            said = None
+        elif action == "approve" and is_admin and r["status"] == "pending":
+            db.bookreq_update(rid, status="queued", next_try=time.time(), detail="approved")
+            said = None
+        else:
+            abort(400)
+    except bookreq.BookRequestError as e:
+        said = str(e)
+    if said:
+        flash(said)
+    _audit(f"book_request_{action}", f"#{rid} {r['title']}")
+    return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
+                    else url_for("status"))
+
+@app.route("/book/<int:book_id>/wrong", methods=["POST"])
+@login_required
+def book_wrong(book_id):
+    """'Wrong book' on a book that came from Get it."""
+    user = session["user"]
+    try:
+        bookreq.wrong_book(user, book_id)
+    except bookreq.BookRequestError:
+        abort(404)
+    _audit("book_wrong", f"book {book_id}")
+    flash("Thanks: it is being taken out of your library, that copy will not be offered again, and the portal is "
+          "looking for another one. You will be asked before anything downloads. Delete it from your Kobo or Kindle "
+          "by hand if it already arrived there.")
+    return redirect(url_for("status"))
+
 
 # ---- AniList (v5.8, anilist.py) ----------------------------------------------------------------
 @app.route("/anilist/connect")

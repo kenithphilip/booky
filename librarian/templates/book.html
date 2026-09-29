@@ -50,7 +50,14 @@
 <button type="submit" class="sec">Find a better copy</button>
 <span class="mut">Badly formatted or no cover? The next EPUB of this book replaces this file, for everyone who has it.</span></form>
 {% endif %}
-{% if not admin or session.user in (b.owners or []) %}<p style="margin:10px 0 0"><a class="btn sec" href="{{ url_for('book_remove', book_id=b.id) }}">Remove from my library…</a></p>{% endif %}
+{% if not admin or session.user in (b.owners or []) %}<p style="margin:10px 0 0"><a class="btn sec" href="{{ url_for('book_remove', book_id=b.id) }}">Remove from my library…</a>
+</p>
+{% if got_it %}<details style="margin-top:8px"><summary>Not the book you asked for?</summary>
+<p class="mut">It came from Get it ({{ got_it.release_title or 'a release found by the portal' }}). <strong>Wrong book</strong> takes it out of
+your library, that copy is never offered again, the admin is told, and the portal looks for another one, asking you before anything downloads.
+Delete it from your Kobo or Kindle by hand if it is already there.</p>
+<form method="post" action="{{ url_for('book_wrong', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="danger">Wrong book</button></form>
+</details>{% endif %}{% endif %}
 </div></div></div>
 {% if description %}<div class="card"><h3 style="margin-top:0">About this book</h3><p style="white-space:pre-line">{{ description }}</p></div>{% endif %}
 {% endblock %}

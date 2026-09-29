@@ -1138,6 +1138,10 @@ def _handle(p, owner, title, kind, box, park_name, fn):
 
 def _ingest_file_entry(p, owner, rid):
     _refuse_links(p)
+    import bookreq
+    held = bookreq.check_arrival(p, owner)      # a Get it download that is not the book: held
+    if held:
+        return held
     note = ingest_local_file(p, owner, rid)
     os.remove(p)
     return note
@@ -2077,6 +2081,33 @@ def comics_once(now=None):
     _link_arrived_comics(now)
     return n
 
+# ---- one-tap book requests (v5.8.3, bookreq.py): the same Shelfmark path as comics ---------------
+BOOKS_EVERY = 60
+
+def books_once(now=None):
+    import shelfmark_api, bookreq
+    now = now or time.time()
+    if not shelfmark_api.configured() or not db.bookreq_open(statuses=("queued", "downloading")):
+        return 0
+    try:
+        queue = shelfmark_api.queue_status()
+    except Exception as e:
+        log.debug("books: could not read Shelfmark's queue: %s", e)
+        queue = None
+    try:
+        bookreq.watch_downloads(shelfmark_api, queue, now)
+    except Exception as e:
+        log.warning("books: watching downloads: %s", e)
+    n = 0
+    for req in db.bookreq_due(now, limit=2):
+        try:
+            bookreq.search_once(req, shelfmark_api, now)
+        except Exception as e:                   # one bad request never blocks the others
+            log.warning("books: request %s: %s", req["id"], e)
+            db.bookreq_update(req["id"], next_try=now + 3600, detail=f"error: {str(e)[:200]}; trying again in an hour")
+        n += 1
+    return n
+
 FOLLOWS_EVERY = 600
 
 def follows_once(now=None):
@@ -2414,6 +2445,7 @@ def run_forever():
     # entry, the metadata chain — never allowed to hold up tag jobs or import reconciliation
     threading.Thread(target=_loop, args=("wanted", wanted_once, WANTED_EVERY), daemon=True).start()
     threading.Thread(target=_loop, args=("comics", comics_once, COMICS_EVERY), daemon=True).start()
+    threading.Thread(target=_loop, args=("books", books_once, BOOKS_EVERY), daemon=True).start()
     # v5.8: followed series and authors (each checked once a day), AniList progress
     threading.Thread(target=_loop, args=("follows", follows_once, FOLLOWS_EVERY), daemon=True).start()
     if config.IMAP_HOST:
