@@ -1907,6 +1907,9 @@ expect '! sed -n "/^  shelfmark:/,/^  uptime-kuma:/p" "$REPO/docker-compose.yml"
 expect 'sed -n "/^  shelfmark:/,/^  uptime-kuma:/p" "$REPO/docker-compose.yml" | grep -q "path: ./shelfmark/metadata.env"' "keys go through an optional env file the installer writes only when a key exists"
 
 echo "== Metadata sources and your own catalogs"
+K51=hc_pat_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQR
+expect '[ "$(hardcover_key_from "$K51")" = "$K51" ] && [ "$(hardcover_key_from "Bearer $K51")" = "$K51" ] && [ "$(hardcover_key_from $'"'"'\e[200~'"'"'"$K51"$'"'"'\e[201~'"'"')" = "$K51" ] && [ "$(hardcover_key_from "Your new API key $K51 Make sure to copy it")" = "$K51" ]' "the Hardcover key is taken out of whatever the paste delivered: 'Bearer ', terminal paste codes, text around it (86 characters reached the box for a 51-character key, live)"
+expect '[ "$(key_preview "$K51")" = "hc_pat_abc…OPQR" ]' "a refusal shows only a masked preview of what arrived, to compare with the page"
 envset HARDCOVER_API_KEY ""; envset GOOGLE_BOOKS_API_KEY ""
 ( metadata_key_ok(){ [ "$2" = good-key ]; }
   reset "good-key" "bad-key"; step_metadata_sources >/dev/null; echo "hc=$(envget HARDCOVER_API_KEY) gb=$(envget GOOGLE_BOOKS_API_KEY)" > "$T/md.out" )

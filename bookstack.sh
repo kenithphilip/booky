@@ -3765,6 +3765,14 @@ write_shelfmark_metadata_env() {
   mv -f "$f.new" "$f"
 }
 KEY_REASON=""
+# The key out of whatever a paste delivered: a Hardcover key is "hc_pat_" + letters and digits
+# (older ones a long "eyJ..." token). A paste of a 51-character key reached the password box as
+# 86 characters on the real server (2026-09-29), and the extra could not be seen there.
+hardcover_key_from(){ local s; s=$(printf '%s' "$1" | tr -d '\r\n\t')
+  if [[ "$s" =~ (hc_pat_[A-Za-z0-9_]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  elif [[ "$s" =~ (eyJ[A-Za-z0-9._-]{40,}) ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  else s="${s#Bearer }"; printf '%s' "${s// /}"; fi; }
+key_preview(){ local k="$1"; [ "${#k}" -gt 14 ] && printf '%s…%s' "${k:0:10}" "${k: -4}" || printf '%s' "${k:0:3}…"; }
 metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it; KEY_REASON says why not
   local k ans
   case "$1" in
@@ -3772,14 +3780,14 @@ metadata_key_ok() { # hardcover|google key -> 0 when the service accepts it; KEY
       # what a paste can carry along: "Bearer ", surrounding spaces, a line break where the settings
       # page wrapped it. Hardcover's own answer is kept, so a refusal says WHY (a cut-short paste
       # and a regenerated key both read "Token is not associated with a user").
-      k=$(printf '%s' "${2#Bearer }" | tr -d ' \t\r\n')
+      k=$(hardcover_key_from "$2")
       ans=$(curl -sS -m 15 -X POST https://api.hardcover.app/v1/graphql \
               -H "Authorization: Bearer $k" -H "Content-Type: application/json" \
               --data '{"query":"{ me { id } }"}' 2>&1)
       case "$ans" in *'"me"'*) return 0;; esac
       KEY_REASON="Hardcover said: $(printf '%s' "$ans" | sed -n 's/.*"error_description":"\([^"]*\)".*/\1/p;s/.*"message":"\([^"]*\)".*/\1/p' | head -1)"
       [ "$KEY_REASON" = "Hardcover said: " ] && KEY_REASON="Hardcover said: ${ans:0:120}"
-      KEY_REASON="$KEY_REASON (the key was ${#k} characters: a whole one is several hundred; a new key on hardcover.app also ends the old one)"
+      KEY_REASON="$KEY_REASON. What reached it: $(key_preview "$k") (${#k} characters; a key made today is hc_pat_ + 44, so 51). Compare it with the key on hardcover.app -> Settings -> API; deleting a key there ends it at once."
       return 1;;
     google) curl -fsS -m 15 "https://www.googleapis.com/books/v1/volumes?q=isbn:9780141439518&maxResults=1&key=$2" >/dev/null 2>&1;;
   esac
@@ -3791,7 +3799,7 @@ step_metadata_sources() {
   case "$hc" in
     -) envset HARDCOVER_API_KEY ""; note="$note\nHardcover: removed.";;
     "") ;;
-    *) hc=$(printf '%s' "${hc#Bearer }" | tr -d ' \t\r\n')
+    *) hc=$(hardcover_key_from "$hc")
        if metadata_key_ok hardcover "$hc"; then envset HARDCOVER_API_KEY "$hc"; note="$note\nHardcover: accepted and saved."
        else note="$note\nHardcover: the token was REFUSED, not saved. $KEY_REASON"; fi;;
   esac
