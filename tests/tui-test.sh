@@ -2382,11 +2382,13 @@ expect 'declare -f install_disk_watch | grep -q install_disk_report' "Deploy ins
 expect 'declare -f step_deploy | grep -q "absctl backups"' "Deploy switches on Audiobookshelf's own nightly database copy"
 
 echo "== v5.7: Library -> Comics (docs/COMICS.md)"
-envset COMICS_ENABLED ""; envset METRON_USER ""; envset METRON_PASS ""; envset COMICVINE_API_KEY ""
+envset COMICS_ENABLED ""; envset METRON_TOKEN ""; envset METRON_USER ""; envset METRON_PASS ""; envset COMICVINE_API_KEY ""
 install_comic_convert
 expect '[ ! -e "$T/etc/cron.d/bookstack-comics" ]' "comics off: no conversion job"
-reset "yes" "comicfan" "metron-pw" "<blank>"; step_comics >/dev/null
-expect '[ "$(envget COMICS_ENABLED)" = true ] && [ "$(envget METRON_USER)" = comicfan ] && [ "$(envget METRON_PASS)" = metron-pw ] && [ -z "$(envget COMICVINE_API_KEY)" ]' "turning comics on stores the Metron account (the password through a password box) and no ComicVine key"
+reset "yes" "<blank>" "comicfan" "metron-pw" "<blank>"; step_comics >/dev/null
+expect '[ "$(envget COMICS_ENABLED)" = true ] && [ "$(envget METRON_USER)" = comicfan ] && [ "$(envget METRON_PASS)" = metron-pw ] && [ -z "$(envget COMICVINE_API_KEY)" ]' "no Metron API key: the account's login is asked for instead (the password through a password box)"
+reset "yes" "metron-key-123" "<blank>"; step_comics >/dev/null
+expect '[ "$(envget METRON_TOKEN)" = metron-key-123 ] && [ -z "$(envget METRON_USER)" ] && [ -z "$(envget METRON_PASS)" ] && grep -q "askpw: Metron API key" "$LOG"' "a Metron API key (in a password box) replaces the login"
 expect 'grep -q "flock -n /run/lock/bookstack-comics.lock env STACK_DIR=.*scripts/comic-convert.sh" "$T/etc/cron.d/bookstack-comics" && grep -q "^\*/3 \* \* \* \* root" "$T/etc/cron.d/bookstack-comics"' "the device-copy job runs every 3 minutes, never twice at once"
 expect 'seen "docker: pull -q ghcr.io/ciromattia/kcc:v12.0.0" && seen "compose up -d librarian" && seen "python -m comicmeta check"' "KCC is pulled, the portal recreated, and the metadata providers asked"
 expect 'grep -F msgbox "$LOG" | grep -q "tick CBR"' "the admin is told the one Shelfmark setting comics need (CBR)"

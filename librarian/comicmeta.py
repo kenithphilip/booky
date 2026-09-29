@@ -1,7 +1,7 @@
 """What a comic or manga IS: series, its issues or volumes, kind, reading direction (docs/COMICS.md).
 
 Three free providers, each for what it describes best:
-  metron        Western comics (metron.cloud, a free account, basic auth; 20 requests/min)
+  metron        Western comics (metron.cloud, a free account: its API key, or user + password; 20 requests/min)
   comicvine     Western comics, the fallback (a free API key; 200 requests/resource/hour)
   mangaupdates  manga, manhwa, manhua (no key)
 Results are cached in the portal's database (a day), so a reader paging through a series costs
@@ -40,7 +40,7 @@ class MetaError(Exception):
 def providers():
     """Which providers can answer, in the order they are asked."""
     western = []
-    if config.METRON_USER and config.METRON_PASS:
+    if config.METRON_TOKEN or (config.METRON_USER and config.METRON_PASS):
         western.append("metron")
     if config.COMICVINE_API_KEY:
         western.append("comicvine")
@@ -70,14 +70,14 @@ def kind_from_metron(series_type_name, name=""):
 
 
 # ---- HTTP and cache ----------------------------------------------------------------------------
-def _get_json(url, params=None, auth=None, method="GET", body=None):
+def _get_json(url, params=None, auth=None, method="GET", body=None, headers=None):
     key = "cm:" + json.dumps([method, url, params, body], sort_keys=True)
     hit = db.cache_get(key, CACHE_SECONDS)
     if hit is not None:
         return hit
     try:
         r = requests.request(method, url, params=params, json=body, auth=auth, timeout=TIMEOUT,
-                             headers={"User-Agent": UA, "Accept": "application/json"})
+                             headers={"User-Agent": UA, "Accept": "application/json", **(headers or {})})
     except requests.RequestException as e:
         stale = db.cache_get(key, None)                  # a provider that is down: the last answer
         if stale is not None:
@@ -102,7 +102,11 @@ def _host(url):
 
 
 def _metron_auth():
-    return (config.METRON_USER, config.METRON_PASS)
+    """Metron's API key as a Bearer token (what its own client, mokkari, sends; it wins over a
+    login), else the account's user name and password."""
+    if config.METRON_TOKEN:
+        return {"headers": {"Authorization": f"Bearer {config.METRON_TOKEN}"}}
+    return {"auth": (config.METRON_USER, config.METRON_PASS)}
 
 
 def _cv(path, **params):
@@ -136,7 +140,7 @@ def search(query, kind="comic", limit=20):
 
 
 def _metron_search(query, limit):
-    d = _get_json(f"{METRON}/series/", params={"name": query}, auth=_metron_auth())
+    d = _get_json(f"{METRON}/series/", params={"name": query}, **_metron_auth())
     out = []
     for s in (d.get("results") or [])[:limit]:
         name = s.get("display_name") or s.get("series") or s.get("name") or ""
@@ -187,7 +191,7 @@ def series(provider, sid, language="en"):
 
 
 def _metron_series(sid):
-    s = _get_json(f"{METRON}/series/{int(sid)}/", auth=_metron_auth())
+    s = _get_json(f"{METRON}/series/{int(sid)}/", **_metron_auth())
     st = (s.get("series_type") or {}).get("name") if isinstance(s.get("series_type"), dict) else None
     name = s.get("name") or s.get("display_name") or ""
     info = {"provider": "metron", "id": str(sid), "name": _strip_year(name), "year": s.get("year_began"),
@@ -197,7 +201,7 @@ def _metron_series(sid):
             "volume": s.get("volume"), "cv_id": s.get("cv_id")}
     items, url, params = [], f"{METRON}/issue/", {"series_id": int(sid)}
     while url and len(items) < MAX_ITEMS:
-        page = _get_json(url, params=params, auth=_metron_auth())
+        page = _get_json(url, params=params, **_metron_auth())
         for i in page.get("results") or []:
             sr = i.get("series") or {}
             if sr.get("id") not in (None, int(sid)) and str(sr.get("id")) != str(sid):

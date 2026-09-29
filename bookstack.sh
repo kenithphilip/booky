@@ -3803,11 +3803,17 @@ step_comics() {
   else
     yesno "Turn on Comics & manga?\n\nReaders get a Comics page: they pick issues or volumes, and each one arrives like a book: on their Kobo (its existing link), their Kindle (Send to Kindle) and as a CBZ download for phones and tablets.\n\nDownloads go through Shelfmark (the seedbox, its ebook category, torrents kept seeding) — nothing new on the seedbox." || return 0
   fi
-  cur=$(envget METRON_USER)
-  u=$(ask "Metron user name (free account at metron.cloud: Western comics metadata). Manga needs no account.\n\nBlank = keep '${cur:-none}'. Type - to remove." "") || u=""
-  case "$u" in -) envset METRON_USER ""; envset METRON_PASS ""; note="$note\nMetron: removed.";; "") ;;
-    *) p=$(askpw "Metron password for $u") || p=""
-       if [ -n "$p" ]; then envset METRON_USER "$u"; envset METRON_PASS "$p"; note="$note\nMetron: saved for $u."; fi;; esac
+  cur=$(envget METRON_TOKEN)
+  u=$(askpw "Metron API key (free account at metron.cloud -> your account -> API key): Western comics metadata. Manga needs no account.\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || u=""
+  case "$u" in -) envset METRON_TOKEN ""; note="$note\nMetron API key: removed.";; "") ;;
+    *) envset METRON_TOKEN "$u"; envset METRON_USER ""; envset METRON_PASS ""; note="$note\nMetron: API key saved.";; esac
+  if [ -z "$(envget METRON_TOKEN)" ]; then          # no key: the account's login works too
+    cur=$(envget METRON_USER)
+    u=$(ask "No Metron API key. Metron user name instead? (Blank = keep '${cur:-none}'; - removes it.)" "") || u=""
+    case "$u" in -) envset METRON_USER ""; envset METRON_PASS ""; note="$note\nMetron login: removed.";; "") ;;
+      *) p=$(askpw "Metron password for $u") || p=""
+         if [ -n "$p" ]; then envset METRON_USER "$u"; envset METRON_PASS "$p"; note="$note\nMetron: login saved for $u."; fi;; esac
+  fi
   cur=$(envget COMICVINE_API_KEY)
   cv=$(askpw "ComicVine API key (optional fallback for Western comics; comicvine.gamespot.com/api, free).\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || cv=""
   case "$cv" in -) envset COMICVINE_API_KEY ""; note="$note\nComicVine: removed.";; "") ;; *) envset COMICVINE_API_KEY "$cv"; note="$note\nComicVine: saved.";; esac

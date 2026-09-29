@@ -527,7 +527,7 @@ one arrives like a book:
 - **Family sharing**: an issue or volume someone has is added to the next reader's library.
 - **CBR, CB7** are repacked as CBZ; the series and number are written into the file, so Calibre
   and the Kobo show them as a series.
-- Setup: **Library → Comics** (a free Metron account; ComicVine optional), and in Shelfmark tick
+- Setup: **Library → Comics** (a free Metron account's API key; ComicVine optional), and in Shelfmark tick
   **CBR** under Formats. Following a series and reading trackers (AniList) come in v5.8.
 
 **Audiobooks on a phone or tablet**: the portal's **Audiobooks** page downloads any audiobook

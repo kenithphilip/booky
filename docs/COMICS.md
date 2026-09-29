@@ -11,7 +11,8 @@ issue or volume arrives on the reader's own devices, the same way books do.
 
 ## The path of one request (built on Shelfmark, like books)
 
-1. **Metadata.** Western comics: Metron (free account), ComicVine as a fallback (free key).
+1. **Metadata.** Western comics: Metron (free account; its API key is sent as a Bearer token),
+   ComicVine as a fallback (free key).
    Manga, manhwa, manhua: MangaUpdates (no key). Cached in the portal's database.
 2. **Family copy first.** An issue or volume the family already has is given to the reader
    (their owner tag is added), nothing is downloaded.
@@ -74,5 +75,6 @@ chapters and swapping them for the volume in v5.9.
 ## What the owner sets up
 
 - Shelfmark → Settings → Formats: tick **CBR** (EPUB, PDF, CBZ are already on).
-- A free Metron account (metron.cloud), optionally a ComicVine API key: TUI Library → Comics.
+- A free Metron account's API key (metron.cloud; its user name and password work too), optionally
+  a ComicVine API key: TUI Library → Comics.
 - Nothing on the seedbox: comics use Shelfmark's existing ebook category and label.

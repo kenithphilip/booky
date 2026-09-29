@@ -207,6 +207,7 @@ services:
       # comics and manga (docs/COMICS.md, Library -> Comics): searched and downloaded through
       # Shelfmark; described by Metron / ComicVine (Western) and MangaUpdates (manga, no key)
       - COMICS_ENABLED=${COMICS_ENABLED:-false}
+      - METRON_TOKEN=${METRON_TOKEN:-}
       - METRON_USER=${METRON_USER:-}
       - METRON_PASS=${METRON_PASS:-}
       - COMICVINE_API_KEY=${COMICVINE_API_KEY:-}

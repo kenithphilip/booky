@@ -98,6 +98,15 @@ def test_metron_trade_paperbacks_are_numbered_by_volume():
     assert comicmeta.kind_from_metron("Trade Paperback", "Saga") == "collected"
     assert comicmeta.kind_from_metron("Ongoing Series", "Saga") == "comic"
 
+def test_a_metron_api_key_is_sent_as_a_bearer_token(monkeypatch):
+    seen = []
+    monkeypatch.setattr(config, "METRON_TOKEN", "mk-123")
+    monkeypatch.setattr(comicmeta.requests, "request",
+                        lambda m, url, **k: (seen.append((k.get("auth"), k["headers"].get("Authorization"))),
+                                             _R({"results": [{"id": 1, "display_name": "Saga (2012)", "year_began": 2012}]}))[1])
+    assert comicmeta.search("Saga", "comic")[0]["name"] == "Saga"
+    assert seen == [(None, "Bearer mk-123")]
+
 def test_western_comics_need_a_metron_account_or_a_comicvine_key(monkeypatch):
     with pytest.raises(comicmeta.MetaError, match="Metron"):
         comicmeta.search("Saga", "comic")

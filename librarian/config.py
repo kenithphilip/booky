@@ -257,6 +257,7 @@ KINDLE_TEST_COOLDOWN = 300   # seconds between "send a test to my Kindle" clicks
 # manhwa / manhua by MangaUpdates (no key). A comic arrives as a CBZ in the reader's dropbox,
 # like any Shelfmark download; the host job scripts/comic-convert.sh adds the Kobo copy (KCC).
 COMICS_ENABLED = _bool("COMICS_ENABLED", False)
+METRON_TOKEN = os.environ.get("METRON_TOKEN", "")      # Metron's API key (preferred; sent as a Bearer token)
 METRON_USER = os.environ.get("METRON_USER", "")
 METRON_PASS = os.environ.get("METRON_PASS", "")
 COMICVINE_API_KEY = os.environ.get("COMICVINE_API_KEY", "")
