@@ -287,6 +287,9 @@ def png(w, h, i):
     ch = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
     return b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", zlib.compress(rows, 6)) + ch(b"IEND", b"")
 with zipfile.ZipFile(sys.argv[1], "w") as z:
+    for i in range(40):                      # v5.9: a volume under 40 pages is held as "a chapter, not a volume?"
+        z.writestr(f"{i + 1:03d}.png", png(600, 900, i))
+with zipfile.ZipFile(sys.argv[1].replace(".cbz", "-short.cbz"), "w") as z:
     for i in range(12):
         z.writestr(f"{i + 1:03d}.png", png(600, 900, i))
 PY
@@ -396,6 +399,25 @@ for e in json.load(sys.stdin) or []:
 else
   cfail "the comic never reached Calibre: $(docker exec librarian python -c "import db; db.init(); print(db.comic_get($crid))" 2>&1 | tail -1)"
 fi
+# v5.9: a file that is not the volume asked for (12 pages: a chapter) is held for the reader, not imported
+hrid=$(docker exec -i librarian python - <<'PY'
+import db
+db.init()
+rid, _ = db.comic_add("alice", {"provider": "mangaupdates", "series_id": "990001", "series_name": "E2E Manga", "kind": "manga",
+                                "reading": "rtl", "number": "4", "label": "Vol. 4", "language": "en"})
+db.comic_update(rid, status="downloading", release_title="E2E Manga v04 (Digital)")
+print(rid)
+PY
+)
+cp "$STACK/testfiles/comic-short.cbz" "$STACK/library/dropbox/alice/E2E Manga v04 (Digital).cbz"
+hst=""
+for _ in $(seq 1 40); do
+  hst=$(docker exec librarian python -c "import db; db.init(); r = db.comic_get($hrid); print(r['status'], r['held_path'] or '')")
+  case "$hst" in held*) break;; esac; sleep 3
+done
+case "$hst" in "held /"*) echo "   [ OK ] a 12-page 'volume' is held for alice to check, not imported ($(docker exec librarian python -c "import db; db.init(); print(db.comic_get($hrid)['detail'][-60:])"))";;
+  *) cfail "the short file was not held: '$hst'";; esac
+[ ! -e "$STACK/library/dropbox/alice/E2E Manga v04 (Digital).cbz" ] && echo "   [ OK ] and it left her dropbox" || cfail "the held file is still in the dropbox"
 echo "== process stability"
 if compose logs librarian 2>/dev/null | grep -qE 'SIGBUS|SIGSEGV|Worker failed to boot|Fatal Python error'; then
   echo "   [FAIL] the portal worker crashed during the run:"; compose logs librarian 2>/dev/null | grep -B2 -A25 -E 'SIGBUS|SIGSEGV|Fatal Python error' | head -60; rc=$((rc+1))

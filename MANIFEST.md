@@ -64,6 +64,10 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   the author's surname, no packs/abridged/summaries, EPUB first and no PDF, the reader's language
 - `templates/book_list.html` — a book series' or an author's books (Hardcover, cached 6 h) with
   what the reader and the family have, Get it / Add to mine / Pick
+- `mangadex.py` — v5.9: which chapters a manga volume holds (MangaDex aggregate), only for the
+  MangaDex entry linked to the same MangaUpdates id; pre-ticks the chapters a volume replaces
+- `metrontrack.py` — v5.9: a reader's own Metron account (Devices); finished Western comics found
+  through Metron are scrobbled to their Metron collection, once each
 - `hardcover.py` — book series and authors from Hardcover (needs HARDCOVER_API_KEY):
   search(Series|Author), a series' books, an author's books; no compilations or duplicates;
   `python -m hardcover` checks the key and the queries

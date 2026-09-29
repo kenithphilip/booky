@@ -3636,6 +3636,7 @@ mail|NOTIFY_WEBHOOK_FORMAT|auto|text|How alerts are posted: auto (ntfy style for
 mail|ALERT_MAIL|high|text|Server alerts also e-mailed: high (problems only), all (incl. monitor up/down), off
 mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files audiobooks into
 requests|BOOK_CONFIRM|always|text|Get it for books: always = the reader confirms every copy; sure = a retail EPUB with title, author and language downloads without asking
+requests|COMIC_CONFIRM|always|text|Comic requests: always = the reader confirms every copy (Yes to all per series); sure = the exact issue/volume, digital, in their language, downloads without asking
 requests|BOOK_SEARCH_DAYS|14|int|How long Get it keeps looking for a book before it says Pick in Shelfmark
 disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
 disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
@@ -3654,7 +3655,7 @@ step_advanced() {
       lockout "Login lockout thresholds and session length" \
       uploads "Size ceilings for uploads, imports and Send-to-Kindle" \
       mail    "IMAP intake, alert format, Audiobookshelf library name" \
-      requests "Get it for books: confirm every copy or only uncertain ones" \
+      requests "Book and comic requests: confirm every copy or only uncertain ones" \
       disk    "Disk watchdog thresholds and the daily disk summary" \
       backup  "restic snapshot retention" \
       0       "Back" 3>&1 1>&2 2>&3) || return 0
@@ -3681,7 +3682,7 @@ step_advanced() {
         bool) case "$new" in true|false) ;; *) msg "$key must be exactly true or false. Nothing was changed."; continue;; esac;;
       esac
       if [ "$key" = ALERT_MAIL ]; then case "$new" in high|all|off) ;; *) msg "ALERT_MAIL is high, all or off. Nothing was changed."; continue;; esac; fi
-      if [ "$key" = BOOK_CONFIRM ]; then case "$new" in always|sure) ;; *) msg "BOOK_CONFIRM is always or sure. Nothing was changed."; continue;; esac; fi
+      case "$key" in BOOK_CONFIRM|COMIC_CONFIRM) case "$new" in always|sure) ;; *) msg "$key is always or sure. Nothing was changed."; continue;; esac;; esac
       envset "$key" "$new" || { msg "Could not write $ENV_FILE, so $key was NOT changed."; continue; }
       case "$g" in
         backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;

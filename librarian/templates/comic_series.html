@@ -8,12 +8,15 @@
 {% if s.desc %}<p style="white-space:pre-line">{{ s.desc }}</p>{% endif %}
 {% if s.kind != 'novel' %}<div class="row" style="margin:6px 0">
 {% if followed %}<form method="post" action="{{ url_for('follow_stop', fid=followed.id) }}">{{ csrf_field() }}<input type="hidden" name="back" value="{{ request.path }}">
-<button type="submit" class="sec">Following ✓ — stop</button></form>
-{% else %}<form method="post" action="{{ url_for('follow_add') }}">{{ csrf_field() }}
+<button type="submit" class="sec">Following{{ ' chapters' if (followed.extra or {}).get('mode') == 'chapters' }} ✓ — stop</button></form>
+<span class="mut">New {{ 'issues' if s.kind == 'comic' else 'chapters and volumes' if (followed.extra or {}).get('mode') == 'chapters' else 'volumes' }} show up under New for you.</span>
+{% else %}{% for mode, label in ((('volumes', 'Follow volumes'), ('chapters', 'Follow chapters, then volumes')) if s.provider == 'mangaupdates' and s.kind != 'comic' else (('volumes', 'Follow'),)) %}
+<form method="post" action="{{ url_for('follow_add') }}">{{ csrf_field() }}
 <input type="hidden" name="kind" value="comic"><input type="hidden" name="provider" value="{{ s.provider }}"><input type="hidden" name="key" value="{{ s.id }}">
 <input type="hidden" name="name" value="{{ s.name }}"><input type="hidden" name="language" value="{{ language }}"><input type="hidden" name="back" value="{{ request.path }}">
-<button type="submit" class="sec">Follow</button></form>{% endif %}
-<span class="mut">New {{ 'issues' if s.kind == 'comic' else 'volumes' }} show up under New for you.</span></div>
+<input type="hidden" name="mode" value="{{ mode }}"><button type="submit" class="sec">{{ label }}</button></form>{% endfor %}
+<span class="mut">{% if s.provider == 'mangaupdates' and s.kind != 'comic' %}Caught up with a weekly series? Follow its chapters: each new one shows up under New for you
+(downloaded when your indexers have it), and when the volume comes out it replaces them in your library.{% else %}New {{ 'issues' if s.kind == 'comic' else 'volumes' }} show up under New for you.{% endif %}</span>{% endif %}</div>
 {% if next_unread %}<p>Next to read: <a href="{{ url_for('book_page', book_id=books[next_unread.number]) }}">{{ next_unread.label }}</a></p>{% endif %}{% endif %}
 {% if s.kind == 'novel' %}<div class="flash">This is a novel, not a comic: <a href="{{ url_for('index', q=s.name) }}">request it on the Search page</a>.</div>{% endif %}
 {% if s.provider == 'mangaupdates' and s.count_english and s.count_original and s.count_english < s.count_original %}
@@ -27,20 +30,22 @@
 <div class="card row">
 <label>Language <select name="language" style="width:auto">{% for code, name in languages.items() %}<option value="{{ code }}" {{ 'selected' if code == language }}>{{ name }}</option>{% endfor %}</select></label>
 <label>Reading <select name="reading" style="width:auto">
-<option value="rtl" {{ 'selected' if reading == 'rtl' }}>right to left (manga)</option>
-<option value="ltr" {{ 'selected' if reading == 'ltr' }}>left to right</option></select></label>
+<option value="rtl" {{ 'selected' if direction == 'rtl' }}>right to left (manga)</option>
+<option value="ltr" {{ 'selected' if direction == 'ltr' }}>left to right</option></select></label>
 <button type="submit">Request the ticked ones</button><span class="busy">Requesting…</span>
 </div>
 <p class="mut">Only copies in the language you choose are downloaded. Up to 25 at a time.</p>
 <table>
 {% for it in items %}
 {% set st = mine.get(it.number) %}{% set lib = have.get(it.number) %}
-<tr><td style="width:32px">{% if not lib and st not in ('queued', 'downloading', 'pending', 'done', 'shared') %}<input type="checkbox" name="number" value="{{ it.number }}" id="n{{ loop.index }}">{% endif %}</td>
+<tr><td style="width:32px">{% if not lib and st not in ('queued', 'downloading', 'pending', 'confirm', 'held', 'done', 'shared') %}<input type="checkbox" name="number" value="{{ it.number }}" id="n{{ loop.index }}">{% endif %}</td>
 <td><label for="n{{ loop.index }}">{{ it.label }}{% if it.title %} <span class="mut">· {{ it.title }}</span>{% endif %}</label>{% if it.date %} <span class="mut">· {{ it.date }}</span>{% endif %}</td>
-<td class="mut" style="white-space:nowrap">{% if lib == 'yours' %}<a href="{{ url_for('book_page', book_id=books[it.number]) }}" class="st-done">in your library</a>{% if progress.get(it.number) %} <span class="badge">{{ reading(progress[it.number]) }}</span>{% endif %}{% elif lib == 'family' %}in the family library (ticking it adds it to yours, no download){% elif st %}{{ {'queued': 'looking', 'downloading': 'downloading', 'pending': 'waiting for approval', 'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled'}.get(st, st) }}{% endif %}</td></tr>
+<td class="mut" style="white-space:nowrap">{% if lib == 'yours' %}<a href="{{ url_for('book_page', book_id=books[it.number]) }}" class="st-done">in your library</a>{% if progress.get(it.number) %} <span class="badge">{{ reading(progress[it.number]) }}</span>{% endif %}
+{% if (progress.get(it.number) or {}).get('status') != 'read' %}<button type="submit" form="readupto" name="number" value="{{ it.number }}" class="sec" style="padding:1px 6px" title="Mark this one and every earlier one you have as read (for a Kindle or an iPad, which do not report it)">read up to here</button>{% endif %}{% elif lib == 'family' %}in the family library (ticking it adds it to yours, no download){% elif st in ('confirm', 'held') %}<a href="{{ url_for('comics_page') }}" class="st-pending">{{ 'a copy found: confirm it' if st == 'confirm' else 'check the file that came' }}</a>{% elif st %}{{ {'queued': 'looking', 'downloading': 'downloading', 'pending': 'waiting for approval', 'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled'}.get(st, st) }}{% endif %}</td></tr>
 {% endfor %}
 </table>
 </form>
+<form method="post" action="{{ url_for('comic_read_up_to', provider=s.provider, sid=s.id) }}" id="readupto">{{ csrf_field() }}</form>
 {% endif %}
 {% endif %}
 {% endblock %}

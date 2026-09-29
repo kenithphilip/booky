@@ -175,8 +175,11 @@ def test_the_best_release_is_queued_in_shelfmark_as_the_reader(family, monkeypat
     monkeypatch.setattr(notify, "admin", lambda ev, r: told.append((ev, r.get("owner"), r.get("status"))))
     rid, _ = comics.request("bob", SERIES, ITEM5)
     s = Shelf([{"source_id": "x1", "title": "One Piece v05 (Digital)", "protocol": "usenet"}])
-    assert comics.search_once(db.comic_get(rid), s) == "downloading"
-    assert s.queued == [("x1", 12)] and s.searched == ["One Piece v05"], "an exact volume: one search is enough"
+    assert comics.search_once(db.comic_get(rid), s) == "confirm"
+    assert s.queued == [] and s.searched == ["One Piece v05"], "an exact volume: one search is enough; nothing before yes"
+    assert "exactly this volume" in db.comic_get(rid)["reasons"] and db.comic_waiting("bob") == 1
+    assert comics.confirm(rid, s) == "downloading"
+    assert s.queued == [("x1", 12)]
     r = db.comic_get(rid)
     assert r["status"] == "downloading" and r["tried"] == ["x1"] and "One Piece v05" in r["detail"]
     assert ("requested", "bob", "queued") in told
@@ -206,7 +209,7 @@ def _png(w, h):
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + \
            chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
 
-def _comic_file(path, w=60, h=90, pages=4):
+def _comic_file(path, w=60, h=90, pages=45):
     with zipfile.ZipFile(path, "w") as z:
         for i in range(pages):
             z.writestr(f"{i + 1:03d}.png", _png(w, h))
@@ -411,3 +414,100 @@ def test_an_audiobook_outside_the_audio_folder_is_never_served(client, monkeypat
         {"id": "li_2", "title": "x", "author": "", "path": str(tmp_path), "size": 1, "is_file": False}])
     login(client, "bob", "bobpass1")
     assert client.get("/audiobooks/li_2/download").status_code == 404
+
+
+# ---- v5.9: the book safeguards for comics -----------------------------------------------------------
+def _with_info(path, series, number, language="en", pages=45, volume=True):
+    _comic_file(path, pages=pages)
+    info = f"<ComicInfo><Series>{series}</Series><{'Volume' if volume else 'Number'}>{number}</{'Volume' if volume else 'Number'}><LanguageISO>{language}</LanguageISO></ComicInfo>"
+    with zipfile.ZipFile(path, "a") as z:
+        z.writestr("ComicInfo.xml", info)
+
+def test_sure_mode_downloads_only_the_exact_digital_volume_and_never_after_a_no(family, monkeypatch):
+    monkeypatch.setattr(comics, "_alt_names", lambda req: [])
+    monkeypatch.setattr(config, "COMIC_CONFIRM", "sure")
+    rid, _ = comics.request("bob", SERIES, ITEM5)
+    assert comics.search_once(db.comic_get(rid), Shelf([{"source_id": "a", "title": "One Piece v05 (Digital)", "protocol": "usenet"}])) == "downloading"
+    rid2, _ = comics.request("bob", SERIES, {"number": "6", "label": "Vol. 6"})
+    assert comics.search_once(db.comic_get(rid2), Shelf([{"source_id": "b", "title": "One Piece v06 (Scan)", "protocol": "usenet"}])) == "confirm"
+    comics.reject(rid2)
+    r = db.comic_get(rid2)
+    assert "one piece v06 scan" in r["blocked"] and r["status"] == "queued"
+    again = Shelf([{"source_id": "c", "title": "One Piece v06 (Scan)", "protocol": "torrent", "seeders": 20},
+                   {"source_id": "d", "title": "One Piece v06 (Digital)", "protocol": "usenet"}])
+    assert comics.search_once(db.comic_get(rid2), again) == "confirm", "after a no, always asked"
+    assert db.comic_get(rid2)["candidate"]["source_id"] == "d", "the same name from another indexer is not offered again"
+
+def test_yes_to_all_downloads_every_copy_offered_in_the_series(family, monkeypatch):
+    monkeypatch.setattr(comics, "_alt_names", lambda req: [])
+    s = Shelf([{"source_id": "v", "title": "One Piece v01-v10 (Digital)", "protocol": "usenet"}])
+    ids = [comics.request("bob", SERIES, {"number": str(n), "label": f"Vol. {n}"})[0] for n in (5, 6, 7)]
+    for rid in ids:
+        assert comics.search_once(db.comic_get(rid), s) == "confirm"
+    assert comics.confirm_all("alice", "mangaupdates", "77", s) == 0, "only the reader's own"
+    assert comics.confirm_all("bob", "mangaupdates", "77", s) == 3 and len(s.queued) == 3
+
+@pytest.mark.parametrize("series,number,language,pages,why", [
+    ("Naruto", "5", "en", 45, "it says it is from “Naruto”"),
+    ("One Piece", "6", "en", 45, "it says it is number 6"),
+    ("One Piece", "5", "fr", 45, "it says it is in fr"),
+    ("One Piece", "5", "en", 18, "only 18 pages: a chapter, not a volume?"),
+])
+def test_a_file_that_is_not_the_volume_is_held_not_imported(family, monkeypatch, tmp_path, series, number, language, pages, why):
+    told = []
+    monkeypatch.setattr(notify, "admin", lambda ev, r: told.append(ev))
+    rid, _ = comics.request("bob", SERIES, ITEM5)
+    db.comic_update(rid, status="downloading", release_title="One Piece v05 (Digital)")
+    src = tmp_path / "One Piece v05 (Digital).cbz"
+    _with_info(src, series, number, language, pages)
+    got = comics.prepare_arrival(str(src), "bob", str(tmp_path))
+    assert got[0] == "skip" and why in got[1]
+    r = db.comic_get(rid)
+    assert r["status"] == "held" and os.path.isfile(r["held_path"]) and "error" in told
+    assert os.path.exists(src), "the caller removes the original, as for every arrival"
+
+def test_the_right_volume_with_its_own_comicinfo_goes_in(family, tmp_path):
+    rid, _ = comics.request("bob", SERIES, ITEM5)
+    db.comic_update(rid, status="downloading")
+    src = tmp_path / "One Piece v05 (Digital).cbz"
+    _with_info(src, "One Piece", "5")
+    cbz, base, req = comics.prepare_arrival(str(src), "bob", str(tmp_path))
+    assert req["id"] == rid and base == "One Piece Vol. 5"
+
+def test_the_downloaded_release_under_another_name_is_held(family, tmp_path):
+    rid, _ = comics.request("bob", SERIES, ITEM5)
+    db.comic_update(rid, status="downloading", release_title="OP_Book_Five_digital")
+    src = tmp_path / "OP_Book_Five_digital.cbz"
+    _comic_file(src)
+    got = comics.prepare_arrival(str(src), "bob", str(tmp_path))
+    assert got[0] == "skip" and db.comic_get(rid)["status"] == "held"
+
+def test_keep_it_anyway_and_not_it(family, tmp_path, monkeypatch):
+    monkeypatch.setattr(notify, "admin", lambda ev, r: None)
+    rid, _ = comics.request("bob", SERIES, ITEM5)
+    db.comic_update(rid, status="downloading", release_title="One Piece v05 (Digital)")
+    src = tmp_path / "One Piece v05 (Digital).cbz"
+    _comic_file(src, pages=18)
+    comics.prepare_arrival(str(src), "bob", str(tmp_path))
+    comics.keep(rid)
+    r = db.comic_get(rid)
+    assert r["status"] == "downloading" and r["skip_check"] == 1
+    assert os.path.exists(os.path.join(config.DROPBOX_DIR, "bob", "One Piece v05 (Digital).cbz"))
+    assert comics.prepare_arrival(str(src), "bob", str(tmp_path))[0] != "skip", "kept: not checked again"
+    db.comic_update(rid, status="downloading", skip_check=0)
+    comics.prepare_arrival(str(src), "bob", str(tmp_path))
+    held = db.comic_get(rid)["held_path"]
+    comics.reject(rid)
+    assert db.comic_get(rid)["status"] == "queued" and not os.path.exists(held)
+
+def test_wrong_comic_takes_it_out_and_that_copy_never_counts_again(family, monkeypatch):
+    monkeypatch.setattr(comics, "_alt_names", lambda req: [])
+    monkeypatch.setattr(notify, "admin", lambda ev, r: None)
+    _comic_book(9, "One Piece", 5, ["Manga", "owner:bob"])
+    rid, what = comics.request("bob", SERIES, ITEM5)
+    db.comic_update(rid, status="done", calibre_id=9, release_title="One Piece v05 (Digital)", release_id="x")
+    comics.wrong_comic("bob", 9)
+    r = db.comic_get(rid)
+    assert r["status"] == "queued" and "book:9" in r["blocked"] and db.untag_pending(9, "bob")
+    s = Shelf([{"source_id": "y", "title": "One Piece v05 (Digital) (Other)", "protocol": "usenet"}])
+    assert comics.search_once(db.comic_get(rid), s) == "confirm", "the wrong copy in the library is not 'already yours'"

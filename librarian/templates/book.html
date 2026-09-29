@@ -5,6 +5,8 @@
 {% elif provider_cover %}<img src="{{ url_for('cover', u=provider_cover) }}" alt="" style="width:120px;height:auto;border-radius:4px" title="Cover from Open Library; it is being added to the library for your devices">{% endif %}
 <div style="flex:1">
 <h2 style="margin-top:0">{{ b.title }}{% if state %} <span class="badge">{{ reading(state) }}</span>{% endif %}</h2>
+<div class="row" style="gap:4px;margin:-4px 0 8px"><span class="mut" title="For what your device does not report: a Kindle, an iPad. Your Kobo reports by itself.">Mark:</span>
+{% for st, label in (('read', 'Read'), ('reading', 'Reading'), ('unread', 'Unread')) %}<form method="post" action="{{ url_for('book_read', book_id=b.id, status=st) }}" style="display:inline">{{ csrf_field() }}<button type="submit" class="sec" style="padding:2px 8px">{{ label }}</button></form>{% endfor %}</div>
 <p>{% for name in b.authors %}{% set m = (authors | selectattr('name', 'equalto', name) | list) %}{% if m %}<a href="{{ url_for('author_page', author_id=m[0].id) }}">{{ name }}</a>{% else %}{{ name }}{% endif %}{% if not loop.last %} &amp; {% endif %}{% else %}<span class="mut">Unknown author</span>{% endfor %}</p>
 {% if b.series %}<p class="mut">{% if series %}<a href="{{ url_for('series_page', series_id=series.id) }}">{{ b.series }}</a>{% else %}{{ b.series }}{% endif %}{% if b.series_index %} · #{{ '%g' % b.series_index }}{% endif %}</p>{% endif %}
 <p class="mut">
@@ -52,11 +54,11 @@
 {% endif %}
 {% if not admin or session.user in (b.owners or []) %}<p style="margin:10px 0 0"><a class="btn sec" href="{{ url_for('book_remove', book_id=b.id) }}">Remove from my library…</a>
 </p>
-{% if got_it %}<details style="margin-top:8px"><summary>Not the book you asked for?</summary>
-<p class="mut">It came from Get it ({{ got_it.release_title or 'a release found by the portal' }}). <strong>Wrong book</strong> takes it out of
+{% if got_it %}<details style="margin-top:8px"><summary>Not the {{ 'comic' if is_comic else 'book' }} you asked for?</summary>
+<p class="mut">It came from a request the portal filled ({{ got_it.release_title or 'a release found by the portal' }}). <strong>Wrong {{ 'comic' if is_comic else 'book' }}</strong> takes it out of
 your library, that copy is never offered again, the admin is told, and the portal looks for another one, asking you before anything downloads.
 Delete it from your Kobo or Kindle by hand if it is already there.</p>
-<form method="post" action="{{ url_for('book_wrong', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="danger">Wrong book</button></form>
+<form method="post" action="{{ url_for('book_wrong', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="danger">Wrong {{ 'comic' if is_comic else 'book' }}</button></form>
 </details>{% endif %}{% endif %}
 </div></div></div>
 {% if description %}<div class="card"><h3 style="margin-top:0">About this book</h3><p style="white-space:pre-line">{{ description }}</p></div>{% endif %}

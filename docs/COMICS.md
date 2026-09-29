@@ -84,3 +84,31 @@ manga volumes. Following chapters and swapping them for the volume come in v5.9.
 - A free Metron account's API key (metron.cloud; its user name and password work too), optionally
   a ComicVine API key: TUI Library → Comics.
 - Nothing on the seedbox: comics use Shelfmark's existing ebook category and label.
+
+
+## v5.9: chapters, safeguards, reading status, Metron
+
+**Chapters, then the volume.** On a manga series (MangaUpdates): *Follow chapters, then volumes*.
+- New chapters: MangaUpdates' `latest_chapter`; the first check only records what is out.
+- A chapter request is judged like a volume: the series, the chapter number (a chapter pack, a
+  volume or another chapter is refused), the language; searched as "<series> chapter <n>", then
+  the series name. Measured on the owner's indexers (2026-09-29): Chainsaw Man 9 chapter
+  releases of 42, One Piece 14 of 316, Kagurabachi none. Not found in 7 days: it says so.
+- Chapters are imported into their own Calibre series, `<series> (chapters)`, tagged `Chapter`.
+- The volume: its New for you item says which chapters it holds (MangaDex `GET /manga/{id}/
+  aggregate`, only for the MangaDex entry whose `links.mu` is this series' MangaUpdates id in base
+  36). Once the volume is in the reader's library (downloaded or shared), Comics offers to remove
+  their chapters of it, pre-ticked; MangaDex's lists can be untidy, so the reader decides.
+
+**Safeguards** (the same as for books): the reader confirms each copy (Yes to all per series;
+`COMIC_CONFIRM=sure` skips it for the exact digital issue/volume in their language); each arrival
+is checked (a ComicInfo.xml it carries: Series, Number/Volume, LanguageISO; its name's language
+markers; the release name without a number; a sensible page count) and held for the reader when
+it does not match; **Wrong comic** takes a delivered comic out of their library, blocks that
+release and that Calibre book, tells the admin and looks again.
+
+**Reading status by hand** for a Kindle or an iPad (which report nothing): Read / Reading /
+Unread on each book, *read up to here* on a series; written to Calibre-Web's `book_read_link`.
+
+**Metron** for Western comics: Devices → Connect Metron; finished issues found through Metron are
+scrobbled (`POST /api/collection/scrobble/`) to the reader's own collection, once each.

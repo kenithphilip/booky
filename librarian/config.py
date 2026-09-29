@@ -270,6 +270,11 @@ COMIC_SEARCH_DAYS = int(os.environ.get("COMIC_SEARCH_DAYS", "30") or 30)
 COMIC_MAX_OPEN_PER_USER = int(os.environ.get("COMIC_MAX_OPEN_PER_USER", "50") or 50)
 # A download Shelfmark accepted but whose file never arrived: searched again (another release)
 COMIC_ARRIVAL_HOURS = int(os.environ.get("COMIC_ARRIVAL_HOURS", "24") or 24)
+# v5.9: always = the reader confirms every copy found (Yes to all per series); sure = the exact
+# issue/volume, digital, in their language, Usenet or seeded, downloads without asking
+COMIC_CONFIRM = (os.environ.get("COMIC_CONFIRM") or "always").lower()
+if COMIC_CONFIRM not in ("always", "sure"):
+    COMIC_CONFIRM = "always"
 # CBR/CB7 are repacked as CBZ with The Unarchiver's unar (every RAR version, solid ones included,
 # and 7z); libarchive's bsdtar is the fallback (it cannot open solid RAR 3/4 archives)
 UNAR = os.environ.get("UNAR", "unar")

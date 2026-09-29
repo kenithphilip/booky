@@ -266,7 +266,8 @@ def _mu_series(sid, language="en"):
             "cover": ((s.get("image") or {}).get("url") or {}).get("original"),
             "language": language, "alt_names": [a.get("title") for a in s.get("associated") or [] if a.get("title")][:30],
             "authors": sorted({a.get("name") for a in s.get("authors") or [] if a.get("name")}),
-            "completed": bool(s.get("completed")), "status": (s.get("status") or "").strip()}
+            "completed": bool(s.get("completed")), "status": (s.get("status") or "").strip(),
+            "latest_chapter": _int(s.get("latest_chapter"))}     # v5.9: following chapters
     items = [{"id": f"{sid}:v{n}", "number": str(n), "date": None, "cover": None} for n in range(1, (count or 0) + 1)]
     return info, _finish_items(kind, items)
 

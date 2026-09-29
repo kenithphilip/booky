@@ -200,6 +200,26 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.9 (chapters then the volume, comic safeguards, reading status, Metron)
+- Unit 701 passed, installer 801 passed, end-to-end 290 checks / 0 failed. End to end: a volume
+  file of 12 pages is held for the reader and leaves her dropbox; the intake check now waits for
+  the page (it failed now and then when Calibre was a few seconds ahead of the portal's read).
+- Measured (2026-09-29): the owner's indexers carry chapter releases for Chainsaw Man (9 of 42)
+  and One Piece (14 of 316), none for Kagurabachi; MangaUpdates gives latest_chapter (Chainsaw
+  Man 232); MangaDex links.mu is the MangaUpdates id in base 36 (75336092483 = ylx5wzn) and its
+  aggregate maps volumes to chapters (vol. 19 = 165-175.5), untidy at times (vol. 20 = 176-203),
+  so removal is always the reader's choice. "One.Piece.C1072.2023" was read as chapter 1072.2023:
+  a chapter's decimal is now one digit.
+- Found while testing, live since v5.8: a comic series page gave a 500 as soon as the reader had
+  reading progress in it (its reading-direction value hid the reading-badge function).
+- On the VPS after Deploy:
+  - Comics: an open comic request now shows "confirm this copy" with the release; Yes to all per
+    series. The menu shows Comics (n) while something waits.
+  - A manga series: Follow chapters, then volumes (e.g. One Piece). The next chapter shows up
+    under New for you; Request → confirm → it arrives as "One Piece (chapters)" #n.
+  - A book on a Kindle: its page → Mark: Read. The series and AniList/Metron follow.
+  - Devices → Connect Metron (user name + API key from your Metron profile).
+
 ## Verified locally in v5.8.3 (clickable follows, Get it for books with three safeguards, Hardcover retry)
 - Unit 676 passed, installer 801 passed, end-to-end 288 checks / 0 failed. Book releases judged on 15 real-world spellings (scene
   names, "by", subtitles, series in brackets, initials): Dune Messiah is never Dune, a Stormlight

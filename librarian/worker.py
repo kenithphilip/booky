@@ -2079,6 +2079,7 @@ def comics_once(now=None):
             db.comic_update(req["id"], next_try=now + 3600, detail=f"error: {str(e)[:200]}; trying again in an hour")
         n += 1
     _link_arrived_comics(now)
+    _offer_shared_swaps(now)
     return n
 
 # ---- one-tap book requests (v5.8.3, bookreq.py): the same Shelfmark path as comics ---------------
@@ -2117,18 +2118,36 @@ def follows_once(now=None):
         anilist.sync_once()
     except Exception as e:                       # AniList down never stops the follow checks
         log.warning("AniList sync: %s", e)
+    try:
+        import metrontrack
+        metrontrack.sync_once()
+    except Exception as e:                       # nor does Metron
+        log.warning("Metron sync: %s", e)
     return n
+
+def _offer_shared_swaps(now):
+    """A volume given from the family library replaces chapters too (v5.9)."""
+    for req in db.comic_open(statuses=("shared",)):
+        if req.get("calibre_id") and now - (req.get("updated") or now) < 86400 and not db.comic_swap_exists(req["owner"], req["id"]):
+            try:
+                comics.offer_swap(req, req["calibre_id"])
+            except Exception as e:
+                log.warning("comics: swap offer for request %s: %s", req["id"], e)
 
 def _link_arrived_comics(now):
     """A delivered comic's Calibre id (for its page and for auto-send to Kindle)."""
     for req in db.comic_open(statuses=("done",)):
         if req.get("calibre_id") or req["id"] in _COMIC_LINKED or now - (req.get("updated") or now) > 86400:
             continue
-        m = comics.find_in_library(req["series_name"], req["number"], req["kind"])
+        m = comics.find_in_library(comics.library_series(req), req["number"], req["kind"])
         if not m or req["owner"] not in m["owners"]:
             continue
         _COMIC_LINKED.add(req["id"])
         db.comic_update(req["id"], calibre_id=m["book_id"])
+        try:
+            comics.offer_swap(req, m["book_id"])     # v5.9: the chapters this volume replaces
+        except Exception as e:
+            log.warning("comics: swap offer for request %s: %s", req["id"], e)
         prefs = db.get_prefs(req["owner"])
         if prefs.get("auto_kindle") and (cwa.get_user(req["owner"]) or {}).get("kindle_mail"):
             comics.kindle_request(req["owner"], _is_admin(req["owner"]), m["book_id"], comics._title(req))

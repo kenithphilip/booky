@@ -13,7 +13,7 @@ live immediately. Also usable as a CLI (bookstack.sh menu "Users" calls it):
     python -m cwa remove-user alice | enable-kobo-sync | rename-user admin kenith-admin
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 """
-import sqlite3, os, sys, json, argparse, re, functools
+import sqlite3, os, sys, json, argparse, re, functools, datetime
 from binascii import hexlify
 from werkzeug.security import generate_password_hash
 import config
@@ -370,6 +370,39 @@ def _reading_state(name):
         except sqlite3.OperationalError:
             pass
     return out
+
+READ_CODE = {v: k for k, v in READ_STATUS.items()}
+
+@_guard
+def set_read_status(name, book_id, status):
+    """v5.9: a reader's own Read / Reading / Unread for one book, for what no device reports (a
+    Kindle, Panels or Chunky on an iPad). Written where Calibre-Web keeps its own (book_read_link,
+    the row its "Mark as read" writes), so its web reader, the portal and AniList/Metron all see
+    one answer. The Kobo's own position (kobo_bookmark) is left alone."""
+    if status not in READ_CODE:
+        raise CwaError("unknown reading status")
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+    with _conn() as c:
+        try:
+            row = c.execute("SELECT id, read_status FROM book_read_link WHERE user_id=? AND book_id=?",
+                            (u["id"], int(book_id))).fetchone()
+        except sqlite3.OperationalError as e:
+            raise CwaError("Calibre-Web has not created its reading table yet (open a book in it once)") from e
+        code = READ_CODE[status]
+        if row:
+            c.execute("UPDATE book_read_link SET read_status=?, last_modified=?" +
+                      (", last_time_started_reading=?, times_started_reading=coalesce(times_started_reading,0)+1"
+                       if status == "reading" and row["read_status"] != 2 else "") + " WHERE id=?",
+                      (code, now, now, row["id"]) if status == "reading" and row["read_status"] != 2 else (code, now, row["id"]))
+        else:
+            c.execute("INSERT INTO book_read_link(book_id, user_id, read_status, last_modified, last_time_started_reading, "
+                      "times_started_reading) VALUES(?,?,?,?,?,?)",
+                      (int(book_id), u["id"], code, now, now if status == "reading" else None, 1 if status == "reading" else 0))
+        c.commit()
+    return status
 
 @_guard
 def kobo_status(name):

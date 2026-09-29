@@ -571,12 +571,34 @@ any request. Also on a book's page (Search): **Get it through Shelfmark** next t
 
 **Reading status** comes from Calibre-Web itself (the Kobo's Finished / Reading and page position,
 KOReader, the web reader): My books, a book's page and a comic series show Read / Reading 45 %,
-and a series shows the next one to read.
+and a series shows the next one to read. A Kindle (Amazon has no API) and Panels or Chunky on an
+iPad report nothing, so (v5.9) every book has **Mark: Read · Reading · Unread** and a comic series
+**read up to here**; it is stored in Calibre-Web itself, where the trackers below read it.
 
 **AniList**: with an AniList API client set (Library → Comics), each reader can connect their
-AniList on **Devices**; manga volumes they finish on the Kobo count as read on their AniList list.
-The number only goes up, and a series is matched by its exact title or not at all. AniList has
-no Western comics; a Kindle or iPad never reports what was read.
+AniList on **Devices**; manga volumes they finish count as read on their AniList list.
+The number only goes up, and a series is matched by its exact title or not at all.
+
+**Metron** (v5.9, Western comics; `librarian/metrontrack.py`): each reader connects their own
+free Metron account on **Devices** (user name and API key, or password; kept in the portal only).
+Issues they finish are marked read in their Metron collection with the date (Metron's collection
+scrobbling). Only comics the portal found through Metron.
+
+**Following chapters** (v5.9, manga from MangaUpdates): **Follow chapters, then volumes** on a
+series. Each new chapter (MangaUpdates' latest chapter) is a New for you item, downloaded like a
+volume when the indexers carry it (measured on the owner's: Chainsaw Man and One Piece yes,
+Kagurabachi no; not found in 7 days, it says the volume will come). Chapters go into their own
+Calibre series ('One Piece (chapters)'), so volume numbers stay clean on the Kobo. When the
+volume is in the reader's library, Comics offers to remove the chapters it holds, pre-ticked from
+MangaDex (only the MangaDex entry whose MangaUpdates link is this series); nothing is removed
+until the reader says so.
+
+**The book safeguards for comics** (v5.9): the reader confirms each copy on Comics (release name,
+size, indexer, why; **Yes to all** per series); every arrival is checked against the request
+(ComicInfo series, number, language; the name's language; at least 40 pages for a volume, 8 for
+an issue, 5 for a chapter) and held when it does not match (**Keep it anyway** / **Not it**);
+**Wrong comic** on a delivered comic's page. `COMIC_CONFIRM=sure` (Advanced settings → requests)
+skips the question only for the exact digital issue or volume in the reader's language.
 
 **Audiobooks on a phone or tablet**: the portal's **Audiobooks** page downloads any audiobook
 the reader has (one file as it is, a folder as one ZIP) for any player; Audiobookshelf's app

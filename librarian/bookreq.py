@@ -411,6 +411,8 @@ def check_arrival(path, owner, now=None):
     stem, _, ext = name.rpartition(".")
     ext = ext.lower() if stem else ""
     stem = stem or name
+    if ext in config.COMIC_EXTS:
+        return None                              # a comic: comics.prepare_arrival checks those
     meta = file_meta(path, ext)
     req = next((r for r in rows if _belongs(r, stem, meta)), None)
     if not req or req.get("skip_check"):

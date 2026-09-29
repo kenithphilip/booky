@@ -1,7 +1,8 @@
 {% extends "base.html" %}{% block body %}
-{% if not q %}{% set bw = books_waiting() %}{% if bw %}
-<div class="card"><strong>{{ bw }} book{{ 's' if bw != 1 }} waiting for your answer</strong>: a copy to confirm before it downloads, or a
-file that did not look like the book. <a href="{{ url_for('status') }}">Answer on Requests</a>.</div>
+{% if not q %}{% set bw = books_waiting() %}{% set cw = comics_waiting() %}{% if bw or cw %}
+<div class="card">{% if bw %}<strong>{{ bw }} book{{ 's' if bw != 1 }} waiting for your answer</strong>: <a href="{{ url_for('status') }}">answer on Requests</a>.{% endif %}
+{% if cw %}<strong>{{ cw }} comic{{ 's' if cw != 1 }} waiting for your answer</strong>: <a href="{{ url_for('comics_page') }}">answer on Comics</a>.{% endif %}
+<span class="mut">A copy to confirm before it downloads, or a file that did not look like what you asked for.</span></div>
 {% endif %}{% endif %}
 {% if not q %}{% set nf = new_for_you() %}{% if nf %}
 <div class="card"><h3 style="margin-top:0">New for you</h3>

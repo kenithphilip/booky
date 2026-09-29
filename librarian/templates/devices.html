@@ -72,6 +72,25 @@ Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files
 </div>
 {% endif %}
 
+{% if cfg.COMICS_ENABLED %}
+<div class="card">
+<h3>Metron (Western comics)</h3>
+{% if metron_link %}
+<p>Connected as <strong>{{ metron_link.username }}</strong>. Comics you finish (on your Kobo, or marked Read here for a Kindle or an
+iPad) are marked read in your Metron collection, with the date. Only comics the portal found through Metron.
+{% if metron_link.detail %}<br><span class="mut">{{ metron_link.detail }}</span>{% endif %}</p>
+<form method="post" action="{{ url_for('metron_disconnect') }}">{{ csrf_field() }}<button type="submit" class="sec">Disconnect Metron</button></form>
+{% else %}
+<p class="mut">AniList has no Western comics; Metron (free, metron.cloud) keeps your collection and what you have read. Use your
+Metron user name and your API key from your Metron profile (your password works too). It is kept in the portal only.</p>
+<form method="post" action="{{ url_for('metron_connect') }}" class="row">{{ csrf_field() }}
+<input type="text" name="username" placeholder="Metron user name" autocomplete="off" style="width:180px">
+<input type="password" name="secret" placeholder="API key or password" autocomplete="off" style="width:240px">
+<button type="submit">Connect Metron</button></form>
+{% endif %}
+</div>
+{% endif %}
+
 <div class="card">
 <h3>Preferences</h3>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="prefs">

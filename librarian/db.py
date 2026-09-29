@@ -302,7 +302,8 @@ def init():
             kind TEXT NOT NULL DEFAULT 'comic', reading TEXT NOT NULL DEFAULT 'ltr', strip INTEGER,
             number TEXT NOT NULL, label TEXT, year INTEGER, publisher TEXT, language TEXT NOT NULL DEFAULT 'en',
             cover TEXT, authors TEXT, summary TEXT,
-            status TEXT NOT NULL DEFAULT 'queued',   -- queued | downloading | done | shared | not-found | failed | cancelled
+            -- queued | pending | confirm | downloading | held | done | shared | not-found | failed | cancelled
+            status TEXT NOT NULL DEFAULT 'queued',
             detail TEXT, tried TEXT DEFAULT '[]', release_title TEXT, release_id TEXT,
             attempts INTEGER DEFAULT 0, next_try REAL, queued_at REAL, calibre_id INTEGER,
             created REAL, updated REAL)""")
@@ -350,6 +351,27 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS anilist_progress(
             owner TEXT NOT NULL, media_id INTEGER NOT NULL, volumes INTEGER NOT NULL, at REAL,
             PRIMARY KEY(owner, media_id))""")
+        # v5.9: a reader's Metron account (Western comics read), and what was sent to it
+        c.execute("""CREATE TABLE IF NOT EXISTS metron_link(
+            owner TEXT PRIMARY KEY, username TEXT NOT NULL, secret TEXT NOT NULL,
+            method TEXT NOT NULL DEFAULT 'key', connected REAL, detail TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS metron_sent(
+            owner TEXT NOT NULL, issue_id INTEGER NOT NULL, at REAL, PRIMARY KEY(owner, issue_id))""")
+        # v5.9: comic requests get the book safeguards (confirm, the arrival check, Wrong comic)
+        ccols = {r[1] for r in c.execute("PRAGMA table_info(comic_requests)")}
+        for col, typ in (("candidate", "TEXT"), ("reasons", "TEXT"), ("blocked", "TEXT DEFAULT '[]'"),
+                         ("skip_check", "INTEGER DEFAULT 0"), ("held_path", "TEXT"), ("held_meta", "TEXT"),
+                         ("unit", "TEXT DEFAULT ''")):          # 'chapter', or '' (a volume or an issue, by kind)
+            if col not in ccols:
+                c.execute(f"ALTER TABLE comic_requests ADD COLUMN {col} {typ}")
+        # v5.9: a volume arrived for a reader who has its chapters: which to take out (they decide)
+        c.execute("""CREATE TABLE IF NOT EXISTS comic_swaps(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, request_id INTEGER NOT NULL,
+            series_name TEXT NOT NULL, volume TEXT NOT NULL, volume_book INTEGER,
+            chapters TEXT NOT NULL,                  -- [{book_id, number, tick}] (JSON)
+            known INTEGER DEFAULT 0,                 -- MangaDex said which chapters the volume holds
+            status TEXT NOT NULL DEFAULT 'offered',  -- offered | done | kept
+            created REAL, updated REAL, UNIQUE(owner, request_id))""")
         kcols = {r[1] for r in c.execute("PRAGMA table_info(kindle_jobs)")}
         for col, typ in (("kind", "TEXT DEFAULT 'book'"), ("files", "TEXT")):
             if col not in kcols:
@@ -1636,15 +1658,17 @@ def gate_done(user, outcome, detail=""):
 
 
 # ---- comics (docs/COMICS.md) --------------------------------------------------------------------
-COMIC_OPEN = ("queued", "downloading")
+COMIC_OPEN = ("queued", "pending", "confirm", "downloading", "held")
+COMIC_JSON = {"tried": [], "blocked": [], "reasons": [], "candidate": None, "held_meta": None}
 COMIC_FIELDS = ("provider", "series_id", "series_name", "kind", "reading", "strip", "number", "label", "year",
-                "publisher", "language", "cover", "authors", "summary")
+                "publisher", "language", "cover", "authors", "summary", "unit")
 
 def _comic(r):
     if not r:
         return None
     d = dict(r)
-    d["tried"] = json.loads(d.get("tried") or "[]")
+    for k, empty in COMIC_JSON.items():
+        d[k] = json.loads(d[k]) if d.get(k) else empty
     d["authors"] = json.loads(d["authors"]) if d.get("authors") else []
     return d
 
@@ -1656,8 +1680,8 @@ def comic_add(owner, fields, now=None):
     f["authors"] = json.dumps(fields.get("authors") or [])
     with _lock, _conn() as c:
         r = c.execute(f"SELECT id FROM comic_requests WHERE owner=? AND provider=? AND series_id=? AND number=? "
-                      f"AND status IN ({','.join('?' * len(COMIC_OPEN))})",
-                      (owner, f.get("provider"), f.get("series_id"), f.get("number"), *COMIC_OPEN)).fetchone()
+                      f"AND coalesce(unit,'')=? AND status IN ({','.join('?' * len(COMIC_OPEN))})",
+                      (owner, f.get("provider"), f.get("series_id"), f.get("number"), f.get("unit") or "", *COMIC_OPEN)).fetchone()
         if r:
             return r["id"], False
         cols = ", ".join(f)
@@ -1671,8 +1695,9 @@ def comic_get(rid):
         return _comic(c.execute("SELECT * FROM comic_requests WHERE id=?", (rid,)).fetchone())
 
 def comic_update(rid, **f):
-    if "tried" in f:
-        f["tried"] = json.dumps(f["tried"])
+    for k in COMIC_JSON:
+        if k in f and f[k] is not None:
+            f[k] = json.dumps(f[k])
     f["updated"] = time.time()
     with _lock, _conn() as c:
         c.execute(f"UPDATE comic_requests SET {', '.join(f'{k}=?' for k in f)} WHERE id=?", (*f.values(), rid))
@@ -1694,13 +1719,58 @@ def comic_open(owner=None, statuses=COMIC_OPEN):
 
 def comic_list(owner=None, limit=200, closed_days=30, now=None):
     now = now or time.time()
-    sql = "SELECT * FROM comic_requests WHERE (status IN ('queued','downloading') OR updated >= ?)"
-    args = [now - closed_days * 86400]
+    sql = f"SELECT * FROM comic_requests WHERE (status IN ({','.join('?' * len(COMIC_OPEN))}) OR updated >= ?)"
+    args = [*COMIC_OPEN, now - closed_days * 86400]
     if owner:
         sql += " AND owner=?"
         args.append(owner)
     with _conn() as c:
         return [_comic(r) for r in c.execute(sql + " ORDER BY id DESC LIMIT ?", (*args, limit))]
+
+def comic_for_book(owner, calibre_id):
+    """This reader's delivered comic request for one Calibre book (for 'Wrong comic'), or None."""
+    with _conn() as c:
+        return _comic(c.execute("SELECT * FROM comic_requests WHERE owner=? AND calibre_id=? AND status='done' "
+                                "ORDER BY id DESC", (owner, calibre_id)).fetchone())
+
+def comic_waiting(owner):
+    """How many of this reader's comics wait for them: a copy to confirm, a file to check, or
+    chapters a volume replaced."""
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*) FROM comic_requests WHERE owner=? AND status IN ('confirm','held')",
+                         (owner,)).fetchone()[0] + \
+            c.execute("SELECT COUNT(*) FROM comic_swaps WHERE owner=? AND status='offered'", (owner,)).fetchone()[0]
+
+def comic_swap_add(owner, request_id, series_name, volume, volume_book, chapters, known, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        cur = c.execute("INSERT OR IGNORE INTO comic_swaps(owner, request_id, series_name, volume, volume_book, chapters, known, "
+                        "created, updated) VALUES(?,?,?,?,?,?,?,?,?)", (owner, request_id, series_name, str(volume), volume_book,
+                                                                     json.dumps(chapters), 1 if known else 0, now, now))
+        return cur.lastrowid if cur.rowcount else None
+
+def _swap(r):
+    if not r:
+        return None
+    d = dict(r)
+    d["chapters"] = json.loads(d["chapters"] or "[]")
+    return d
+
+def comic_swap_get(sid):
+    with _conn() as c:
+        return _swap(c.execute("SELECT * FROM comic_swaps WHERE id=?", (sid,)).fetchone())
+
+def comic_swaps_offered(owner):
+    with _conn() as c:
+        return [_swap(r) for r in c.execute("SELECT * FROM comic_swaps WHERE owner=? AND status='offered' ORDER BY id", (owner,))]
+
+def comic_swap_exists(owner, request_id):
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM comic_swaps WHERE owner=? AND request_id=?", (owner, request_id)).fetchone() is not None
+
+def comic_swap_set(sid, status):
+    with _lock, _conn() as c:
+        c.execute("UPDATE comic_swaps SET status=?, updated=? WHERE id=?", (status, time.time(), sid))
 
 def comic_count_open(owner):
     with _conn() as c:
@@ -1711,7 +1781,7 @@ def comic_series_status(owner, provider, series_id):
     """{number: status} of this reader's requests in one series (the newest per number)."""
     with _conn() as c:
         rows = c.execute("SELECT number, status FROM comic_requests WHERE owner=? AND provider=? AND series_id=? "
-                         "ORDER BY id", (owner, provider, str(series_id))).fetchall()
+                         "AND coalesce(unit,'')='' ORDER BY id", (owner, provider, str(series_id))).fetchall()
     return {r["number"]: r["status"] for r in rows}
 
 # which comics have their Kobo copy (the host job asks, converts, reports)
@@ -1947,6 +2017,38 @@ def bookreq_count_open(owner):
     with _conn() as c:
         return c.execute(f"SELECT COUNT(*) FROM book_requests WHERE owner=? AND status IN "
                          f"({','.join('?' * len(BOOK_OPEN))})", (owner, *BOOK_OPEN)).fetchone()[0]
+
+# ---- Metron (v5.9, metrontrack.py) ---------------------------------------------------------------
+def metron_get(owner):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM metron_link WHERE owner=?", (owner,)).fetchone()
+    return dict(r) if r else None
+
+def metron_set(owner, username, secret, method, now=None):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO metron_link(owner, username, secret, method, connected, detail) VALUES(?,?,?,?,?,NULL)",
+                  (owner, username[:100], secret[:300], method, now or time.time()))
+
+def metron_note(owner, detail):
+    with _lock, _conn() as c:
+        c.execute("UPDATE metron_link SET detail=? WHERE owner=?", ((detail or "")[:300], owner))
+
+def metron_remove(owner):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM metron_link WHERE owner=?", (owner,))
+        c.execute("DELETE FROM metron_sent WHERE owner=?", (owner,))
+
+def metron_all():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM metron_link ORDER BY owner")]
+
+def metron_was_sent(owner, issue_id):
+    with _conn() as c:
+        return c.execute("SELECT 1 FROM metron_sent WHERE owner=? AND issue_id=?", (owner, int(issue_id))).fetchone() is not None
+
+def metron_sent_set(owner, issue_id, now=None):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO metron_sent(owner, issue_id, at) VALUES(?,?,?)", (owner, int(issue_id), now or time.time()))
 
 # ---- AniList (v5.8, anilist.py) ------------------------------------------------------------------
 def anilist_get(owner):

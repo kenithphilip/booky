@@ -26,17 +26,42 @@ and on your devices: your Kobo on its next sync, your Kindle by mail (Send to Ki
 
 <h2>{{ 'All comic requests' if request.args.get('all') else 'Your comic requests' }}</h2>
 {% if session.admin %}<p class="mut"><a href="{{ url_for('comics_page', all=1) }}">Everyone's</a> · <a href="{{ url_for('comics_page') }}">yours</a></p>{% endif %}
+{% for sw in swaps %}
+<div class="card"><strong>{{ sw.series_name }} Vol. {{ sw.volume }} is in your library.</strong>
+{% if sw.known %}It holds the ticked chapters (MangaDex): take them out of your library?{% else %}MangaDex does not say which chapters it holds: tick the ones it replaces.{% endif %}
+<form method="post" action="{{ url_for('comic_swap', sid=sw.id) }}">{{ csrf_field() }}
+<div class="row" style="flex-wrap:wrap;gap:10px;margin:6px 0">{% for c in sw.chapters %}<label><input type="checkbox" name="book" value="{{ c.book_id }}" {{ 'checked' if c.tick }}> Ch. {{ c.number | string | replace('.0', '') }}</label>{% endfor %}</div>
+<button type="submit" name="action" value="remove">Remove the ticked chapters</button>
+<button type="submit" name="action" value="keep" class="sec">Keep them all</button></form></div>
+{% endfor %}
+{% set asks = rows | selectattr('status', 'equalto', 'confirm') | selectattr('owner', 'equalto', session.user) | list %}
+{% if asks %}<div class="card"><strong>{{ asks | length }} cop{{ 'y' if asks | length == 1 else 'ies' }} found, waiting for you.</strong>
+Nothing downloads until you say yes{% if cfg.COMIC_CONFIRM == 'sure' %} (the exact issue or volume, digital, in your language, is downloaded without asking){% endif %}.
+Each file is checked when it arrives (series, number, language, pages) before it goes into your library.
+{% set series_seen = [] %}{% for a in asks %}{% set key = a.provider ~ ':' ~ a.series_id %}{% if key not in series_seen %}{% set _ = series_seen.append(key) %}
+{% set n = asks | selectattr('series_id', 'equalto', a.series_id) | list | length %}{% if n > 1 %}
+<form method="post" action="{{ url_for('comic_confirm_all', provider=a.provider, sid=a.series_id) }}" style="margin-top:6px">{{ csrf_field() }}
+<button type="submit">Yes to all {{ n }} for {{ a.series_name }}</button></form>{% endif %}{% endif %}{% endfor %}</div>{% endif %}
 {% if not rows %}<p class="mut">None yet.</p>{% endif %}
 <table>
 {% for r in rows %}
 <tr><td><a href="{{ url_for('comic_series', provider=r.provider, sid=r.series_id) }}">{{ r.series_name }}</a> {{ r.label or r.number }}
 {% if request.args.get('all') %}<span class="mut"> · {{ r.owner }}</span>{% endif %}
-<div class="mut">{{ r.detail or '' }}</div></td>
-<td class="st-{{ 'done' if r.status in ('done', 'shared') else 'error' if r.status in ('failed', 'not-found') else r.status }}" style="white-space:nowrap">{{
+<div class="mut">{{ r.detail or '' }}</div>
+{% if r.status == 'confirm' and r.candidate %}<div>Found: <span class="code">{{ r.candidate.title }}</span><br>
+<span class="mut">{% if r.candidate.size_bytes %}{{ (r.candidate.size_bytes / 1048576) | round(1) }} MB · {% endif %}{% if r.candidate.indexer %}from {{ r.candidate.indexer }} · {% endif %}{{ r.reasons | join(' · ') }}</span></div>{% endif %}
+{% if r.status == 'held' and r.held_meta %}{% set h = r.held_meta %}<div>The file <span class="code">{{ h.file }}</span>{% if h.series %} says {{ h.series }}{% if h.number %} #{{ h.number }}{% endif %}{% endif %}{% if h.language %} · {{ h.language }}{% endif %}{% if h.pages is not none and h.pages != '' %} · {{ h.pages }} pages{% endif %}.
+<span class="mut">Not added to your library. Keep it if it is right after all.</span></div>{% endif %}</td>
+<td class="st-{{ 'done' if r.status in ('done', 'shared') else 'error' if r.status in ('failed', 'not-found', 'held') else 'pending' if r.status == 'confirm' else r.status }}" style="white-space:nowrap">{{
   {'queued': 'looking', 'downloading': 'downloading', 'done': 'in your library', 'shared': 'from the family library',
-   'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled', 'pending': 'waiting for approval'}.get(r.status, r.status) }}</td>
+   'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled', 'pending': 'waiting for approval',
+   'confirm': 'confirm this copy', 'held': 'check this file'}.get(r.status, r.status) }}</td>
 <td style="white-space:nowrap">
-{% if r.status in ('queued', 'pending', 'not-found', 'failed') %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='cancel') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Cancel</button></form>{% endif %}
+{% if r.status == 'confirm' and r.owner == session.user %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='yes') }}" style="display:inline">{{ csrf_field() }}<button type="submit">Yes, that one</button></form>
+<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='no') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Not it</button></form>{% endif %}
+{% if r.status == 'held' and r.owner == session.user %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='keep') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Keep it anyway</button></form>
+<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='no') }}" style="display:inline">{{ csrf_field() }}<button type="submit">Not it: find another</button></form>{% endif %}
+{% if r.status in ('queued', 'pending', 'confirm', 'held', 'not-found', 'failed') %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='cancel') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Cancel</button></form>{% endif %}
 {% if r.status in ('not-found', 'failed', 'cancelled') %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='retry') }}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Look again</button></form>{% endif %}
 {% if session.admin and r.status == 'pending' %}<form method="post" action="{{ url_for('comic_request_action', rid=r.id, action='approve') }}" style="display:inline">{{ csrf_field() }}<button type="submit">Approve</button></form>{% endif %}
 {% if r.calibre_id and r.status in ('done', 'shared') %}<a class="btn sec" href="{{ url_for('book_page', book_id=r.calibre_id) }}">Open</a>{% endif %}

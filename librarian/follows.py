@@ -45,17 +45,37 @@ def follow(owner, kind, provider, key, name, extra=None, now=None):
 # ---- what is out now, per kind: {item_key: {title, detail, item}} ------------------------------------
 def _comic_items(f):
     ex = f["extra"] or {}
-    info, items = comicmeta.series(f["provider"], f["key"], ex.get("language") or "en", fresh=True)
+    lang = ex.get("language") or "en"
+    info, items = comicmeta.series(f["provider"], f["key"], lang, fresh=True)
+    chapters = ex.get("mode") == "chapters" and f["provider"] == "mangaupdates"
     out = {}
     for it in items:
         if not _released(it.get("date")):
             continue
-        out[it["number"]] = {"title": f"{info['name']} {it['label']}",
-                             "detail": "out now" + (f" ({it['date']})" if it.get("date") else ""),
+        detail = "out now" + (f" ({it['date']})" if it.get("date") else "")
+        out[it["number"]] = {"title": f"{info['name']} {it['label']}", "detail": detail, "volume": True,
                              "item": {"type": "comic", "provider": f["provider"], "series_id": f["key"],
-                                      "number": it["number"], "label": it["label"],
-                                      "language": ex.get("language") or "en"}}
+                                      "number": it["number"], "label": it["label"], "language": lang}}
+    if chapters and info.get("latest_chapter"):
+        # v5.9: every chapter so far is 'out'; the ones after the last check become notices
+        for n in range(1, int(info["latest_chapter"]) + 1):
+            out[f"c{n}"] = {"title": f"{info['name']} Ch. {n}", "detail": "new chapter",
+                            "item": {"type": "comic", "unit": "chapter", "provider": f["provider"], "series_id": f["key"],
+                                     "number": str(n), "label": f"Ch. {n}", "language": lang}}
     return out
+
+
+def _volume_detail(f, n):
+    """For a reader who follows chapters: which chapters this new volume holds (MangaDex)."""
+    import mangadex
+    try:
+        held = mangadex.chapters_in(f["key"], f["name"], n["item"]["number"])
+    except Exception:
+        held = None
+    if not held:
+        return n["detail"] + "; it replaces chapters you have (you choose which, once it is in your library)"
+    fmt = lambda v: str(int(v)) if float(v).is_integer() else str(v)
+    return n["detail"] + f"; holds chapters {fmt(held[0])}-{fmt(held[-1])}, which it replaces in your library (you confirm)"
 
 
 def _book(b, series_name=None):
@@ -95,10 +115,14 @@ def check(f, now=None):
     new = 0
     if known is not None:
         seen = set(known)
+        if not any(str(k).startswith("c") for k in seen):
+            seen |= {k for k in current if str(k).startswith("c")}   # switched to chapters: no flood of old ones
+        chapters = (f.get("extra") or {}).get("mode") == "chapters"
         for key, n in current.items():
             if key in seen:
                 continue
-            if db.notice_add(f["owner"], f["id"], key, n["title"], n["detail"], n["item"], now):
+            detail = _volume_detail(f, n) if chapters and n.get("volume") else n["detail"]
+            if db.notice_add(f["owner"], f["id"], key, n["title"], detail, n["item"], now):
                 new += 1
     db.follow_checked(f["id"], sorted(set(current) | set(known or [])), nxt,
                       f"{len(current)} out" + (f", {new} new" if new else ""), now)
@@ -142,7 +166,9 @@ def act(owner, nid, action):
     if it.get("type") == "comic":
         import comics
         info, items = comicmeta.series(it["provider"], it["series_id"], it.get("language") or "en")
-        item = next((i for i in items if i["number"] == it["number"]), None) or \
+        item = {"number": it["number"], "label": it.get("label") or f"Ch. {it['number']}", "unit": "chapter"} \
+            if it.get("unit") == "chapter" else \
+            next((i for i in items if i["number"] == it["number"]), None) or \
             {"number": it["number"], "label": it.get("label") or it["number"]}
         _rid, what = comics.request(owner, info, item, it.get("language"))
         db.notice_set(nid, "requested")

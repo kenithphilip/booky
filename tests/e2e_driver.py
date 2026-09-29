@@ -236,7 +236,10 @@ check(st2 == 200 and b'"duplicate"' in b2, "a replayed intake POST returns the e
 intake_id = wait(lambda: imported("Intake Hook Book", "bob"), 300, 5)
 check(intake_id is not None, "intake download was fetched, tagged owner:bob and imported by CWA")
 if intake_id:
-    st, h, b = pb.get(PORTAL + "/library"); check(b"Intake Hook Book" in b, "bob sees the intake book")
+    # the import is done in Calibre, but the portal's read of metadata.db can trail it by a few
+    # seconds (WAL): wait for the page instead of looking once (it failed now and then, v5.9)
+    seen = wait(lambda: b"Intake Hook Book" in pb.get(PORTAL + "/library")[2] or None, 60, 3)
+    check(seen is not None, "bob sees the intake book")
     st, h, b = p.get(PORTAL + "/library"); check(b"Intake Hook Book" not in b, "alice does not see bob's intake book")
 
 print("== 7. Shelfmark-style drop: a file appearing in library/dropbox/<user> is tagged + imported")

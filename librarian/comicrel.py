@@ -38,8 +38,9 @@ EDITIONS = {"omnibus": "omnibus", "deluxe": "deluxe", "3-in-1": "omnibus", "2-in
 
 _VOL = re.compile(r"(?<![a-z0-9])(?:v|vol\.?|volume|volumes|tome|t|band)\s*0*(\d+(?:\.\d+)?)"
                   r"(?:\s*(?:-|–|~|to)\s*(?:v|vol\.?|volume|t)?\s*0*(\d+(?:\.\d+)?))?(?![a-z0-9])", re.I)
-_CH = re.compile(r"(?<![a-z0-9])(?:c|ch\.?|chap\.?|chapter|chapters)\s*0*(\d+(?:\.\d+)?)"
-                 r"(?:\s*(?:-|–|~|to)\s*(?:c|ch\.?)?\s*0*(\d+(?:\.\d+)?))?(?![a-z0-9])", re.I)
+# a chapter's decimal is one digit ('61.5'): 'One.Piece.C1072.2023' is chapter 1072 of 2023, not 1072.2023
+_CH = re.compile(r"(?<![a-z0-9])(?:c|ch\.?|chap\.?|chapter|chapters)\s*0*(\d+(?:\.\d(?!\d))?)"
+                 r"(?:\s*(?:-|–|~|to)\s*(?:c|ch\.?)?\s*0*(\d+(?:\.\d(?!\d))?))?(?![a-z0-9])", re.I)
 _HASH = re.compile(r"#\s*0*(\d+(?:\.\d+)?)(?:\s*(?:-|–)\s*#?\s*0*(\d+(?:\.\d+)?))?", re.I)
 # a bare issue number after the series: "Saga 012 (2013)", "Batman 001-050"
 _BARE = re.compile(r"(?<![\w.#])0*(\d{1,4}(?:\.\d)?)(?:\s*(?:-|–)\s*0*(\d{1,4}))?(?=\s*(?:\(|\[|$|of\b|\.cb|\.pdf|\.epub))", re.I)
@@ -151,7 +152,15 @@ def judge(req, release):
     if not _series_ok(req, p):
         return False, 0, "another series"
     pack = False
-    if kind in PAGE_KINDS:
+    if req.get("unit") == "chapter":             # v5.9: one chapter, never a volume or a chapter pack
+        if p["chapters"] is None:
+            return False, 0, ("a volume, not the chapter" if p["volumes"] else "no chapter number")
+        lo, hi = p["chapters"]
+        if n is None or not (lo <= n <= hi):
+            return False, 0, "another chapter"
+        if hi > lo:
+            return False, 0, "a pack of chapters"
+    elif kind in PAGE_KINDS:
         if p["volumes"] is None:
             return False, 0, ("chapters, not a volume" if p["chapters"] else "no volume number")
         lo, hi = p["volumes"]
@@ -231,6 +240,8 @@ def queries(req):
         num = int(float(n)) if whole else n
     except ValueError:
         whole, num = False, n
+    if req.get("unit") == "chapter":             # 'One Piece Chapter 1148', 'Chainsaw Man Chapter 0190', 'One.Piece.C1072'
+        return [f"{name} chapter {num}", name]
     if (req.get("kind") or "comic") in PAGE_KINDS:
         return [f"{name} v{num:02d}" if whole else f"{name} v{num}", name]
     return [f"{name} {num:03d}" if whole else f"{name} {num}", f"{name} #{num}"]
@@ -243,3 +254,45 @@ def volume_of(filename):
         if p[k] and p[k][0] == p[k][1]:
             return p[k][0]
     return None
+
+
+def sure(req, release):
+    """A pick good enough to download without asking (COMIC_CONFIRM=sure): the exact issue or
+    volume (not a pack), digital, not a fan translation, the reader's language (marked, or
+    English for an English reader), and Usenet or a torrent with a few seeders."""
+    ok, _score, why = judge(req, release)
+    if not ok or why != "exact":
+        return False
+    p = parse(release.get("title") or "", release.get("format"))
+    lang = (req.get("language") or "en").lower()
+    lang_ok = lang in p["langs"] or (lang == "en" and not p["langs"])
+    proto = (release.get("protocol") or "").lower()
+    seeded = proto in ("usenet", "nzb") or (proto == "torrent" and (release.get("seeders") or 0) >= 3)
+    return p["digital"] and not p["fan"] and lang_ok and seeded
+
+
+def explain(req, release):
+    """Why this copy was chosen, for the reader who confirms it."""
+    p = parse(release.get("title") or "", release.get("format"))
+    _ok, _score, why = judge(req, release)
+    out = ["exactly this " + ("chapter" if req.get("unit") == "chapter" else
+                              "volume" if (req.get("kind") or "comic") in PAGE_KINDS else "issue")
+           if why == "exact" else "a pack that contains it (only this one is imported)"]
+    out.append(f"{p['format'].upper()} file" if p["format"] else "format not stated in the name")
+    if p["digital"]:
+        out.append("digital")
+    elif p["scan"]:
+        out.append("a scan")
+    if p["official"]:
+        out.append("official publisher")
+    if p["fan"]:
+        out.append("fan translation")
+    lang = (req.get("language") or "en").lower()
+    out.append(f"language: {', '.join(sorted(p['langs']))}" if p["langs"] else
+               ("no language marked (usually English)" if lang == "en" else "no language marked: check it"))
+    proto = (release.get("protocol") or "").lower()
+    if proto in ("usenet", "nzb"):
+        out.append("Usenet (nothing to seed)")
+    elif proto == "torrent":
+        out.append(f"torrent, {release.get('seeders') or 0} seeders (kept seeding on the seedbox)")
+    return out

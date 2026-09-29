@@ -19,6 +19,7 @@ ALL_COMIC_TAGS = ("Comics", "Manga", "Manhwa", "Manhua")
 STRIP_TAG = "Long strip"            # webtoon-style vertical pages: KCC's webtoon mode
 RTL_KINDS = ("manga",)
 RETRY = (3600, 6 * 3600) + (86400,) * 60
+CHAPTER_SEARCH_DAYS = 7              # a chapter nobody posted in a week will not be; the volume will come
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".jxl")
 MAX_PAGES = 3000
 
@@ -42,11 +43,11 @@ def request(owner, series, item, language=None, reading=None, now=None):
               "number": str(item["number"]), "label": item.get("label"), "year": series.get("year"),
               "publisher": series.get("publisher"), "language": (language or config.BOOK_LANGUAGE).lower(),
               "cover": item.get("cover") or series.get("cover"), "authors": series.get("authors") or [],
-              "summary": (series.get("desc") or "")[:1000]}
+              "summary": (series.get("desc") or "")[:1000], "unit": item.get("unit") or ""}
     rid, created = db.comic_add(owner, fields, now)
     if not created:
         return rid, "exists"
-    m = find_in_library(series["name"], item["number"], kind)
+    m = find_in_library(library_series(fields), item["number"], kind)
     if m and config.FAMILY_SHARING:
         if owner in m["owners"]:
             db.comic_update(rid, status="done", calibre_id=m["book_id"], detail="already in your library")
@@ -65,6 +66,12 @@ def request(owner, series, item, language=None, reading=None, now=None):
     return rid, "queued"
 
 
+def library_series(req):
+    """The Calibre series a request's comic goes into: chapters have their own ('X (chapters)'),
+    so the series' volume numbers stay the volumes on the Kobo."""
+    return f"{req['series_name']} (chapters)" if req.get("unit") == "chapter" else req["series_name"]
+
+
 def _is_admin(owner):
     try:
         return bool(((cwa.get_user(owner) or {}).get("role") or 0) & cwa.ROLE_ADMIN)
@@ -79,9 +86,10 @@ def _calibre():
     return c
 
 
-def find_in_library(series_name, number, kind="comic"):
+def find_in_library(series_name, number, kind="comic", exclude=()):
     """The Calibre book that IS this issue/volume (a comic tag, the series, the number), with
-    its owners, or None. Never guesses between two."""
+    its owners, or None. Never guesses between two. `exclude`: Calibre ids a reader said were
+    the wrong comic."""
     want = comicrel.norm(series_name)
     try:
         n = float(number)
@@ -95,7 +103,7 @@ def find_in_library(series_name, number, kind="comic"):
                 WHERE b.series_index = ? AND EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag
                       WHERE l.book=b.id AND t.name IN ({','.join('?' * len(ALL_COMIC_TAGS))}))""",
                              (n, *ALL_COMIC_TAGS)).fetchall()
-            hits = [r["id"] for r in rows if comicrel.norm(r["series"]) == want]
+            hits = [r["id"] for r in rows if comicrel.norm(r["series"]) == want and r["id"] not in exclude]
             if len(hits) != 1:
                 return None
             owners = sorted(t[len(config.OWNER_PREFIX):] for (t,) in c.execute(
@@ -116,11 +124,15 @@ def _alt_names(req):
         return []
 
 
+def _rejected_books(req):
+    return {int(b[5:]) for b in req.get("blocked") or [] if isinstance(b, str) and b.startswith("book:") and b[5:].isdigit()}
+
+
 def search_once(req, shelfmark_api, now=None):
     """One attempt for one queued request. Returns the new status."""
     now = now or time.time()
     rid, owner = req["id"], req["owner"]
-    m = find_in_library(req["series_name"], req["number"], req["kind"])
+    m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
     if m and config.FAMILY_SHARING:              # arrived for someone else while this one waited
         if owner not in m["owners"]:
             share.give_ebook(m, owner)
@@ -128,10 +140,11 @@ def search_once(req, shelfmark_api, now=None):
                         detail="already in the family library: added to yours, nothing downloaded")
         return "shared"
     req = dict(req, alt_names=_alt_names(req))
+    blocked = set(req.get("blocked") or [])
     releases, errors = [], []
     for q in comicrel.queries(req):
         try:
-            releases += shelfmark_api.search_releases(q)
+            releases += [r for r in shelfmark_api.search_releases(q) if comicrel.norm(r.get("title") or "") not in blocked]
         except shelfmark_api.ShelfmarkError as e:
             errors.append(str(e))
         best, _notes = comicrel.pick(req, releases, exclude=set(req.get("tried") or []))
@@ -141,9 +154,11 @@ def search_once(req, shelfmark_api, now=None):
     attempts = (req.get("attempts") or 0) + 1
     if not best:
         why = "; ".join(errors) if errors and not releases else _why_none(notes)
-        if now - (req.get("created") or now) > config.COMIC_SEARCH_DAYS * 86400:
+        days = CHAPTER_SEARCH_DAYS if req.get("unit") == "chapter" else config.COMIC_SEARCH_DAYS
+        if now - (req.get("created") or now) > days * 86400:
             db.comic_update(rid, status="not-found", attempts=attempts,
-                            detail=f"not found in {config.COMIC_SEARCH_DAYS} days of looking ({why})")
+                            detail=f"not found in {days} days of looking ({why})" +
+                                   ("; your indexers may not carry this series' chapters: its volume will come" if req.get("unit") == "chapter" else ""))
             notify.admin("wanted-expired", {"owner": owner, "title": _title(req), "source": "comics",
                                             "seq": notify.seq_id("comic", rid)})
             return "not-found"
@@ -151,21 +166,113 @@ def search_once(req, shelfmark_api, now=None):
         db.comic_update(rid, attempts=attempts, next_try=now + wait,
                         detail=f"not found yet ({why}); looking again {_when(wait)}")
         return "queued"
+    if config.COMIC_CONFIRM == "sure" and not blocked and comicrel.sure(req, best):
+        return _queue(dict(req, attempts=attempts), best, shelfmark_api, now)
+    db.comic_update(rid, status="confirm", attempts=attempts, candidate=best, reasons=comicrel.explain(req, best),
+                    detail="found a copy: is it the one you want?")
+    return "confirm"
+
+
+def _queue(req, release, shelfmark_api, now):
+    """Hand the chosen release to Shelfmark, as the reader."""
+    rid, owner = req["id"], req["owner"]
     try:
         uid = shelfmark_api.user_id(owner)
         if not uid:
             raise shelfmark_api.ShelfmarkError(f"{owner} has no Shelfmark account yet")
-        shelfmark_api.queue_release(best, uid)
+        shelfmark_api.queue_release(release, uid)
     except shelfmark_api.ShelfmarkError as e:
-        db.comic_update(rid, attempts=attempts, next_try=now + 900, detail=f"Shelfmark: {str(e)[:200]}; trying again soon")
+        db.comic_update(rid, status="queued", candidate=None, attempts=req.get("attempts") or 0, next_try=now + 900,
+                        detail=f"Shelfmark: {str(e)[:200]}; looking again soon")
         return "queued"
-    tried = list(req.get("tried") or []) + [str(best.get("source_id"))]
-    db.comic_update(rid, status="downloading", attempts=attempts, tried=tried, queued_at=now,
-                    release_title=(best.get("title") or "")[:300], release_id=str(best.get("source_id")),
-                    detail=f"downloading: {best.get('title')}")
+    tried = list(req.get("tried") or []) + [str(release.get("source_id"))]
+    db.comic_update(rid, status="downloading", attempts=req.get("attempts") or 0, tried=tried, queued_at=now,
+                    candidate=None, release_title=(release.get("title") or "")[:300], release_id=str(release.get("source_id")),
+                    detail=f"downloading: {release.get('title')}")
     notify.admin("requested", {"owner": owner, "title": _title(req), "source": "comics", "status": "queued",
-                               "detail": best.get("title"), "seq": notify.seq_id("comic", rid)})
+                               "detail": release.get("title"), "seq": notify.seq_id("comic", rid)})
     return "downloading"
+
+
+def confirm(rid, shelfmark_api, now=None):
+    """'Yes, that one': the offered copy is downloaded."""
+    req = db.comic_get(rid)
+    if not req or req["status"] != "confirm" or not req.get("candidate"):
+        raise ComicError("there is no copy waiting to be confirmed")
+    return _queue(req, req["candidate"], shelfmark_api, now or time.time())
+
+
+def confirm_all(owner, provider, series_id, shelfmark_api, now=None):
+    """'Yes to all' for one series: every copy offered to this reader in it is downloaded."""
+    n = 0
+    for req in db.comic_open(owner, statuses=("confirm",)):
+        if req["provider"] == provider and req["series_id"] == str(series_id) and req.get("candidate"):
+            n += _queue(req, req["candidate"], shelfmark_api, now or time.time()) == "downloading"
+    return n
+
+
+def _block(req, release_title=None, release_id=None, book_id=None):
+    tried, blocked = list(req.get("tried") or []), list(req.get("blocked") or [])
+    if release_id and str(release_id) not in tried:
+        tried.append(str(release_id))
+    if release_title and comicrel.norm(release_title) not in blocked:
+        blocked.append(comicrel.norm(release_title))
+    if book_id and f"book:{book_id}" not in blocked:
+        blocked.append(f"book:{book_id}")
+    return tried, blocked
+
+
+def reject(rid, now=None):
+    """'Not it', for an offered copy or a held file: never offered again; the search goes on."""
+    now = now or time.time()
+    req = db.comic_get(rid)
+    if not req or req["status"] not in ("confirm", "held"):
+        raise ComicError("there is nothing waiting for your answer")
+    if req["status"] == "confirm":
+        c = req.get("candidate") or {}
+        tried, blocked = _block(req, c.get("title"), c.get("source_id"))
+    else:
+        tried, blocked = _block(req, req.get("release_title"), req.get("release_id"))
+        drop_held(req)
+        notify.admin("error", {"owner": req["owner"], "title": _title(req), "source": "comics",
+                               "detail": f"the reader turned down the file that came from {req.get('release_title')}",
+                               "seq": notify.seq_id("comic", rid)})
+    db.comic_update(rid, status="queued", next_try=now, tried=tried, blocked=blocked, candidate=None, held_path=None,
+                    detail="not that one: looking for another copy")
+    return "queued"
+
+
+def keep(rid, now=None):
+    """'Keep it anyway' for a held file: back into the reader's dropbox, imported unchecked."""
+    req = db.comic_get(rid)
+    if not req or req["status"] != "held" or not req.get("held_path") or not os.path.isfile(req["held_path"]):
+        raise ComicError("the held file is no longer there")
+    box = os.path.join(config.DROPBOX_DIR, req["owner"])
+    os.makedirs(box, exist_ok=True)
+    name = os.path.basename(req["held_path"])
+    dest = os.path.join(box, name) if not os.path.exists(os.path.join(box, name)) else os.path.join(box, f"{rid}-{name}")
+    shutil.move(req["held_path"], dest)
+    shutil.rmtree(os.path.dirname(req["held_path"]), ignore_errors=True)
+    db.comic_update(rid, status="downloading", skip_check=1, held_path=None, queued_at=now or time.time(),
+                    detail="kept: being added to your library")
+    return "downloading"
+
+
+def wrong_comic(owner, book_id, now=None):
+    """'Wrong comic' on a delivered comic's page: out of the reader's library, that release and
+    that Calibre book never offered again, the admin told, and the search goes on (asking first)."""
+    now = now or time.time()
+    req = db.comic_for_book(owner, book_id)
+    if not req:
+        raise ComicError("this comic did not come from a comic request")
+    db.queue_untag(book_id, owner)
+    tried, blocked = _block(req, req.get("release_title"), req.get("release_id"), book_id)
+    db.comic_update(req["id"], status="queued", next_try=now, tried=tried, blocked=blocked, calibre_id=None,
+                    skip_check=0, detail="you said it was the wrong comic: looking for another copy")
+    notify.admin("error", {"owner": owner, "title": _title(req), "source": "comics",
+                           "detail": f"wrong comic reported; it came from {req.get('release_title') or 'an unknown release'}",
+                           "seq": notify.seq_id("comic", req["id"])})
+    return req["id"]
 
 
 def _why_none(notes):
@@ -224,10 +331,98 @@ def prepare_arrival(path, owner, workdir):
     req, pack_of = match_request(owner, stem)
     if req is None and pack_of is not None:
         return "skip", f"skipped: part of a pack; {_title(pack_of)} was asked for, not this one", pack_of
+    if req is None:                              # the release this reader is downloading, under another name?
+        req = next((r for r in db.comic_open(owner, statuses=("downloading",))
+                    if r.get("release_title") and comicrel.norm(r["release_title"]) == comicrel.norm(stem)), None)
+        if req and not req.get("skip_check"):
+            return "skip", _hold(req, path, ["its name does not say it is " + _title(req)], {"file": name}), req
+    if req and not req.get("skip_check"):
+        info = comicinfo(cbz)
+        problems = verify_arrival(req, cbz, stem, info)
+        if problems:
+            meta = {"file": name, "series": info.get("Series") or "", "number": info.get("Number") or info.get("Volume") or "",
+                    "language": info.get("LanguageISO") or "", "pages": page_count(cbz)}
+            return "skip", _hold(req, path, problems, meta), req
     strip = looks_like_strip(cbz)
     write_metadata(cbz, req, stem, strip)
     base = _title(req) if req else stem
     return cbz, base, req
+
+
+# ---- the arrival check (v5.9): is the file the comic that was asked for? --------------------------------
+MIN_PAGES = {"volume": 40, "issue": 8, "chapter": 5}
+HELD_DIR = os.path.join(os.path.dirname(config.STATE_DB), "held-comics")
+
+
+def page_count(cbz):
+    try:
+        with zipfile.ZipFile(cbz) as z:
+            return sum(1 for n in z.namelist() if n.lower().endswith(IMAGE_EXTS) and "__macosx" not in n.lower())
+    except (zipfile.BadZipFile, OSError):
+        return 0
+
+
+def comicinfo(cbz):
+    """{Series, Number, Volume, LanguageISO, ...} from a ComicInfo.xml the file already carries;
+    {} when there is none. No entities, no network, at most 1 MB."""
+    try:
+        from lxml import etree
+        with zipfile.ZipFile(cbz) as z:
+            name = next((n for n in z.namelist() if n.lower().rsplit("/", 1)[-1] == "comicinfo.xml"), None)
+            if not name or z.getinfo(name).file_size > 1024 * 1024:
+                return {}
+            root = etree.fromstring(z.read(name), etree.XMLParser(resolve_entities=False, no_network=True))
+        return {el.tag: (el.text or "").strip() for el in root if isinstance(el.tag, str) and (el.text or "").strip()}
+    except Exception:                            # a broken ComicInfo says nothing either way
+        return {}
+
+
+def verify_arrival(req, cbz, stem, info=None):
+    """[problems]: why this file does not look like the issue or volume asked for."""
+    info = comicinfo(cbz) if info is None else info
+    problems = []
+    names = [req["series_name"]] + list(req.get("alt_names") or [])
+    if info.get("Series"):
+        s = comicrel.norm(info["Series"])
+        if not any(s == comicrel.norm(n) or s.startswith(comicrel.norm(n) + " ") for n in names if n):
+            problems.append(f"it says it is from “{info['Series'][:80]}”")
+    n = comicrel._num(req["number"])
+    volume = req["kind"] in comicrel.PAGE_KINDS and req.get("unit") != "chapter"
+    said = comicrel._num(info.get("Volume") if volume and info.get("Volume") else info.get("Number"))
+    if said is not None and n is not None and said != n and not (volume and info.get("Volume") is None and said > n * 3):
+        problems.append(f"it says it is number {info.get('Volume') if volume and info.get('Volume') else info.get('Number')}")
+    code = (info.get("LanguageISO") or "").lower()[:2]
+    lang = (req.get("language") or "en").lower()
+    if len(code) == 2 and code.isalpha() and code != lang:
+        problems.append(f"it says it is in {code}")
+    langs = comicrel.parse(stem)["langs"]
+    if langs and lang not in langs:
+        problems.append(f"its name says {', '.join(sorted(langs))}")
+    pages = page_count(cbz)
+    chapter = req.get("unit") == "chapter"
+    least = MIN_PAGES["chapter" if chapter else "volume" if volume else "issue"]
+    if pages < least:
+        problems.append(f"only {pages} pages" + (": a chapter, not a volume?" if volume and not chapter else ""))
+    return problems
+
+
+def _hold(req, path, problems, meta):
+    """Keep a copy of the arrived file aside for the reader; the caller removes the original."""
+    held = os.path.join(HELD_DIR, str(req["id"]))
+    os.makedirs(held, exist_ok=True)
+    dest = os.path.join(held, os.path.basename(path))
+    shutil.copyfile(path, dest)
+    db.comic_update(req["id"], status="held", held_path=dest, held_meta=meta,
+                    detail="the file that came does not look like this one: " + "; ".join(problems))
+    notify.admin("error", {"owner": req["owner"], "title": _title(req), "source": "comics",
+                           "detail": "held for the reader to check: " + "; ".join(problems),
+                           "seq": notify.seq_id("comic", req["id"])})
+    return f"skipped: held for {req['owner']} to check, it does not look like {_title(req)}: " + "; ".join(problems)
+
+
+def drop_held(req):
+    if req.get("held_path"):
+        shutil.rmtree(os.path.dirname(req["held_path"]), ignore_errors=True)
 
 
 def match_request(owner, stem):
@@ -240,8 +435,13 @@ def match_request(owner, stem):
         if not comicrel._series_ok(r, p):
             continue
         n = comicrel._num(req["number"])
-        rng = p["volumes"] if req["kind"] in comicrel.PAGE_KINDS else p["issues"]
-        rng = rng or p["volumes"] or p["issues"]
+        if req.get("unit") == "chapter":
+            rng = p["chapters"]
+        else:
+            rng = p["volumes"] if req["kind"] in comicrel.PAGE_KINDS else p["issues"]
+            rng = rng or p["volumes"] or p["issues"]
+            if p["chapters"] and not p["volumes"]:
+                rng = None                       # a chapter file never fills a volume or issue request
         if rng and n is not None and rng[0] == rng[1] == n:
             return req, None
         if req["status"] == "downloading":
@@ -323,11 +523,13 @@ def write_metadata(cbz, req, stem, strip):
                    "Manga": "YesAndRightToLeft" if req.get("reading") == "rtl" else "No",
                    "Summary": req.get("summary") or "", "Publisher": req.get("publisher") or "",
                    "Writer": ", ".join(req.get("authors") or []), "Notes": f"bookstack comic request {req['id']}"})
-        if req["kind"] in comicrel.PAGE_KINDS:
+        if req["kind"] in comicrel.PAGE_KINDS and req.get("unit") != "chapter":
             ci["Volume"] = n
         if req.get("year"):
             ci["Year"] = str(req["year"])
-        cbi.update({"series": req["series_name"], "issue": n, "publisher": req.get("publisher") or None,
+        if req.get("unit") == "chapter":
+            tags.append("Chapter")
+        cbi.update({"series": library_series(req), "issue": n, "publisher": req.get("publisher") or None,
                     "comments": req.get("summary") or None, "language": req.get("language") or "en",
                     "credits": [{"person": a, "role": "Writer", "primary": True} for a in req.get("authors") or []]})
         if req.get("year"):
@@ -530,3 +732,55 @@ def kindle_result(job, ok, files=(), reason=None):
         db.kindle_update(job, status="failed", detail="the Kindle copy was not found")
         return
     db.kindle_update(job, status="queued", files=json.dumps(names), next_try=time.time())
+
+
+
+# ---- v5.9: a volume replaces the chapters a reader had (they decide) ----------------------------------
+def _chapter_books(owner, series_name):
+    """[{book_id, number}] of the reader's chapters of a series (Calibre series 'X (chapters)')."""
+    want = comicrel.norm(f"{series_name} (chapters)")
+    tag = config.OWNER_PREFIX + owner
+    try:
+        with _calibre() as c:
+            rows = c.execute("""SELECT b.id, s.name AS series, b.series_index FROM books b
+                JOIN books_series_link bsl ON bsl.book=b.id JOIN series s ON s.id=bsl.series
+                WHERE EXISTS (SELECT 1 FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=b.id AND t.name=?)""",
+                             (tag,)).fetchall()
+    except sqlite3.Error:
+        return []
+    return sorted(({"book_id": r["id"], "number": r["series_index"]} for r in rows if comicrel.norm(r["series"]) == want),
+                  key=lambda x: x["number"] or 0)
+
+
+def offer_swap(req, volume_book):
+    """A volume arrived (or was shared) for a reader who has chapters of the series: offer to take
+    out the ones it holds (pre-ticked from MangaDex when it knows; the reader decides)."""
+    if req.get("unit") == "chapter" or req["kind"] not in comicrel.PAGE_KINDS or db.comic_swap_exists(req["owner"], req["id"]):
+        return None
+    chapters = _chapter_books(req["owner"], req["series_name"])
+    if not chapters:
+        return None
+    held = None
+    if req["provider"] == "mangaupdates":
+        import mangadex
+        held = mangadex.chapters_in(req["series_id"], req["series_name"], req["number"])
+    held_set = set(held or [])
+    rows = [dict(ch, tick=bool(held_set) and float(ch["number"] or -1) in held_set) for ch in chapters]
+    if held_set and not any(r["tick"] for r in rows):
+        return None                              # none of the reader's chapters are in this volume
+    return db.comic_swap_add(req["owner"], req["id"], req["series_name"], req["number"], volume_book, rows, bool(held_set))
+
+
+def swap(owner, sid, book_ids):
+    """Take the chosen chapters out of the reader's library (as Remove from my library does)."""
+    sw = db.comic_swap_get(sid)
+    if not sw or sw["owner"] != owner or sw["status"] != "offered":
+        raise ComicError("nothing to swap")
+    mine = {c["book_id"] for c in sw["chapters"]}
+    n = 0
+    for bid in book_ids:
+        if bid in mine:
+            db.queue_untag(bid, owner)
+            n += 1
+    db.comic_swap_set(sid, "done" if n else "kept")
+    return n

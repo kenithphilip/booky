@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta, follows, hardcover, anilist, bookreq, share
+import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share
 import abs as absapi
 
 app = Flask(__name__)
@@ -95,6 +95,7 @@ def _inject():
             "can_get_books": _can_get,
             # v5.8.3: copies to confirm and held files, waiting for this reader
             "books_waiting": lambda: db.bookreq_waiting(session["user"]) if session.get("user") else 0,
+            "comics_waiting": lambda: db.comic_waiting(session["user"]) if session.get("user") and config.COMICS_ENABLED else 0,
             "reading": _reading_badge}
 
 def _reading_badge(state):
@@ -1001,7 +1002,7 @@ def book_page(book_id):
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
         converting=db.convert_for_book(book_id),
         replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS,
-        got_it=db.bookreq_for_book(user, book_id))
+        got_it=db.bookreq_for_book(user, book_id) or db.comic_for_book(user, book_id))
 
 @app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
 @login_required
@@ -1209,7 +1210,24 @@ def comics_page():
             error = str(e)
     rows = db.comic_list(None if session.get("admin") and request.args.get("all") else user)
     return render_template("comics.html", q=q, kind=kind, results=results, error=error, rows=rows,
-                           providers=comicmeta.providers(), labels=comicmeta.KIND_LABEL)
+                           providers=comicmeta.providers(), labels=comicmeta.KIND_LABEL,
+                           swaps=db.comic_swaps_offered(user))
+
+@app.route("/comics/swaps/<int:sid>", methods=["POST"])
+@login_required
+def comic_swap(sid):
+    """v5.9: take the ticked chapters out of the reader's library now that the volume is there."""
+    _comics_on()
+    user = session["user"]
+    ids = [int(x) for x in request.form.getlist("book") if x.isdigit()] if request.form.get("action") == "remove" else []
+    try:
+        n = comics.swap(user, sid, ids)
+    except comics.ComicError:
+        abort(404)
+    _audit("comic_swap", f"#{sid} ({n} chapters)")
+    flash(f"{n} chapter{'s' if n != 1 else ''} leave your library within a couple of minutes (delete them from your Kobo by hand)."
+          if n else "Kept your chapters.")
+    return redirect(url_for("comics_page"))
 
 def _series_or_404(provider, sid, language):
     if provider not in ("metron", "comicvine", "mangaupdates") or not re.fullmatch(r"\d{1,20}", sid or ""):
@@ -1242,7 +1260,7 @@ def comic_series(provider, sid):
     next_unread = next((it for it in items if it["number"] in books and (progress.get(it["number"]) or {}).get("status") != "read"), None)
     return render_template("comic_series.html", s=info, items=items, mine=mine, have=have, language=language,
                            languages=config.LANGUAGES, labels=comicmeta.KIND_LABEL,
-                           reading=comicmeta.READING.get(info["kind"], "ltr"), books=books, progress=progress,
+                           direction=comicmeta.READING.get(info["kind"], "ltr"), books=books, progress=progress,
                            next_unread=next_unread, followed=db.follow_find(user, "comic", provider, sid))
 
 @app.route("/comics/request", methods=["POST"])
@@ -1282,22 +1300,98 @@ def comic_request():
 @app.route("/comics/requests/<int:rid>/<action>", methods=["POST"])
 @login_required
 def comic_request_action(rid, action):
+    """yes / no (a copy offered, or a held file), keep (a held file anyway), cancel, retry, approve."""
+    import shelfmark_api
     _comics_on()
     user, is_admin = session["user"], session.get("admin", False)
     r = db.comic_get(rid)
     if not r or (r["owner"] != user and not is_admin):
         abort(404)
-    if action == "cancel" and r["status"] in ("queued", "pending", "not-found", "failed"):
-        db.comic_update(rid, status="cancelled", detail="cancelled")
-    elif action == "retry" and r["status"] in ("not-found", "failed", "cancelled"):
-        db.comic_update(rid, status="queued", next_try=time.time(), attempts=0, detail="looking again")
-    elif action == "approve" and is_admin and r["status"] == "pending":
-        db.comic_update(rid, status="queued", next_try=time.time(), detail="approved")
-    else:
-        abort(400)
+    said = None
+    try:
+        if action == "yes" and r["owner"] == user and r["status"] == "confirm":
+            said = ("Downloading it now: it is checked when it arrives." if comics.confirm(rid, shelfmark_api) == "downloading"
+                    else "Shelfmark did not take it; the portal looks again shortly.")
+        elif action == "no" and r["owner"] == user and r["status"] in ("confirm", "held"):
+            comics.reject(rid)
+            said = "Not that one: it will not be offered again. Looking for another copy."
+        elif action == "keep" and r["owner"] == user and r["status"] == "held":
+            comics.keep(rid)
+            said = "Kept: it is being added to your library."
+        elif action == "cancel" and r["status"] in ("queued", "pending", "confirm", "held", "not-found", "failed"):
+            comics.drop_held(r)
+            db.comic_update(rid, status="cancelled", candidate=None, held_path=None, detail="cancelled")
+        elif action == "retry" and r["status"] in ("not-found", "failed", "cancelled"):
+            db.comic_update(rid, status="queued", next_try=time.time(), attempts=0, detail="looking again")
+        elif action == "approve" and is_admin and r["status"] == "pending":
+            db.comic_update(rid, status="queued", next_try=time.time(), detail="approved")
+        else:
+            abort(400)
+    except comics.ComicError as e:
+        said = str(e)
+    if said:
+        flash(said)
     _audit(f"comic_{action}", f"#{rid} {r['series_name']} {r.get('label') or r['number']}")
     return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
                     else url_for("comics_page"))
+
+@app.route("/comics/series/<provider>/<sid>/confirm-all", methods=["POST"])
+@login_required
+def comic_confirm_all(provider, sid):
+    """'Yes to all': every copy offered to this reader in one series downloads."""
+    import shelfmark_api
+    _comics_on()
+    if provider not in ("metron", "comicvine", "mangaupdates") or not re.fullmatch(r"\d{1,20}", sid or ""):
+        abort(404)
+    n = comics.confirm_all(session["user"], provider, sid, shelfmark_api)
+    _audit("comic_confirm_all", f"{provider}:{sid} ({n})")
+    flash(f"Downloading {n}: each is checked when it arrives." if n else "Nothing was waiting to be confirmed.")
+    return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
+                    else url_for("comics_page"))
+
+# ---- v5.9: reading status by hand, for what no device reports (a Kindle, an iPad) ------------------
+@app.route("/book/<int:book_id>/read/<status>", methods=["POST"])
+@login_required
+def book_read(book_id, status):
+    user, is_admin = session["user"], session.get("admin", False)
+    if status not in ("read", "reading", "unread") or not library.visible(user, book_id, is_admin):
+        abort(404)
+    try:
+        cwa.set_read_status(user, book_id, status)
+    except cwa.CwaError as e:
+        flash(f"Could not save that: {e}")
+    else:
+        _audit("read_status", f"book {book_id} {status}")
+    return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
+                    else url_for("book_page", book_id=book_id))
+
+@app.route("/comics/series/<provider>/<sid>/read-up-to", methods=["POST"])
+@login_required
+def comic_read_up_to(provider, sid):
+    """'Read up to here' on a series: every issue/volume of it the reader has, up to that number."""
+    _comics_on()
+    user = session["user"]
+    info, items = _series_or_404(provider, sid, db.get_prefs(user).get("language") or config.BOOK_LANGUAGE)
+    if not info:
+        return redirect(url_for("comics_page"))
+    upto = comicrel._num(request.form.get("number"))
+    if upto is None:
+        abort(400)
+    n = 0
+    try:
+        for it in items:
+            v = comicrel._num(it["number"])
+            if v is None or v > upto:
+                continue
+            m = comics.find_in_library(info["name"], it["number"], info["kind"])
+            if m and user in m["owners"]:
+                cwa.set_read_status(user, m["book_id"], "read")
+                n += 1
+    except cwa.CwaError as e:
+        flash(f"Could not save that: {e}")
+    _audit("read_up_to", f"{provider}:{sid} <= {upto} ({n})")
+    flash(f"Marked {n} as read." if n else "None of those are in your library.")
+    return redirect(url_for("comic_series", provider=provider, sid=sid))
 
 @app.route("/book/<int:book_id>/kobo", methods=["POST"])
 @login_required
@@ -1345,6 +1439,8 @@ def follow_add():
     if kind == "comic":
         lang = request.form.get("language")
         extra["language"] = lang if lang in config.LANGUAGES else config.BOOK_LANGUAGE
+        if request.form.get("mode") == "chapters" and provider == "mangaupdates":
+            extra["mode"] = "chapters"            # v5.9: new chapters, then the volume that replaces them
     try:
         _fid, created = follows.follow(user, kind, provider, key, name, extra)
     except follows.FollowError as e:
@@ -1541,16 +1637,42 @@ def book_request_action(rid, action):
 def book_wrong(book_id):
     """'Wrong book' on a book that came from Get it."""
     user = session["user"]
+    is_comic = bool(db.comic_for_book(user, book_id))
     try:
-        bookreq.wrong_book(user, book_id)
-    except bookreq.BookRequestError:
+        if is_comic:
+            comics.wrong_comic(user, book_id)
+        else:
+            bookreq.wrong_book(user, book_id)
+    except (bookreq.BookRequestError, comics.ComicError):
         abort(404)
     _audit("book_wrong", f"book {book_id}")
     flash("Thanks: it is being taken out of your library, that copy will not be offered again, and the portal is "
           "looking for another one. You will be asked before anything downloads. Delete it from your Kobo or Kindle "
           "by hand if it already arrived there.")
-    return redirect(url_for("status"))
+    return redirect(url_for("comics_page" if is_comic else "status"))
 
+
+# ---- Metron (v5.9, metrontrack.py): Western comics read, in the reader's own Metron collection ---
+@app.route("/metron/connect", methods=["POST"])
+@login_required
+def metron_connect():
+    import metrontrack
+    try:
+        name = metrontrack.connect(session["user"], request.form.get("username"), request.form.get("secret"))
+    except metrontrack.MetronError as e:
+        flash(f"Metron: {e}")
+    else:
+        _audit("metron_connect", name)
+        flash(f"Metron connected as {name}. Comics you finish are marked read in your Metron collection within the hour.")
+    return redirect(url_for("devices"))
+
+@app.route("/metron/disconnect", methods=["POST"])
+@login_required
+def metron_disconnect():
+    db.metron_remove(session["user"])
+    _audit("metron_disconnect", "")
+    flash("Metron disconnected. What was already marked read there stays.")
+    return redirect(url_for("devices"))
 
 # ---- AniList (v5.8, anilist.py) ----------------------------------------------------------------
 @app.route("/anilist/connect")
@@ -1797,7 +1919,7 @@ def devices():
     return render_template("devices.html", u=u, prefs=prefs, kobo=kobo, kstat=kstat,
                            kobo_on=kobo_on, formats=config.FORMATS, kosync=config.KOSYNC_ENABLED,
                            abs_linked=absapi.configured(), anilist_ok=anilist.configured(),
-                           anilist_link=db.anilist_get(user))
+                           anilist_link=db.anilist_get(user), metron_link=db.metron_get(user))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])
