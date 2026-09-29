@@ -27,6 +27,9 @@ NOTIFY_WEBHOOK     = os.environ.get("NOTIFY_WEBHOOK", "")  # POST on new request
 # "json" (generic webhook), "ntfy" (plain-text body + Title/Priority headers) or "auto" (ntfy
 # when the host name contains "ntfy", which is what the installer's Alerts step suggests).
 NOTIFY_WEBHOOK_FORMAT = os.environ.get("NOTIFY_WEBHOOK_FORMAT", "auto").lower()
+# Which server alerts ALSO go to ADMIN_EMAIL (the webhook/ntfy gets every one): high = problems
+# only (priority high/urgent), all, or off. Every alert by mail as well as ntfy was noise.
+ALERT_MAIL = (os.environ.get("ALERT_MAIL", "high") or "high").lower()
 DEDUPE_WARN        = _bool("DEDUPE_WARN", True)         # warn if a title already exists in the library
 # Family sharing (share.py): a book already in the library is given to the next reader who asks
 # (their owner tag added to the same copy) instead of being downloaded again.
@@ -272,3 +275,8 @@ COMIC_ARRIVAL_HOURS = int(os.environ.get("COMIC_ARRIVAL_HOURS", "24") or 24)
 UNAR = os.environ.get("UNAR", "unar")
 LSAR = os.environ.get("LSAR", "lsar")
 BSDTAR = os.environ.get("BSDTAR", "bsdtar")
+# --- v5.8: following series and authors; AniList ---------------------------------------------
+# AniList API client (anilist.co -> Settings -> Developer; redirect URL
+# https://request.<domain>/anilist/callback). Readers connect their own accounts on Devices.
+ANILIST_CLIENT_ID = os.environ.get("ANILIST_CLIENT_ID", "")
+ANILIST_CLIENT_SECRET = os.environ.get("ANILIST_CLIENT_SECRET", "")

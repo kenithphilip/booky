@@ -57,6 +57,21 @@ Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files
 {% if not kindle_enabled %}<p class="mut">Sending from this portal is not enabled yet (the admin has not configured outgoing mail). You can still use <em>Send to Kindle</em> inside the <a href="{{ cfg.BOOKS_URL }}" target="_blank" rel="noopener">library site</a>.</p>{% endif %}
 </div>
 
+{% if anilist_ok %}
+<div class="card">
+<h3>AniList</h3>
+{% if anilist_link %}
+<p>Connected as <strong>{{ anilist_link.al_name }}</strong>. Manga volumes you finish on your Kobo count as read on your AniList list
+(the number only goes up; a series it cannot match by its exact title is left out).
+{% if anilist_link.detail %}<br><span class="mut">{{ anilist_link.detail }}</span>{% endif %}</p>
+<form method="post" action="{{ url_for('anilist_disconnect') }}">{{ csrf_field() }}<button type="submit" class="sec">Disconnect AniList</button></form>
+{% else %}
+<p class="mut">Keep your AniList manga list up to date by itself: volumes you finish on your Kobo are counted there.</p>
+<a class="btn" href="{{ url_for('anilist_connect') }}">Connect AniList</a>
+{% endif %}
+</div>
+{% endif %}
+
 <div class="card">
 <h3>Preferences</h3>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="prefs">

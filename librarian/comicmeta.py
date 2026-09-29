@@ -12,7 +12,7 @@ alt_names, authors}; its items as [{number, label, date, cover, id}] (issues for
 for manga: request what people actually download).
 Kinds: comic (left to right), manga (right to left), manhwa / manhua (left to right, often a long
 vertical strip), novel (text: not a comic, offered as a book request instead)."""
-import json, re
+import json, re, threading
 import requests
 import config, db
 
@@ -70,9 +70,11 @@ def kind_from_metron(series_type_name, name=""):
 
 
 # ---- HTTP and cache ----------------------------------------------------------------------------
+_FRESH = threading.local()      # follows.py's daily check: ask the provider, not the day-old cache
+
 def _get_json(url, params=None, auth=None, method="GET", body=None, headers=None):
     key = "cm:" + json.dumps([method, url, params, body], sort_keys=True)
-    hit = db.cache_get(key, CACHE_SECONDS)
+    hit = None if getattr(_FRESH, "on", False) else db.cache_get(key, CACHE_SECONDS)
     if hit is not None:
         return hit
     try:
@@ -177,10 +179,16 @@ def _mu_search(query, limit):
 
 
 # ---- one series and its issues / volumes -----------------------------------------------------------
-def series(provider, sid, language="en"):
+def series(provider, sid, language="en", fresh=False):
     """(series, items). For manga the items are volumes 1..N, N being the ENGLISH volume count
     when the reader reads English and an English publisher is listed (what can be found in
-    English), else the original count."""
+    English), else the original count. fresh: past the cache (the answer is cached again)."""
+    if fresh:
+        _FRESH.on = True
+        try:
+            return series(provider, sid, language)
+        finally:
+            _FRESH.on = False
     if provider == "metron":
         return _metron_series(sid)
     if provider == "comicvine":

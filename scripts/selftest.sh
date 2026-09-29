@@ -36,6 +36,9 @@ compose(){ (cd "$STACK_DIR" && docker compose "$@"); }
 # One retry when nothing answered at all (000): a single request Cloudflare dropped on the way is
 # not a finding, and it was the only thing a live FAIL on 2026-09-28 turned out to be.
 code(){ local c t; for t in 1 2; do c=$(curl -s -m 12 -o /dev/null -w '%{http_code}' "$@" 2>/dev/null) || true; [ "${c:-000}" != 000 ] && break; [ "$t" = 1 ] && sleep "${CODE_RETRY_SLEEP:-3}"; done; printf '%s' "${c:-000}"; }
+# the same one retry for the edge probes that read headers or bodies (curl exits non-zero when
+# nothing answered; an HTTP error status is still exit 0 without -f)
+ecurl(){ local out rc t; for t in 1 2; do out=$(curl "$@" 2>/dev/null); rc=$?; [ "$rc" = 0 ] && break; [ "$t" = 1 ] && sleep "${CODE_RETRY_SLEEP:-3}"; done; printf '%s' "$out"; return "$rc"; }
 # NEVER `producer | grep -q`: with pipefail on, grep -q quits at its first match, the producer dies
 # of SIGPIPE writing the rest, and the pipeline "fails" although the match was found (sshd -T,
 # Caddy's access log, `ip -o addr` on a box with dozens of Docker interfaces: all false alarms on
@@ -481,25 +484,25 @@ if [ -n "$D" ]; then
   else
     for pair in "/api/v3/content/checkforchanges|[]" "/api/UserStorage/Metadata|{}"; do
       u="${pair%%|*}"; want="${pair#*|}"
-      b=$(curl -s -m 12 "https://books.$D$u" 2>/dev/null | tr -d ' \r\n')
+      b=$(ecurl -s -m 12 "https://books.$D$u" | tr -d ' \r\n')
       [ "$b" = "$want" ] && ok "books.$D$u answers CWA's own empty reply (the Kobo's sync needs it)" \
         || bad "books.$D$u answered '${b:0:80}', not '$want': a Kobo's sync fails on it (re-run Install -> Deploy to render the Caddyfile)"
     done
   fi
   c=$(code -k "https://$(envget PUBLIC_IP)/" -H "Host: books.$D")
   [ "$c" = 000 ] && ok "origin refuses direct (non-Cloudflare) connections" || bad "origin answered a direct connection ($c) — mTLS/firewall not enforcing"
-  cc=$(curl -sI -m 12 "https://books.$D/login" 2>/dev/null | grep -i '^cf-cache-status:' | awk '{print toupper($2)}' | tr -d '\r')
+  cc=$(ecurl -sI -m 12 "https://books.$D/login" | grep -i '^cf-cache-status:' | awk '{print toupper($2)}' | tr -d '\r')
   case "$cc" in HIT|"") [ -n "$cc" ] && bad "Cloudflare served books./login from its cache ($cc): create the no-cache Cache Rule" || warn "no cf-cache-status header (not behind Cloudflare?)";; *) ok "edge cache: $cc";; esac
   # device paths must reach the apps, not a Cloudflare challenge page
   hdr=$(mktemp); body=$(mktemp)
-  c=$(curl -s -m 12 -D "$hdr" -o "$body" -w '%{http_code}' "https://books.$D/opds/" 2>/dev/null)
+  c=$(ecurl -s -m 12 -D "$hdr" -o "$body" -w '%{http_code}' "https://books.$D/opds/")
   if grep -qi '^cf-mitigated' "$hdr"; then bad "Cloudflare challenges /opds (Browser Integrity Check / Bot Fight Mode must be OFF)"
   elif [ "$c" = 401 ] && grep -qi '^www-authenticate' "$hdr"; then ok "/opds answers a Basic-auth challenge (CWA reached)"
   else bad "/opds -> $c without WWW-Authenticate"; fi
   tok=$(docker exec librarian python -m cwa kobo-url "$ADMIN_USER" 2>/dev/null | tr -d '"' | sed 's#.*/kobo/##; s#/.*##')
   case "$tok" in None|null|"") tok="";; esac
   if [ -n "$tok" ]; then
-    c=$(curl -s -m 12 -A 'Mozilla/5.0 (Linux; U; Android 2.0; en-us;) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1 Kobo' -D "$hdr" -o "$body" -w '%{http_code}' "https://books.$D/kobo/$tok/v1/initialization" 2>/dev/null)
+    c=$(ecurl -s -m 12 -A 'Mozilla/5.0 (Linux; U; Android 2.0; en-us;) AppleWebKit/533.1 (KHTML, like Gecko) Version/4.0 Mobile Safari/533.1 Kobo' -D "$hdr" -o "$body" -w '%{http_code}' "https://books.$D/kobo/$tok/v1/initialization" 2>/dev/null)
     if grep -qi '^cf-mitigated' "$hdr" || [ "$c" = 403 ] || [ "$c" = 503 ]; then bad "Kobo init challenged by Cloudflare ($c): Browser Integrity Check / Bot Fight Mode must be OFF"
     elif [ "$c" = 200 ] && grep -q Resources "$body"; then ok "Kobo /v1/initialization -> 200 with Resources"
     else bad "Kobo /v1/initialization -> $c"; fi

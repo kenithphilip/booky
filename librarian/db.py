@@ -310,6 +310,28 @@ def init():
         c.execute("""CREATE TABLE IF NOT EXISTS comic_convert(
             calibre_id INTEGER PRIMARY KEY, status TEXT NOT NULL,   -- due | done | failed
             forced INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, next_try REAL, detail TEXT, updated REAL)""")
+        # v5.8: what readers follow, what turned up for them, and their AniList link
+        c.execute("""CREATE TABLE IF NOT EXISTS follows(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
+            kind TEXT NOT NULL,            -- comic (a comic/manga series) | book-series | author
+            provider TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, extra TEXT,
+            known TEXT,                    -- what was already out at the last check (JSON list)
+            checked REAL, next_check REAL, created REAL, detail TEXT,
+            UNIQUE(owner, kind, provider, key))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS notices(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, follow_id INTEGER,
+            item_key TEXT NOT NULL, title TEXT NOT NULL, detail TEXT, item TEXT,
+            status TEXT NOT NULL DEFAULT 'new',   -- new | requested | dismissed
+            mailed INTEGER DEFAULT 0, created REAL, updated REAL,
+            UNIQUE(owner, follow_id, item_key))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS anilist(
+            owner TEXT PRIMARY KEY, token TEXT NOT NULL, al_user_id INTEGER, al_name TEXT,
+            connected REAL, detail TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS anilist_media(
+            series TEXT PRIMARY KEY, media_id INTEGER, title TEXT, volumes INTEGER, status TEXT, at REAL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS anilist_progress(
+            owner TEXT NOT NULL, media_id INTEGER NOT NULL, volumes INTEGER NOT NULL, at REAL,
+            PRIMARY KEY(owner, media_id))""")
         kcols = {r[1] for r in c.execute("PRAGMA table_info(kindle_jobs)")}
         for col, typ in (("kind", "TEXT DEFAULT 'book'"), ("files", "TEXT")):
             if col not in kcols:
@@ -1711,3 +1733,150 @@ def kindle_comic_jobs(status, limit=5):
     with _conn() as c:
         return [dict(r) for r in c.execute(
             "SELECT * FROM kindle_jobs WHERE kind='comic' AND status=? ORDER BY id LIMIT ?", (status, limit))]
+
+
+# ---- following (v5.8, follows.py) --------------------------------------------------------------
+def _follow(r):
+    if not r:
+        return None
+    d = dict(r)
+    d["extra"] = json.loads(d["extra"]) if d.get("extra") else {}
+    d["known"] = json.loads(d["known"]) if d.get("known") else None
+    return d
+
+def follow_add(owner, kind, provider, key, name, extra=None, now=None):
+    """(id, created?). Checked for the first time within minutes (that check only records
+    what is already out)."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        r = c.execute("SELECT id FROM follows WHERE owner=? AND kind=? AND provider=? AND key=?",
+                      (owner, kind, provider, str(key))).fetchone()
+        if r:
+            return r["id"], False
+        fid = c.execute("INSERT INTO follows(owner, kind, provider, key, name, extra, next_check, created) "
+                        "VALUES(?,?,?,?,?,?,?,?)", (owner, kind, provider, str(key), name[:200],
+                                                    json.dumps(extra or {}), now, now)).lastrowid
+        return fid, True
+
+def follow_get(fid):
+    with _conn() as c:
+        return _follow(c.execute("SELECT * FROM follows WHERE id=?", (fid,)).fetchone())
+
+def follow_find(owner, kind, provider, key):
+    with _conn() as c:
+        return _follow(c.execute("SELECT * FROM follows WHERE owner=? AND kind=? AND provider=? AND key=?",
+                                 (owner, kind, provider, str(key))).fetchone())
+
+def follow_list(owner=None):
+    sql, args = "SELECT * FROM follows", ()
+    if owner:
+        sql, args = sql + " WHERE owner=?", (owner,)
+    with _conn() as c:
+        return [_follow(r) for r in c.execute(sql + " ORDER BY name COLLATE NOCASE", args)]
+
+def follow_due(now, limit=10):
+    with _conn() as c:
+        return [_follow(r) for r in c.execute(
+            "SELECT * FROM follows WHERE next_check IS NULL OR next_check <= ? ORDER BY next_check LIMIT ?", (now, limit))]
+
+def follow_checked(fid, known, next_check, detail=None, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE follows SET known=?, checked=?, next_check=?, detail=? WHERE id=?",
+                  (json.dumps(known) if known is not None else None, now or time.time(), next_check, detail, fid))
+
+def follow_retry(fid, next_check, detail):
+    with _lock, _conn() as c:
+        c.execute("UPDATE follows SET next_check=?, detail=? WHERE id=?", (next_check, (detail or "")[:300], fid))
+
+def follow_remove(fid, owner):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM notices WHERE follow_id=? AND owner=? AND status='new'", (fid, owner))
+        return c.execute("DELETE FROM follows WHERE id=? AND owner=?", (fid, owner)).rowcount
+
+def notice_add(owner, follow_id, item_key, title, detail, item, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        cur = c.execute("INSERT OR IGNORE INTO notices(owner, follow_id, item_key, title, detail, item, created, updated) "
+                        "VALUES(?,?,?,?,?,?,?,?)", (owner, follow_id, str(item_key), title[:300], (detail or "")[:500],
+                                                     json.dumps(item or {}), now, now))
+        return cur.lastrowid if cur.rowcount else None
+
+def _notice(r):
+    if not r:
+        return None
+    d = dict(r)
+    d["item"] = json.loads(d["item"]) if d.get("item") else {}
+    return d
+
+def notices(owner, statuses=("new",), limit=50):
+    with _conn() as c:
+        return [_notice(r) for r in c.execute(
+            f"SELECT * FROM notices WHERE owner=? AND status IN ({','.join('?' * len(statuses))}) "
+            f"ORDER BY created DESC, id DESC LIMIT ?", (owner, *statuses, limit))]
+
+def notice_get(nid):
+    with _conn() as c:
+        return _notice(c.execute("SELECT * FROM notices WHERE id=?", (nid,)).fetchone())
+
+def notice_set(nid, status):
+    with _lock, _conn() as c:
+        c.execute("UPDATE notices SET status=?, updated=? WHERE id=?", (status, time.time(), nid))
+
+def notices_unmailed():
+    with _conn() as c:
+        return [_notice(r) for r in c.execute(
+            "SELECT * FROM notices WHERE status='new' AND mailed=0 ORDER BY owner, created")]
+
+def notices_mailed(ids):
+    if not ids:
+        return
+    with _lock, _conn() as c:
+        c.execute(f"UPDATE notices SET mailed=1 WHERE id IN ({','.join('?' * len(ids))})", list(ids))
+
+def notices_since(since):
+    with _conn() as c:
+        return c.execute("SELECT COUNT(*), COUNT(DISTINCT owner) FROM notices WHERE created >= ?", (since,)).fetchone()
+
+# ---- AniList (v5.8, anilist.py) ------------------------------------------------------------------
+def anilist_get(owner):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM anilist WHERE owner=?", (owner,)).fetchone()
+        return dict(r) if r else None
+
+def anilist_set(owner, token, al_user_id, al_name, now=None):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO anilist(owner, token, al_user_id, al_name, connected, detail) "
+                  "VALUES(?,?,?,?,?,NULL)", (owner, token, al_user_id, al_name, now or time.time()))
+
+def anilist_note(owner, detail):
+    with _lock, _conn() as c:
+        c.execute("UPDATE anilist SET detail=? WHERE owner=?", ((detail or "")[:300], owner))
+
+def anilist_remove(owner):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM anilist WHERE owner=?", (owner,))
+        c.execute("DELETE FROM anilist_progress WHERE owner=?", (owner,))
+
+def anilist_all():
+    with _conn() as c:
+        return [dict(r) for r in c.execute("SELECT * FROM anilist ORDER BY owner")]
+
+def anilist_media_get(series):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM anilist_media WHERE series=?", (series,)).fetchone()
+        return dict(r) if r else None
+
+def anilist_media_put(series, media_id, title, volumes, status):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO anilist_media(series, media_id, title, volumes, status, at) VALUES(?,?,?,?,?,?)",
+                  (series, media_id, title, volumes, status, time.time()))
+
+def anilist_sent(owner, media_id):
+    with _conn() as c:
+        r = c.execute("SELECT volumes FROM anilist_progress WHERE owner=? AND media_id=?", (owner, media_id)).fetchone()
+        return r["volumes"] if r else 0
+
+def anilist_sent_set(owner, media_id, volumes):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO anilist_progress(owner, media_id, volumes, at) VALUES(?,?,?,?)",
+                  (owner, media_id, volumes, time.time()))

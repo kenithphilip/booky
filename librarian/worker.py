@@ -2077,6 +2077,17 @@ def comics_once(now=None):
     _link_arrived_comics(now)
     return n
 
+FOLLOWS_EVERY = 600
+
+def follows_once(now=None):
+    import follows, anilist
+    n = follows.run_once(now)
+    try:
+        anilist.sync_once()
+    except Exception as e:                       # AniList down never stops the follow checks
+        log.warning("AniList sync: %s", e)
+    return n
+
 def _link_arrived_comics(now):
     """A delivered comic's Calibre id (for its page and for auto-send to Kindle)."""
     for req in db.comic_open(statuses=("done",)):
@@ -2403,6 +2414,8 @@ def run_forever():
     # entry, the metadata chain — never allowed to hold up tag jobs or import reconciliation
     threading.Thread(target=_loop, args=("wanted", wanted_once, WANTED_EVERY), daemon=True).start()
     threading.Thread(target=_loop, args=("comics", comics_once, COMICS_EVERY), daemon=True).start()
+    # v5.8: followed series and authors (each checked once a day), AniList progress
+    threading.Thread(target=_loop, args=("follows", follows_once, FOLLOWS_EVERY), daemon=True).start()
     if config.IMAP_HOST:
         import imap
         threading.Thread(target=imap.poll_forever, daemon=True).start()

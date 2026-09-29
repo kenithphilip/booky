@@ -211,6 +211,9 @@ services:
       - METRON_USER=${METRON_USER:-}
       - METRON_PASS=${METRON_PASS:-}
       - COMICVINE_API_KEY=${COMICVINE_API_KEY:-}
+      # v5.8: readers connect AniList on Devices (Library -> Comics sets the client)
+      - ANILIST_CLIENT_ID=${ANILIST_CLIENT_ID:-}
+      - ANILIST_CLIENT_SECRET=${ANILIST_CLIENT_SECRET:-}
       - CONVERT_MAX_PER_DAY=${CONVERT_MAX_PER_DAY:-10}      # on-demand conversions per reader per day
       - MAX_UPLOAD_TAILNET_MB=${MAX_UPLOAD_TAILNET_MB:-2048} # L18: upload.<domain> (Tailscale only)
       - KOSYNC_ENABLED=${KOSYNC_ENABLED:-false}
@@ -260,6 +263,7 @@ services:
       - LIBRARY_RELEASE_DAYS=${LIBRARY_RELEASE_DAYS:-7}   # a book no reader has any more is deleted after this (0 = never)
       - NOTIFY_WEBHOOK=${NOTIFY_WEBHOOK:-}
       - NOTIFY_WEBHOOK_FORMAT=${NOTIFY_WEBHOOK_FORMAT:-auto}   # auto = ntfy style when the URL host contains 'ntfy'
+      - ALERT_MAIL=${ALERT_MAIL:-high}   # which server alerts ALSO reach ADMIN_EMAIL: high (problems only) | all | off
       - AUTHELIA_ENABLED=${AUTHELIA_ENABLED:-false}           # portal hides self-service user creation when the gate is on
       - TORRENTS_ENABLED=${TORRENTS_ENABLED:-false}           # shows the qBittorrent admin link
       - EPHEMERA_ENABLED=${EPHEMERA_ENABLED:-false}          # shows the Ephemera admin link

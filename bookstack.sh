@@ -2536,7 +2536,7 @@ kuma_config() { # the bootstrap's JSON input on stdout — secrets included, so 
   KC_TOR="$(envget TORRENTS_ENABLED)" KC_EPH="$(envget EPHEMERA_ENABLED)" KC_AUTH="$(envget AUTHELIA_ENABLED)" \
   KC_FS="$(solver_on && echo true)" KC_REBOOT="$(kuma_reboot_time)" KC_SMA="$(envget SHELFMARK_AUTH_METHOD)" \
   KC_PS="$ps" KC_PD="$pd" KC_PM="$pm" KC_PC="$pc" KC_PB="$pb" KC_PK="$pk" \
-  KC_HOOK="$(envget NOTIFY_WEBHOOK)" KC_FMT="$(envget NOTIFY_WEBHOOK_FORMAT)" KC_TO="$(envget ADMIN_EMAIL)" \
+  KC_HOOK="$(envget NOTIFY_WEBHOOK)" KC_FMT="$(envget NOTIFY_WEBHOOK_FORMAT)" KC_TO="$({ [ "$(adv_value ALERT_MAIL high)" = all ] || [ -z "$(envget NOTIFY_WEBHOOK)" ]; } && envget ADMIN_EMAIL)" \
   KC_SH="$(envget SMTP_HOST)" KC_SP="$(envget SMTP_PORT)" KC_SS="$(envget SMTP_SECURITY)" \
   KC_SU="$(envget SMTP_USER)" KC_SW="$(envget SMTP_PASS)" KC_SF="$(envget SMTP_FROM)" \
   python3 -c '
@@ -3626,6 +3626,7 @@ mail|IMAP_PORT|0|int|IMAP port; 0 = the default for the mode (993 implicit TLS, 
 mail|IMAP_SSL|true|bool|true = implicit TLS on 993; false = STARTTLS on 143, for a local relay
 mail|IMAP_FOLDER|INBOX|text|Mailbox the e-mail-to-library poller reads
 mail|NOTIFY_WEBHOOK_FORMAT|auto|text|How alerts are posted: auto (ntfy style for an ntfy host), ntfy or json
+mail|ALERT_MAIL|high|text|Server alerts also e-mailed: high (problems only), all (incl. monitor up/down), off
 mail|ABS_LIBRARY_NAME|Audiobooks|text|Audiobookshelf library the portal files audiobooks into
 disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
 disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
@@ -3669,6 +3670,7 @@ step_advanced() {
              { [ "$new" -ge 1 ] && [ "$new" -le 99 ]; } || { msg "$key must be between 1 and 99. Nothing was changed."; continue; };;
         bool) case "$new" in true|false) ;; *) msg "$key must be exactly true or false. Nothing was changed."; continue;; esac;;
       esac
+      if [ "$key" = ALERT_MAIL ]; then case "$new" in high|all|off) ;; *) msg "ALERT_MAIL is high, all or off. Nothing was changed."; continue;; esac; fi
       envset "$key" "$new" || { msg "Could not write $ENV_FILE, so $key was NOT changed."; continue; }
       case "$g" in
         backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;
@@ -3683,7 +3685,8 @@ step_advanced() {
                   || msg "WARNING: the thresholds now read warn=$w stop=$s resume=$r. They only work as resume < stop and warn <= stop — otherwise the watchdog either stops the downloaders before it ever warns you, or never starts them again."
                 if restart_portal; then msg "$key is now $new.\n\nThe hourly watchdog reads $ENV_FILE when it runs, and the portal was recreated so its own copy of the thresholds matches."
                 else msg "$key is now $new in $ENV_FILE and the hourly watchdog will use it, but the portal could NOT be restarted, so the portal still pauses its imports at the OLD threshold (Operations -> Logs -> librarian)."; fi;;
-        *)      if restart_portal; then msg "$key is now $new and the portal was recreated, so it is live."
+        *)      [ "$key" = ALERT_MAIL ] && { setup_monitoring >/dev/null 2>&1 || true; }   # Kuma's e-mail channel follows it
+                if restart_portal; then msg "$key is now $new and the portal was recreated, so it is live."
                 else msg "$key is now $new in $ENV_FILE, but the portal could NOT be restarted, so it is NOT in force yet (Operations -> Logs -> librarian)."; fi;;
       esac
     done
@@ -3781,9 +3784,15 @@ step_metadata_sources() {
        else note="$note\nGoogle Books: the key was REFUSED by googleapis.com, not saved."; fi;;
   esac
   write_shelfmark_metadata_env || { msg "Could not write shelfmark/metadata.env (disk full?).$note"; return 1; }
-  local rc=0
+  local rc=0 hcq=""
   compose up -d librarian shelfmark >/dev/null 2>&1 || rc=1
   prune_shelfmark_placeholder
+  # v5.8: following book series and authors reads Hardcover's series/author queries: prove them here
+  if [ -n "$(envget HARDCOVER_API_KEY)" ]; then
+    wait_for http://127.0.0.1:8090/healthz 30 || true
+    hcq=$(docker exec -i librarian python -m hardcover 2>/dev/null | tail -1)
+    note="$note\nFollowing book series (Hardcover's series query): ${hcq:-the portal did not answer}"
+  fi
   msg "Metadata sources$note\n\nAlways on: Open Library (book search, author pages, links to free copies) and the bookinfo/Hardcover mirrors for library enrichment.\nOptional now: Hardcover $([ -n "$(envget HARDCOVER_API_KEY)" ] && echo ON || echo off), Google Books $([ -n "$(envget GOOGLE_BOOKS_API_KEY)" ] && echo ON || echo off) — in the portal's enrichment AND in Shelfmark's own metadata search.$([ $rc != 0 ] && printf '\n\nWARNING: the portal or Shelfmark could not be recreated, so the change is not live yet (Operations -> Logs).')"
   return $rc
 }
@@ -3814,6 +3823,12 @@ step_comics() {
       *) p=$(askpw "Metron password for $u") || p=""
          if [ -n "$p" ]; then envset METRON_USER "$u"; envset METRON_PASS "$p"; note="$note\nMetron: login saved for $u."; fi;; esac
   fi
+  cur=$(envget ANILIST_CLIENT_ID)
+  u=$(ask "AniList client ID (optional: readers then connect their AniList on Devices, and manga volumes finished on the Kobo count there). anilist.co -> Settings -> Developer -> Create New Client; redirect URL: https://request.$(envget DOMAIN)/anilist/callback\n\nBlank = keep '${cur:-none}'. Type - to remove." "") || u=""
+  case "$u" in -) envset ANILIST_CLIENT_ID ""; envset ANILIST_CLIENT_SECRET ""; note="$note\nAniList: removed.";; "") ;;
+    *[!0-9]*) note="$note\nAniList: '$u' is not a client ID (it is a number), not saved.";;
+    *) p=$(askpw "AniList client secret for client $u") || p=""
+       if [ -n "$p" ]; then envset ANILIST_CLIENT_ID "$u"; envset ANILIST_CLIENT_SECRET "$p"; note="$note\nAniList: client $u saved (readers: Devices -> Connect AniList)."; fi;; esac
   cur=$(envget COMICVINE_API_KEY)
   cv=$(askpw "ComicVine API key (optional fallback for Western comics; comicvine.gamespot.com/api, free).\n\nBlank = keep the current one ($([ -n "$cur" ] && echo set || echo none)). Type - to remove it.") || cv=""
   case "$cv" in -) envset COMICVINE_API_KEY ""; note="$note\nComicVine: removed.";; "") ;; *) envset COMICVINE_API_KEY "$cv"; note="$note\nComicVine: saved.";; esac

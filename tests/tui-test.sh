@@ -1950,8 +1950,14 @@ expect '[ "$(kq "sorted(d[\"push\"])")" = "['"'"'disk'"'"', '"'"'selftest'"'"']"
 expect '[ "$(kq "d[\"features\"]")" = "{'"'"'torrents'"'"': True, '"'"'ephemera'"'"': True, '"'"'authelia'"'"': False, '"'"'flaresolverr'"'"': True}" ]' "features follow .env; Ephemera implies the FlareSolverr monitor"
 expect '[ "$(kq "d[\"reboot_time\"]")" = 03:10 ] && [ "$(kq "d[\"password\"]")" = "$kp1" ] && [ "$(kq "d[\"notify\"][\"smtp\"]")" = None ]' "the reboot window follows unattended-upgrades' own time; no SMTP -> no e-mail channel"
 envset SMTP_HOST smtp.example.test; envset SMTP_FROM lib@example.test; envset ADMIN_EMAIL me@example.test
+kwh=$(envget NOTIFY_WEBHOOK); envset NOTIFY_WEBHOOK https://ntfy.sh/family-topic; envset ALERT_MAIL ""
 kc=$(kuma_config)
-expect '[ "$(kq "d[\"notify\"][\"smtp\"][\"host\"]")" = smtp.example.test ] && [ "$(kq "d[\"notify\"][\"to\"]")" = me@example.test ]' "SMTP configured -> Kuma mails the same admin address alert.sh uses"
+expect '[ -z "$(kq "d[\"notify\"][\"to\"]")" ]' "ALERT_MAIL=high (the default) with ntfy set: Kuma's up/down goes to ntfy only, not also to the mailbox (v5.8)"
+envset ALERT_MAIL all; kc=$(kuma_config)
+expect '[ "$(kq "d[\"notify\"][\"smtp\"][\"host\"]")" = smtp.example.test ] && [ "$(kq "d[\"notify\"][\"to\"]")" = me@example.test ]' "ALERT_MAIL=all: Kuma mails the same admin address alert.sh uses"
+envset ALERT_MAIL ""; envset NOTIFY_WEBHOOK ""; kc=$(kuma_config)
+expect '[ "$(kq "d[\"notify\"][\"to\"]")" = me@example.test ]' "no webhook at all: mail stays Kuma's channel whatever ALERT_MAIL says"
+envset NOTIFY_WEBHOOK "$kwh"; kc=$(kuma_config)
 envset SMTP_HOST ""; envset TORRENTS_ENABLED false; envset EPHEMERA_ENABLED false
 # setup_monitoring against a stub compose: the bootstrap's answer drives the result
 KB_OUT='{"ok": true, "setup": "created", "added": ["a","b"], "updated": [], "deleted": [], "notifications": ["bookstack: webhook"], "maintenance": "5 3 * * *", "monitors": 9}'
@@ -2117,10 +2123,11 @@ printf '#!/usr/bin/env bash\necho "ALERT $1 $2" >> "%s/log"\n' "$CW" > "$CW/aler
 printf "CF_API_TOKEN='tok'\n" > "$CW/.env"
 cat > "$CW/bin/curl" <<'EOS'
 #!/usr/bin/env bash
+[ "$CW_TOKEN_ANSWER" = NONE ] && { echo "calls" >> "$CW/curl.calls"; exit 28; }   # no answer at all
 printf '%s\n' "$CW_TOKEN_ANSWER"
 EOS
 chmod +x "$CW/bin/curl"
-cwrun(){ : > "$CW/log"; PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER="${1:-"{\"result\":{\"status\":\"active\"}}"}" bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1; }
+cwrun(){ : > "$CW/log"; CW="$CW" CERT_STATE="$CW/state" CERT_RETRY_SLEEP=0 PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER="${1:-"{\"result\":{\"status\":\"active\"}}"}" bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1; }
 cwrun; rc=$?
 expect '[ $rc = 1 ] && grep -q "certificate for books.example.test expires in [0-9] days" "$CW/log" && grep -q "renewal is failing" "$CW/log"' "a certificate under 14 days is an alert: Caddy's renewal has been failing"
 rm -rf "$CW/certs/acme"; cwrun '{"result":{"status":"disabled"}}'
@@ -2134,6 +2141,12 @@ expect '[ $rc = 1 ] && grep -q "origin-pull certificate expires in [0-9]* days" 
 : > "$CW/log"; PATH="$CW/bin:$PATH" STACK_DIR="$CW" CERT_DIR="$CW/certs" CERT_CA="$CW/ca.pem" CERT_AOP="$CW/nope.pem" CERT_ALERT="$CW/alert.sh" CW_TOKEN_ANSWER='{"result":{"status":"active"}}' bash "$REPO/scripts/cert-watch.sh" >/dev/null 2>&1
 expect 'grep -q "aop.*missing\|nope.pem is missing" "$CW/log"' "and a zone lock whose certificate file is gone is an alert"
 printf "CF_API_TOKEN='tok'\n" > "$CW/.env"
+rm -f "$CW/state" "$CW/curl.calls"; cwrun NONE; rc=$?
+expect '[ $rc = 0 ] && [ ! -s "$CW/log" ] && [ "$(grep -c . "$CW/curl.calls")" = 3 ] && grep -q "^cf_no_answer=" "$CW/state"' "no answer from Cloudflare: three tries, then silence on the first day (a dropped request is not a finding; live 2026-09-29)"
+printf 'cf_no_answer=2000-01-01\n' > "$CW/state"; cwrun NONE
+expect 'grep -q "ALERT Bookstack: Cloudflare.s API is not reachable" "$CW/log" && ! grep -q "certificate/token expiry" "$CW/log"' "no answer two days running: a plain notice about the network, not a token emergency"
+cwrun '{"result":{"status":"active"}}'
+expect '[ ! -e "$CW/state" ] && [ ! -s "$CW/log" ]' "an answer again clears the memory of the silent day"
 expect 'declare -f install_disk_watch | grep -q install_cert_watch' "installed on Deploy (daily cron, output to the journal)"
 
 echo "== L06: update notices (scripts/update-check.sh)"
@@ -2348,7 +2361,7 @@ EOS
 printf '#!/usr/bin/env bash\nprintf "%%s\\ttotal\\n" 1073741824\n' > "$DR/bin/du"
 cat > "$DR/bin/docker" <<'EOS'
 #!/usr/bin/env bash
-case "$*" in "system df --format "*) printf 'Images=7.9GB\nContainers=12MB\nLocal Volumes=0B\nBuild Cache=400MB\n';; esac
+case "$*" in "system df --format "*) printf 'Images=7.9GB=2.1GB (26%%)\nContainers=12MB=0B (0%%)\nLocal Volumes=0B=0B\nBuild Cache=400MB=400MB\n';; esac
 EOS
 printf '#!/usr/bin/env bash\nprintf "              total  used  free\\nMem:   4294967296 2147483648 0\\nSwap:  2147483648 107374182 0\\n"\n' > "$DR/bin/free"
 cat > "$DR/alert" <<'EOS'
@@ -2362,7 +2375,7 @@ GiB=1073741824
 rm -f "$DR/etc/hist"; dr $((40 * GiB))
 expect 'grep -q "^ALERT seq=disk-daily tags=floppy_disk prio=low title=Disk 50% used, 40.0 GB free$" "$DR/log"' "a quiet (low) notification with the same id every day, so today's replaces yesterday's"
 expect 'grep -q "Used 40.0 GB of 80.0 GB (50%), 40.0 GB free · inodes 9%" "$DR/log" && grep -q "First report" "$DR/log"' "says how full, in bytes and inodes; the trend starts tomorrow"
-expect 'grep -q "Ebooks 1.0 GB · Audiobooks 1.0 GB · Seedbox copies 1.0 GB" "$DR/log" && grep -q "Docker images 7.9GB, build cache 400MB" "$DR/log" && grep -q "Memory: 2.0 of 4.0 GB in use, swap 0.1 GB" "$DR/log"' "where the space went, Docker's share and memory"
+expect 'grep -q "Ebooks 1.0 GB · Audiobooks 1.0 GB · Seedbox copies 1.0 GB" "$DR/log" && grep -q "Docker images 7.9GB, 2.1GB of it old versions or unused; build cache 400MB" "$DR/log" && grep -q "Memory: 2.0 of 4.0 GB in use, swap 0.1 GB" "$DR/log"' "where the space went, Docker's share and memory"
 expect 'grep -q "^$(date +%F) $((40 * GiB))$" "$DR/etc/hist"' "today's figure is kept for tomorrow's comparison"
 { echo "$(date -d '-7 day' +%F) $((33 * GiB))"; echo "$(date -d '-1 day' +%F) $((39 * GiB))"; } > "$DR/etc/hist"
 dr $((40 * GiB))
@@ -2379,6 +2392,7 @@ envset DISK_REPORT_HOUR 31; install_disk_report; expect 'grep -q "^5 9 \* \* \* 
 envset DISK_REPORT false; install_disk_report; expect '[ ! -e "$T/etc/cron.d/bookstack-diskreport" ]' "DISK_REPORT=false removes it"
 envset DISK_REPORT ""; envset DISK_REPORT_HOUR ""
 expect 'declare -f install_disk_watch | grep -q install_disk_report' "Deploy installs it with the other scheduled jobs"
+expect '[ "$(PATH="$DR/bin:$PATH" bash -c "$(sed -n "/^gb()/,/^  if (b < 1073741824)/p" "$REPO/scripts/disk-report.sh" | sed "\$s/\$/ }/"); gb 52428800")" = "50 MB" ] 2>/dev/null || grep -q "printf \"%s%.0f MB\"" "$REPO/scripts/disk-report.sh"' "under 1 GB the summary says MB (a young library read as 0.0 GB)"
 expect 'declare -f step_deploy | grep -q "absctl backups"' "Deploy switches on Audiobookshelf's own nightly database copy"
 
 echo "== v5.7: Library -> Comics (docs/COMICS.md)"
@@ -2392,6 +2406,11 @@ expect '[ "$(envget METRON_TOKEN)" = metron-key-123 ] && [ -z "$(envget METRON_U
 expect 'grep -q "flock -n /run/lock/bookstack-comics.lock env STACK_DIR=.*scripts/comic-convert.sh" "$T/etc/cron.d/bookstack-comics" && grep -q "^\*/3 \* \* \* \* root" "$T/etc/cron.d/bookstack-comics"' "the device-copy job runs every 3 minutes, never twice at once"
 expect 'seen "docker: pull -q ghcr.io/ciromattia/kcc:v12.0.0" && seen "compose up -d librarian" && seen "python -m comicmeta check"' "KCC is pulled, the portal recreated, and the metadata providers asked"
 expect 'grep -F msgbox "$LOG" | grep -q "tick CBR"' "the admin is told the one Shelfmark setting comics need (CBR)"
+reset "yes" "<blank>" "52302" "al-secret" "<blank>"; step_comics >/dev/null
+expect '[ "$(envget ANILIST_CLIENT_ID)" = 52302 ] && [ "$(envget ANILIST_CLIENT_SECRET)" = al-secret ] && grep -q "askpw: AniList client secret" "$LOG" && grep -q "request.*/anilist/callback" "$LOG"' "v5.8: the AniList client (its secret in a password box), with the redirect URL to register"
+reset "yes" "<blank>" "not-a-number" "<blank>"; step_comics >/dev/null
+expect '[ "$(envget ANILIST_CLIENT_ID)" = 52302 ] && grep -F msgbox "$LOG" | grep -q "is not a client ID"' "a client ID that is not a number is refused, the saved one kept"
+envset ANILIST_CLIENT_ID ""; envset ANILIST_CLIENT_SECRET ""
 reset "no"; step_comics >/dev/null
 expect '[ "$(envget COMICS_ENABLED)" = false ] && [ ! -e "$T/etc/cron.d/bookstack-comics" ]' "turning comics off removes the job; nothing in the library changes"
 envset COMICS_ENABLED ""

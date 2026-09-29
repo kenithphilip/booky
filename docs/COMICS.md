@@ -69,8 +69,9 @@ From a pack, only the requested volume is imported; the rest of the pack stays o
    split into parts if it still is. The portal mails the parts and deletes them.
 
 Reading progress comes back from the Kobo (Calibre-Web records it); a Kindle or an iPad never
-reports it. Following a series, "new for you" notices and AniList come in v5.8; following
-chapters and swapping them for the volume in v5.9.
+reports it. v5.8: **Follow** on a series page puts new issues or volumes (once released) on the
+reader's New for you list with one-tap Request; AniList (Devices) gets the reader's finished
+manga volumes. Following chapters and swapping them for the volume come in v5.9.
 
 ## What the owner sets up
 

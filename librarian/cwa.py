@@ -332,6 +332,45 @@ def kobo_token(name, create=True):
     _checkpoint()
     return tok
 
+READ_STATUS = {0: "unread", 1: "read", 2: "reading"}      # CWA's ReadBook.STATUS_* (cps/ub.py)
+
+def reading_state(name):
+    """{book_id: {"status": "read" | "reading", "pct": float | None}} for this reader, from what
+    Calibre-Web itself records: its read status (the Kobo's 'Finished' / 'Reading', KOReader's
+    sync, the web reader's own mark) and the Kobo's page position. Books never opened are absent.
+    Tables CWA has not created yet read as nothing, and a busy or unreadable app.db as nothing too:
+    reading status is a nicety, never a reason for a page to fail."""
+    try:
+        return _reading_state(name)
+    except (sqlite3.Error, CwaError):
+        return {}
+
+def _reading_state(name):
+    u = get_user(name)
+    if not u:
+        return {}
+    out = {}
+    with _conn() as c:
+        try:
+            for bid, st in c.execute("SELECT book_id, read_status FROM book_read_link WHERE user_id=?", (u["id"],)):
+                if st in (1, 2):
+                    out[bid] = {"status": READ_STATUS[st], "pct": None}
+        except sqlite3.OperationalError:
+            pass
+        try:
+            for bid, pct in c.execute(
+                    "SELECT s.book_id, b.progress_percent FROM kobo_reading_state s "
+                    "JOIN kobo_bookmark b ON b.kobo_reading_state_id = s.id WHERE s.user_id=?", (u["id"],)):
+                if pct is None:
+                    continue
+                cur = out.setdefault(bid, {"status": "reading", "pct": None})
+                cur["pct"] = round(float(pct))
+                if cur["status"] != "read" and float(pct) > 0:
+                    cur["status"] = "reading"
+        except sqlite3.OperationalError:
+            pass
+    return out
+
 @_guard
 def kobo_status(name):
     """What CWA itself records about this reader's Kobo (L12), read-only: how many books it has

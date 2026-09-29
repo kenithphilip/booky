@@ -1,0 +1,10 @@
+<table>
+{% for n in (notices if notices is defined else new_for_you()) if n.status == 'new' %}
+<tr><td><strong>{{ n.title }}</strong>{% if n.detail %} <span class="mut">· {{ n.detail }}</span>{% endif %}</td>
+<td style="text-align:right;white-space:nowrap">
+<form method="post" action="{{ url_for('notice_action', nid=n.id, action='request') }}" style="display:inline">{{ csrf_field() }}
+<button type="submit">{{ 'Request' if n.item.type == 'comic' else 'Find in Shelfmark' }}</button></form>
+<form method="post" action="{{ url_for('notice_action', nid=n.id, action='dismiss') }}" style="display:inline">{{ csrf_field() }}
+<button type="submit" class="sec">Dismiss</button></form></td></tr>
+{% endfor %}
+</table>

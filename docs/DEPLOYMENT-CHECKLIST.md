@@ -200,6 +200,26 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.8 (following, New for you, reading status, AniList)
+- Unit 628 passed, installer 792 passed, end-to-end 288 checks / 0 failed. End to end: alice's
+  Kobo PUTs 'Finished' for her comic to the real Calibre-Web (as a Kobo does), and the portal reads
+  it back as Read (book_read_link + kobo_bookmark) and as volume 3 finished for AniList.
+- From the first night's alerts (2026-09-29): every self-test edge probe retries once when
+  nothing answered (a single "/opds -> 000" flipped the hourly self-test red and back); the
+  Cloudflare token check tries three times, and "no answer" (the network, not the token) is a
+  plain notice only on two days running; the disk summary says MB under 1 GB and how much of
+  Docker's images is old versions; ALERT_MAIL (default high) mails only problems, and Kuma's
+  e-mail channel exists only with ALERT_MAIL=all (ntfy gets everything either way).
+- Not verifiable here (no keys): Hardcover's series/author queries (Library -> Metadata sources
+  now runs `python -m hardcover` after saving a key and shows the answer), AniList's OAuth and
+  GraphQL (unit-tested against the documented shapes; connect once on Devices to prove it).
+- On the VPS after Deploy:
+  - Library -> Comics: the AniList client ID and secret (recreate the client first: its secret
+    was in a screenshot). Then Devices -> Connect AniList as a reader.
+  - Library -> Metadata sources: a Hardcover key, if books are to be followed; read the check line.
+  - Follow a manga series and a book series; New for you fills when something comes out (the
+    first check only records what is already out).
+
 ## Verified locally in v5.7 (comics and manga, audiobook downloads)
 - Unit 612 passed, installer 790 passed, end-to-end 287 checks / 0 failed. KCC made the 12-page
   colour test volume's Kobo copy in 14 s on the Mac (a 200-page volume on the VPS: see below).

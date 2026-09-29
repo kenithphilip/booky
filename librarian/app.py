@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta
+import comics, comicmeta, follows, hardcover, anilist
 import abs as absapi
 
 app = Flask(__name__)
@@ -88,7 +88,18 @@ def _inject():
     return {"csrf_field": lambda: Markup(f'<input type="hidden" name="csrf" value="{_csrf_token()}">'),
             "kindle_enabled": kindle.configured(), "cfg": config,
             "source_label": config.source_label, "friendly_detail": _friendly_detail,
-            "mail_intake": _mail_intake_address}
+            "mail_intake": _mail_intake_address,
+            # v5.8: what turned up for this reader (New for you), counted for the nav
+            "new_for_you": lambda: db.notices(session["user"]) if session.get("user") else [],
+            "reading": _reading_badge}
+
+def _reading_badge(state):
+    """'Read', 'Reading 45 %' or '' for one book's entry in cwa.reading_state()."""
+    if not state:
+        return ""
+    if state["status"] == "read":
+        return "Read"
+    return f"Reading {state['pct']} %" if state.get("pct") else "Reading"
 
 def _kobo_link_test(user):
     """Ask Calibre-Web, as the Kobo would, whether this reader's link works: the same
@@ -935,9 +946,11 @@ def my_library():
     total = library.count_for(user, is_admin, q=q)
     # removed by this reader a moment ago: gone for them now, the host job catches up in minutes
     books = [x for x in books if not db.untag_pending(x["id"], user)]
+    state = cwa.reading_state(user)
     for b in books:
         b["best"] = library.best_format(b, prefs["preferred_format"])
         b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
+        b["reading"] = state.get(b["id"])
     u = _cwa_user(user)
     return render_template("library.html", books=books, prefs=prefs, admin=is_admin,
                            kindle_mail=u.get("kindle_mail") or "", q=q, page=page, total=total,
@@ -968,7 +981,7 @@ def book_page(book_id):
     b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"]) or "cbz" in b["formats"]
     is_comic = "cbz" in b["formats"]
     return render_template(
-        "book.html", b=b, admin=is_admin, is_comic=is_comic,
+        "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
         # Calibre is the authority (it holds hand corrections); the portal's metadata fills gaps
         description=b["description"] or work.get("description") or "",
@@ -1211,14 +1224,19 @@ def comic_series(provider, sid):
     if not info:
         return redirect(url_for("comics_page"))
     mine = db.comic_series_status(user, provider, sid)
-    have = {}
+    have, books, state = {}, {}, cwa.reading_state(user)
     for it in items:
         m = comics.find_in_library(info["name"], it["number"], info["kind"])
         if m:
             have[it["number"]] = "yours" if user in m["owners"] else "family"
+            if user in m["owners"]:
+                books[it["number"]] = m["book_id"]
+    progress = {n: state.get(bid) for n, bid in books.items()}
+    next_unread = next((it for it in items if it["number"] in books and (progress.get(it["number"]) or {}).get("status") != "read"), None)
     return render_template("comic_series.html", s=info, items=items, mine=mine, have=have, language=language,
                            languages=config.LANGUAGES, labels=comicmeta.KIND_LABEL,
-                           reading=comicmeta.READING.get(info["kind"], "ltr"))
+                           reading=comicmeta.READING.get(info["kind"], "ltr"), books=books, progress=progress,
+                           next_unread=next_unread, followed=db.follow_find(user, "comic", provider, sid))
 
 @app.route("/comics/request", methods=["POST"])
 @login_required
@@ -1285,6 +1303,124 @@ def book_kobo_copy(book_id):
     _audit("comic_kobo_copy", f"book {book_id}")
     flash("Making the Kobo copy — a few minutes. Then sync your Kobo.")
     return redirect(url_for("book_page", book_id=book_id))
+
+# ---- following series and authors; New for you (v5.8, follows.py) -------------------------------
+@app.route("/following")
+@login_required
+def following():
+    user = session["user"]
+    q, kind = (request.args.get("q") or "").strip()[:120], request.args.get("kind", "Series")
+    kind = kind if kind in ("Series", "Author") else "Series"
+    results, error = [], None
+    if q:
+        if not hardcover.configured():
+            error = "Following books needs the admin's Hardcover key (Library -> Metadata sources)."
+        else:
+            try:
+                results = hardcover.search(q, kind)
+            except hardcover.HardcoverError as e:
+                error = str(e)
+    return render_template("following.html", q=q, kind=kind, results=results, error=error,
+                           follows=db.follow_list(user), books_ok=hardcover.configured(),
+                           notices=db.notices(user, ("new", "requested"), 100))
+
+@app.route("/follow", methods=["POST"])
+@login_required
+def follow_add():
+    user = session["user"]
+    kind, provider, key = request.form.get("kind", ""), request.form.get("provider", ""), request.form.get("key", "")
+    name = (request.form.get("name") or "").strip()[:200]
+    ok = (kind == "comic" and provider in ("metron", "comicvine", "mangaupdates")) or \
+         (kind in ("book-series", "author") and provider == "hardcover")
+    if not ok or not re.fullmatch(r"\d{1,20}", key or "") or not name:
+        abort(400)
+    extra = {}
+    if kind == "comic":
+        lang = request.form.get("language")
+        extra["language"] = lang if lang in config.LANGUAGES else config.BOOK_LANGUAGE
+    try:
+        _fid, created = follows.follow(user, kind, provider, key, name, extra)
+    except follows.FollowError as e:
+        flash(str(e))
+        return redirect(url_for("following"))
+    _audit("follow", f"{kind} {provider}:{key} {name}")
+    flash(f"Following {name}. Anything new that comes out shows up under New for you." if created else f"You already follow {name}.")
+    back = request.form.get("back") or ""
+    return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("following"))
+
+@app.route("/follows/<int:fid>/stop", methods=["POST"])
+@login_required
+def follow_stop(fid):
+    user = session["user"]
+    f = db.follow_get(fid)
+    if not f or f["owner"] != user:
+        abort(404)
+    db.follow_remove(fid, user)
+    _audit("unfollow", f"{f['kind']} {f['name']}")
+    flash(f"Stopped following {f['name']}.")
+    back = request.form.get("back") or ""
+    return redirect(back if back.startswith("/") and not back.startswith("//") else url_for("following"))
+
+@app.route("/notices/<int:nid>/<action>", methods=["POST"])
+@login_required
+def notice_action(nid, action):
+    user = session["user"]
+    if action not in ("request", "dismiss"):
+        abort(400)
+    try:
+        what, url = follows.act(user, nid, action)
+    except follows.FollowError:
+        abort(404)
+    except (comics.ComicError, comicmeta.MetaError) as e:
+        flash(str(e))
+        return redirect(url_for("index"))
+    _audit(f"notice_{action}", f"#{nid} {what}")
+    if url:
+        return redirect(url)                       # a book: Shelfmark, already searching for it
+    if action == "request":
+        flash({"queued": "Requested.", "shared": "It was in the family library: added to yours.",
+               "owned": "You have it already.", "exists": "Already requested.",
+               "pending": "Requested; waiting for the admin's approval."}.get(what, "Requested."))
+    return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
+                    else url_for("index"))
+
+# ---- AniList (v5.8, anilist.py) ----------------------------------------------------------------
+@app.route("/anilist/connect")
+@login_required
+def anilist_connect():
+    if not anilist.configured():
+        abort(404)
+    session["anilist_state"] = secrets.token_urlsafe(24)
+    return redirect(anilist.authorize_url(session["anilist_state"]))
+
+@app.route("/anilist/callback")
+@login_required
+def anilist_callback():
+    if not anilist.configured():
+        abort(404)
+    state, want = request.args.get("state", ""), session.pop("anilist_state", "")
+    if not want or not hmac.compare_digest(state, want):
+        flash("That AniList sign-in did not start here, so it was ignored. Try Connect again.")
+        return redirect(url_for("devices"))
+    if request.args.get("error") or not request.args.get("code"):
+        flash("AniList was not connected (the sign-in was cancelled).")
+        return redirect(url_for("devices"))
+    try:
+        name = anilist.connect(session["user"], request.args["code"])
+    except anilist.AniListError as e:
+        flash(f"AniList was not connected: {e}")
+        return redirect(url_for("devices"))
+    _audit("anilist_connect", name)
+    flash(f"AniList connected as {name}. Manga volumes you finish on your Kobo now count there.")
+    return redirect(url_for("devices"))
+
+@app.route("/anilist/disconnect", methods=["POST"])
+@login_required
+def anilist_disconnect():
+    db.anilist_remove(session["user"])
+    _audit("anilist_disconnect", "")
+    flash("AniList disconnected (you can also revoke it on anilist.co -> Settings -> Apps).")
+    return redirect(url_for("devices"))
 
 # ---- audiobooks: a download for phones and tablets (the listening itself is Audiobookshelf's) ----
 @app.route("/audiobooks")
@@ -1492,7 +1628,8 @@ def devices():
         kstat = None
     return render_template("devices.html", u=u, prefs=prefs, kobo=kobo, kstat=kstat,
                            kobo_on=kobo_on, formats=config.FORMATS, kosync=config.KOSYNC_ENABLED,
-                           abs_linked=absapi.configured())
+                           abs_linked=absapi.configured(), anilist_ok=anilist.configured(),
+                           anilist_link=db.anilist_get(user))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])

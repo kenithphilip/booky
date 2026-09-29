@@ -4,7 +4,7 @@
 {% if b.has_cover %}<img src="{{ url_for('book_cover', book_id=b.id) }}" alt="" style="width:120px;height:auto;border-radius:4px">
 {% elif provider_cover %}<img src="{{ url_for('cover', u=provider_cover) }}" alt="" style="width:120px;height:auto;border-radius:4px" title="Cover from Open Library; it is being added to the library for your devices">{% endif %}
 <div style="flex:1">
-<h2 style="margin-top:0">{{ b.title }}</h2>
+<h2 style="margin-top:0">{{ b.title }}{% if state %} <span class="badge">{{ reading(state) }}</span>{% endif %}</h2>
 <p>{% for name in b.authors %}{% set m = (authors | selectattr('name', 'equalto', name) | list) %}{% if m %}<a href="{{ url_for('author_page', author_id=m[0].id) }}">{{ name }}</a>{% else %}{{ name }}{% endif %}{% if not loop.last %} &amp; {% endif %}{% else %}<span class="mut">Unknown author</span>{% endfor %}</p>
 {% if b.series %}<p class="mut">{% if series %}<a href="{{ url_for('series_page', series_id=series.id) }}">{{ b.series }}</a>{% else %}{{ b.series }}{% endif %}{% if b.series_index %} · #{{ '%g' % b.series_index }}{% endif %}</p>{% endif %}
 <p class="mut">

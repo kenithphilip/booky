@@ -530,6 +530,25 @@ one arrives like a book:
 - Setup: **Library → Comics** (a free Metron account's API key; ComicVine optional), and in Shelfmark tick
   **CBR** under Formats. Following a series and reading trackers (AniList) come in v5.8.
 
+## Following & New for you (v5.8)
+**Follow** a comic or manga series (its page under Comics), a book series or an author (the
+**Following** page, from Hardcover: needs the admin's free Hardcover key under Library → Metadata
+sources). Once a day each is checked; what has come OUT since (released, not merely announced)
+shows on the reader's **New for you** list at the top of the portal, with one tap:
+**Request** for a comic or manga volume, **Find in Shelfmark** for a book (Shelfmark opens already
+searching for it; the reader picks the copy). Nothing downloads by itself, and following a long
+series never floods anyone: the first check only records what is already out. Readers who turned
+mail on (Devices) get one digest; the admin's ntfy gets a daily count.
+
+**Reading status** comes from Calibre-Web itself (the Kobo's Finished / Reading and page position,
+KOReader, the web reader): My books, a book's page and a comic series show Read / Reading 45 %,
+and a series shows the next one to read.
+
+**AniList**: with an AniList API client set (Library → Comics), each reader can connect their
+AniList on **Devices**; manga volumes they finish on the Kobo count as read on their AniList list.
+The number only goes up, and a series is matched by its exact title or not at all. AniList has
+no Western comics; a Kindle or iPad never reports what was read.
+
 **Audiobooks on a phone or tablet**: the portal's **Audiobooks** page downloads any audiobook
 the reader has (one file as it is, a folder as one ZIP) for any player; Audiobookshelf's app
 keeps your place and can keep books offline too.

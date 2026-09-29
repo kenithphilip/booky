@@ -1,0 +1,38 @@
+{% extends "base.html" %}{% block body %}
+<h2>Following</h2>
+<p class="mut">Follow a series or an author: when something new comes out it shows up under <strong>New for you</strong> on the
+home page{% if cfg.SMTP_HOST %} (and by mail, if you turned mail on under Devices){% endif %}, with one tap to get it.
+Nothing downloads by itself. Comics and manga: use the Follow button on a series in <a href="{{ url_for('comics_page') }}">Comics</a>.</p>
+
+{% set new = notices | selectattr('status', 'equalto', 'new') | list %}
+{% if new %}<h3>New for you</h3>{% include "_notices.html" %}{% endif %}
+
+<h3>Follow a book series or an author</h3>
+{% if not books_ok %}<div class="flash">Following books needs the admin's Hardcover key (installer: Library → Metadata sources). Comics and manga work without it.</div>{% else %}
+<form method="get" class="row">
+<input type="text" name="q" value="{{ q }}" placeholder="Series or author, e.g. Discworld or Brandon Sanderson" style="flex:1;min-width:220px">
+<select name="kind" style="width:auto"><option value="Series" {{ 'selected' if kind == 'Series' }}>Book series</option><option value="Author" {{ 'selected' if kind == 'Author' }}>Author</option></select>
+<button type="submit">Search</button><span class="busy">Searching…</span></form>
+{% endif %}
+{% if error %}<div class="flash">{{ error }}</div>{% endif %}
+{% for r in results %}
+<div class="card row" style="justify-content:space-between">
+<div><strong>{{ r.name }}</strong>{% if r.author %} <span class="mut">· {{ r.author }}</span>{% endif %}{% if r.books_count %} <span class="mut">· {{ r.books_count }} books</span>{% endif %}
+{% if r.books %}<div class="mut">{{ r.books[:4] | join(' · ') }}</div>{% endif %}</div>
+<form method="post" action="{{ url_for('follow_add') }}">{{ csrf_field() }}
+<input type="hidden" name="kind" value="{{ 'book-series' if kind == 'Series' else 'author' }}"><input type="hidden" name="provider" value="hardcover">
+<input type="hidden" name="key" value="{{ r.id }}"><input type="hidden" name="name" value="{{ r.name }}">
+<button type="submit">Follow</button></form>
+</div>
+{% endfor %}
+
+<h3>What you follow</h3>
+{% if not follows %}<p class="mut">Nothing yet.</p>{% endif %}
+<table>
+{% for f in follows %}
+<tr><td><strong>{{ f.name }}</strong> <span class="mut">· {{ {'comic': 'comic / manga series', 'book-series': 'book series', 'author': 'author'}[f.kind] }}</span>
+<div class="mut">{% if f.checked %}checked {{ f.detail or '' }}{% else %}first check within minutes{% endif %}</div></td>
+<td style="text-align:right"><form method="post" action="{{ url_for('follow_stop', fid=f.id) }}">{{ csrf_field() }}<button class="sec" type="submit">Stop following</button></form></td></tr>
+{% endfor %}
+</table>
+{% endblock %}

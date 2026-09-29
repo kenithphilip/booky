@@ -545,7 +545,25 @@ def test_alert_helper_posts_webhook_and_mails_admin_best_effort(monkeypatch, cap
     assert mails[0][0] == "admin@example.test" and mails[0][1] == "[bookstack] backup failed" and "restic exit 1" in mails[0][2]
     def boom(*a, **k): raise OSError("smtp down")
     monkeypatch.setattr(notify, "_deliver", boom)
-    assert notify.alert("t", "x") == ["webhook"] and "mail failed" in capsys.readouterr().err
+    assert notify.alert("t", "x", "high") == ["webhook"] and "mail failed" in capsys.readouterr().err
+
+def test_only_problems_are_mailed_by_default_as_well_as_posted(monkeypatch):
+    """ALERT_MAIL=high: ntfy gets everything, the mailbox only what needs someone (v5.8)."""
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: None)
+    mails = []
+    monkeypatch.setattr(notify, "_deliver", lambda to, subject, text: mails.append(subject))
+    monkeypatch.setattr(config, "SMTP_HOST", "smtp"); monkeypatch.setattr(config, "SMTP_FROM", "lib@example.test")
+    monkeypatch.setattr(config, "ADMIN_EMAIL", "admin@example.test")
+    monkeypatch.setattr(config, "NOTIFY_WEBHOOK", "https://ntfy.sh/x")
+    assert notify.alert("Disk 52% used", "summary", "low") == ["webhook"] and mails == []
+    assert notify.alert("Disk 96% full", "stop", "high") == ["webhook", "mail"]
+    monkeypatch.setattr(config, "ALERT_MAIL", "all")
+    assert notify.alert("self-test passes again", "ok") == ["webhook", "mail"]
+    monkeypatch.setattr(config, "ALERT_MAIL", "off")
+    assert notify.alert("Disk 96% full", "stop", "high") == ["webhook"]
+    monkeypatch.setattr(config, "NOTIFY_WEBHOOK", "")
+    assert notify.alert("Disk 96% full", "stop", "high") == ["mail"], "mail is the only channel: used anyway"
 
 def test_alert_cli_exits_3_when_nobody_was_told_and_ntfy_gets_plain_text(monkeypatch, capsys):
     """C1/F04: alert.sh falls back to the journal + its own curl only if it can see the failure."""

@@ -1,4 +1,9 @@
 {% extends "base.html" %}{% block body %}
+{% if not q %}{% set nf = new_for_you() %}{% if nf %}
+<div class="card"><h3 style="margin-top:0">New for you</h3>
+{% with notices=nf %}{% include "_notices.html" %}{% endwith %}
+<p class="mut" style="margin:6px 0 0">From what you <a href="{{ url_for('following') }}">follow</a>.</p></div>
+{% endif %}{% endif %}
 <form method="get" class="row" style="margin-bottom:6px">
 <input type="text" name="q" value="{{q}}" placeholder="Search title or author…" style="flex:1">
 <button type="submit">Search</button><span class="busy">Searching the catalogs — this can take a few seconds…</span></form>

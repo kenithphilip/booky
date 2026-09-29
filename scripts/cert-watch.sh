@@ -16,7 +16,9 @@ CA="${CERT_CA:-$STACK_DIR/caddy/cf-origin-pull-ca.pem}"
 CF_API="${CF_API:-https://api.cloudflare.com/client/v4}"
 envget(){ local raw; raw=$({ grep -E "^$1=" "$ENV_FILE" 2>/dev/null || true; } | head -1 | cut -d= -f2-)
   if [[ "$raw" == \'*\' && "${#raw}" -ge 2 ]]; then raw="${raw:1:${#raw}-2}"; local bs=\\ q=\'; raw="${raw//"$bs$q"/$q}"; fi; printf '%s' "$raw"; }
-problems=() checked=0
+problems=() checked=0 soft=()
+STATE="${CERT_STATE:-/etc/bookstack/certwatch.state}"
+RETRY_SLEEP="${CERT_RETRY_SLEEP:-20}"
 days_left(){ local end; end=$(openssl x509 -enddate -noout -in "$1" 2>/dev/null | cut -d= -f2) || return 1
   [ -n "$end" ] || return 1
   local e; e=$(date -d "$end" +%s 2>/dev/null || date -j -f "%b %e %T %Y %Z" "$end" +%s 2>/dev/null) || return 1
@@ -45,10 +47,21 @@ fi
 tok=$(envget CF_API_TOKEN)
 if [ -n "$tok" ]; then
   checked=$((checked+1))
-  ans=$(curl -fsS -m 20 -H "Authorization: Bearer $tok" "$CF_API/user/tokens/verify" 2>/dev/null) || ans=""
+  # three tries a little apart: one dropped request is not a finding (live, 2026-09-29 06:40)
+  ans=""; for t in 1 2 3; do
+    ans=$(curl -fsS -m 20 -H "Authorization: Bearer $tok" "$CF_API/user/tokens/verify" 2>/dev/null) && break
+    ans=""; [ "$t" -lt 3 ] && sleep "$RETRY_SLEEP"
+  done
   st=$(printf '%s' "$ans" | python3 -c 'import sys,json; d=json.load(sys.stdin); r=d.get("result") or {}; print(r.get("status",""), r.get("expires_on") or "")' 2>/dev/null)
-  if [ -z "$ans" ]; then problems+=("the Cloudflare API token could not be verified (no answer from api.cloudflare.com)")
-  elif [ "${st%% *}" != active ]; then problems+=("the Cloudflare API token is '${st%% *}', not active: DNS-01 renewals and Cloudflare bans stop (Install -> Cloudflare)")
+  prev_quiet=$(cat "$STATE" 2>/dev/null | sed -n 's/^cf_no_answer=//p' | head -1)
+  if [ -z "$ans" ]; then
+    # NO ANSWER is the network, not the token (a refused token answers, with a status): say
+    # so only when it happens on two days running, and not as an emergency
+    mkdir -p "$(dirname "$STATE")" 2>/dev/null; printf 'cf_no_answer=%s\n' "$(date +%F)" > "$STATE" 2>/dev/null || true
+    if [ -n "$prev_quiet" ] && [ "$prev_quiet" != "$(date +%F)" ]; then
+      soft+=("api.cloudflare.com has not answered this server's token check on two days running (since $prev_quiet). The token itself may be fine; check the server's outbound network (curl https://api.cloudflare.com).")
+    else echo "cert-watch: no answer from api.cloudflare.com (3 tries); checking again tomorrow before alerting"; fi
+  elif rm -f "$STATE" 2>/dev/null; [ "${st%% *}" != active ]; then problems+=("the Cloudflare API token is '${st%% *}', not active: DNS-01 renewals and Cloudflare bans stop (Install -> Cloudflare)")
   else
     exp=${st#* }
     if [ -n "$exp" ]; then
@@ -58,6 +71,9 @@ if [ -n "$tok" ]; then
   fi
 fi
 
+if [ "${#soft[@]}" -gt 0 ]; then
+  ALERT_SEQ=certs-network "$ALERT" "Bookstack: Cloudflare's API is not reachable from the server" "$(printf -- '- %s\n' "${soft[@]}")" >/dev/null 2>&1 || true
+fi
 if [ "${#problems[@]}" -gt 0 ]; then
   msg=$(printf -- '- %s\n' "${problems[@]}")
   ALERT_SEQ=certs "$ALERT" "Bookstack: certificate/token expiry" "$msg" high >/dev/null 2>&1 || true

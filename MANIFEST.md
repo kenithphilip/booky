@@ -51,6 +51,17 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   the queueing THROUGH Shelfmark as the reader, arrivals (CBR/CB7 repacked as CBZ with unar,
   matched to the request, ComicInfo.xml + ComicBookInfo written in), which comics need a Kobo copy
   (an owner whose Kobo syncs, or 'Make Kobo copy'), Kindle jobs that need a Kindle copy first
+- `follows.py` — v5.8: follow a comic/manga series, a book series or an author; the daily check
+  (first check records what is out, then what came out since becomes a notice); one tap (a comic
+  request, or Shelfmark already searching for a book); mail digests; the admin's daily count
+- `hardcover.py` — book series and authors from Hardcover (needs HARDCOVER_API_KEY):
+  search(Series|Author), a series' books, an author's books; no compilations or duplicates;
+  `python -m hardcover` checks the key and the queries
+- `anilist.py` — v5.8: a reader's AniList (authorization code; the token in the portal database
+  only), exact-title matching of a series, the highest FINISHED volume from Calibre-Web's read
+  state sent as progressVolumes, never lowered
+- `templates/following.html`, `_notices.html` — Following, and the New for you list (also on the
+  home page)
 - `comicmeta.py` — what a series is: Metron / ComicVine (Western, account / key) and MangaUpdates
   (manga, manhwa, manhua; no key), cached a day; kind and reading direction; `python -m comicmeta check`
 - `comicrel.py` — which release is the one asked for: parses a release title (series, volume,

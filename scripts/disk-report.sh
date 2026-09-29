@@ -22,7 +22,9 @@ num(){ local v="${!1:-}"; [ -n "$v" ] || v=$(envget "$1"); case "$v" in ''|*[!0-
 [ "$(envget DISK_REPORT)" = false ] && exit 0
 WARN_PCT=$(num DISK_WARN_PCT 85)
 
-gb(){ awk -v b="${1:-0}" 'BEGIN{ s = b < 0 ? "-" : ""; if (b < 0) b = -b; printf "%s%.1f GB", s, b / 1073741824 }'; }
+# GB, or MB under one (a young library is tens of MB: "0.0 GB" said nothing)
+gb(){ awk -v b="${1:-0}" 'BEGIN{ s = b < 0 ? "-" : ""; if (b < 0) b = -b;
+  if (b < 1073741824) printf "%s%.0f MB", s, b / 1048576; else printf "%s%.1f GB", s, b / 1073741824 }'; }
 # bytes under the given directories, each file counted once (du skips a hard link it has seen
 # already, which is how library/seedbox shares its files with library/seedbox-sync)
 bytes(){ local d=() p; for p in "$@"; do [ -e "$STACK_DIR/$p" ] && d+=("$STACK_DIR/$p"); done
@@ -41,8 +43,10 @@ audio=$(bytes library/audiobooks library/podcasts)
 seed=$(bytes library/seedbox-sync library/seedbox)
 waiting=$(bytes library/ingest library/staging library/dropbox downloads)
 appdata=$(bytes cwa abs librarian/state shelfmark caddy/data uptime-kuma syncthing authelia)
-docker_imgs=$(docker system df --format '{{.Type}}={{.Size}}' 2>/dev/null | sed -n 's/^Images=//p' | head -1)
-docker_cache=$(docker system df --format '{{.Type}}={{.Size}}' 2>/dev/null | sed -n 's/^Build Cache=//p' | head -1)
+dsf=$(docker system df --format '{{.Type}}={{.Size}}={{.Reclaimable}}' 2>/dev/null)
+docker_imgs=$(printf '%s\n' "$dsf" | sed -n 's/^Images=\([^=]*\)=.*/\1/p' | head -1)
+docker_cache=$(printf '%s\n' "$dsf" | sed -n 's/^Build Cache=\([^=]*\)=.*/\1/p' | head -1)
+docker_free=$(printf '%s\n' "$dsf" | sed -n 's/^Images=[^=]*=\([^ ]*\).*/\1/p' | head -1)
 # comics live in the same Calibre library: their share of it, from Calibre's own sizes
 comics=$(python3 - "$STACK_DIR/library/books/metadata.db" 2>/dev/null <<'PY'
 import sqlite3, sys
@@ -91,7 +95,7 @@ $trend
 
 Ebooks $(gb "$ebooks")$([ "$comics" -gt 0 ] && printf ' (comics %s of it)' "$(gb "$comics")") · Audiobooks $(gb "$audio") · Seedbox copies $(gb "$seed")
 Imports waiting $(gb "$waiting") · App data $(gb "$appdata")
-System, Docker and the rest $(gb "$other")${docker_imgs:+ (Docker images $docker_imgs${docker_cache:+, build cache $docker_cache})}
+System, Docker and the rest $(gb "$other")${docker_imgs:+ (Docker images $docker_imgs${docker_free:+, $docker_free of it old versions or unused}${docker_cache:+; build cache $docker_cache})}
 ${mem}"
 
 if [ "$pct" -ge "$WARN_PCT" ] || [ "${ipct:-0}" -ge "$WARN_PCT" ]; then prio=default; tags=warning; else prio=low; tags=floppy_disk; fi

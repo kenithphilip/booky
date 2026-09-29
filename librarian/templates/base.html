@@ -34,6 +34,7 @@ button:focus ~ .busy,button:active ~ .busy{display:inline}
 <a href="{{url_for('my_library')}}" class="{{ 'active' if request.endpoint=='my_library' }}">My books</a>
 {% if cfg.COMICS_ENABLED %}<a href="{{url_for('comics_page')}}" class="{{ 'active' if request.endpoint in ('comics_page', 'comic_series') }}">Comics</a>{% endif %}
 <a href="{{url_for('my_audiobooks')}}" class="{{ 'active' if request.endpoint=='my_audiobooks' }}">Audiobooks</a>
+{% set nfc = new_for_you() | length %}<a href="{{url_for('following')}}" class="{{ 'active' if request.endpoint=='following' }}">Following{% if nfc %} ({{ nfc }}){% endif %}</a>
 <a href="{{url_for('upload')}}" class="{{ 'active' if request.endpoint=='upload' }}">Upload</a>
 <a href="{{url_for('devices')}}" class="{{ 'active' if request.endpoint=='devices' }}">Devices</a>
 {% if session.admin %}<a href="{{url_for('admin')}}" class="{{ 'active' if request.endpoint=='admin' }}">Admin</a>{% endif %}

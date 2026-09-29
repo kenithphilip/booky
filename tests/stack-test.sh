@@ -368,6 +368,24 @@ print(",".join(f for f in fmts if f))'; }
   bf=$(kobo_fmt "$btok")
   case "$af" in *EPUB3FL*|*KEPUB*) echo "   [ OK ] alice's Kobo is offered the comic as $af (fixed layout, through her existing link)";; *) cfail "alice's Kobo sync offers the comic as '${af:-nothing}'";; esac
   [ -z "$bf" ] && echo "   [ OK ] bob's Kobo is not offered alice's comic" || cfail "bob's Kobo sees alice's comic ($bf)"
+  # v5.8: the Kobo says alice finished it (the request a real Kobo makes); the portal reads it back
+  uuid=$(curl -s -m 30 -H "User-Agent: Kobo eReader" "http://127.0.0.1:18083/kobo/$tok/v1/library/sync" | python3 -c '
+import json, sys
+for e in json.load(sys.stdin) or []:
+    ent = e.get("NewEntitlement") or e.get("ChangedEntitlement") or {}
+    md = ent.get("BookMetadata") or {}
+    if "E2E Manga" in (md.get("Title") or ""):
+        print(md.get("EntitlementId") or ""); break')
+  [ -z "$uuid" ] && uuid=$(docker exec -u "$(id -u):$(id -g)" -e HOME=/tmp calibre-web /app/calibre/calibredb list --fields uuid --search "id:$cbid" --for-machine --with-library /calibre-library 2>/dev/null | python3 -c 'import json,sys; o=sys.stdin.read(); print(json.loads(o[o.find("["):])[0]["uuid"])' 2>/dev/null)
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  st=$(curl -s -m 30 -o /dev/null -w '%{http_code}' -X PUT -H "User-Agent: Kobo eReader" -H "Content-Type: application/json" \
+       "http://127.0.0.1:18083/kobo/$tok/v1/library/$uuid/state" --data "{\"ReadingStates\": [{\"EntitlementId\": \"$uuid\", \"LastModified\": \"$now\",
+       \"StatusInfo\": {\"Status\": \"Finished\", \"LastModified\": \"$now\"},
+       \"CurrentBookmark\": {\"ProgressPercent\": 100, \"ContentSourceProgressPercent\": 100, \"LastModified\": \"$now\"},
+       \"Statistics\": {\"SpentReadingMinutes\": 12, \"RemainingTimeMinutes\": 0, \"LastModified\": \"$now\"}}]}")
+  rs=$(docker exec librarian python -c "import cwa, anilist; print(cwa.reading_state('alice').get($cbid), anilist.finished_volumes('alice'))")
+  case "$rs" in *"'status': 'read'"*"'E2E Manga': 3"*) echo "   [ OK ] v5.8: alice's Kobo said 'Finished' ($st); the portal reads it as Read, and AniList would count volume 3";;
+    *) cfail "reading status after the Kobo's Finished (HTTP $st, uuid ${uuid:-none}): $rs";; esac
   kjob=$(docker exec librarian python -c "import db, comics; db.init(); print(comics.kindle_request('alice', False, $cbid, 'E2E Manga Vol. 3'))")
   COMICS_ENABLED=true COMIC_METAPUSH_LOCK="$STACK/metapush.lock" STACK_DIR="$STACK" bash "$REPO/scripts/comic-convert.sh" >> "$STACK/comic-convert.log" 2>&1
   kj=$(docker exec librarian python -c "import db, json; db.init(); j=[x for x in db.kindle_recent('alice', 5) if x['id']==$kjob][0]; print(j['status'], j.get('files'))")

@@ -170,7 +170,9 @@ def alert(title, text, priority="default", seq=None, tags=None, click=None):
             took.append("webhook")
         except Exception as e:
             print(f"alert: webhook failed: {e}", file=sys.stderr)
-    if config.ADMIN_EMAIL and kindle.configured():
+    mail_it = config.ALERT_MAIL == "all" or (config.ALERT_MAIL != "off" and priority in ("high", "urgent")) \
+        or not config.NOTIFY_WEBHOOK            # mail is the only channel: never leave the admin untold
+    if config.ADMIN_EMAIL and kindle.configured() and mail_it:
         try:
             _deliver(config.ADMIN_EMAIL, f"[bookstack] {title}", f"{text}\n\npriority: {priority}\n"); took.append("mail")
         except Exception as e:
