@@ -52,6 +52,12 @@
 <button type="submit" class="sec">Find a better copy</button>
 <span class="mut">Badly formatted or no cover? The next EPUB of this book replaces this file, for everyone who has it.</span></form>
 {% endif %}
+<details style="margin-top:10px"><summary>Send to an e-reader</summary>
+<p class="mut">On the Kobo or Kindle, open its web browser at <span class="code">{{ cfg.PORTAL_URL }}/send</span>
+(bookmark it) and type the code it shows here. No mail and no size limit; the book downloads straight into it.</p>
+<form method="post" action="{{ url_for('book_send', book_id=b.id) }}" class="row">{{ csrf_field() }}
+<input type="text" name="code" maxlength="6" placeholder="Code, e.g. K7QM" autocomplete="off" style="width:140px;text-transform:uppercase">
+<button type="submit">Send</button></form></details>
 {% if not admin or session.user in (b.owners or []) %}<p style="margin:10px 0 0"><a class="btn sec" href="{{ url_for('book_remove', book_id=b.id) }}">Remove from my library…</a>
 </p>
 {% if got_it %}<details style="margin-top:8px"><summary>Not the {{ 'comic' if is_comic else 'book' }} you asked for?</summary>

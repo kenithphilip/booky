@@ -72,6 +72,8 @@ access_control:
       policy: bypass
       resources:
         - '^/intake(\?.*)?$'
+        # send-to-e-reader: the e-reader's browser shows a code; the book needs that browser's cookie
+        - '^/send(/file)?(\?.*)?$'
     # everything else on the public apps requires login + 2FA at Authelia first
     - domain:
         - 'books.@@DOMAIN@@'

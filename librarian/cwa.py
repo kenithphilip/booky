@@ -378,29 +378,47 @@ def set_read_status(name, book_id, status):
     """v5.9: a reader's own Read / Reading / Unread for one book, for what no device reports (a
     Kindle, Panels or Chunky on an iPad). Written where Calibre-Web keeps its own (book_read_link,
     the row its "Mark as read" writes), so its web reader, the portal and AniList/Metron all see
-    one answer. The Kobo's own position (kobo_bookmark) is left alone."""
+    one answer.
+
+    v5.9.1, so the Kobo gets it too: Calibre-Web's Kobo sync sends a book's state only when its
+    kobo_reading_state.last_modified is newer than the device's sync token (cps/kobo.py
+    HandleSyncRequest, CWA v4.0.7), and its own "Mark as read" gets that bump from an ORM hook
+    (ub.py before_flush) that raw SQL skips. So the same transaction bumps last_modified and
+    priority_timestamp, or creates the state with an empty bookmark and statistics exactly as
+    helper.edit_book_read_status does. The Kobo's own position (kobo_bookmark, kobo_statistics
+    values) is never written. Times are naive UTC with microseconds, as SQLAlchemy stores them:
+    the sync compares them as strings."""
     if status not in READ_CODE:
         raise CwaError("unknown reading status")
     u = get_user(name)
     if not u:
         raise CwaError(f"no such user '{name}'")
-    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+    bid, uid, code = int(book_id), u["id"], READ_CODE[status]
     with _conn() as c:
         try:
-            row = c.execute("SELECT id, read_status FROM book_read_link WHERE user_id=? AND book_id=?",
-                            (u["id"], int(book_id))).fetchone()
+            row = c.execute("SELECT id, read_status FROM book_read_link WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
         except sqlite3.OperationalError as e:
             raise CwaError("Calibre-Web has not created its reading table yet (open a book in it once)") from e
-        code = READ_CODE[status]
+        started = status == "reading" and (not row or row["read_status"] != 2)
         if row:
             c.execute("UPDATE book_read_link SET read_status=?, last_modified=?" +
-                      (", last_time_started_reading=?, times_started_reading=coalesce(times_started_reading,0)+1"
-                       if status == "reading" and row["read_status"] != 2 else "") + " WHERE id=?",
-                      (code, now, now, row["id"]) if status == "reading" and row["read_status"] != 2 else (code, now, row["id"]))
+                      (", last_time_started_reading=?, times_started_reading=coalesce(times_started_reading,0)+1" if started else "") +
+                      " WHERE id=?", (code, now, now, row["id"]) if started else (code, now, row["id"]))
         else:
             c.execute("INSERT INTO book_read_link(book_id, user_id, read_status, last_modified, last_time_started_reading, "
-                      "times_started_reading) VALUES(?,?,?,?,?,?)",
-                      (int(book_id), u["id"], code, now, now if status == "reading" else None, 1 if status == "reading" else 0))
+                      "times_started_reading) VALUES(?,?,?,?,?,?)", (bid, uid, code, now, now if started else None, 1 if started else 0))
+        try:
+            st = c.execute("SELECT id FROM kobo_reading_state WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
+            if st:
+                c.execute("UPDATE kobo_reading_state SET last_modified=?, priority_timestamp=? WHERE id=?", (now, now, st["id"]))
+            else:
+                sid = c.execute("INSERT INTO kobo_reading_state(user_id, book_id, last_modified, priority_timestamp) "
+                                "VALUES(?,?,?,?)", (uid, bid, now, now)).lastrowid
+                c.execute("INSERT INTO kobo_bookmark(kobo_reading_state_id, last_modified) VALUES(?,?)", (sid, now))
+                c.execute("INSERT INTO kobo_statistics(kobo_reading_state_id, last_modified) VALUES(?,?)", (sid, now))
+        except sqlite3.OperationalError:
+            pass                                 # no Kobo tables yet (nobody has synced a Kobo): nothing to tell one
         c.commit()
     return status
 
@@ -431,6 +449,16 @@ def kobo_status(name):
         except sqlite3.OperationalError:
             pass
     return out
+
+@_guard
+def hardcover_tokens():
+    """{user name: Hardcover token} for every reader who set one (v5.9.1: audiobooks, hcaudio.py)."""
+    with _conn() as c:
+        try:
+            return {r["name"]: r["hardcover_token"] for r in c.execute(
+                "SELECT name, hardcover_token FROM user WHERE hardcover_token IS NOT NULL AND hardcover_token != ''")}
+        except sqlite3.OperationalError:
+            return {}
 
 @_guard
 def set_kobo_prefs(name, shelves_only=None, hardcover_token=None):

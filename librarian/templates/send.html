@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% if not f and not r.fetched %}<meta http-equiv="refresh" content="5">{% endif %}
+<title>Send to this e-reader</title>
+<style>
+/* kept plain on purpose: e-ink browsers (Kobo, Kindle) are old WebKit without much CSS */
+body{font-family:Georgia,serif;margin:24px;color:#000;background:#fff;line-height:1.4}
+h1{font-size:26px;margin:0 0 12px}.code{font-family:"Courier New",monospace;font-size:64px;letter-spacing:12px;font-weight:bold;margin:12px 0}
+a.big{display:inline-block;font-size:26px;padding:14px 22px;border:3px solid #000;color:#000;text-decoration:none;margin:12px 0}
+p{font-size:19px;max-width:34em}.mut{color:#444;font-size:16px}
+</style></head><body>
+{% if f %}
+<h1>Your book is here</h1>
+<p><strong>{{ f.filename }}</strong></p>
+<a class="big" href="{{ url_for('send_file_to_reader') }}">Download it</a>
+<p class="mut">{% if device == 'kobo' %}After the download, go to My Books: it is there (and it stays, like any book you copy by USB).{% elif device == 'kindle' %}After the download, it is in your Library under Documents.{% else %}Open it with your reading app.{% endif %}</p>
+<p class="mut"><a href="{{ url_for('send_page', new=1) }}">Send another book</a></p>
+{% elif r.book_id %}
+<h1>That link has expired</h1>
+<p><a href="{{ url_for('send_page', new=1) }}">Get a new code</a></p>
+{% else %}
+<h1>Send a book to this e-reader</h1>
+<p>On your phone or computer, open the book in the library portal, choose <strong>Send to an e-reader</strong> and type:</p>
+<div class="code">{{ r.code }}</div>
+<p class="mut">This page checks every few seconds and offers the book as soon as it is sent. The code works for {{ life }} minutes.
+{% if device == 'kindle' %}A Kindle's browser takes AZW3, MOBI, PDF and TXT; the portal picks one.{% elif device == 'kobo' %}Your Kobo gets a KEPUB or EPUB.{% endif %}</p>
+{% endif %}
+</body></html>

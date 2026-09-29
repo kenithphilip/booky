@@ -1349,6 +1349,59 @@ def comic_confirm_all(provider, sid):
     return redirect(request.referrer if request.referrer and urlsplit(request.referrer).netloc == request.host
                     else url_for("comics_page"))
 
+# ---- v5.9.1: send a book to an e-reader's browser with a short code (sendcode.py) -----------------
+SEND_COOKIE = "send_secret"
+_SEND_TRIES = {}
+
+@app.route("/send")
+def send_page():
+    """The e-reader's page: no login, a code, and (once a book is attached) its download."""
+    import sendcode
+    r = sendcode.page_state(request.cookies.get(SEND_COOKIE))
+    fresh = None
+    if r is None or (r.get("fetched") and request.args.get("new")):
+        code, secret = sendcode.new_code(request.headers.get("User-Agent"))
+        r, fresh = db.send_code_get(code), secret
+    f = sendcode.file_for(r) if r.get("book_id") else None
+    resp = Response(render_template("send.html", r=r, f=f, device=r["device"], life=sendcode.CODE_LIFE // 60))
+    if fresh:
+        resp.set_cookie(SEND_COOKIE, fresh, max_age=sendcode.CODE_LIFE + sendcode.FETCH_LIFE, httponly=True,
+                        secure=config.COOKIE_SECURE, samesite="Lax", path="/send")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+@app.route("/send/file")
+def send_file_to_reader():
+    import sendcode
+    r = sendcode.page_state(request.cookies.get(SEND_COOKIE))
+    f = sendcode.file_for(r) if r else None
+    if not f:
+        abort(404)
+    db.send_code_fetched(r["code"])
+    _audit("send_to_ereader", f"{f['filename']} -> {r['device']}", user=r["owner"])
+    return send_file(f["path"], as_attachment=True, download_name=f["filename"], max_age=0, mimetype=f.get("mimetype"))
+
+@app.route("/book/<int:book_id>/send", methods=["POST"])
+@login_required
+def book_send(book_id):
+    """'Send to an e-reader': the code the e-reader's /send page shows."""
+    import sendcode
+    user, is_admin = session["user"], session.get("admin", False)
+    now = time.time()
+    tries = [t for t in _SEND_TRIES.get(user, []) if now - t < 600]
+    if len(tries) >= 20:
+        flash("Too many codes tried; wait a few minutes.")
+        return redirect(url_for("book_page", book_id=book_id))
+    _SEND_TRIES[user] = tries + [now]
+    try:
+        device, fmt = sendcode.attach(user, is_admin, request.form.get("code"), book_id)
+    except sendcode.SendError as e:
+        flash(f"Not sent: {e}.")
+    else:
+        _audit("send_attach", f"book {book_id} {fmt} -> {device}")
+        flash(f"Sent as {fmt.upper()}: the e-reader's page offers the download within a few seconds. Tap it there.")
+    return redirect(url_for("book_page", book_id=book_id))
+
 # ---- v5.9: reading status by hand, for what no device reports (a Kindle, an iPad) ------------------
 @app.route("/book/<int:book_id>/read/<status>", methods=["POST"])
 @login_required
@@ -1919,7 +1972,8 @@ def devices():
     return render_template("devices.html", u=u, prefs=prefs, kobo=kobo, kstat=kstat,
                            kobo_on=kobo_on, formats=config.FORMATS, kosync=config.KOSYNC_ENABLED,
                            abs_linked=absapi.configured(), anilist_ok=anilist.configured(),
-                           anilist_link=db.anilist_get(user), metron_link=db.metron_get(user))
+                           anilist_link=db.anilist_get(user), metron_link=db.metron_get(user),
+                           hc_audio=db.hc_audio_state(user))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])

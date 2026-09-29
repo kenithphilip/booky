@@ -10,11 +10,15 @@ ENV_FILE="$STACK_DIR/.env"
 ETC="${BOOKSTACK_ETC:-/etc}"          # host config root (tests point it at a temp dir)
 STACK_USER=books
 CF_API=https://api.cloudflare.com/client/v4
-BOOKSTACK_VERSION=5.6
+BOOKSTACK_VERSION=5.9.1               # only when this is not a git checkout; a checkout reports its tag:
+# 'git checkout v5.9.0' shows 5.9.0, a commit after it 5.9.0-3-gabc1234 (the constant went stale at 5.6)
+_bv=$(git -C "$SRC_DIR" describe --tags 2>/dev/null || true)
+case "$_bv" in v[0-9]*) BOOKSTACK_VERSION=${_bv#v};; esac
+unset _bv
 # Image pins (looked up 2026-09-22). Seeded into .env by Configure; changed by Operations -> Update.
-IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.7 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
+IMG_DEFAULTS="IMG_CWA=crocodilestick/calibre-web-automated:v4.0.8 IMG_ABS=ghcr.io/advplyr/audiobookshelf:2.36.1
 IMG_SHELFMARK=ghcr.io/calibrain/shelfmark:v1.4.0 IMG_QBIT=lscr.io/linuxserver/qbittorrent:5.2.3
-IMG_KUMA=louislam/uptime-kuma:1 IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2
+IMG_KUMA=louislam/uptime-kuma:2.5.5-slim IMG_AUTHELIA=authelia/authelia:4.39.28 IMG_FLARESOLVERR=ghcr.io/flaresolverr/flaresolverr:v3.5.2
 IMG_SYNCTHING=syncthing/syncthing:2.1.5 IMG_KCC=ghcr.io/ciromattia/kcc:v12.0.0"
 CADDY_BASE=caddy:2.11.4               # used for `caddy hash-password`; same base as caddy/Dockerfile
 
@@ -1167,7 +1171,8 @@ step_deploy() {
   big "Stack is up" "Public (your users):
   https://request.$d   the portal: search, request, upload, My books, Devices
   https://books.$d     the library (Kobo/OPDS/Send-to-Kindle also live here)
-  https://audio.$d     audiobooks        https://shelf.$d   extended search
+  https://audio.$d     audiobooks
+  https://shelf.$d     Shelfmark: search every source and download (readers sign in here too)
 
 Private (Tailscale only, admin):
   $privline
@@ -2552,7 +2557,7 @@ e = lambda k: os.environ.get(k, "")
 on = lambda k: e(k) == "true"
 smtp = {"host": e("KC_SH"), "port": e("KC_SP") or "587", "security": e("KC_SS") or "starttls",
         "user": e("KC_SU"), "password": e("KC_SW"), "from": e("KC_SF")} if e("KC_SH") else None
-print(json.dumps({"url": "http://127.0.0.1:3001", "user": e("KC_USER"), "password": e("KC_PASS"),
+print(json.dumps({"url": "http://127.0.0.1:3001", "wait": int(e("KC_WAIT") or 90), "user": e("KC_USER"), "password": e("KC_PASS"),
   "domain": e("KC_DOMAIN"), "bind_ip": e("KC_BIND"), "reboot_time": e("KC_REBOOT"),
   "shelfmark_auth": e("KC_SMA") or "cwa",
   "features": {"torrents": on("KC_TOR"), "ephemera": on("KC_EPH"), "authelia": on("KC_AUTH"), "flaresolverr": on("KC_FS")},
@@ -2570,7 +2575,7 @@ setup_monitoring() {
   wait_for http://127.0.0.1:3001 90 || { MON_NOTE="Uptime Kuma is not answering on 127.0.0.1:3001 (Operations -> Logs -> uptime-kuma), so it was not configured; run Operations -> Monitoring once it is up"; return 1; }
   docker image inspect bookstack/kuma-bootstrap:local >/dev/null 2>&1 || compose build kuma-bootstrap >/dev/null 2>&1 \
     || { MON_NOTE="the kuma-bootstrap image could not be built (compose build kuma-bootstrap)"; return 1; }
-  out=$(kuma_config | compose run --rm -T kuma-bootstrap 2>/dev/null | tail -1) || rc=$?
+  out=$(KC_WAIT="$(kuma_migrating && echo 3600 || echo 90)" kuma_config | compose run --rm -T kuma-bootstrap 2>/dev/null | tail -1) || rc=$?
   local ok added upd del mons chans err code
   ok=$(printf '%s' "$out" | json 'd.get("ok")') || ok=""
   if [ "$ok" != True ]; then
@@ -2586,6 +2591,8 @@ setup_monitoring() {
   del=$(printf '%s' "$out" | json 'len(d.get("deleted") or [])')
   chans=$(printf '%s' "$out" | json '", ".join(n.replace("bookstack: ", "") for n in d.get("notifications") or []) or "NONE"')
   envset KUMA_BOOTSTRAP_AT "$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S)" || true
+  rm -f "$STACK_DIR/$KUMA_MIG_REL"             # it answered its API: any 2.x migration is over
+  [ "$(kuma_major "$(img IMG_KUMA)")" = 2 ] && rm -rf "$STACK_DIR/kuma/data.v1"
   MON_NOTE="$mons monitors at https://monitor.$d (+$added ~$upd -$del this run), alerts via: $chans; login '$(envget KUMA_USER)', password under Operations -> Monitoring"
   [ "$chans" = NONE ] && MON_NOTE="$MON_NOTE. NO alert channel: Kuma can show problems but tell nobody (Install -> Alerts, then Operations -> Monitoring)"
   return 0
@@ -2691,6 +2698,15 @@ if host and "@" in sender and b in s and e in s:
     s = s[:start] + "\n".join(block) + "\n" + s[stop:]
 open(f, "w").write(s)
 PYN
+  # v5.9.1: passkey sign-in (opt-in, Advanced settings -> lockout -> AUTHELIA_PASSKEYS). A passkey
+  # alone is ONE factor to Authelia 4.39, so every two_factor site here would still ask for the
+  # password; experimental_enable_passkey_uv_two_factors lets a passkey with user verification
+  # (fingerprint, face, device PIN) count as both. Authelia calls it experimental and plans to
+  # replace it, which is why it is off unless chosen.
+  if [ "$(envget AUTHELIA_PASSKEYS)" = true ]; then
+    printf '%s\n' "" "webauthn:" "  enable_passkey_login: true" "  experimental_enable_passkey_uv_two_factors: true" \
+      "  selection_criteria:" "    discoverability: 'preferred'" "    user_verification: 'required'" >> "$out.new"
+  fi
   # L05: the OpenID Connect provider for Audiobookshelf, once its secrets exist (gate_sso_on)
   if [ -n "$(envget ABS_OIDC_SECRET)" ] && [ -s "$STACK_DIR/authelia/oidc-jwks.pem" ]; then
     python3 - "$out.new" "$(envget DOMAIN)" "$(envget ABS_OIDC_SECRET)" <<'PYO' || { rm -f "$out.new"; return 1; }
@@ -3406,11 +3422,35 @@ stack_up_all() { # (re)start every enabled service with the tags in .env
   prune_shelfmark_placeholder    # J35
   return 0
 }
+# ---- Uptime Kuma 1.x -> 2.x (v5.9.1) ----
+# 2.x migrates kuma.db one way on its first start; 1.x cannot open it afterwards. So before the
+# first 2.x start: stop Kuma, keep a copy of its data (kuma/data.v1), and mark the migration so
+# nothing interrupts it (heal.sh, the update's health gate) and the bootstrap waits for it. A
+# rollback to 1.x puts the copy back; a successful update drops it.
+KUMA_MIG_REL=kuma/data/.bookstack-migrating
+kuma_major(){ case "${1##*:}" in 1|1.*) echo 1;; 2|2.*) echo 2;; *) echo "";; esac; }
+kuma_migrating(){ [ -f "$STACK_DIR/$KUMA_MIG_REL" ]; }
+kuma_v2_prepare(){ # old-image new-image
+  [ "$(kuma_major "$1")" = 1 ] && [ "$(kuma_major "$2")" = 2 ] || return 0
+  [ -f "$STACK_DIR/kuma/data/kuma.db" ] || return 0            # a fresh 2.x starts empty: nothing to migrate
+  compose stop uptime-kuma >/dev/null 2>&1 || true
+  rm -rf "$STACK_DIR/kuma/data.v1"
+  cp -a "$STACK_DIR/kuma/data" "$STACK_DIR/kuma/data.v1" || { echo "could not copy kuma/data"; return 1; }
+  touch "$STACK_DIR/$KUMA_MIG_REL"
+}
+kuma_v1_restore(){ # after a rollback: a 1.x image back on the copy it can still open
+  [ "$(kuma_major "$(img IMG_KUMA)")" = 1 ] && [ -d "$STACK_DIR/kuma/data.v1" ] || return 0
+  compose stop uptime-kuma >/dev/null 2>&1 || true
+  rm -rf "$STACK_DIR/kuma/data" && mv "$STACK_DIR/kuma/data.v1" "$STACK_DIR/kuma/data"
+}
 wait_healthy() { # seconds: every container that HAS a healthcheck reports healthy
   local i c st all
   for i in $(seq 1 $(( $1 / 5 ))); do
     all=1
     for c in $(docker ps -q 2>/dev/null); do
+      # Kuma 1 -> 2 migrates its heartbeat tables on first start (minutes, more on a slow disk)
+      # and is not "healthy" meanwhile: that is not a reason to roll the whole update back
+      kuma_migrating && [ "$(docker inspect -f '{{.Name}}' "$c" 2>/dev/null)" = /uptime-kuma ] && continue
       st=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c" 2>/dev/null)
       case "$st" in healthy|none) ;; *) all=0;; esac
     done
@@ -3489,7 +3529,20 @@ step_update() {
   else
     msg "A previous update did not finish and you chose not to roll it back, so the last known-good image tags in $STACK_DIR/.env.images.prev and the bookstack/*:prev images are KEPT as they are. This run will not overwrite them."
   fi
-  # (c) which tags
+  # (c) which tags. First what THIS bookstack pins that the server does not run yet: a new pin
+  # in IMG_DEFAULTS never reached an existing install (Configure only seeds missing keys), so
+  # e.g. CWA v4.0.8's fix for new Kobos (#1476) waited on the admin typing the tag by hand.
+  local rec="" kv d
+  for kv in $IMG_DEFAULTS; do
+    k=${kv%%=*}; d=${kv#*=}; cur=$(img "$k")
+    [ "$cur" != "$d" ] && rec="$rec\n  $k: $cur -> $d"
+  done
+  if [ -n "$rec" ] && yesno "This version of bookstack pins other images than the server runs:$rec\n\nMove to them? (No = keep the current ones; you can still type tags next)"; then
+    for kv in $IMG_DEFAULTS; do
+      k=${kv%%=*}; d=${kv#*=}; cur=$(img "$k")
+      [ "$cur" != "$d" ] && { envset "$k" "$d"; changed="$changed\n  $k: $cur -> $d"; }
+    done
+  fi
   if yesno "Change image versions? (No = re-pull the current tags and rebuild caddy/librarian; Yes = type a new tag per image, Cancel keeps one)"; then
     for k in $IMG_KEYS; do
       cur=$(img "$k"); new=$(ask "$k (current: $cur). New image:tag, or leave as is:" "$cur") || continue
@@ -3509,6 +3562,8 @@ step_update() {
   render_caddy_all || { update_failed "the new Caddyfile could not be rendered"; return 1; }
   # the rebuilt images carry this checkout's version (J03); Self-test compares it with .version
   pull_kcc
+  kuma_v2_prepare "$(grep -E '^IMG_KUMA=' "$STACK_DIR/.env.images.prev" 2>/dev/null | cut -d= -f2-)" "$(img IMG_KUMA)" \
+    || { update_failed "Uptime Kuma's data could not be copied before its 2.x migration"; return 1; }
   if ! { compose pull --ignore-buildable && BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap && stack_up_all; }; then
     update_failed "pull/build/start failed"; return 1
   fi
@@ -3524,6 +3579,7 @@ step_update() {
   local st=0; STACK_DIR="$STACK_DIR" bash "$STACK_DIR/scripts/selftest.sh" > "${TMPDIR:-/tmp}/bookstack-selftest.log" 2>&1 || st=$?
   # (g) only now free old layers; the update landed, so the frozen rollback point is released
   rm -f "$mark"
+  kuma_migrating || rm -rf "$STACK_DIR/kuma/data.v1"   # the 1.x copy goes once 2.x has migrated
   docker system prune -f --filter until=72h >/dev/null 2>&1 || true
   # new code may carry new monitors or scheduled jobs (the timer wrapper is regenerated too)
   install_selftest_timer; setup_monitoring >/dev/null 2>&1 || true
@@ -3538,7 +3594,7 @@ update_failed() { # (f) offer the rollback: previous tags, previous caddy/librar
   # build must survive a retry of this update (step_update honours the marker).
   touch "$STACK_DIR/$UPDATE_MARKER_REL" 2>/dev/null || true
   if yesno "Update problem: $1.\n\nRoll back to the previous image tags and the previous caddy/librarian builds?"; then
-    rollback_images; tag_images prev latest
+    rollback_images; kuma_v1_restore; tag_images prev latest
     local cf="$STACK_DIR/caddy/Caddyfile"; [ -s "$cf.pre-update" ] && cat "$cf.pre-update" > "$cf"
     rm -f "$STACK_DIR/$UPDATE_MARKER_REL"      # back on the known-good build: nothing left to protect
     if stack_up_all; then
@@ -3623,6 +3679,7 @@ lockout|LOCKOUT_WINDOW|900|int|Seconds those failures are counted over
 lockout|LOCKOUT_SECONDS|900|int|How long a lockout lasts, in seconds
 lockout|LOCKOUT_IP_FAILS|20|int|Wrong passwords from ONE address across all accounts before the address is locked
 lockout|SESSION_HOURS|12|int|How long a portal login stays signed in, in hours
+lockout|AUTHELIA_PASSKEYS|false|bool|Sign in to the gate with a passkey alone (fingerprint/face/PIN counts as both factors; Authelia calls this experimental)
 uploads|MAX_UPLOAD_MB|95|int|Largest file the portal browser form takes (Cloudflare refuses bodies over 100 MB)
 uploads|MAX_EBOOK_MB|200|int|Largest ebook the worker downloads or imports
 uploads|MAX_AUDIO_MB|2048|int|Largest audiobook (a LibriVox zip of a long book runs past 1 GB)
@@ -3697,6 +3754,16 @@ step_advanced() {
                   || msg "WARNING: the thresholds now read warn=$w stop=$s resume=$r. They only work as resume < stop and warn <= stop — otherwise the watchdog either stops the downloaders before it ever warns you, or never starts them again."
                 if restart_portal; then msg "$key is now $new.\n\nThe hourly watchdog reads $ENV_FILE when it runs, and the portal was recreated so its own copy of the thresholds matches."
                 else msg "$key is now $new in $ENV_FILE and the hourly watchdog will use it, but the portal could NOT be restarted, so the portal still pauses its imports at the OLD threshold (Operations -> Logs -> librarian)."; fi;;
+        lockout) if [ "$key" = AUTHELIA_PASSKEYS ]; then
+                  if [ "$(envget AUTHELIA_ENABLED)" = true ]; then
+                    if render_authelia_config && composeA up -d --force-recreate authelia >/dev/null 2>&1 && authelia_healthy 60; then
+                      msg "$key is now $new and Authelia was restarted.$([ "$new" = true ] && printf '\n\nEach person adds a passkey once: sign in at https://auth.%s, open Settings -> Two-Factor Authentication -> WebAuthn, and register it. A security key registered before may need registering again, as a passkey.' "$(envget DOMAIN)")"
+                    else msg "$key is now $new, but Authelia did not come back healthy: Operations -> Logs -> authelia (setting it back to the previous value restores it)."; fi
+                  else msg "$key is now $new. It takes effect when the sign-in gate (Authelia) is switched on."; fi
+                  continue
+                fi
+                if restart_portal; then msg "$key is now $new and the portal was recreated, so it is live."
+                else msg "$key is now $new in $ENV_FILE, but the portal could NOT be restarted, so it is NOT in force yet (Operations -> Logs -> librarian)."; fi;;
         *)      [ "$key" = ALERT_MAIL ] && { setup_monitoring >/dev/null 2>&1 || true; }   # Kuma's e-mail channel follows it
                 if restart_portal; then msg "$key is now $new and the portal was recreated, so it is live."
                 else msg "$key is now $new in $ENV_FILE, but the portal could NOT be restarted, so it is NOT in force yet (Operations -> Logs -> librarian)."; fi;;
@@ -3737,8 +3804,9 @@ sync_shelfmark_requests(){
   return 0
 }
 # ---------- L16: the portal's service login for Shelfmark's approval API ----------
-# Shelfmark has no API key, so the portal signs in as a dedicated Calibre-Web ADMIN account with
-# a generated password (kept in .env only; nobody types it). Created/reset idempotently.
+# The portal signs in as a dedicated Calibre-Web ADMIN account with a generated password (kept in
+# .env only; nobody types it). Created/reset idempotently. v5.9.1: Shelfmark's API key too, which
+# the portal uses first; the account stays as the fallback (and makes Shelfmark have an admin).
 SHELFMARK_SVC_NAME=svc-portal
 ensure_shelfmark_service() {
   local pw; pw=$(envget SHELFMARK_SVC_PASS)
@@ -3749,6 +3817,8 @@ ensure_shelfmark_service() {
     printf '%s\n' "$pw" | lib add-user "$SHELFMARK_SVC_NAME" --email "svc-portal@localhost" --password-stdin --admin >/dev/null 2>&1 || return 1
   fi
   envset SHELFMARK_SVC_USER "$SHELFMARK_SVC_NAME" && envset SHELFMARK_SVC_PASS "$pw"
+  # v5.9.1: Shelfmark v1.4.0's API key; the portal prefers it (librarian/shelfmark_api.py)
+  envdefault SHELFMARK_API_KEY "$(openssl rand -hex 32)"
 }
 
 # ---------- metadata sources ----------

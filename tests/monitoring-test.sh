@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Integration test for monitoring/kuma_bootstrap.py against the REAL pinned Uptime Kuma image
-# (louislam/uptime-kuma:1) — the socket.io API is the part no unit test can vouch for.
+# (louislam/uptime-kuma:2.5.5-slim, v5.9.1) — the socket.io API is the part no unit test can vouch for.
 #   bash tests/monitoring-test.sh            (needs Docker; ~1-2 minutes)
 # Proves: first-run account setup, idempotent re-runs, feature toggles add/remove only managed
 # monitors, a hand-made monitor survives, wrong credentials exit 2, push URLs are live, a DOWN
@@ -9,7 +9,7 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 # shellcheck disable=SC2034  # met/rc/state are read inside the check strings (eval)
 N=bsmon; NET=${N}-net; KUMA=${N}-kuma; HOOK=${N}-hook; MAIL=${N}-mail
-IMG_KUMA=${IMG_KUMA:-louislam/uptime-kuma:1}
+IMG_KUMA=${IMG_KUMA:-louislam/uptime-kuma:2.5.5-slim}
 pass=0; fail=0
 ok(){ printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 no(){ printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
@@ -19,7 +19,7 @@ trap cleanup EXIT
 cleanup
 docker build -q -t bookstack/kuma-bootstrap:local monitoring >/dev/null || { echo "bootstrap image build failed"; exit 1; }
 docker network create "$NET" >/dev/null
-docker run -d --name "$KUMA" --network "$NET" -e TZ=Europe/Berlin "$IMG_KUMA" >/dev/null
+docker run -d --name "$KUMA" --network "$NET" -e TZ=Europe/Berlin -e UPTIME_KUMA_DB_TYPE=sqlite "$IMG_KUMA" >/dev/null
 # webhook receiver: every request -> one JSON line on stdout (docker logs)
 docker run -d --name "$HOOK" --network "$NET" python:3.12-slim python -u -c '
 import http.server, json
@@ -33,7 +33,7 @@ http.server.HTTPServer(("0.0.0.0", 8000), H).serve_forever()' >/dev/null
 # SMTP + IMAP for the e-mail channel (the same GreenMail the e2e suite uses)
 docker run -d --name "$MAIL" --network "$NET" -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled" greenmail/standalone:2.1.3 >/dev/null
 
-TOK_SELF=selftest0123456789abcdefghijklmnop; TOK_DISK=disk0123456789abcdefghijklmnopqrs
+TOK_SELF=selftest0123456789abcdefghijklmn; TOK_DISK=disk0123456789abcdefghijklmnopqr
 cfg(){ # features-json [password] [smtp=1]
   python3 - "$1" "${2:-correct-horse-battery-staple-42}" "${3:-0}" << 'PY'
 import json, sys
@@ -43,7 +43,7 @@ if sys.argv[3] == "1":
                                                  "user": "", "password": "", "from": "library@example.test"})
 print(json.dumps({"url": "http://bsmon-kuma:3001", "wait": 120, "user": "kenith-admin", "password": sys.argv[2],
   "domain": "example.test", "bind_ip": "203.0.113.7", "features": json.loads(sys.argv[1]),
-  "push": {"selftest": "selftest0123456789abcdefghijklmnop", "disk": "disk0123456789abcdefghijklmnopqrs"},
+  "push": {"selftest": "selftest0123456789abcdefghijklmn", "disk": "disk0123456789abcdefghijklmnopqr"},
   "notify": notify, "reboot_time": "04:30"}))
 PY
 }
@@ -158,7 +158,8 @@ docker run --rm --network "$NET" curlimages/curl:8.11.1 -s "http://bsmon-kuma:30
 met=$(docker run --rm --network "$NET" curlimages/curl:8.11.1 -s -u "kenith-admin:correct-horse-battery-staple-42" http://bsmon-kuma:3001/metrics 2>/dev/null)
 check "/metrics answers with basic auth and lists monitor_status" 'printf %s "$met" | grep -q "^monitor_status{"'
 check "  names the managed monitors" 'printf %s "$met" | grep -q "monitor_name=\"Portal (request.) - health\""'
-check "  the DOWN push shows as 0" 'printf %s "$met" | grep -E "^monitor_status\{monitor_name=\"Self-test \(hourly\)\"" | grep -qE " 0$"'
+# 2.x puts monitor_id (and tag labels) before monitor_name: match the label anywhere, as selftest.sh does
+check "  the DOWN push shows as 0" 'printf %s "$met" | grep -E "^monitor_status\{.*monitor_name=\"Self-test \(hourly\)\"" | grep -qE " 0$"'
 bad=$(docker run --rm --network "$NET" curlimages/curl:8.11.1 -s -o /dev/null -w '%{http_code}' -u "kenith-admin:nope" http://bsmon-kuma:3001/metrics 2>/dev/null)
 check "  a wrong password is refused ($bad)" '[ "$bad" = 401 ]'
 

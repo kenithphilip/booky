@@ -30,7 +30,8 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <label><input type="checkbox" name="shelves_only" value="1" {{ 'checked' if kstat and kstat.shelves_only }}> Only sync the shelves I mark for Kobo in Calibre-Web (not my whole library)</label><br>
 <label class="mut"><input type="checkbox" name="hardcover_change" value="1"> Set my Hardcover token
 <input type="password" name="hardcover_token" placeholder="{{ 'set — type a new one or leave blank to remove' if kstat and kstat.hardcover else 'hardcover.app → Settings → API' }}" autocomplete="off" style="width:260px"></label>
-<span class="mut">(reading progress from the Kobo is shared with your Hardcover account, when the admin has Hardcover sync on)</span><br>
+<span class="mut">(reading progress from the Kobo is shared with your Hardcover account, when the admin has Hardcover sync on;
+your audiobook listening progress too{% if hc_audio and hc_audio.detail %}: {{ hc_audio.detail }}{% endif %})</span><br>
 <button type="submit" class="sec">Save Kobo options</button></form>
 <p class="mut" style="margin-top:8px">This link is a key in its own right: anyone holding it reads your whole library, and
 <strong>changing your password does not change it</strong>. If the link leaked, or a device carrying it was lost, regenerate it here.</p>
@@ -112,7 +113,13 @@ E-mail me{% if u.email %} at {{ u.email }}{% endif %} when a request is ready or
 <ul class="mut">
 <li>Read in the browser or in any OPDS reader app: catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the trailing slash) with your library login.</li>
 {% if kosync %}<li>KOReader reading-progress sync: KOReader's built-in <em>Progress sync</em> does not work with this library. Open <a href="{{ cfg.BOOKS_URL }}/kosync" target="_blank" rel="noopener">{{ cfg.BOOKS_URL }}/kosync</a> while signed in, install the plugin it offers into KOReader, then sign in there with your library username and password.</li>{% endif %}
-<li>Audiobooks: install the Audiobookshelf app and sign in at <span class="code">{{ cfg.AUDIO_URL }}</span>{% if abs_linked %} with the same username and password{% endif %}.</li>
+<li>Audiobooks: install the Audiobookshelf app and sign in at <span class="code">{{ cfg.AUDIO_URL }}</span>{% if abs_linked %} with the same username and password{% endif %}.
+On an iPhone or iPad there is no official Audiobookshelf app yet (only a TestFlight beta): ShelfPlayer, SoundLeaf and AudioBooth
+are good ones, and sign in with the same address and login.{% if cfg.AUTHELIA_ENABLED %} If one of them offers "sign in with OpenID", ask the admin: its return address has to be allowed first.{% endif %}</li>
+<li>Lost a phone or tablet? Sign in at <span class="code">{{ cfg.AUDIO_URL }}</span>, open your account settings and use
+<em>Log out all devices</em>; then change your password below, so the old one stops working everywhere.</li>
+<li>Hardcover: once you set your Hardcover token above, your Kobo and KOReader reading progress reaches your Hardcover
+account, and so does your audiobook listening progress from Audiobookshelf.</li>
 {% set box = mail_intake(session.user) %}{% if box %}
 <li>E-mail books in: attach the file to a mail to <span class="code">{{ box }}</span> sent from your own address ({{ u.email or 'set it below' }}).</li>{% endif %}
 </ul>

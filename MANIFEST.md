@@ -64,6 +64,10 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
   the author's surname, no packs/abridged/summaries, EPUB first and no PDF, the reader's language
 - `templates/book_list.html` — a book series' or an author's books (Hardcover, cached 6 h) with
   what the reader and the family have, Get it / Add to mine / Pick
+- `sendcode.py` — v5.9.1: send a book to an e-reader's own browser with a 4-character code
+  (/send, no login; the book only reaches the browser holding the code's secret cookie)
+- `hcaudio.py` — v5.9.1: Audiobookshelf listening progress to each reader's own Hardcover
+  (their Devices token), matched by ASIN / ISBN / exact title+author, never reopening a Read book
 - `mangadex.py` — v5.9: which chapters a manga volume holds (MangaDex aggregate), only for the
   MangaDex entry linked to the same MangaUpdates id; pre-ticks the chapters a volume replaces
 - `metrontrack.py` — v5.9: a reader's own Metron account (Devices); finished Western comics found
@@ -218,6 +222,8 @@ Copy this whole folder to the VPS and run `bash bookstack.sh` (see README.md).
 - `tui-test.sh` — installer logic harness (stubbed prompts/docker)
 - `stack-test.sh` + `docker-compose.test.yml` + `e2e_driver.py` — end-to-end UAT on the real
   containers
+- `kuma-upgrade-test.sh` — v5.9.1: Uptime Kuma 1.23.17 -> 2.5.5-slim on the same data, the way
+  Operations -> Update moves it (every monitor, the channel, the window and the push tokens survive)
 - `monitoring-test.sh` — `kuma_bootstrap.py` against the real pinned Uptime Kuma, a webhook
   receiver and GreenMail (setup, idempotence, drift repair, push, /metrics, both alert channels)
 - `caddy-build-test.sh` — builds `caddy/Dockerfile`, checks `caddy version` is the release it asks

@@ -222,3 +222,26 @@ def test_wrong_comic_on_its_page(client, monkeypatch):
     assert "Wrong comic" in client.get("/book/9").get_data(as_text=True)
     post(client, "/book/9/wrong")
     assert db.comic_get(rid)["status"] == "queued" and db.untag_pending(9, "bob")
+
+
+def test_a_read_mark_reaches_the_kobo_on_its_next_sync(client):
+    """v5.9.1: Calibre-Web's Kobo sync sends a state only when kobo_reading_state.last_modified moved."""
+    import sqlite3
+    bob = cwa.get_user("bob")["id"]
+    add_calibre_book(1, "Mort", "Terry Pratchett", tags=["owner:bob"])
+    add_calibre_book(2, "Eric", "Terry Pratchett", tags=["owner:bob"])
+    _cwa_reading(bob, [], bookmarks=[(2, 37.0)])
+    c = sqlite3.connect(config.CWA_DB)
+    c.execute("UPDATE kobo_reading_state SET last_modified='2020-01-01 00:00:00.000000' WHERE book_id=2")
+    c.commit(); c.close()
+    cwa.set_read_status("bob", 1, "read")
+    cwa.set_read_status("bob", 2, "read")
+    c = sqlite3.connect(config.CWA_DB)
+    (s1, lm1, pt1), = c.execute("SELECT id, last_modified, priority_timestamp FROM kobo_reading_state WHERE book_id=1").fetchall()
+    assert lm1 == pt1 and len(lm1) == 26, "naive UTC with microseconds, as SQLAlchemy writes it"
+    assert c.execute("SELECT COUNT(*) FROM kobo_bookmark WHERE kobo_reading_state_id=?", (s1,)).fetchone()[0] == 1
+    assert c.execute("SELECT COUNT(*) FROM kobo_statistics WHERE kobo_reading_state_id=?", (s1,)).fetchone()[0] == 1
+    (lm2, pct), = c.execute("SELECT s.last_modified, b.progress_percent FROM kobo_reading_state s JOIN kobo_bookmark b "
+                            "ON b.kobo_reading_state_id=s.id WHERE s.book_id=2").fetchall()
+    assert lm2 > "2020-01-02" and pct == 37.0, "the state is bumped, the Kobo's own position left alone"
+    c.close()

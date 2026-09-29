@@ -114,6 +114,25 @@ def list_users(token=None):
 def find_user(name, token=None):
     return next((u for u in list_users(token) if (u.get("username") or "").lower() == name.lower()), None)
 
+def progress(user_id, token=None):
+    """[mediaProgress] of one ABS user (admin API, GET /api/users/:id; ABS 2.36.1 UserController.
+    findOne): libraryItemId, mediaItemType, duration, progress 0-1, currentTime s, isFinished,
+    startedAt / finishedAt / lastUpdate in ms. Podcast episodes are left out."""
+    r = _req("GET", f"/api/users/{user_id}", token=token)
+    if r.status_code != 200:
+        raise AbsError(f"could not read ABS user {user_id}: {r.status_code}")
+    return [p for p in (_json(r).get("mediaProgress") or []) if p.get("mediaItemType", "book") == "book" and not p.get("episodeId")]
+
+def item_meta(item_id, token=None):
+    """{title, author, asin, isbn, duration} of one library item."""
+    r = _req("GET", f"/api/items/{item_id}", token=token, params={"expanded": 1})
+    if r.status_code != 200:
+        raise AbsError(f"could not read ABS item {item_id}: {r.status_code}")
+    m = _json(r).get("media") or {}
+    md = m.get("metadata") or {}
+    return {"title": md.get("title") or "", "author": md.get("authorName") or "", "asin": md.get("asin") or "",
+            "isbn": md.get("isbn") or "", "duration": m.get("duration")}
+
 def ensure_user(name, password=None, token=None):
     """Create the ABS account for a library user, or align an existing one with the
     isolation model (tag-restricted to owner:<name>). Returns (user, 'created'|'updated'|'root')."""

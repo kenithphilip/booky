@@ -357,6 +357,17 @@ def init():
             method TEXT NOT NULL DEFAULT 'key', connected REAL, detail TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS metron_sent(
             owner TEXT NOT NULL, issue_id INTEGER NOT NULL, at REAL, PRIMARY KEY(owner, issue_id))""")
+        # v5.9.1: audiobook progress sent to each reader's Hardcover (hcaudio.py)
+        c.execute("""CREATE TABLE IF NOT EXISTS hc_audio(
+            owner TEXT NOT NULL, item_id TEXT NOT NULL,
+            book_id INTEGER, edition_id INTEGER, matched TEXT,   -- the Hardcover book ('' = none found)
+            sent_seconds INTEGER, sent_finished INTEGER DEFAULT 0, last_update REAL, at REAL,
+            PRIMARY KEY(owner, item_id))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS hc_audio_state(owner TEXT PRIMARY KEY, detail TEXT, at REAL)""")
+        # v5.9.1: send a book to an e-reader's own browser with a 4-character code (sendcode.py)
+        c.execute("""CREATE TABLE IF NOT EXISTS send_codes(
+            code TEXT PRIMARY KEY, secret TEXT NOT NULL, device TEXT NOT NULL, created REAL NOT NULL,
+            owner TEXT, book_id INTEGER, fmt TEXT, attached REAL, fetched REAL)""")
         # v5.9: comic requests get the book safeguards (confirm, the arrival check, Wrong comic)
         ccols = {r[1] for r in c.execute("PRAGMA table_info(comic_requests)")}
         for col, typ in (("candidate", "TEXT"), ("reasons", "TEXT"), ("blocked", "TEXT DEFAULT '[]'"),
@@ -2017,6 +2028,54 @@ def bookreq_count_open(owner):
     with _conn() as c:
         return c.execute(f"SELECT COUNT(*) FROM book_requests WHERE owner=? AND status IN "
                          f"({','.join('?' * len(BOOK_OPEN))})", (owner, *BOOK_OPEN)).fetchone()[0]
+
+# ---- audiobooks to Hardcover (v5.9.1, hcaudio.py) ---------------------------------------------------
+def hc_audio_get(owner, item_id):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM hc_audio WHERE owner=? AND item_id=?", (owner, item_id)).fetchone()
+    return dict(r) if r else None
+
+def hc_audio_put(owner, item_id, **f):
+    f["at"] = time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO hc_audio(owner, item_id) VALUES(?,?)", (owner, item_id))
+        c.execute(f"UPDATE hc_audio SET {', '.join(f'{k}=?' for k in f)} WHERE owner=? AND item_id=?", (*f.values(), owner, item_id))
+
+def hc_audio_note(owner, detail):
+    with _lock, _conn() as c:
+        c.execute("INSERT OR REPLACE INTO hc_audio_state(owner, detail, at) VALUES(?,?,?)", (owner, (detail or "")[:300], time.time()))
+
+def hc_audio_state(owner):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM hc_audio_state WHERE owner=?", (owner,)).fetchone()
+    return dict(r) if r else None
+
+# ---- send to an e-reader (v5.9.1, sendcode.py) -----------------------------------------------------
+def send_code_new(code, secret, device, now=None):
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM send_codes WHERE created < ?", (now - 3600,))
+        c.execute("INSERT INTO send_codes(code, secret, device, created) VALUES(?,?,?,?)", (code, secret, device, now))
+
+def send_code_get(code):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM send_codes WHERE code=?", (code,)).fetchone()
+    return dict(r) if r else None
+
+def send_code_by_secret(secret):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM send_codes WHERE secret=?", (secret,)).fetchone()
+    return dict(r) if r else None
+
+def send_code_attach(code, owner, book_id, fmt, now=None):
+    """True when the code was free and is now this book's (one book per code)."""
+    with _lock, _conn() as c:
+        return c.execute("UPDATE send_codes SET owner=?, book_id=?, fmt=?, attached=? WHERE code=? AND book_id IS NULL",
+                         (owner, book_id, fmt, now or time.time(), code)).rowcount == 1
+
+def send_code_fetched(code, now=None):
+    with _lock, _conn() as c:
+        c.execute("UPDATE send_codes SET fetched=coalesce(fetched, ?) WHERE code=?", (now or time.time(), code))
 
 # ---- Metron (v5.9, metrontrack.py) ---------------------------------------------------------------
 def metron_get(owner):

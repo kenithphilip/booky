@@ -31,7 +31,7 @@ KEEP_DAYS = 30
 # is listed; anything else on the monitor (Kuma's own bookkeeping) is left alone.
 COMPARED = ("type", "name", "url", "hostname", "port", "interval", "retryInterval", "maxretries",
             "resendInterval", "maxredirects", "accepted_statuscodes", "jsonPath", "expectedValue",
-            "pushToken", "expiryNotification", "timeout", "description")
+            "jsonPathOperator", "pushToken", "expiryNotification", "timeout", "description")
 
 
 def _http(key, name, url, **kw):
@@ -44,7 +44,9 @@ def _http(key, name, url, **kw):
 
 def _json(key, name, url, path, expected, **kw):
     k, spec = _http(key, name, url, **kw)
-    spec.update(type="json-query", jsonPath=path, expectedValue=expected)
+    # jsonPathOperator: Kuma 2.x evaluates json-query as "<path> <operator> <expected>" and a
+    # monitor created without an operator is DOWN for ever ("Invalid condition"); 1.x ignores it
+    spec.update(type="json-query", jsonPath=path, expectedValue=expected, jsonPathOperator="==")
     return k, spec
 
 
@@ -168,7 +170,13 @@ def _norm(v):
 
 def monitor_changes(current, spec):
     """The spec fields whose value differs on `current` (a monitor as Kuma returns it)."""
-    return [k for k in COMPARED if k in spec and _norm(current.get(k)) != _norm(spec[k])]
+    # a field the server does not return is one it does not have (jsonPathOperator on Kuma 1.x):
+    # comparing it would "update" every json-query monitor on every run
+    return [k for k in COMPARED if k in spec and (k in current or k not in V2_ONLY)
+            and _norm(current.get(k)) != _norm(spec[k])]
+
+
+V2_ONLY = ("jsonPathOperator",)
 
 
 def plan(existing, desired):
@@ -225,10 +233,21 @@ def apply(cfg):
     ntypes = {"webhook": NotificationType.WEBHOOK, "smtp": NotificationType.SMTP}
     res = {"ok": True, "setup": "existing", "added": [], "updated": [], "deleted": [],
            "notifications": [], "maintenance": None}
-    api = _connect(cfg.get("url") or "http://127.0.0.1:3001", time.time() + int(cfg.get("wait", 90)))
+    deadline = time.time() + int(cfg.get("wait", 90))
+    api = _connect(cfg.get("url") or "http://127.0.0.1:3001", deadline)
     try:
         user, pw = cfg["user"], cfg["password"]
-        if api.need_setup():
+        # Kuma 2.x answers its socket before its first-start database work is done, and the first
+        # calls then time out (measured with 2.5.5 on a fresh volume): ask again until the deadline
+        while True:
+            try:
+                fresh = api.need_setup()
+                break
+            except Exception:
+                if time.time() > deadline:
+                    raise
+                time.sleep(3)
+        if fresh:
             api.setup(user, pw)
             res["setup"] = "created"
         try:
@@ -247,7 +266,7 @@ def apply(cfg):
         if any(cur.get(k) != v for k, v in want.items()):
             merged = {k: v for k, v in cur.items() if k in (
                 "checkUpdate", "checkBeta", "keepDataPeriodDays", "serverTimezone", "entryPage",
-                "searchEngineIndex", "primaryBaseURL", "steamAPIKey", "nscd", "dnsCache",
+                "searchEngineIndex", "primaryBaseURL", "steamAPIKey", "nscd",
                 "chromeExecutable", "tlsExpiryNotifyDays", "disableAuth", "trustProxy")}
             merged.update(want)
             api.set_settings(password=pw, **merged)

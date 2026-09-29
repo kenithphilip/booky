@@ -147,7 +147,9 @@ def _cwa_reading(user_id, rows, bookmarks=()):
                         last_modified DATETIME, priority_timestamp DATETIME);
                        CREATE TABLE IF NOT EXISTS kobo_bookmark(id INTEGER PRIMARY KEY, kobo_reading_state_id INTEGER, last_modified DATETIME,
                         location_source TEXT, location_type TEXT, location_value TEXT, progress_percent FLOAT,
-                        content_source_progress_percent FLOAT);""")
+                        content_source_progress_percent FLOAT);
+                       CREATE TABLE IF NOT EXISTS kobo_statistics(id INTEGER PRIMARY KEY, kobo_reading_state_id INTEGER, last_modified DATETIME,
+                        remaining_time_minutes INTEGER, spent_reading_minutes INTEGER);""")
     for bid, st in rows:
         c.execute("INSERT INTO book_read_link(book_id, user_id, read_status) VALUES(?,?,?)", (bid, user_id, st))
     for bid, pct in bookmarks:

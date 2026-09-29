@@ -402,6 +402,16 @@ request.@@DOMAIN@@ {
 			events 60
 			window 1m
 		}
+		# /send makes a code for anyone who opens it (an e-reader cannot log in): its page
+		# refreshes every 5 s, so 30 a minute per address is plenty and a flood is not
+		zone portal_send {
+			match {
+				path /send /send/*
+			}
+			key {client_ip}
+			events 30
+			window 1m
+		}
 	}
 	# @AUTHELIA_GATE:request@
 	reverse_proxy 127.0.0.1:8090 {

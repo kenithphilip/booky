@@ -1,6 +1,5 @@
 """'Remove from my library', and deleting books no reader has any more from the VPS."""
-import json, os, time
-import pytest
+import json
 import config, db, worker, admin_cli, cwa
 from conftest import add_calibre_book, calibre_conn, login, post
 

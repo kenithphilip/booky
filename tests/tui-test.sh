@@ -183,7 +183,7 @@ touch "$T/notadir"
 ( STACK_DIR="$T/notadir/sub"; ENV_FILE="$STACK_DIR/.env"; envset X y ) 2>/dev/null; rc=$?
 expect '[ $rc != 0 ]' "envset returns non-zero when .env cannot be written (full disk / read-only root) (A11)"
 envdefault K1 'ignored'; envdefault KNEW 'set'; expect '[ "$(envget K1)" = changed ] && [ "$(envget KNEW)" = set ]' "envdefault only fills blanks"
-expect '[ "$(img IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.7 ]' "img() falls back to the pinned default"
+expect '[ "$(img IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.8 ]' "img() falls back to the pinned default"
 envset IMG_CWA x/y:1; expect '[ "$(img IMG_CWA)" = x/y:1 ]' "img() prefers .env"; envset IMG_CWA ""
 if command docker info >/dev/null 2>&1; then
   printf 'services:\n  t:\n    image: alpine\n    environment:\n' > "$STACK_DIR/docker-compose.yml"
@@ -202,6 +202,12 @@ fi
 
 PATH="$bin:$PATH"   # from here on child processes only ever see the stub binaries
 
+echo "== the version the menu shows"
+if git -C "$REPO" describe --tags >/dev/null 2>&1; then
+  want=$(git -C "$REPO" describe --tags); want=${want#v}
+  [ "$BOOKSTACK_VERSION" = "$want" ] && ok "the menu shows the checkout's tag ($BOOKSTACK_VERSION), not a constant that goes stale" \
+    || bad "BOOKSTACK_VERSION '$BOOKSTACK_VERSION' is not git describe '$want'"
+fi
 echo "== image pins: bookstack.sh defaults == compose defaults == .env.example"
 python3 - "$REPO" "$IMG_DEFAULTS" <<'PY' && ok "IMG_* defaults agree across bookstack.sh, compose files and .env.example" || bad "IMG_* pin mismatch"
 import re, sys, glob
@@ -458,7 +464,7 @@ reset "example.test" "admin@example.test" "UTC" "cf-token-123" "yes"; step_confi
 
 echo "== Authelia gate + users"
 inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 4 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && grep -qE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile"' "gate injected into 4 vhosts (shelf without a bypass matcher)"
-expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
+expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$|/send$|/send/file$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
 render_caddyfile; expect '! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "re-render removes the gate (disable path)"
 envset AUTHELIA_ENABLED true; reset "example.test" "admin@example.test" "UTC" "" "yes"; step_configure >/dev/null
 expect 'grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Configure re-applies the gate when Authelia is enabled"
@@ -1147,7 +1153,7 @@ C6="<cancel> <cancel> <cancel> <cancel> <cancel> <cancel> <cancel> <cancel>"   #
 export BACKUP_RC=1; reset; step_update; rc=$?; export BACKUP_RC=0
 expect '[ $rc = 1 ] && seen "backup.sh --tag pre-update" && seen "Pre-update backup failed" && ! seen "compose pull"' "step_update returns 1 when the pre-update backup fails (nothing pulled)"
 envset IMG_CWA crocodilestick/calibre-web-automated:v4.0.6
-reset "yes" "crocodilestick/calibre-web-automated:v4.0.7" $C6 "yes"; step_update && ok "step_update (bump one tag)" || bad "step_update failed"
+reset "no" "yes" "crocodilestick/calibre-web-automated:v4.0.7" $C6 "yes"; step_update && ok "step_update (bump one tag)" || bad "step_update failed"
 expect 'grep -q "^IMG_CWA=crocodilestick/calibre-web-automated:v4.0.6$" "$STACK_DIR/.env.images.prev" && ! grep -q "IMG_ARIA" "$STACK_DIR/.env.images.prev"' ".env.images.prev records the previous tags (no aria2 keys)"
 expect '[ "$(envget IMG_CWA)" = crocodilestick/calibre-web-automated:v4.0.7 ] && grep -q "IMG_CWA: crocodilestick/calibre-web-automated:v4.0.6 -> crocodilestick/calibre-web-automated:v4.0.7" "$LOG"' "new tag stored and shown old -> new before applying"
 expect 'seen "compose pull --ignore-buildable" && seen "compose build --pull caddy librarian" && seen "compose up -d" && seen "docker: system prune -f --filter until=72h" && [ "$(line_of "compose up -d")" -lt "$(line_of "system prune")" ]' "pull/build/up then prune only at the end"
@@ -1155,17 +1161,17 @@ expect 'seen "copy_code_trees" && [ "$(line_of "copy_code_trees")" -lt "$(line_o
 expect 'seen "build-version: " && ! seen "build-version: <unset>" && [ "$(grep -m1 "^build-version: " "$LOG" | cut -d" " -f2)" = "$(cut -d" " -f1 "$STACK_DIR/.version")" ]' "Update rebuilds with BUILD_VERSION and re-records .version (J03)"
 expect 'seen "docker: image tag bookstack/caddy:latest bookstack/caddy:prev" && seen "docker: image tag bookstack/librarian:latest bookstack/librarian:prev" && [ "$(line_of "image tag bookstack/caddy:latest")" -lt "$(line_of "compose build")" ]' "locally built caddy/librarian images kept as :prev before the rebuild (F17)"
 expect 'seen "curl: -fs -m 5 -o /dev/null http://127.0.0.1:8090/healthz" && seen "curl: -fs -m 5 -o /dev/null http://127.0.0.1:13378/healthcheck"' "gate = health checks + local endpoints"
-rm -f "$T/etc/systemd/system/bookstack-postboot.service"; reset "no" "yes"; step_update >/dev/null
+rm -f "$T/etc/systemd/system/bookstack-postboot.service"; reset "no" "no" "yes"; step_update >/dev/null
 expect '[ -s "$T/etc/systemd/system/bookstack-postboot.service" ] && seen "systemctl: enable bookstack-postboot.service"' "Update installs the host-side units this version introduces, so an install that only ever Updates still gets them (F.6)"
-export SELFTEST_RC=3; reset "no" "yes"; step_update; rc=$?; export SELFTEST_RC=0
+export SELFTEST_RC=3; reset "no" "no" "yes"; step_update; rc=$?; export SELFTEST_RC=0
 expect '[ $rc = 0 ] && ! seen "yesno: Update problem" && seen "system prune" && grep -q "3 failure(s) unrelated" "$LOG"' "a failing full self-test (disk, NTP, Tailscale...) is reported but is NOT a rollback reason (F17)"
-FAIL_HEALTHZ=1; reset "no" "yes" "no"; step_update; rc=$?; FAIL_HEALTHZ=0
+FAIL_HEALTHZ=1; reset "no" "no" "yes" "no"; step_update; rc=$?; FAIL_HEALTHZ=0
 expect '[ $rc = 1 ] && grep -F "yesno: Update problem" "$LOG" | grep -q "portal:/healthz" && ! seen "system prune"' "a failing local endpoint -> rollback offered, no prune"
 envset IMG_CWA x/y:old; printf 'IMG_CWA=x/y:old\n' > "$STACK_DIR/.env.images.prev"
-reset "yes" "x/y:new" $C6 "no"; step_update
+reset "no" "yes" "x/y:new" $C6 "no"; step_update
 expect '[ "$(envget IMG_CWA)" = x/y:old ] && ! seen "compose pull"' "declining at the final confirmation restores the previous tags"
 echo "# before update" > "$STACK_DIR/caddy/Caddyfile"
-FAIL_HEALTHZ=1; reset "yes" "x/y:new" $C6 "yes" "yes"; step_update; FAIL_HEALTHZ=0
+FAIL_HEALTHZ=1; reset "no" "yes" "x/y:new" $C6 "yes" "yes"; step_update; FAIL_HEALTHZ=0
 expect '[ "$(envget IMG_CWA)" = x/y:old ] && [ "$(grep -c "docker: compose up -d" "$LOG")" -ge 2 ] && seen "docker: image tag bookstack/caddy:prev bookstack/caddy:latest" && [ "$(cat "$STACK_DIR/caddy/Caddyfile")" = "# before update" ]' "rollback restores the previous tags, the previous caddy/librarian builds and the previous Caddyfile"
 expect 'grep -F msgbox "$LOG" | grep -q "tagged .pre-update. -> .Config + databases only."' "rollback advice names the pre-update snapshot and the config + databases restore (F16)"
 rm -f "$renv"; reset "no"; step_update; expect '[ $? = 1 ] && seen "yesno: No backup repository is configured"' "without backups, Update asks and stops on No"
@@ -1173,13 +1179,18 @@ rm -f "$renv"; reset "no"; step_update; expect '[ $? = 1 ] && seen "yesno: No ba
 rm -f "$STACK_DIR/.update-in-progress"; envset IMG_CWA good/img:1
 printf '#!/usr/bin/env bash\necho "backup.sh $*" >> "%s"\nexit 0\n' "$LOG" > "$STACK_DIR/scripts/backup.sh"; chmod +x "$STACK_DIR/scripts/backup.sh"
 printf 'RESTIC_REPOSITORY=/mnt/backup\n' > "$renv"
-FAIL_HEALTHZ=1; reset "yes" "broken/img:2" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
+FAIL_HEALTHZ=1; reset "no" "yes" "broken/img:2" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
 expect '[ -f "$STACK_DIR/.update-in-progress" ] && grep -q "^IMG_CWA=good/img:1$" "$STACK_DIR/.env.images.prev"' "a declined rollback freezes the rollback point and records the known-good tag (A07)"
-FAIL_HEALTHZ=1; reset "yes" "worse/img:3" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
+FAIL_HEALTHZ=1; reset "no" "yes" "worse/img:3" $C6 "yes" "no"; step_update >/dev/null; FAIL_HEALTHZ=0
 expect 'grep -q "^IMG_CWA=good/img:1$" "$STACK_DIR/.env.images.prev" && ! grep -q "broken/img:2" "$STACK_DIR/.env.images.prev" && [ "$(grep -c "docker: image tag bookstack/caddy:latest bookstack/caddy:prev" "$LOG")" = 0 ]' "a SECOND update neither overwrites .env.images.prev nor re-points :prev at the broken build (A07)"
 expect 'grep -F msgbox "$LOG" | grep -q "will not overwrite them"' "and it says so, so the admin knows the rollback point is still intact (A07)"
-reset "no" "yes" "yes"; step_update >/dev/null
+reset "no" "no" "yes" "yes"; step_update >/dev/null
 expect '[ ! -f "$STACK_DIR/.update-in-progress" ]' "a successful update releases the frozen rollback point (A07)"
+envset IMG_CWA ""
+# v5.9.1: a pin this bookstack moved (CWA v4.0.8 fixes new Kobos, #1476) is offered in one step
+envset IMG_CWA crocodilestick/calibre-web-automated:v4.0.7
+reset "yes" "no" "yes"; step_update >/dev/null
+expect '[ "$(envget IMG_CWA)" = "$(for kv in $IMG_DEFAULTS; do [ "${kv%%=*}" = IMG_CWA ] && echo "${kv#*=}"; done)" ] && grep -F yesno "$LOG" | grep -q "pins other images than the server runs"' "Update offers this version's newer pins and applies them on Yes"
 envset IMG_CWA ""
 # A09: the step an admin reaches for after a leaked password must not claim sessions were ended
 reset "yes"; step_rotate_secret; rc=$?

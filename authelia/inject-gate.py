@@ -31,8 +31,10 @@ BYPASS = {
     # against Server.js and the client bundle). The share path is the client route
     # /share/:slug, whose data comes from /public/* — see configuration.yml.template.
     "audio": "/login /logout /init /auth/refresh /auth/openid /auth/openid/* /api/* /socket.io /socket.io/* /hls/* /ping /status /healthcheck /public/* /feed/*",
-    # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback
-    "request": "/intake",
+    # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback.
+    # /send: an e-reader's browser cannot do SSO; the page only shows a code, and a book only
+    # reaches the browser holding that code's secret cookie (librarian/sendcode.py)
+    "request": "/intake /send /send/file",
     # Shelfmark: nothing bypassed
     "shelf": "",
 }

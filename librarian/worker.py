@@ -2123,6 +2123,11 @@ def follows_once(now=None):
         metrontrack.sync_once()
     except Exception as e:                       # nor does Metron
         log.warning("Metron sync: %s", e)
+    try:
+        import hcaudio
+        hcaudio.sync_once()
+    except Exception as e:                       # nor Hardcover (audiobook progress, v5.9.1)
+        log.warning("Hardcover audiobook sync: %s", e)
     return n
 
 def _offer_shared_swaps(now):

@@ -2,7 +2,7 @@
 instead of being downloaded again — from Shelfmark, a dropbox, or the portal."""
 import json, os, time, zipfile
 import pytest
-import config, db, worker, share, admin_cli, notify, cwa
+import config, db, worker, share, admin_cli, notify
 import abs as absapi
 from conftest import add_calibre_book, calibre_conn, make_epub
 

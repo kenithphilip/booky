@@ -24,10 +24,16 @@ def configured():
     return bool(config.HARDCOVER_API_KEY)
 
 
-def _q(query, variables):
-    if not configured():
+class TokenRefused(HardcoverError):
+    """A reader's own token was refused (v5.9.1, hcaudio.py): theirs to fix, not the admin's."""
+
+
+def _q(query, variables, token=None):
+    """One GraphQL call with the admin's key, or with `token` (a reader's own, hcaudio.py)."""
+    if not (token or configured()):
         raise HardcoverError("no Hardcover API key (Library -> Metadata sources)")
-    token = config.HARDCOVER_API_KEY.replace("Bearer ", "").strip()
+    own = bool(token)
+    token = (token or config.HARDCOVER_API_KEY).replace("Bearer ", "").strip()
     for attempt in (1, 2):
         try:
             r = requests.post(URL, json={"query": query, "variables": variables}, timeout=TIMEOUT,
@@ -41,6 +47,9 @@ def _q(query, variables):
         except requests.RequestException as e:
             raise HardcoverError(f"Hardcover did not answer ({type(e).__name__})") from e
     if r.status_code in (401, 403):
+        if own:
+            raise TokenRefused(f"Hardcover refused your token (HTTP {r.status_code}); a token made since "
+                               f"August 2026 needs the read:library and write:library permissions")
         raise HardcoverError(f"Hardcover refused the API key (HTTP {r.status_code})")
     if r.status_code == 429:
         raise HardcoverError("Hardcover asked us to slow down")

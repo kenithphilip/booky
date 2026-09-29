@@ -174,6 +174,8 @@ TURNSTILE_SECRET = os.environ.get("TURNSTILE_SECRET", "")
 SHELFMARK_API = os.environ.get("SHELFMARK_API", "http://127.0.0.1:8084").rstrip("/")
 SHELFMARK_SVC_USER = os.environ.get("SHELFMARK_SVC_USER", "")
 SHELFMARK_SVC_PASS = os.environ.get("SHELFMARK_SVC_PASS", "")
+# v5.9.1: Shelfmark v1.4.0's API key (X-Api-Key), preferred over the service login above
+SHELFMARK_API_KEY = os.environ.get("SHELFMARK_API_KEY", "").strip()
 # L05: "proxy" while the Authelia gate is on (Shelfmark then trusts Remote-User from Caddy); the
 # portal, a host process Shelfmark trusts the same way, then sends the service name as the header
 SHELFMARK_AUTH_METHOD = (os.environ.get("SHELFMARK_AUTH_METHOD") or "cwa").strip().lower()
@@ -195,6 +197,7 @@ DOMAIN      = os.environ.get("DOMAIN", "")
 BOOKS_URL   = os.environ.get("BOOKS_URL")   or (f"https://books.{DOMAIN}"   if DOMAIN else "")
 AUDIO_URL   = os.environ.get("AUDIO_URL")   or (f"https://audio.{DOMAIN}"   if DOMAIN else "")
 SHELF_URL   = os.environ.get("SHELF_URL")   or (f"https://shelf.{DOMAIN}"   if DOMAIN else "")
+PORTAL_URL  = os.environ.get("PORTAL_URL")  or (f"https://request.{DOMAIN}" if DOMAIN else "")
 def admin_links():
     """Shown on the admin dashboard; tailnet-only ones are labelled as such."""
     d = DOMAIN

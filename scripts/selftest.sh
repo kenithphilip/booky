@@ -708,6 +708,9 @@ hp=$(envget HEALTH_PING_URL)
 if [ -n "$hp" ]; then
   if [ "$fail" = 0 ]; then curl -fsS -m 10 --retry 3 "$hp" >/dev/null 2>&1 || true
   else curl -fsS -m 10 --retry 3 "${hp%/}/fail" >/dev/null 2>&1 || true; fi
+else
+  # v5.9.1: said every hour until set, because nothing on this box can report the box being gone
+  warn "no external check (HEALTH_PING_URL): if the whole server goes down, nothing tells you. A free healthchecks.io check (period 1 h, grace 1 h), pasted in Operations -> Monitoring, fixes that"
 fi
 
 echo; echo "RESULT: $pass passed, $fail failed, $guards guard(s) set"

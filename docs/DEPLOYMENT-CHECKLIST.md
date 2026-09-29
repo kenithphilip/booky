@@ -200,6 +200,43 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## Verified locally in v5.9.1 (Kuma 2.x, new Kobos, send to an e-reader, audiobooks to Hardcover)
+- Unit 711 passed, installer 803 passed, monitoring 41 passed on louislam/uptime-kuma:2.5.5-slim,
+  Kuma upgrade 8 passed (1.23.17 -> 2.5.5 on the same data: migrated in 38 s, nothing added or
+  deleted, the channel, the reboot window and the push tokens intact), end-to-end 290 checks / 0 failed on CWA v4.0.8.
+- CWA v4.0.8 (2026-09-28) answers /v1/user/add-device and /v1/auth/refresh, so a Kobo that was
+  never paired, on firmware 4.38, can pair (CWA #1476). Operations -> Update now offers every pin
+  this release moved (CWA v4.0.8, Kuma 2.5.5-slim) in one question.
+- A Read / Reading / Unread marked on the portal now reaches the Kobo: Calibre-Web's Kobo sync
+  sends a state only when kobo_reading_state.last_modified moved, and its own "Mark as read" gets
+  that from an ORM hook raw SQL skips (cps/kobo.py, ub.py at v4.0.7); the portal now bumps it, or
+  creates the state as Calibre-Web does, never touching the Kobo's own position.
+- Kuma 2.x: the bootstrap uses uptime-kuma-api2 2.9.0 (same import name), json-query monitors carry
+  jsonPathOperator "==" (2.x keeps one without it DOWN), a fresh 2.x gets UPTIME_KUMA_DB_TYPE=sqlite
+  (else it stops at a database-choice page), the first calls are retried while 2.x finishes its
+  first start (they timed out once on a fresh volume). Update keeps kuma/data.v1 until the
+  migration is done, heal.sh and the health gate leave a migrating Kuma alone, a rollback puts the
+  1.x copy back.
+- Hardcover (read-only checks with the owner's key, 2026-09-29): an ASIN finds the audiobook
+  edition (B08G9PRS1K -> edition 31878554, book 427578), an ISBN or the exact title+author the
+  book; the write mutations follow the live schema (introspection), not exercised on a real account.
+- IRC (Shelfmark v1.4.0, read from its source): nothing here blocks it: DCC is outbound only
+  (Shelfmark connects to the bot), ufw allows all outgoing, there are no egress rules. Its client
+  sends no NickServ/SASL identification, and IRC Highway's #ebooks admits registered, identified
+  nicks only (answered as "Timeout waiting for JOIN confirmation"), and bans automated clients.
+  Read the cause: `docker logs shelfmark 2>&1 | grep -iE 'irc|dcc|join|welcome|offer'`. Unless
+  that shows another cause, treat IRC as unsupported until Shelfmark learns to identify.
+- On the VPS after Deploy:
+  - Operations -> Update: answer Yes to "pins other images than the server runs" (CWA v4.0.8,
+    Uptime Kuma 2.5.5-slim). Kuma migrates on its first start (seconds to minutes); Operations ->
+    Monitoring afterwards shows the same monitors.
+  - A Kobo: open its browser at https://request.<domain>/send, type the code on a book's page.
+  - Devices: with a Hardcover token set, an audiobook you listen to appears on Hardcover within
+    ~10 minutes (the Hardcover line on Devices says when it last sent).
+  - Self-test: set HEALTH_PING_URL (Operations -> Monitoring) if it warns there is no external check.
+  - Optional: Advanced settings -> lockout -> AUTHELIA_PASSKEYS=true, then register a passkey at
+    https://auth.<domain> (Settings -> Two-Factor Authentication).
+
 ## Verified locally in v5.9 (chapters then the volume, comic safeguards, reading status, Metron)
 - Unit 701 passed, installer 801 passed, end-to-end 290 checks / 0 failed. End to end: a volume
   file of 12 pages is held for the reader and leaves her dropbox; the intake check now waits for

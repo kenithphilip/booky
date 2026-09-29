@@ -600,6 +600,19 @@ an issue, 5 for a chapter) and held when it does not match (**Keep it anyway** /
 **Wrong comic** on a delivered comic's page. `COMIC_CONFIRM=sure` (Advanced settings → requests)
 skips the question only for the exact digital issue or volume in the reader's language.
 
+**Send to an e-reader** (v5.9.1, `librarian/sendcode.py`): on the Kobo or Kindle, open its web
+browser at `request.<domain>/send`; it shows a 4-character code (no login on an e-ink keyboard).
+Type that code on a book's page (**Send to an e-reader**) and the e-reader's page offers the
+download a few seconds later, straight into its library: no mail, no size limit. A Kobo gets a
+KEPUB/EPUB, a Kindle's browser AZW3/MOBI/PDF (never EPUB: convert first). Only the browser that
+showed the code can fetch the book (a secret cookie), a code lives 15 minutes and carries one book.
+
+**Audiobook progress to Hardcover** (v5.9.1, `librarian/hcaudio.py`): with the Hardcover token a
+reader already set on Devices, their Audiobookshelf listening progress goes to their own Hardcover
+account (the book found by ASIN, ISBN, or exact title and author; Currently Reading, then Read
+when finished, with the audiobook edition and the seconds listened), every 10 minutes when
+something moved. A book already Read there is not reopened by a re-listen.
+
 **Audiobooks on a phone or tablet**: the portal's **Audiobooks** page downloads any audiobook
 the reader has (one file as it is, a folder as one ZIP) for any player; Audiobookshelf's app
 keeps your place and can keep books offline too.

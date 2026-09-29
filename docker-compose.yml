@@ -63,7 +63,7 @@ services:
 
   calibre-web:
     <<: *common
-    image: ${IMG_CWA:-crocodilestick/calibre-web-automated:v4.0.7}
+    image: ${IMG_CWA:-crocodilestick/calibre-web-automated:v4.0.8}
     container_name: calibre-web
     # Calibre conversions fork several processes and peak high; the largest fence in the stack.
     pids_limit: 1024
@@ -201,6 +201,7 @@ services:
       - SHELFMARK_API=http://127.0.0.1:8084
       - SHELFMARK_SVC_USER=${SHELFMARK_SVC_USER:-}
       - SHELFMARK_SVC_PASS=${SHELFMARK_SVC_PASS:-}
+      - SHELFMARK_API_KEY=${SHELFMARK_API_KEY:-}
       - SHELFMARK_AUTH_METHOD=${SHELFMARK_AUTH_METHOD:-cwa}   # L05: proxy behind the gate
       - ABS_OIDC_SECRET=${ABS_OIDC_SECRET:-}               # L05: Audiobookshelf's client at Authelia
       - HARDCOVER_API_KEY=${HARDCOVER_API_KEY:-}
@@ -378,6 +379,8 @@ services:
       # Shelfmark's network. The same accounts are taken over by username (measured on v1.3.15:
       # cwa -> proxy -> cwa keeps every user id), admin comes ONLY from the "admins" group.
       - AUTH_METHOD=${SHELFMARK_AUTH_METHOD:-cwa}
+      # v5.9.1: the portal's key (X-Api-Key, admin on /api/*). Empty = off (config/env.py strips it)
+      - SHELFMARK_API_KEY=${SHELFMARK_API_KEY:-}
       - PROXY_AUTH_USER_HEADER=Remote-User
       - PROXY_AUTH_ADMIN_GROUP_HEADER=Remote-Groups
       - PROXY_AUTH_ADMIN_GROUP_NAME=admins
@@ -522,15 +525,20 @@ services:
 
   uptime-kuma:
     <<: *common
-    # Stay on the 1.x line: 2.x needs a database migration.
-    image: ${IMG_KUMA:-louislam/uptime-kuma:1}
+    # 2.x (v5.9.1): 1.23.17 carries two advisories 1.x will never fix. An exact pin, never ":2",
+    # so a release with new migrations never arrives unannounced; "-slim": no embedded MariaDB or
+    # Chromium, which nothing here uses. The first 2.x start migrates kuma.db one way: bookstack.sh
+    # (kuma_v2_prepare) keeps a 1.x copy until the migration is done.
+    image: ${IMG_KUMA:-louislam/uptime-kuma:2.5.5-slim}
     container_name: uptime-kuma
     # Host network, listening on loopback only, so monitors such as
     # http://127.0.0.1:8090/healthz and http://127.0.0.1:8084/api/health reach the services
     # (on a bridge network 127.0.0.1 would be Kuma's own container).
     network_mode: host
-    mem_limit: 384m
+    mem_limit: 512m                # 2.x, and room for the one-time heartbeat migration
     environment:
+      # a fresh 2.x otherwise stops at a "choose a database" page and has no API to set up
+      - UPTIME_KUMA_DB_TYPE=sqlite
       - UPTIME_KUMA_HOST=127.0.0.1
       - UPTIME_KUMA_PORT=3001
       - TZ=${TZ}

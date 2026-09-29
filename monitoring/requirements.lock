@@ -193,25 +193,30 @@ idna==3.20 \
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-    # via uptime-kuma-api
+    # via uptime-kuma-api2
 python-engineio==4.14.0 \
     --hash=sha256:9f0fe275fb7d67bfc1a632421adf22949fd4843bd9c458c004b0a89cede302a2 \
     --hash=sha256:eaa1e386baf9c2c7959eef7f9d9165c5ea910c5b392f5316e78d29ed073cb43d
-    # via python-socketio
+    # via
+    #   python-socketio
+    #   uptime-kuma-api2
 python-socketio==5.17.0 \
     --hash=sha256:b5826fd2f8aa02e11347816349b74ac6b53e8a4f4e4b1cf1388e1aff19b7f3f4 \
     --hash=sha256:c3bbfc4937dcfea7c4d1b182afa94d4a30335d153987e8f2078b344beacf95a0
-    # via uptime-kuma-api
+    # via uptime-kuma-api2
 requests==2.34.2 \
     --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0 \
     --hash=sha256:f288924cae4e29463698d6d60bc6a4da69c89185ad1e0bcc4104f584e960b9ed
-    # via python-socketio
+    # via
+    #   python-socketio
+    #   uptime-kuma-api2
 simple-websocket==1.1.0 \
     --hash=sha256:4af6069630a38ed6c561010f0e11a5bc0d4ca569b36306eb257cd9a192497c8c \
     --hash=sha256:7939234e7aa067c534abdab3a9ed933ec9ce4691b0713c78acb195560aa52ae4
     # via python-engineio
-uptime-kuma-api==1.2.1 \
-    --hash=sha256:b59e659f7b32e96e512dcc23ccb6e1a1b08d2db1d72215c8ceb70e5421be67e1
+uptime-kuma-api2==2.9.0 \
+    --hash=sha256:05cee12da0c1a786fb4a8aeaf1770e65564cba2364ed2ec908368559a2cc6e47 \
+    --hash=sha256:c003384340a3993dd0cbfb6a474e9fb35735e406bb4b04592b42c598f5296c0e
     # via -r requirements.txt
 urllib3==2.8.0 \
     --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
