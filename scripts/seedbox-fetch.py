@@ -40,7 +40,8 @@ An item is handed over when:
 Each item is remembered by its names, sizes and times: handed over once, again only if it
 changes. It appears under library/seedbox/ only whole (built in .incoming/, renamed into place).
 After KEEP_DAYS both the hand-over and the synced copy go (the latter ignored in Syncthing
-first), so this server keeps about a week of seedbox downloads. Standard library only; root.
+first). v6.1.1: a day by default (SEEDBOX_KEEP_DAYS in .env, Advanced settings -> disk): what was
+handed over has been imported long before, and one asked for again later is fetched back. Standard library only; root.
 
 Config: /etc/bookstack/seedbox.env (0600; Library -> Seedbox writes it). Syncthing's API key:
 SYNCTHING_API_KEY in $STACK_DIR/.env (the container reads it). State and the failure latch:
@@ -65,7 +66,7 @@ WANTED = os.environ.get("SEEDBOX_WANTED", os.path.join(STACK, "librarian/state/s
 WANTED_FRESH = 180
 MIN_AGE = int(os.environ.get("SEEDBOX_MIN_AGE", "60"))           # seconds an item must be unchanged
 RT_SETTLE = int(os.environ.get("SEEDBOX_RT_SETTLE", "90"))       # seconds after rTorrent finished it
-KEEP_DAYS = float(os.environ.get("SEEDBOX_KEEP_DAYS", "7"))       # hand-overs and synced copies here
+KEEP_DAYS = 1.0         # hand-overs and synced copies here: set from SEEDBOX_KEEP_DAYS below (v6.1.1)
 FREE_MARGIN = int(os.environ.get("SEEDBOX_FREE_MARGIN_GB", "5")) * 2**30
 FAILS_BEFORE_ALERT = int(os.environ.get("SEEDBOX_FAILS_BEFORE_ALERT", "45"))   # 15 minutes of 20 s runs
 SKIP_PREFIX = ("_UNPACK_", "_FAILED_", "_ADMIN_", ".")
@@ -104,6 +105,18 @@ def envfile(path):
         pass
     return out
 
+
+
+def _keep_days():
+    """SEEDBOX_KEEP_DAYS: the environment (tests), else .env (Advanced settings), else 1."""
+    v = os.environ.get("SEEDBOX_KEEP_DAYS") or envfile(os.path.join(STACK, ".env")).get("SEEDBOX_KEEP_DAYS") or "1"
+    try:
+        return max(0.0, float(v))            # 0: dropped at the next run after the hand-over
+    except ValueError:
+        return 1.0
+
+
+KEEP_DAYS = _keep_days()
 
 def load_state():
     try:

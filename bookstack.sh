@@ -1045,6 +1045,13 @@ install_disk_watch() { # hourly watchdog: alerts at 85 %, stops downloaders at 9
 }
 comics_on(){ [ "$(envget COMICS_ENABLED)" = true ]; }
 # KCC is not a compose service (the host job runs it in a throwaway container): pulled here, never fatal
+# v6.1.1: the build cache a Deploy or Update leaves (the Go toolchain Caddy is built with, pip
+# wheels) trimmed at once to BUILD_CACHE_KEEP_MB, newest kept; the hourly watchdog does the same
+trim_build_cache(){
+  local keep; keep="$(adv_value BUILD_CACHE_KEEP_MB 1024)"; case "$keep" in ''|*[!0-9]*) keep=1024;; esac
+  docker builder prune -f --reserved-space "${keep}mb" >/dev/null 2>&1 \
+    || docker builder prune -f --keep-storage "${keep}mb" >/dev/null 2>&1 || true
+}
 pull_kcc(){ comics_on || return 0; docker pull -q "$(img IMG_KCC)" >/dev/null 2>&1 || echo "(could not pull $(img IMG_KCC); comic device copies wait for it)"; return 0; }
 install_comic_convert() { # comics: KCC device copies, one at a time (scripts/comic-convert.sh); off = no cron
   if ! comics_on; then rm -f "$ETC/cron.d/bookstack-comics"; return 0; fi
@@ -1119,6 +1126,7 @@ step_deploy() {
   # BUILD_VERSION is baked into the images (compose build arg, default "dev"); the portal
   # reports it on /healthz and Self-test compares it with $STACK_DIR/.version (J03).
   BUILD_VERSION="$(build_version)" compose build --pull caddy librarian kuma-bootstrap || { msg "Image build failed (caddy/librarian/kuma-bootstrap). See the output above; nothing was started."; return 1; }
+  trim_build_cache
   compose pull --ignore-buildable || { msg "Image pull failed. Check the network / registry and run Deploy again."; return 1; }
   pull_kcc
   # Caddy (the only thing that listens publicly) starts LAST: after the admin password is
@@ -3668,6 +3676,7 @@ step_update() {
   # (e) health gate: container health checks + the local endpoints this update could break
   echo "Waiting for health checks (up to 5 min)..."
   if ! wait_healthy 300; then update_failed "a container did not become healthy"; return 1; fi
+  trim_build_cache
   local i; for i in $(seq 1 12); do local_checks && break; sleep 5; done
   if [ -n "$GATE_FAILS" ]; then update_failed "local checks failed:$GATE_FAILS"; return 1; fi
   # the full self-test is information, not a rollback reason (disk, NTP, Tailscale, edge...)
@@ -3796,6 +3805,8 @@ requests|BOOK_SEARCH_DAYS|14|int|How long Get it keeps looking for a book before
 comics|KCC_MEMORY|1536m|text|Memory cap of one KCC conversion (1536m held a 700-page colour volume at about 1.2 GB)
 comics|KCC_KOBO_MAX_MB|1024|int|Largest Kobo copy of a comic; a bigger one gets none (readers still download the CBZ)
 disk|DISK_WARN_PCT|85|pct|Disk use that alerts you, once per 24 h
+disk|BUILD_CACHE_KEEP_MB|1024|int|Docker build cache kept for quick rebuilds; the rest is freed hourly and after every Deploy and Update
+disk|SEEDBOX_KEEP_DAYS|1|int|Days this server keeps a seedbox download after handing it over (asked for again later, it is fetched back)
 disk|DISK_STOP_PCT|95|pct|Disk use that stops the downloaders and pauses imports
 disk|DISK_RESUME_PCT|80|pct|Disk use they are started again below
 disk|DISK_REPORT|true|bool|Send the daily disk summary on the alert channel (true or false)
@@ -3848,7 +3859,11 @@ step_advanced() {
                 [ "$key" = KCC_MEMORY ] && msg "Mind the 4 GB box: KCC runs beside everything else. 1536m held a 700-page colour volume at ~1.2 GB (v6.0.1)."
                 continue;;
         backup) msg "$key is now $new.\n\nscripts/backup.sh reads $ENV_FILE each time it runs, so nothing has to be restarted; the new retention applies at the next nightly forget --prune.";;
-        disk)   if [ "${key#DISK_REPORT}" != "$key" ]; then
+        disk)   if [ "$key" = BUILD_CACHE_KEEP_MB ] || [ "$key" = SEEDBOX_KEEP_DAYS ]; then
+                  msg "$key is now $new.\n\nThe job that uses it reads $ENV_FILE on every run (the disk watchdog hourly, the seedbox hand-over every 20 s), so nothing has to be restarted."
+                  continue
+                fi
+                if [ "${key#DISK_REPORT}" != "$key" ]; then
                   install_disk_report
                   if [ "$(adv_value DISK_REPORT true)" = false ]; then msg "$key is now $new. The daily disk summary is off."
                   else msg "$key is now $new. The daily disk summary is sent at $(printf '%02d' "$(disk_report_hour)"):00 server time."; fi
@@ -4179,7 +4194,7 @@ NOTHING ON THE SEEDBOX IS EVER MOVED, DELETED OR CHANGED:
   - this server's side is Receive Only: nothing done here is ever sent; checked every
     minute, and a folder found otherwise is paused at once
   - torrents are handed over only once rTorrent reports them complete, and keep seeding
-  - this server keeps about a week of them, then drops its OWN copy (never the seedbox's)
+  - this server keeps them for a day (SEEDBOX_KEEP_DAYS), then drops its OWN copy (never the seedbox's)
 
 You need: the seedbox's Syncthing Device ID (its Syncthing: Actions -> Show ID), SABnzbd's
 completed folder, and the rTorrent folder and login Shelfmark already uses."

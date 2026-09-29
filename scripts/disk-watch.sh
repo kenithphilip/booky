@@ -143,6 +143,12 @@ journalctl --vacuum-size=200M >/dev/null 2>&1
 # the cheap fix is local and one line: raise `until=168h`, and accept that disk. Do NOT stand
 # up a registry and a cross-arch publish pipeline for an event that happens a few times a year.
 docker builder prune -f --filter until=168h >/dev/null 2>&1
+# v6.1.1: and never more than BUILD_CACHE_KEEP_MB (1 GB) of it, however recent: a week of several
+# Deploys and Updates left 5.3 GB on the live server, all newer than the week. The newest cache is
+# what is kept, so the next rebuild is still quick. --reserved-space is Docker 28's name for it.
+keep_mb=$(envget BUILD_CACHE_KEEP_MB); case "$keep_mb" in ''|*[!0-9]*) keep_mb=1024;; esac
+docker builder prune -f --reserved-space "${keep_mb}mb" >/dev/null 2>&1 \
+  || docker builder prune -f --keep-storage "${keep_mb}mb" >/dev/null 2>&1
 # Image layers nothing refers to any more (every Update and Deploy rebuild leaves the previous
 # caddy/librarian layers behind): DANGLING only. Tagged images stay, including the :prev tags
 # Operations -> Update keeps for its rollback. And the .deb packages apt keeps after upgrades.

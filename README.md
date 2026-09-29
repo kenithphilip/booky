@@ -710,8 +710,8 @@ again (`librarian/share.py`):
   never had an owner (the admin's own, added in Calibre-Web) is never touched. `0` = never.
   v6.1: audiobooks too (Audiobookshelf deletes the item and its files), and a book or audiobook
   asked for again during the countdown is given back, never downloaded again.
-- **Seedbox downloads**: this server keeps its Syncthing copy for a week, then drops it and
-  ignores it (the seedbox keeps seeding). Asked for again, Shelfmark finds the torrent complete
+- **Seedbox downloads**: this server keeps its Syncthing copy for a day (`SEEDBOX_KEEP_DAYS`,
+  v6.1.1; it was a week), then drops it and ignores it (the seedbox keeps seeding). Asked for again, Shelfmark finds the torrent complete
   and waits for the file; the portal passes what it is waiting for to the seedbox job, which
   stops ignoring that item, so Syncthing brings it back and it is handed over again.
 - **Hourly** (scripts/disk-watch.sh): stale partial files, the journal (200 MB), Docker's build
@@ -741,8 +741,12 @@ folders (SABnzbd's bookstack categories, rTorrent's bookstack folder) to this se
 container (compose profile `seedbox`, into `library/seedbox-sync`), and `scripts/seedbox-fetch.py`
 (every 20 seconds) hands each finished, fully arrived item to `library/seedbox` (Shelfmark's
 `/seedbox`) as hard links, where Shelfmark's remote path mappings file it into the reader's
-dropbox. After a week this server drops its own copy (Syncthing is told to ignore the item
-first), so its disk holds about a week of seedbox downloads.
+dropbox. After a day (`SEEDBOX_KEEP_DAYS`, Advanced settings -> disk) this server drops its own
+copy (Syncthing is told to ignore the item first), so its disk holds about a day of seedbox
+downloads; the library copy is the one that stays. A very large one asked for again after that
+can need a Retry in Shelfmark while Syncthing brings it back (Shelfmark waits 5 minutes).
+- **Docker's build cache** is kept to `BUILD_CACHE_KEEP_MB` (1 GB, newest first), trimmed hourly and
+  right after every Deploy and Update (v6.1.1: a busy week of releases had left 5.3 GB).
 
 **Nothing on the seedbox is ever moved, deleted or changed** (private trackers: strict seeding,
 no hit-and-run). Enforced independently, and tested with two real Syncthing instances by

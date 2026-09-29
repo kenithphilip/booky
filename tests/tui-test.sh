@@ -1310,6 +1310,10 @@ dw(){ DF_PCT=$1 DF_IPCT="${2-NONE}" STACK_DIR="$fs" DISK_STATE="$T/disk.state" b
 expect 'grep -q "docker: compose stop shelfmark" "$DLOG" && ! grep -q "aria2" "$DLOG" && ! grep -q "stop qbittorrent" "$DLOG" && grep -q "^paused=1" "$T/disk.state" && grep -q "python -m notify alert Disk 96% full" "$DLOG" && grep -q " high --seq disk-level$" "$DLOG"' "96 %: shelfmark stopped (no aria2; qBittorrent not running), high-priority alert, state recorded"
 expect '[ ! -f "$fs/downloads/incomplete/old.part" ] && [ ! -f "$fs/library/staging/old.bin" ] && [ ! -f "$fs/library/ingest/old.part" ] && [ -f "$fs/downloads/incomplete/new.part" ] && [ -f "$fs/library/ingest/stuck.epub" ]' "stale partials/staging deleted; fresh files and real ingest files kept"
 expect 'grep -q "journalctl: --vacuum-size=200M" "$DLOG" && grep -q "docker: builder prune -f --filter until=168h" "$DLOG"' "journal and build cache trimmed"
+expect 'grep -q "docker: builder prune -f --reserved-space 1024mb" "$DLOG"' "the build cache is also held to BUILD_CACHE_KEEP_MB (1 GB), however recent (v6.1.1: 5.3 GB after a busy week)"
+expect 'declare -f step_deploy | grep -q trim_build_cache && declare -f step_update | grep -q trim_build_cache && declare -f trim_build_cache | grep -q -- "--keep-storage"' "Deploy and Update trim the cache they leave at once (Docker 28 and older)"
+expect 'printf "%s\n" "$ADV_SETTINGS" | grep -q "^disk|BUILD_CACHE_KEEP_MB|1024|int|" && printf "%s\n" "$ADV_SETTINGS" | grep -q "^disk|SEEDBOX_KEEP_DAYS|1|int|" && grep -q "^BUILD_CACHE_KEEP_MB=1024" "$REPO/.env.example" && grep -q "^SEEDBOX_KEEP_DAYS=1" "$REPO/.env.example"' "both are Advanced settings, with the same defaults in .env.example"
+expect '[ "$(cd "$T" && mkdir -p kd && printf "SEEDBOX_KEEP_DAYS=3\n" > kd/.env && env -u SEEDBOX_KEEP_DAYS STACK_DIR="$T/kd" python3 -c "import importlib.util as u; s=u.spec_from_file_location(\"sf\", \"$REPO/scripts/seedbox-fetch.py\"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.KEEP_DAYS)")" = 3.0 ] && [ "$(cd "$T" && env -u SEEDBOX_KEEP_DAYS STACK_DIR="$T/nokd" python3 -c "import importlib.util as u; s=u.spec_from_file_location(\"sf\", \"$REPO/scripts/seedbox-fetch.py\"); m=u.module_from_spec(s); s.loader.exec_module(m); print(m.KEEP_DAYS)")" = 1.0 ]' "the seedbox job keeps its copies SEEDBOX_KEEP_DAYS from .env, a day by default (v6.1.1; it was a week)"
 : > "$DLOG"; dw 96; expect '! grep -q "notify alert" "$DLOG"' "still 96 %: no repeated alert"
 : > "$DLOG"; dw 50; expect 'grep -q "docker: compose up -d shelfmark" "$DLOG" && ! grep -q qbittorrent "$DLOG" && grep -q "^paused=0" "$T/disk.state"' "back under 80 %: shelfmark recreated with up -d (start cannot revive a removed container); qBittorrent left alone while torrents are off"
 expect 'grep -q "notify alert Disk back to 50% .* --seq disk-level --tags white_check_mark" "$DLOG"' "the all-clear carries the problem's id, so on the phone it replaces the 'Disk full' alert (v5.6)"
@@ -2372,11 +2376,13 @@ case "$*" in
   *--output=pcent*) printf 'Use%%\n %s%%\n' "$((DR_USED * 100 / S))";;
 esac
 EOS
-printf '#!/usr/bin/env bash\nprintf "%%s\\ttotal\\n" 1073741824\n' > "$DR/bin/du"
+printf '#!/usr/bin/env bash\nprintf "%%s\\ttotal\\n" "${DR_DU:-1073741824}"\n' > "$DR/bin/du"
 cat > "$DR/bin/docker" <<'EOS'
 #!/usr/bin/env bash
-case "$*" in "system df --format "*) printf 'Images=7.9GB=2.1GB (26%%)\nContainers=12MB=0B (0%%)\nLocal Volumes=0B=0B\nBuild Cache=400MB=400MB\n';; esac
+case "$*" in "system df --format "*) printf 'Images=7.9GB=2.1GB (26%%)\nContainers=12MB=0B (0%%)\nLocal Volumes=0B=0B\nBuild Cache=400MB=400MB\n';;
+  "stats --no-stream "*) printf 'calibre-web 612.3MiB / 1.562GiB\nlibrarian 250MiB / 1GiB\nuptime-kuma 90.5MiB / 512MiB\ncaddy 30MiB / 256MiB\n';; esac
 EOS
+mkdir -p "$DR/stack/library/audiobooks/Andy Weir/Project Hail Mary"; head -c 3145728 /dev/zero > "$DR/stack/library/audiobooks/Andy Weir/Project Hail Mary/01.m4b"
 printf '#!/usr/bin/env bash\nprintf "              total  used  free\\nMem:   4294967296 2147483648 0\\nSwap:  2147483648 107374182 0\\n"\n' > "$DR/bin/free"
 cat > "$DR/alert" <<'EOS'
 #!/usr/bin/env bash
@@ -2389,7 +2395,8 @@ GiB=1073741824
 rm -f "$DR/etc/hist"; dr $((40 * GiB))
 expect 'grep -q "^ALERT seq=disk-daily tags=floppy_disk prio=low title=Disk 50% used, 40.0 GB free$" "$DR/log"' "a quiet (low) notification with the same id every day, so today's replaces yesterday's"
 expect 'grep -q "Used 40.0 GB of 80.0 GB (50%), 40.0 GB free · inodes 9%" "$DR/log" && grep -q "First report" "$DR/log"' "says how full, in bytes and inodes; the trend starts tomorrow"
-expect 'grep -q "Ebooks 1.0 GB · Audiobooks 1.0 GB · Seedbox copies 1.0 GB" "$DR/log" && grep -q "Docker images 7.9GB, 2.1GB of it old versions or unused; build cache 400MB" "$DR/log" && grep -q "Memory: 2.0 of 4.0 GB in use, swap 0.1 GB" "$DR/log"' "where the space went, Docker's share and memory"
+expect 'grep -q "Ebooks 1.0 GB · Audiobooks 1.0 GB · Seedbox copies 1.0 GB" "$DR/log" && grep -q "Docker images 7.9GB, 2.1GB of it old versions or unused; build cache 400MB" "$DR/log" && grep -q "Memory: 2.0 of 4.0 GB in use, swap 0.1 of 2.0 GB" "$DR/log"' "where the space went, Docker's share and memory (swap: used of total)"
+expect 'grep -q "^Largest: Project Hail Mary 3 MB$" "$DR/log" && grep -q "^Most memory: calibre-web 612 MB, librarian 250 MB, uptime-kuma 90 MB$" "$DR/log" && ! grep -q "past 30 GB" "$DR/log"' "the largest items and the busiest containers (v6.1.1); no cold-storage note at this size"
 expect 'grep -q "^$(date +%F) $((40 * GiB))$" "$DR/etc/hist"' "today's figure is kept for tomorrow's comparison"
 { echo "$(date -d '-7 day' +%F) $((33 * GiB))"; echo "$(date -d '-1 day' +%F) $((39 * GiB))"; } > "$DR/etc/hist"
 dr $((40 * GiB))
@@ -2397,6 +2404,8 @@ expect 'grep -q "+1.0 GB since yesterday · 7-day average +1.0 GB a day · 85% i
 dr $((40 * GiB)); expect '[ "$(grep -c "^$(date +%F) " "$DR/etc/hist")" = 1 ]' "a second run the same day replaces today's figure instead of adding one"
 dr $((70 * GiB))
 expect 'grep -q "^ALERT seq=disk-daily tags=warning prio=default title=Disk 87% used" "$DR/log"' "at or over DISK_WARN_PCT it makes a sound and shows a warning sign"
+DR_DU=$((20 * GiB)) dr $((60 * GiB))
+expect 'grep -q "The library is past 30 GB: keeping large, unread audiobooks and comics only on the seedbox is worth a look now" "$DR/log"' "past 30 GB of books and audiobooks the summary says cold storage is worth a look"
 printf 'DISK_REPORT=false\n' > "$DR/stack/.env"; dr $((40 * GiB)); printf 'X=1\n' > "$DR/stack/.env"
 expect '[ ! -s "$DR/log" ]' "DISK_REPORT=false: nothing is sent"
 envset DISK_REPORT ""; envset DISK_REPORT_HOUR ""; install_disk_report

@@ -200,6 +200,32 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.1.1 (disk upkeep: build cache, seedbox copies, a fuller daily summary)
+- Measured on the live server (2026-09-30): 21 GB of 79 GB used, of which the library was about
+  1 GB, Docker about 15 GB (images 9.6 GB, of them 1.8 GB the rollback set and on-demand images
+  kept on purpose; build cache 5.3 GB, all newer than the watchdog's one-week age limit after a
+  week of releases) and the swapfile 4 GB. Memory: about 1.9 of 3.9 GB used, 2 GB available.
+- The build cache is now held to BUILD_CACHE_KEEP_MB (1 GB, newest kept) hourly and right after
+  every Deploy and Update. Old image versions were already removed daily with a keep-list (the
+  pinned tags, the rollback set, KCC, kuma-bootstrap); `docker image prune -a` is never used.
+- Seedbox copies (hand-over and synced) are kept 1 day, not 7 (SEEDBOX_KEEP_DAYS): the library copy
+  is the one that stays; asked for again, the file is fetched back through Syncthing (a very large
+  one can need a Retry in Shelfmark).
+- The daily disk summary adds the three largest items, the three containers using the most memory,
+  swap as used-of-total, and a note once books and audiobooks pass 30 GB.
+- Cold storage (keeping large, unread audiobooks and comics only on the seedbox) was weighed and NOT
+  built: at 1 GB of library it saves nothing, and it would make the seedbox (not ours, no backups
+  here yet) the only copy and leave a Kobo unable to download a book it was offered. If the note
+  appears: audiobooks and comics only, never ebooks; only items unopened for ~60 days whose seedbox
+  copy is verified by hash at that moment; the record, progress, cover (and a comic's Kobo copy)
+  stay; the reader sees "on the seedbox - Get it back"; recall through Syncthing, a few at a time.
+  Prove first that Audiobookshelf keeps an item's identity and progress when its folder returns.
+- After Deploy: nothing to do; `docker system df` shows the build cache at about 1 GB after the
+  first hourly run.
+- Tests: unit 815 passed, installer 829 passed, seedbox 47 passed (it caught a floor on
+  SEEDBOX_KEEP_DAYS that turned its 2-second test value into 6 hours: removed), end-to-end 334
+  checks / 0 failed, lint clean.
+
 ## v6.1.0 (removal reaches the Kobo; audiobooks removed and released; landscape comics)
 - Remove from my library now takes the book off the reader's Kobo at its next sync: the portal does
   what Calibre-Web's own Archive does (CWA v4.0.8: archived_book for the reader, the book off

@@ -60,6 +60,45 @@ except Exception:
 PY
 )
 comics=${comics:-0}; case "$comics" in ''|*[!0-9]*) comics=0;; esac
+# v6.1.1: the three largest things in the library (a book by its files in Calibre, an audiobook
+# by its folder): where a cleanup would count
+largest=$(nice -n 19 python3 - "$STACK_DIR" 2>/dev/null <<'PY'
+import os, sqlite3, sys
+stack, items = sys.argv[1], []
+try:
+    c = sqlite3.connect(f"file:{stack}/library/books/metadata.db?mode=ro", uri=True)
+    items += [(s or 0, t) for t, s in c.execute(
+        "SELECT b.title, SUM(d.uncompressed_size) AS s FROM books b JOIN data d ON d.book=b.id GROUP BY b.id ORDER BY s DESC LIMIT 3")]
+except Exception:
+    pass
+root = os.path.join(stack, "library/audiobooks")
+for a in (os.listdir(root) if os.path.isdir(root) else []):
+    pa = os.path.join(root, a)
+    for t in (os.listdir(pa) if os.path.isdir(pa) else []):
+        pt, size = os.path.join(pa, t), 0
+        for r, _d, fs in os.walk(pt):
+            for f in fs:
+                try:
+                    size += os.path.getsize(os.path.join(r, f))
+                except OSError:
+                    pass
+        if os.path.isfile(pt):
+            size = os.path.getsize(pt)
+        items.append((size, t))
+gb = lambda b: f"{b / 1073741824:.1f} GB" if b >= 1073741824 else f"{b / 1048576:.0f} MB"
+print(" · ".join(f"{t[:40]} {gb(s)}" for s, t in sorted(items, reverse=True)[:3] if s))
+PY
+)
+# ...and the three containers using the most memory right now (the 4 GB box's other limit)
+topmem=$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null | python3 -c '
+import re, sys
+u = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "kB": 1e3, "MB": 1e6, "GB": 1e9}
+rows = []
+for l in sys.stdin:
+    m = re.match(r"(\S+)\s+([\d.]+)([A-Za-z]+)\s*/", l)
+    if m and m.group(3) in u:
+        rows.append((float(m.group(2)) * u[m.group(3)], m.group(1)))
+print(", ".join(f"{n} {b / 1048576:.0f} MB" for b, n in sorted(rows, reverse=True)[:3]))' 2>/dev/null)
 known=$(( ebooks + audio + seed + waiting + appdata ))
 other=$(( used - known )); [ "$other" -lt 0 ] && other=0
 
@@ -88,15 +127,22 @@ else
   trend="First report: the trend starts tomorrow"
 fi
 
-mem=$(free -b 2>/dev/null | awk '/^Mem:/{t=$2; u=$3} /^Swap:/{s=$3} END{ if (t) printf "Memory: %.1f of %.1f GB in use, swap %.1f GB", u/1073741824, t/1073741824, s/1073741824 }')
+mem=$(free -b 2>/dev/null | awk '/^Mem:/{t=$2; u=$3} /^Swap:/{s=$3; st=$2} END{ if (t) printf "Memory: %.1f of %.1f GB in use, swap %.1f of %.1f GB", u/1073741824, t/1073741824, s/1073741824, st/1073741824 }')
+# v6.1.1: past 30 GB of books and audiobooks, keeping the large, unread ones only on the seedbox
+# starts to pay (the design weighed in docs/DEPLOYMENT-CHECKLIST.md, v6.1.1); below it, it does not
+lib=$(( ebooks + audio )); coldnote=""
+[ "$lib" -gt $(( 30 * 1073741824 )) ] && coldnote="The library is past 30 GB: keeping large, unread audiobooks and comics only on the seedbox is worth a look now (docs/DEPLOYMENT-CHECKLIST.md, v6.1.1)."
 
 text="Used $(gb "$used") of $(gb "$size") (${pct}%), $(gb "$avail") free${ipct:+ · inodes ${ipct}%}
 $trend
 
 Ebooks $(gb "$ebooks")$([ "$comics" -gt 0 ] && printf ' (comics %s of it)' "$(gb "$comics")") · Audiobooks $(gb "$audio") · Seedbox copies $(gb "$seed")
 Imports waiting $(gb "$waiting") · App data $(gb "$appdata")
-System, Docker and the rest $(gb "$other")${docker_imgs:+ (Docker images $docker_imgs${docker_free:+, $docker_free of it old versions or unused}${docker_cache:+; build cache $docker_cache})}
-${mem}"
+System, Docker and the rest $(gb "$other")${docker_imgs:+ (Docker images $docker_imgs${docker_free:+, $docker_free of it old versions or unused}${docker_cache:+; build cache $docker_cache})}${largest:+
+Largest: $largest}
+${mem}${topmem:+
+Most memory: $topmem}${coldnote:+
+$coldnote}"
 
 if [ "$pct" -ge "$WARN_PCT" ] || [ "${ipct:-0}" -ge "$WARN_PCT" ]; then prio=default; tags=warning; else prio=low; tags=floppy_disk; fi
 ALERT_SEQ=disk-daily ALERT_TAGS="$tags" "$ALERT" "Disk ${pct}% used, $(gb "$avail") free" "$text" "$prio" >/dev/null 2>&1 || true
