@@ -1,5 +1,5 @@
 {% extends "help/_layout.html" %}{% block guide %}
-<p>A Kobo gets your books by itself once it is linked: every book in your library, and every new one, arrives on its next sync. Colour Kobos (Libra Colour, Clara Colour) also get comics as proper fixed-layout books.</p>
+<p>A Kobo gets your books by itself once it is linked: every book in your library, and every new one, arrives on its next sync. Comics come as proper fixed-layout books, made for your Kobo's screen (in colour on a Libra Colour or Clara Colour).</p>
 <h3>Link it (once)</h3>
 <ol>
 <li>On the portal open <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> and copy your <strong>Kobo sync link</strong>. Press <strong>Test my link</strong> to check it.</li>
@@ -13,6 +13,7 @@
 <li><strong>Your place</strong> is saved to the library, so the portal can show "Reading 45 %", and, with a Hardcover token, your Hardcover account too.</li>
 <li><strong>Finished on the Kobo</strong> shows as Read on the portal; <strong>Read</strong> marked on the portal shows as Finished on the Kobo after its next sync.</li>
 <li><strong>Only some books on the Kobo?</strong> Devices → Kobo → <em>Only sync the shelves I mark for Kobo</em>: then only books on shelves you mark for Kobo sync on the library site are sent.</li>
+<li><strong>Deleted a book on the Kobo</strong> but want it back? It stays in your library: its page on the portal says so and offers <strong>Put it back on my Kobo</strong>; it returns at the next sync.</li>
 <li><strong>Removing a book</strong> from your library (its page → Remove) deletes it from the Kobo at its next sync (Wi-Fi on, Sync). If it is still there after that: My Books → press and hold the cover → Remove → Remove from My Books.</li>
 </ul>
 <h3>Comics on your Kobo</h3>
@@ -20,7 +21,7 @@
 <li><strong>Tell the library which Kobo you have</strong> on the <a href="{{ url_for('hub') }}#devices">start page</a>: comics are made for its screen (a Sage or an Elipsa gets sharper pages than a Clara), in colour on a Libra Colour or Clara Colour, in greyscale on a black-and-white Kobo (smaller, and made for e-ink).</li>
 <li><strong>How the pages are laid out</strong> is chosen from the comic's own pages: two-page spreads come as each half in turn, then the whole spread turned sideways; a landscape book (every page wide, like The Complete Peanuts) has its pages turned, never cut; webtoons are cut into screens.</li>
 <li><strong>Pages turned sideways:</strong> lock the Kobo's screen rotation to portrait, then turn the Kobo to read them.</li>
-<li><strong>Looks wrong?</strong> On the comic's page, <em>Pages on e-readers</em> lets you choose another layout; the Kobo copy is made again and replaces the old one at the next sync.</li>
+<li><strong>Looks wrong?</strong> On the comic's page, <em>Pages on e-readers</em> lets you choose another layout; the Kobo copy is made again. Your Kobo keeps the copy it has until you download it again: press and hold the cover → <em>Remove download</em> (not Remove from My Books), then tap the book.</li>
 </ul>
 <h3>Without linking: send one book</h3>
 <p>On the Kobo open the web browser (Settings → Beta features → Web browser) at <span class="code">{{ cfg.PORTAL_URL }}/send</span>. It shows a 4-letter code. On your phone, open the book in <a href="{{ cfg.PORTAL_URL }}/library">My books</a> → <strong>Send to an e-reader</strong> → type the code. The Kobo's page offers the download a few seconds later.</p>

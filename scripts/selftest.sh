@@ -373,6 +373,23 @@ echo "== Isolation invariants (the library itself)"
 # CWA's UI, a `needs-tag` format, a removed user (cwa.remove_user touches app.db only, never
 # metadata.db), a renamed admin. The portal's needs-tag queue covers only rows the portal
 # itself created — the one route that was already fine.
+# v6.2.1: the portal holds these rules now (librarian/crosscheck.py), with the states it makes
+# itself: a book its last reader removed has no owner for LIBRARY_RELEASE_DAYS before it is deleted
+# (v6.1), which the SQL below took for a lost book and FAILED every hour (The Kite Runner,
+# 2026-09-30). Problems FAIL; notes are normal states, shown and never counted. Only when the
+# portal cannot answer does the direct check below run, as before.
+inv_done=0
+inv=$(docker exec librarian python -m admin_cli invariants 2>/dev/null | tail -1)
+if printf '%s' "$inv" | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get("ok") else 1)' 2>/dev/null; then
+  inv_done=1
+  probs=$(printf '%s' "$inv" | python3 -c 'import sys,json; [print(p["text"]) for p in json.load(sys.stdin)["problems"]]')
+  notes=$(printf '%s' "$inv" | python3 -c 'import sys,json; [print(n["text"]) for n in json.load(sys.stdin)["notes"]]')
+  if [ -z "$probs" ]; then ok "every book carries an owner:<user> tag naming an existing account (or is a removal counting down)"
+  else while IFS= read -r line; do [ -n "$line" ] && bad "$line"; done <<< "$probs"; fi
+  [ -n "$notes" ] && while IFS= read -r line; do [ -n "$line" ] && printf '  [note] %s\n' "$line"; done <<< "$notes"
+fi
+if [ "$inv_done" != 1 ]; then
+[ -n "$inv" ] && warn "the portal could not check the library's rules ($(printf '%s' "$inv" | cut -c1-120)): checking directly"
 # Two pure reads, one query each, against the live metadata.db inside the container.
 untagged=$(docker exec calibre-web sqlite3 /calibre-library/metadata.db \
   "select count(*) from books b where not exists (select 1 from books_tags_link l join tags t on t.id=l.tag where l.book=b.id and t.name like 'owner:%')" 2>/dev/null | tr -dc 0-9)
@@ -399,6 +416,7 @@ if [ -n "$ulist" ]; then
       || bad "owner tag(s) naming accounts that no longer exist: $orph — every book with one is invisible to everybody (re-create the account, or re-tag those books to a current user)"
   fi
 fi
+fi   # inv_done
 # A dropbox folder whose CWA account does not exist is a black hole: librarian/worker.py's
 # _known_user returns None, logs "dropbox/%s is not an existing user's folder; ignored" ONCE
 # per process (_WARNED is a module-level set), and scan_dropbox_once skips it for ever. Four

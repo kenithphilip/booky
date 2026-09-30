@@ -1464,8 +1464,10 @@ def queue_tag_push(calibre_id, rid, owner, now=None, share=False, op="add"):
                 if c.execute("UPDATE tag_push SET status='withdrawn', updated=? WHERE calibre_id=? AND owner=? "
                              "AND status='pending' AND op='remove'", (now, int(calibre_id), owner)).rowcount:
                     return True
+            # share: 1 a family share (a second owner); 2 (v6.2.1) a book its last reader removed, given
+            # back during its countdown: the first owner again, which the host job otherwise refuses
             c.execute("INSERT INTO tag_push(calibre_id, rid, owner, share, op, created, updated) VALUES(?,?,?,?,?,?,?)",
-                      (int(calibre_id), rid, owner, 1 if share else 0, op, now, now))
+                      (int(calibre_id), rid, owner, 2 if share == 2 else 1 if share else 0, op, now, now))
         return True
     except sqlite3.IntegrityError:
         return False                          # one open job per book and reader

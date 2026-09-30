@@ -201,6 +201,7 @@ tagged = tag_failed = 0
 tags_pending = admin("tags", "pending")
 for row in (tags_pending.get("rows") or []) if tags_pending.get("ok") else []:
     pid, bid, owner, share = row["id"], row["calibre_id"], row["owner"], bool(row.get("share"))
+    giveback = row.get("share") == 2          # v6.2.1: a removed book given back during its countdown
     want_tag = f"owner:{owner}"
     before = all_tags(bid)
     if before is None:
@@ -239,7 +240,9 @@ for row in (tags_pending.get("rows") or []) if tags_pending.get("ok") else []:
             admin("tags", "result", str(pid), "ok")      # already theirs: nothing to write
             tagged += 1
             continue
-        if not owners_now:
+        if not owners_now and not giveback:
+            # (a give-back is the one exception: the portal checked the book is counting down after its
+            # last reader removed it, not an import still under way)
             admin("tags", "result", str(pid), "fail", "--reason", "refused: a family share, but the book has no owner yet")
             tag_failed += 1
             continue

@@ -24,7 +24,7 @@ for you the moment it turns up. With the author filled in, a match is requested 
 {% if not q %}
 <div class="card"><h3 style="margin-top:0">Start here</h3>
 <ul class="mut" style="margin:0;padding-left:18px">
-<li><strong>Search</strong> above for a free, public-domain book — it lands in <a href="{{ url_for('my_library') }}">My books</a> and on your devices by itself.</li>
+<li><strong>Search</strong> above for a free, public-domain book — it lands in <a href="{{ url_for('my_library') }}">My books</a>, and on a linked Kobo at its next sync.</li>
 <li><strong>Upload</strong> a book you already own under <a href="{{ url_for('upload') }}">Upload</a> (EPUB, PDF, CBZ, or an M4B/zip audiobook).</li>
 {% set box = mail_intake(session.user) %}{% if box %}
 <li><strong>E-mail</strong> a book to <span class="code">{{ box }}</span> from your own registered address and it is added for you.</li>{% endif %}

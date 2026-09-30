@@ -30,7 +30,7 @@ def test_add_user_defaults_email_and_uses_cwa_default_sidebar():
     c = sqlite3.connect(config.CWA_DB); c.execute("UPDATE settings SET config_default_show=4095"); c.commit(); c.close()
     cwa.add_user("carol", "carolpass1")
     r = _row("carol")
-    assert r["email"] == "carol@example.test" and r["sidebar_view"] == 4095
+    assert r["email"] == "carol@example.test" and r["sidebar_view"] == 4095 | cwa.SIDEBAR_ARCHIVED   # v6.2.1: a Kobo delete is kept
 
 @pytest.mark.parametrize("bad", ["", "al ice", "a/b", "../x", "ALICE!", " alice"])
 def test_add_user_rejects_bad_names(bad):
@@ -169,7 +169,7 @@ def test_cli_roundtrip(capsys):
     assert cwa._cli(["kindle", "alice", "k@kindle.com"]) == 0
     assert json.loads(capsys.readouterr().out)["kindle_mail"] == "k@kindle.com"
     assert cwa._cli(["harden"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"ok": True, "changed": True, "restart_cwa": True}
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "changed": True, "restart_cwa": True, "archive_view": 0}
     assert cwa.kobo_sync_enabled()
     assert cwa._cli(["harden"]) == 0
     assert json.loads(capsys.readouterr().out)["changed"] is False

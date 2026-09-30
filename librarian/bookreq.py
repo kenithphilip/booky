@@ -335,7 +335,7 @@ def wrong_book(owner, book_id, now=None):
     req = db.bookreq_for_book(owner, book_id)
     if not req:
         raise BookRequestError("this book did not come from a Get it request")
-    db.queue_untag(book_id, owner)
+    share.remove_ebook(owner, book_id, now)             # v6.2.1: off their Kobo too, as Remove does
     tried, blocked = _block(req, req.get("release_title"), req.get("release_id"), book_id)
     db.bookreq_update(req["id"], status="queued", next_try=now, tried=tried, blocked=blocked, calibre_id=None,
                       downloaded=None, skip_check=0, detail="you said it was the wrong book: looking for another copy")

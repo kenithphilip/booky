@@ -200,6 +200,43 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.2.1 (where a book stands on your Kobo; Put it back; the library's rules in one place)
+- Found live (2026-09-30): the remade Peanuts never reached the Kobo. Deleting a book on a Kobo makes
+  Calibre-Web archive it for that reader, and the next sync (telling the Kobo "removed") puts it on
+  the reader's synced list; a Kobo is only ever sent books NOT on that list. The portal cleared the
+  archive mark only, so nothing was sent. Calibre-Web's own Unarchive also takes the book off the
+  list; the portal now does exactly that. The same bug stopped a book given back after a removal
+  (v6.1) from ever reaching the Kobo.
+- One place (cwa.kobo_state) says where a book stands on a reader's Kobo: on it, coming at the next
+  sync, being removed, deleted on the Kobo, or not on a synced shelf. Every ebook's and comic's page
+  shows it; a book deleted on the Kobo offers "Put it back on my Kobo". Remake Kobo copy puts back a
+  comic deleted on the Kobo, and says honestly that a Kobo keeps the file it has (Calibre-Web gives a
+  book the same identity whatever its file): Remove download, then tap it to get the new one.
+- Found by the new end-to-end steps: a removed ebook asked for again during its countdown (v6.1's
+  give-back) was never given back: the host job refused to add an owner to an ownerless book ("a
+  family share, but the book has no owner yet"). A give-back is now marked as one (share=2), and only
+  that is allowed; an untagged book that is not counting down is still never adopted.
+- Every removal (Remove, Wrong book, Wrong comic, a volume replacing chapters) now tells the Kobo, as
+  Remove did since v6.1 (share.remove_ebook).
+- Readers may see Archived Books in Calibre-Web (set on Deploy, and for new accounts): Calibre-Web
+  keeps a Kobo deletion only for readers who may see them, so for everyone but admins a book deleted
+  on the Kobo came straight back at the next sync.
+- The library's rules live in the portal (crosscheck.py), for books AND audiobooks; the hourly
+  self-check (python -m admin_cli invariants) and the admin dashboard both ask it. Problems FAIL;
+  notes are normal states, shown and never counted: a book or audiobook counting down after its last
+  reader removed it (The Kite Runner failed the self-check every hour and marked Kuma down), a share
+  being tagged, an audiobook just added, books deleted on a reader's Kobo, removals waiting for a Kobo
+  that does not sync, comic Kobo copies made for other Kobos than their readers' now. If the portal
+  does not answer, the self-check falls back to its old direct check.
+- The end-to-end test now does what people do on the device: delete a book on the Kobo, put it back,
+  sync; remove a book, ask for it again, sync; add an owner tag by hand in Calibre-Web.
+- Page wording checked against what really happens on a device (Remake, a changed layout, "arrives
+  by itself" on a Kindle, "delete it from your Kobo by hand").
+- After Deploy: nothing to do. The Kite Runner shows as a note until it is deleted (7 days after its
+  removal) or someone asks for it again.
+- Tests: unit 862 passed, installer 834 passed, end-to-end 347 checks / 0 failed (13 new: the device
+  steps above; they found the give-back bug), lint clean. comic-convert.sh is unchanged since v6.2.0.
+
 ## v6.2.0 (your devices on the start page; comics made for them; every page shape laid out)
 - The start page (home.) asks each reader which devices they read on: Kobo and Kindle models,
   iPhone, iPad, Android phone and tablet. It then shows, per device, what to do and which apps to use

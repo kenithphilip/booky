@@ -1799,6 +1799,9 @@ expect 'grep "calibredb set_metadata" "$MP/log" | grep -q "tags:Fiction,owner:al
 MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["Fiction"]}]' MP_AFTER='[{"id":50,"tags":["Fiction"]}]' mprun
 expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 8 fail --reason refused: a family share, but the book has no owner yet" "$MP/log"' \
   "a share never adopts an UNTAGGED book (that is someone's import in progress)"
+MP_TAGROWS='{"ok":true,"rows":[{"id":8,"calibre_id":50,"rid":3,"owner":"bob","share":2}]}' MP_BEFORE='[{"id":50,"tags":["Fiction"]}]' MP_AFTER='[{"id":50,"tags":["Fiction","owner:bob"]}]' mprun
+expect 'grep "calibredb set_metadata" "$MP/log" | grep -q "tags:Fiction,owner:bob" && grep -q "tags result 8 ok" "$MP/log"' \
+  "a removed book given back during its countdown (share=2, the portal checked) gets its reader again (v6.1 refused it: never given back)"
 MP_TAGROWS="$share_row" MP_BEFORE='[{"id":50,"tags":["owner:alice","owner:bob"]}]' MP_AFTER='[{"id":50,"tags":["owner:alice","owner:bob"]}]' mprun
 expect '! grep -q "calibredb set_metadata" "$MP/log" && grep -q "tags result 8 ok" "$MP/log"' \
   "bob already has it: nothing is written, the job is simply done"
@@ -2627,5 +2630,28 @@ rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data" "$STACK_DIR/kuma/data.
 expect 'grep -q v1 "$STACK_DIR/kuma/data/kuma.db"' "a rollback also restores the 1.x copy an earlier (v5.9.1) update made"
 rm -rf "$STACK_DIR/kuma"; mkdir -p "$STACK_DIR/kuma/data"
 envset AUTHELIA_READERS_2FA ""; envset AUTHELIA_PASSKEYS ""
+
+# v6.2.1: the self-check's library rules come from the portal (admin_cli invariants): problems FAIL,
+# notes never do (a removal counting down FAILED every hour, The Kite Runner); no answer -> the old check
+echo "== self-check: the library's rules from the portal (v6.2.1)"
+awk '/^inv_done=0$/,/^fi   # inv_done$/' "$REPO/scripts/selftest.sh" > "$T/inv.sh"
+cat > "$T/inv-run.sh" <<'SH'
+pass=0; fail=0
+ok(){ printf '  [ OK ] %s\n' "$1"; pass=$((pass+1)); }
+bad(){ printf '  [FAIL] %s\n' "$1"; fail=$((fail+1)); }
+warn(){ printf '  [warn] %s\n' "$1"; }
+docker(){ if [ "$*" = "exec librarian python -m admin_cli invariants" ]; then printf '%s\n' "$INV"; else echo 0; fi; }
+ulist=""
+. "$1"
+echo "fail=$fail"
+SH
+INV='{"ok": true, "problems": [], "notes": [{"code": "releasing", "text": "1 book(s) no reader has any more: The Kite Runner (in 6 days)"}]}' \
+  bash "$T/inv-run.sh" "$T/inv.sh" > "$T/inv.out" 2>&1
+expect 'grep -q "fail=0" "$T/inv.out" && grep -q "\[note\] 1 book(s) no reader has any more: The Kite Runner" "$T/inv.out" && grep -q "\[ OK \] every book carries" "$T/inv.out" && ! grep -q "every book in the library carries" "$T/inv.out"' "a removal counting down is a note, never a FAIL (it failed every hour and marked Kuma down)"
+INV='{"ok": true, "problems": [{"code": "untagged", "text": "1 book(s) carry NO owner:<user> tag"}, {"code": "abs-untagged", "text": "1 audiobook(s) carry NO owner:<user> tag"}], "notes": []}' \
+  bash "$T/inv-run.sh" "$T/inv.sh" > "$T/inv.out" 2>&1
+expect 'grep -q "fail=2" "$T/inv.out" && grep -q "\[FAIL\] 1 audiobook(s) carry NO owner" "$T/inv.out"' "a lost book and a lost audiobook each FAIL"
+INV='not json' bash "$T/inv-run.sh" "$T/inv.sh" > "$T/inv.out" 2>&1
+expect 'grep -q "the portal could not check" "$T/inv.out" && grep -q "\[ OK \] every book in the library carries" "$T/inv.out"' "the portal not answering: the direct check runs, as before"
 
 echo; echo "TUI RESULT: $pass passed, $fails failed"; exit $fails

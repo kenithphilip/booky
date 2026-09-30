@@ -525,6 +525,11 @@ one arrives like a book:
   (Colorsoft, Paperwhite, the basic Kindle, Oasis, Scribe), iPhone, iPad, Android phone or tablet.
   Comics are made for those screens; the start page shows the steps and apps for each device. A
   reader who ticks nothing gets what v6.1 made (a Libra Colour / Colorsoft copy, in colour).
+- **Your Kobo, in one place (v6.2.1)**: every book's page says where it stands on the reader's Kobo
+  (on it, coming at the next sync, being removed, deleted on the Kobo, not on a synced shelf); a book
+  deleted on the Kobo offers **Put it back on my Kobo**. Every removal tells the Kobo. The library's
+  rules (every book and audiobook has an owner; removals counting down are normal) are checked by
+  the portal, and the hourly self-check and the dashboard both ask it.
 - **Page layouts (v6.2)**: the portal reads every page's shape and chooses how KCC lays the comic
   out: two-page spreads as each half (cut on the gutter) then the whole spread turned; a landscape
   book (The Complete Peanuts) turned, never cut; webtoons cut into screens between panels;

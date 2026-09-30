@@ -802,6 +802,58 @@ if rm_id:
     check(wait(lambda: imported("E2E Remove Me", "alice") is None, 120, 5), "the host job took her owner tag off", job.stdout[-200:])
     st, titles = kobo_sync_titles(alice_kobo)
     check("E2E Remove Me" not in titles, "and it is never offered to her Kobo again", str(sorted(titles))[:160])
+    # v6.2.1: the portal knows the book is counting down: a note in the library's rules, never a failure
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-m", "admin_cli", "invariants"], capture_output=True, text=True)
+    inv = jload(r.stdout.strip().splitlines()[-1].encode()) if r.stdout.strip() else {}
+    check(bool(inv.get("ok")) and not any("E2E Remove Me" in x["text"] for x in inv.get("problems", []))
+          and any("E2E Remove Me" in x["text"] for x in inv.get("notes", [])),
+          "the self-check's rules (from the portal): the removal counting down is a note, not a FAIL", r.stdout[-300:] + r.stderr[-200:])
+    # v6.2.1: asked for again, it is given back AND reaches her Kobo (v6.1 cleared the mark only: never sent)
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-c",
+                        f"import share; share.give_ebook({{'book_id': {rm_id}, 'owners': [], 'released': True}}, 'alice')"], capture_output=True, text=True)
+    subprocess.run(["bash", f"{REPO_DIR}/scripts/metadata-push.sh"], capture_output=True, text=True, env=dict(os.environ, STACK_DIR=STACK), timeout=900)
+    check(wait(lambda: imported("E2E Remove Me", "alice"), 120, 5) == rm_id, "given back to alice (her tag again, nothing downloaded)", r.stderr[-200:])
+    back = [e for it in (kobo_sync_raw(alice_kobo) or []) for e in [it.get("ChangedEntitlement") or it.get("NewEntitlement")]
+            if e and (e.get("BookMetadata") or {}).get("Title") == "E2E Remove Me"]
+    check(bool(back) and back[0]["BookEntitlement"].get("IsRemoved") is False,
+          "and her Kobo's next sync brings it back (not removed)", json.dumps(back)[:200])
+
+# --- v6.2.1: what a reader does on the device: deletes a book on the Kobo, then wants it back
+dd_bytes = make_epub("E2E Device Delete", "Test Harness")
+st, h, b = upload_as(p, "Test Harness - E2E Device Delete.epub", dd_bytes)
+dd_id = wait(lambda: imported("E2E Device Delete", "alice"), 300, 5)
+check(dd_id is not None, "alice's book for the device test arrived", str(st))
+if dd_id:
+    def kobo_entries(token, title):
+        st, h, b = Session().get(f"{CWA}/kobo/{token}/v1/library/sync", headers={"User-Agent": "Kobo eReader", "x-kobo-synctoken": ""})
+        return [e for it in (jload(b) if st == 200 else []) for e in [it.get("ChangedEntitlement") or it.get("NewEntitlement")]
+                if e and (e.get("BookMetadata") or {}).get("Title") == title]
+    got = kobo_entries(alice_kobo, "E2E Device Delete")
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is False, "her Kobo gets it", json.dumps(got)[:160])
+    dd_uuid = got[0]["BookEntitlement"]["Id"] if got else "0"
+    st, h, b = Session().req(f"{CWA}/kobo/{alice_kobo}/v1/library/{dd_uuid}", method="DELETE", headers={"User-Agent": "Kobo eReader"})
+    check(st in (200, 204), "she deletes it on the Kobo (the Kobo tells Calibre-Web)", str(st))
+    got = kobo_entries(alice_kobo, "E2E Device Delete")
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is True, "the next sync confirms it removed", json.dumps(got)[:160])
+    st, h, b = p.get(PORTAL + f"/book/{dd_id}")
+    check(b"you deleted it on the Kobo" in b and b"Put it back on my Kobo" in b, "its page says so and offers Put it back")
+    st, h, b = portal_post(p, f"/book/{dd_id}/kobo-back", f"/book/{dd_id}", {})
+    check(st in (302, 303), "she presses Put it back on my Kobo", str(st))
+    got = kobo_entries(alice_kobo, "E2E Device Delete")
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is False,
+          "and the Kobo's next sync brings it back (the Peanuts, 2026-09-30, never came back)", json.dumps(got)[:160])
+
+# --- v6.2.1: an owner tag added by hand in Calibre-Web reaches that reader everywhere
+if dd_id:
+    puid = next((l.split("=", 1)[1].strip().strip("'") for l in open(f"{STACK}/.env") if l.startswith("PUID=")), "1000") or "1000"
+    r = subprocess.run(["docker", "exec", "-u", f"{puid}:{puid}", "-e", "HOME=/tmp", "calibre-web", "/app/calibre/calibredb",
+                        "set_metadata", str(dd_id), "--field", "tags:owner:alice,owner:bob", "--with-library", "/calibre-library"],
+                       capture_output=True, text=True, timeout=120)
+    check(r.returncode == 0, "the admin adds bob's owner tag in Calibre-Web itself", (r.stdout + r.stderr)[-200:])
+    seen = wait(lambda: b"E2E Device Delete" in pb.get(PORTAL + "/library")[2] or None, 60, 3)
+    check(seen is not None, "bob sees it in My books")
+    st, titles = kobo_sync_titles(bob_kobo)
+    check("E2E Device Delete" in titles, "and his Kobo gets it", str(sorted(titles))[:160])
 
 # --- the admin's dashboard and the reader's Help
 st, h, b = pa.get(PORTAL + "/admin")

@@ -27,6 +27,11 @@ ADMIN_ROLES    = (ROLE_ADMIN | ROLE_DOWNLOAD | ROLE_UPLOAD | ROLE_EDIT | ROLE_PA
 KOBO_TOKEN_TYPE = 1
 DATETIME_MAX = "9999-12-31 23:59:59.999999"   # what SQLAlchemy writes for datetime.max
 USER_SIDEBAR = 1
+# v6.2.1: Calibre-Web archives a book deleted on a Kobo ONLY for readers who may see Archived Books
+# (cps/kobo.py HandleBookDeletionRequest: check_visibility(SIDEBAR_ARCHIVED)); without it the next
+# sync sends the book straight back. Every reader gets it, so deleting on the Kobo sticks for all of
+# them as it did for admins, and 'Put it back on my Kobo' has something to undo.
+SIDEBAR_ARCHIVED = 1 << 15
 ADMIN_SIDEBAR = 524287   # constants.ADMIN_USER_SIDEBAR (all sidebar items)
 
 class CwaError(Exception):
@@ -196,7 +201,7 @@ def add_user(name, password, email="", admin=False):
         if email and c.execute("SELECT 1 FROM user WHERE email=? COLLATE NOCASE", (email,)).fetchone():
             raise CwaError("that e-mail address is already used by another account")
         have = set(_columns(c, "user"))
-        sidebar = ADMIN_SIDEBAR if admin else int(_setting(c, "config_default_show", USER_SIDEBAR))
+        sidebar = ADMIN_SIDEBAR if admin else int(_setting(c, "config_default_show", USER_SIDEBAR)) | SIDEBAR_ARCHIVED
         values = {
             "name": name, "email": email or f"{name}@{config.DOMAIN or 'localhost'}",
             "role": ADMIN_ROLES if admin else END_USER_ROLES, "password": _hash(password),
@@ -296,9 +301,21 @@ def ensure_isolation(name):
     if u["role"] & ROLE_ADMIN:
         return False
     with _conn() as c:
-        c.execute("UPDATE user SET allowed_tags=? WHERE id=?", (owner_tag(u["name"]), u["id"]))
+        c.execute("UPDATE user SET allowed_tags=?, sidebar_view=coalesce(sidebar_view, 0) | ? WHERE id=?",
+                  (owner_tag(u["name"]), SIDEBAR_ARCHIVED, u["id"]))
     _checkpoint()
     return True
+
+@_guard
+def grant_archive_view():
+    """v6.2.1 (Deploy's harden): every reader may see Archived Books (see SIDEBAR_ARCHIVED). Returns
+    how many accounts changed. Calibre-Web reads it per request: no restart."""
+    with _conn() as c:
+        n = c.execute("UPDATE user SET sidebar_view=coalesce(sidebar_view, 0) | ? WHERE (role & ?)=0 "
+                      "AND (coalesce(sidebar_view, 0) & ?)=0", (SIDEBAR_ARCHIVED, ROLE_ANONYMOUS, SIDEBAR_ARCHIVED)).rowcount
+    if n:
+        _checkpoint()
+    return n
 
 # ---- devices ---------------------------------------------------------------------
 @_guard
@@ -483,7 +500,10 @@ def kobo_removed(name, book_id, how):
 @_guard
 def kobo_unarchive(name, book_id):
     """v6.1: a book given to a reader (again) is not 'archived' for them any more, or their Kobo
-    would be told to delete it the moment it arrives."""
+    would be told to delete it the moment it arrives. v6.2.1: and it comes OFF the reader's synced
+    list, exactly as Calibre-Web's own Unarchive does (cps/web.py toggle_archived): a Kobo is only
+    ever sent books that are not on that list, and the sync that told it 'removed' put the book
+    back on it, so clearing the mark alone never reached the Kobo (the Peanuts, 2026-09-30)."""
     u = get_user(name)
     if not u:
         return False
@@ -492,12 +512,72 @@ def kobo_unarchive(name, book_id):
         try:
             n = c.execute("UPDATE archived_book SET is_archived=0, last_modified=? WHERE user_id=? AND book_id=? "
                           "AND is_archived=1", (now, u["id"], int(book_id))).rowcount
+            if n:
+                c.execute("DELETE FROM kobo_synced_books WHERE user_id=? AND book_id=?", (u["id"], int(book_id)))
         except sqlite3.OperationalError:
             return False
         c.commit()
     if n:
         _checkpoint()
     return bool(n)
+
+# v6.2.1: where a book stands for a reader's Kobo, from Calibre-Web's own records (the one place the
+# portal asks, so no page or action guesses). Calibre-Web sends a Kobo only books NOT on the reader's
+# synced list; a book the reader deleted on the Kobo is archived for them (cps/kobo.py
+# HandleBookDeletionRequest), and the next sync tells the Kobo 'removed' and lists it as synced again.
+KOBO_STATES = {
+    "no-kobo": "no Kobo has synced for this reader",
+    "coming": "reaches the Kobo at its next sync",
+    "on-kobo": "on the Kobo",
+    "removing": "the Kobo is told to delete it at its next sync",
+    "deleted": "deleted on the Kobo (still in the library)",
+    "not-on-shelf": "the Kobo syncs only chosen shelves, and this book is on none of them",
+}
+
+@_guard
+def kobo_state(name, book_id):
+    """One of KOBO_STATES for this reader and book (see above)."""
+    u = get_user(name)
+    if not u:
+        return "no-kobo"
+    uid, bid = u["id"], int(book_id)
+    with _conn() as c:
+        try:
+            # a Kobo: one has synced, or a sync link exists (every book put back empties the list)
+            if not (c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+                    or c.execute("SELECT 1 FROM archived_book WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+                    or c.execute("SELECT 1 FROM remote_auth_token WHERE user_id=? AND token_type=?",
+                                 (uid, KOBO_TOKEN_TYPE)).fetchone()):
+                return "no-kobo"
+            synced = c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? AND book_id=?", (uid, bid)).fetchone() is not None
+            shelves_only = (c.execute("SELECT kobo_only_shelves_sync FROM user WHERE id=?", (uid,)).fetchone() or [0])[0]
+            if shelves_only:
+                on_shelf = c.execute("SELECT 1 FROM book_shelf_link l JOIN shelf s ON s.id=l.shelf WHERE l.book_id=? "
+                                     "AND s.user_id=? AND s.kobo_sync=1", (bid, uid)).fetchone() is not None
+                if synced:                       # CWA's two-way sync removes a synced book no shelf holds
+                    return "on-kobo" if on_shelf else "removing"
+                return "coming" if on_shelf else "not-on-shelf"
+            row = c.execute("SELECT is_archived FROM archived_book WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
+        except sqlite3.OperationalError:
+            return "no-kobo"
+    archived = bool(row and row[0])
+    if archived:
+        return "deleted" if synced else "removing"
+    return "on-kobo" if synced else "coming"
+
+def kobo_put_back(name, book_id):
+    """'Put it back on my Kobo': what Calibre-Web's Unarchive does. True when something changed."""
+    return kobo_unarchive(name, book_id)
+
+@_guard
+def kobo_archived():
+    """[(user name, book id)] of every book archived for a reader's Kobo (the daily cross-check)."""
+    with _conn() as c:
+        try:
+            return [(r[0], r[1]) for r in c.execute(
+                "SELECT u.name, a.book_id FROM archived_book a JOIN user u ON u.id=a.user_id WHERE a.is_archived=1")]
+        except sqlite3.OperationalError:
+            return []
 
 @_guard
 def kobo_status(name):
@@ -756,7 +836,7 @@ def _cli(argv=None):
             print(json.dumps({"ok": True, "changed": ch, "restart_cwa": ch}))
         elif args.cmd == "harden":
             ch = disable_public_registration() | enable_kobo_sync()
-            print(json.dumps({"ok": True, "changed": ch, "restart_cwa": ch}))
+            print(json.dumps({"ok": True, "changed": ch, "restart_cwa": ch, "archive_view": grant_archive_view()}))
         return 0
     except CwaError as e:
         print(json.dumps({"ok": False, "error": str(e)}), file=sys.stderr)

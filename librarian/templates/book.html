@@ -21,6 +21,16 @@
 {% if kindle_enabled and kindle_mail and b.kindle_ok %}
 <form method="post" action="{{ url_for('send_kindle', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="sec">Send to Kindle</button></form>{% endif %}
 </div>
+{% if kobo_where and kobo_where != 'no-kobo' %}
+<p class="mut" style="margin:8px 0 0">Your Kobo:
+{% if kobo_where == 'on-kobo' %}on it.
+{% elif kobo_where == 'coming' %}it arrives at the next sync.
+{% elif kobo_where == 'removing' %}it is told to delete it at the next sync.
+{% elif kobo_where == 'not-on-shelf' %}not sent: your Kobo syncs only the shelves you mark for Kobo, and this book is on none of them (add it to one on the <a href="{{ cfg.BOOKS_URL }}">library site</a>).
+{% elif kobo_where == 'deleted' %}you deleted it on the Kobo (it is still in your library).{% endif %}</p>
+{% if kobo_where == 'deleted' %}<form method="post" action="{{ url_for('book_kobo_back', book_id=b.id) }}" class="row" style="margin-top:6px">{{ csrf_field() }}
+<button type="submit" class="sec">Put it back on my Kobo</button></form>{% endif %}
+{% endif %}
 {% if is_comic %}
 <p class="mut" style="margin:8px 0 0">{% if kobo_ahead is not none %}The {{ 'new ' if 'kepub' in b.formats }}Kobo copy is {% if kobo_ahead == 0 %}being made now{% else %}in the queue, {{ kobo_ahead }} comic{{ '' if kobo_ahead == 1 else 's' }} ahead of it (one at a time, a few minutes each; readers take turns){% endif %} — then sync your Kobo.
 {% elif 'kepub' in b.formats %}Kobo copy ready ({{ 'greyscale' if made and not made.colour else 'colour' }}, fixed layout{% if made and made_name %}, made for a {{ made_name }}{% endif %}): it reaches your Kobo on its next sync. The CBZ is for phones and tablets{% if not my_platforms %} (Panels, Chunky){% endif %}.
@@ -34,7 +44,8 @@
 {% if 'kepub' in b.formats and kobo_ahead is none %}
 <form method="post" action="{{ url_for('book_kobo_copy', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
 <input type="hidden" name="remake" value="1"><button type="submit" class="sec">Remake Kobo copy</button>
-<span class="mut">Pages cut wrongly, or looking wrong? This makes it again for your family's Kobos, laid out as below, and replaces it on your Kobo.</span></form>{% endif %}
+<span class="mut">Pages cut wrongly, or looking wrong? This makes it again for your family's Kobos, laid out as below. Your Kobo keeps the copy it has
+until you download it again (press and hold the cover → Remove download, then tap it).</span></form>{% endif %}
 {% for p in my_platforms | sort %}<p class="mut" style="margin:8px 0 0">On your {{ my_platforms[p] }}: {{ device_apps[p].comics }}.</p>{% endfor %}
 {% if layout %}
 <details style="margin-top:8px" {{ 'open' if kobo_stale }}><summary>Pages on e-readers: {{ layouts[layout].split(':')[0].split(' (')[0] }}{% if not layout_chosen %} (chosen from its pages){% endif %}</summary>
@@ -83,7 +94,7 @@ in its Aa menu. Phones and tablets show the pages as they are.</p>
 {% if got_it %}<details style="margin-top:8px"><summary>Not the {{ 'comic' if is_comic else 'book' }} you asked for?</summary>
 <p class="mut">It came from a request the portal filled ({{ got_it.release_title or 'a release found by the portal' }}). <strong>Wrong {{ 'comic' if is_comic else 'book' }}</strong> takes it out of
 your library, that copy is never offered again, the admin is told, and the portal looks for another one, asking you before anything downloads.
-Delete it from your Kobo or Kindle by hand if it is already there.</p>
+Your Kobo is told to delete it at its next sync; delete it from a Kindle by hand if it is already there.</p>
 <form method="post" action="{{ url_for('book_wrong', book_id=b.id) }}">{{ csrf_field() }}<button type="submit" class="danger">Wrong {{ 'comic' if is_comic else 'book' }}</button></form>
 </details>{% endif %}{% endif %}
 </div></div></div>

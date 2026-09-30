@@ -1,4 +1,4 @@
-import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress, json
+import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress
 from functools import wraps
 from urllib.parse import urlsplit, quote
 from uuid import uuid4
@@ -1045,6 +1045,13 @@ def book_page(book_id):
     b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"]) or "cbz" in b["formats"]
     is_comic = "cbz" in b["formats"]
     layout = _layout_context(user, book_id, is_admin) if is_comic else {}
+    kobo_where = None                            # v6.2.1: where it stands on the reader's own Kobo
+    mine = not is_admin or user in (b.get("owners") or [])   # a reader only ever opens their own books
+    if mine and any(f in b["formats"] for f in ("epub", "kepub")):
+        try:
+            kobo_where = cwa.kobo_state(user, book_id)
+        except Exception:
+            kobo_where = None
     return render_template(
         "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
@@ -1063,7 +1070,7 @@ def book_page(book_id):
         replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS,
         got_it=db.bookreq_for_book(user, book_id) or db.comic_for_book(user, book_id),
         my_families={m["family"] for m in devicemodels.chosen(user)}, device_apps=devicemodels.APPS,
-        my_platforms=_platform_names(user), **layout)
+        my_platforms=_platform_names(user), kobo_where=kobo_where, **layout)
 
 def _platform_names(user):
     """{'ios': 'iPad', 'android': 'Android phone or Android tablet'}: the reader's phones and tablets."""
@@ -1079,19 +1086,11 @@ def _layout_context(user, book_id, is_admin):
     b = comics.comic_books([book_id]).get(book_id)
     if not b or not b.get("rel"):
         return {}
-    layout, chosen = comics.layout_for(b)
-    st = db.comic_convert_state([book_id]).get(book_id) or {}
-    try:
-        made = json.loads(st.get("made") or "null")
-    except ValueError:
-        made = None
-    readers = [o for o in b["owners"] if comics.uses_kobo(o)]
-    profile, colour, names = devicemodels.kobo_target(readers)
-    stale = bool(made and names and (made.get("profile") != (profile or made.get("profile")) or made.get("colour") != colour
-                                     or made.get("layout") != layout))
-    return {"layout": layout, "layout_chosen": chosen, "layouts": comics.LAYOUTS, "choosable": comics.CHOOSABLE,
+    k = comics.kobo_copy_status(b, db.comic_convert_state([book_id]).get(book_id))
+    made = k["made"]
+    return {"layout": k["layout"], "layout_chosen": k["chosen"], "layouts": comics.LAYOUTS, "choosable": comics.CHOOSABLE,
             "made": made, "made_name": devicemodels.profile_name(made.get("profile")) if made else "",
-            "kobo_for": names, "kobo_stale": stale}
+            "kobo_for": k["names"], "kobo_stale": k["stale"]}
 
 @app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
 @login_required
@@ -1114,12 +1113,7 @@ def book_remove(book_id):
         return redirect(url_for("book_page", book_id=book_id))
     # v6.1: off their Kobo too, at its next sync; their owner tag stays until that has happened
     # (Calibre-Web only tells a Kobo about a book the reader can still see), at most 7 days
-    try:
-        kobo = cwa.kobo_remove(user, book_id)
-    except (cwa.CwaError, cwa.CwaUnavailable) as e:
-        app.logger.warning("Kobo removal of book %s for %s: %s", book_id, user, e)
-        kobo = None
-    db.queue_untag(book_id, user, not_before=(time.time() + worker.KOBO_REMOVE_WAIT) if kobo else None, kobo_wait=kobo)
+    kobo = share.remove_ebook(user, book_id)
     _audit("remove_from_library", f"book {book_id}" + (f" (Kobo: {kobo})" if kobo else ""))
     flash(f"“{b['title']}” is being removed from your library: it leaves My books now"
           + (" and your Kobo at its next sync (Wi-Fi on, then Sync)." if kobo else ".")
@@ -1324,7 +1318,7 @@ def comic_swap(sid):
     except comics.ComicError:
         abort(404)
     _audit("comic_swap", f"#{sid} ({n} chapters)")
-    flash(f"{n} chapter{'s' if n != 1 else ''} leave your library within a couple of minutes (delete them from your Kobo by hand)."
+    flash(f"{n} chapter{'s' if n != 1 else ''} leave your library within a couple of minutes, and your Kobo at its next sync."
           if n else "Kept your chapters.")
     return redirect(url_for("comics_page"))
 
@@ -1651,9 +1645,38 @@ def book_kobo_copy(book_id):
         abort(404)
     remake = request.form.get("remake") == "1"                # v6.1: replace the Kobo copy there is
     db.comic_convert_force(book_id, remake=remake)
-    _audit("comic_kobo_copy", f"book {book_id}" + (" (remake)" if remake else ""))
-    flash(("Remaking" if remake else "Making") + " the Kobo copy — a few minutes. Then sync your Kobo"
-          + (" (it replaces the old copy there)." if remake else "."))
+    back = False
+    try:                                         # v6.2.1: deleted on their Kobo? asking for a copy puts it back
+        back = cwa.kobo_state(user, book_id) == "deleted" and cwa.kobo_put_back(user, book_id)
+    except Exception:
+        pass
+    _audit("comic_kobo_copy", f"book {book_id}" + (" (remake)" if remake else "") + (" (put back on the Kobo)" if back else ""))
+    # a Kobo keeps the file it downloaded (Calibre-Web gives the book the same identity whatever its
+    # file): the new copy reaches a Kobo that has the book only when the reader downloads it again
+    flash(("Remaking" if remake else "Making") + " the Kobo copy — a few minutes."
+          + (" It was deleted on your Kobo: it is put back, and comes at the next sync." if back else "")
+          + (" A Kobo keeps the copy it already has: once this one is ready, on the Kobo press and hold the cover, "
+             "choose Remove download (not Remove from My Books), then tap the book to download the new copy."
+             if remake and not back else " Then sync your Kobo."))
+    return redirect(url_for("book_page", book_id=book_id))
+
+@app.route("/book/<int:book_id>/kobo-back", methods=["POST"])
+@login_required
+def book_kobo_back(book_id):
+    """v6.2.1: 'Put it back on my Kobo' for a book the reader deleted on their Kobo (it stays in
+    their library): what Calibre-Web's own Unarchive does, for this reader only."""
+    user, is_admin = session["user"], session.get("admin", False)
+    b = library.book_detail(user, book_id, is_admin)
+    if not b or (is_admin and user not in (b.get("owners") or [])):   # a reader only ever opens their own
+        abort(404)
+    try:
+        done = cwa.kobo_put_back(user, book_id)
+    except cwa.CwaError as e:
+        flash(str(e))
+        return redirect(url_for("book_page", book_id=book_id))
+    _audit("kobo_put_back", f"book {book_id}")
+    flash("Put back: it comes to your Kobo at its next sync (it may need a tap to download)." if done
+          else "It was not deleted on your Kobo: nothing to put back.")
     return redirect(url_for("book_page", book_id=book_id))
 
 @app.route("/book/<int:book_id>/layout", methods=["POST"])
@@ -1931,8 +1954,8 @@ def book_wrong(book_id):
         abort(404)
     _audit("book_wrong", f"book {book_id}")
     flash("Thanks: it is being taken out of your library, that copy will not be offered again, and the portal is "
-          "looking for another one. You will be asked before anything downloads. Delete it from your Kobo or Kindle "
-          "by hand if it already arrived there.")
+          "looking for another one. You will be asked before anything downloads. Your Kobo is told to delete it at "
+          "its next sync; delete it from a Kindle by hand if it already arrived there.")
     return redirect(url_for("comics_page" if is_comic else "status"))
 
 

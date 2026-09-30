@@ -612,12 +612,11 @@ def _owner_tags_by_book():
     finally:
         c.close()
 
-KOBO_REMOVE_WAIT = 7 * 86400
 
 def release_kobo_waits(now=None):
     """v6.1: a reader's removal waits (their owner tag stays) until their Kobo has synced and been
     told to delete the book (cwa.kobo_remove); then it goes ahead. A Kobo that never syncs holds
-    it at most KOBO_REMOVE_WAIT (queue_untag's not_before). Returns how many went ahead."""
+    it at most share.KOBO_REMOVE_WAIT (queue_untag's not_before). Returns how many went ahead."""
     n = 0
     for w in db.kobo_waits():
         try:

@@ -282,7 +282,7 @@ def wrong_comic(owner, book_id, now=None):
     req = db.comic_for_book(owner, book_id)
     if not req:
         raise ComicError("this comic did not come from a comic request")
-    db.queue_untag(book_id, owner)
+    share.remove_ebook(owner, book_id, now)             # v6.2.1: off their Kobo too, as Remove does
     tried, blocked = _block(req, req.get("release_title"), req.get("release_id"), book_id)
     db.comic_update(req["id"], status="queued", next_try=now, tried=tried, blocked=blocked, calibre_id=None,
                     skip_check=0, detail="you said it was the wrong comic: looking for another copy")
@@ -944,6 +944,23 @@ def _device_fields(row, profile, colour, default):
     return row
 
 
+def kobo_copy_status(b, st=None):
+    """v6.2.1, one definition for the comic's page and the cross-check: {layout, chosen, made,
+    names, stale}. made: what its Kobo copy was made for (None before v6.2); names: its readers'
+    Kobo models; stale: those Kobos, or its layout, now call for another copy."""
+    import devicemodels
+    layout, chosen = layout_for(b)
+    try:
+        made = json.loads((st or {}).get("made") or "null")
+    except ValueError:
+        made = None
+    readers = [o for o in b.get("owners") or [] if uses_kobo(o)]
+    profile, colour, names = devicemodels.kobo_target(readers)
+    stale = bool(made and names and (made.get("profile") != (profile or made.get("profile"))
+                                     or made.get("colour") != colour or made.get("layout") != layout))
+    return {"layout": layout, "chosen": chosen, "made": made, "names": names, "stale": stale}
+
+
 def kobo_due(now=None, limit=3):
     """The next comics for the host job (kobo_queue's head), each with its layout and the Kobo it
     is made for: the sharpest of its readers' Kobos (devicemodels.kobo_target)."""
@@ -1052,7 +1069,7 @@ def swap(owner, sid, book_ids):
     n = 0
     for bid in book_ids:
         if bid in mine:
-            db.queue_untag(bid, owner)
+            share.remove_ebook(owner, bid)               # v6.2.1: off their Kobo too, as Remove does
             n += 1
     db.comic_swap_set(sid, "done" if n else "kept")
     return n

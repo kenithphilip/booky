@@ -142,7 +142,9 @@ def _audiobook_match(title, author="", owner=None, exclude=()):
 def give_ebook(match, owner, rid=None, now=None):
     """Queue the host job that adds owner:<owner> to the existing Calibre book."""
     if owner not in match["owners"] or db.untag_pending(match["book_id"], owner):
-        db.queue_tag_push(match["book_id"], rid, owner, now, share=True)   # False: already queued
+        # v6.2.1: a book counting down (released) has no owner: its give-back is marked as such, or the
+        # host job refused it as "a family share, but the book has no owner yet" (never given back)
+        db.queue_tag_push(match["book_id"], rid, owner, now, share=2 if match.get("released") else True)
     try:                                         # v6.1: never 'archived' for them (their Kobo would drop it)
         import cwa
         cwa.kobo_unarchive(owner, match["book_id"])
@@ -150,6 +152,25 @@ def give_ebook(match, owner, rid=None, now=None):
         log.warning("could not clear the Kobo archive mark of book %s for %s: %s", match["book_id"], owner, e)
     if rid:
         db.link_calibre(rid, match["book_id"], owner)
+
+
+KOBO_REMOVE_WAIT = 7 * 86400     # a Kobo that never syncs holds a removal at most this long (v6.1)
+
+
+def remove_ebook(owner, book_id, now=None):
+    """v6.2.1, the ONE way a book leaves a reader's library (Remove, Wrong book, Wrong comic, a volume
+    replacing chapters): their Kobo is told to delete it first (cwa.kobo_remove: Calibre-Web's
+    archive), then their owner tag comes off (host job), held until the Kobo has synced, at most
+    KOBO_REMOVE_WAIT. Returns how the Kobo is told ('archive' / 'shelf'), or None (never on it)."""
+    import cwa, time
+    try:
+        kobo = cwa.kobo_remove(owner, book_id)
+    except Exception as e:
+        log.warning("Kobo removal of book %s for %s: %s", book_id, owner, e)
+        kobo = None
+    db.queue_untag(book_id, owner, now=now,
+                   not_before=((now or time.time()) + KOBO_REMOVE_WAIT) if kobo else None, kobo_wait=kobo)
+    return kobo
 
 
 def give_audiobook(match, owner):

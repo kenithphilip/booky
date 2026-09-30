@@ -242,6 +242,12 @@ def _made(raw):
     layout = m.get("layout") if m.get("layout") in comics.LAYOUTS else None
     return {"profile": profile, "colour": m.get("colour") is True, "layout": layout, "upscale": m.get("upscale") is True}
 
+def _invariants(args):
+    """v6.2.1: problems (the self-check FAILs them) and notes (normal states it shows)."""
+    import crosscheck
+    r = crosscheck.run()
+    return {"ok": "error" not in r, **r}
+
 def _replaces(args):
     """'Find a better copy': the host job swaps a staged EPUB into the same Calibre book."""
     if args.what == "pending":
@@ -454,6 +460,8 @@ def _parser():
     cn.add_parser("recent").add_argument("--limit", type=int, default=10)
     cn.add_parser("session").add_argument("name")
 
+    sp.add_parser("invariants")          # v6.2.1: the library's rules, for scripts/selftest.sh (crosscheck.py)
+
     gt = sp.add_parser("gate").add_subparsers(dest="what", required=True)
     gt.add_parser("pending")
     gd = gt.add_parser("done")
@@ -463,7 +471,7 @@ def _parser():
 
 ARMS = {"lockout": _lockout, "requests": _requests, "parked": _parked, "pushes": _pushes,
         "catalogs": _catalogs, "wanted": _wanted, "tags": _tags, "converts": _converts, "replaces": _replaces, "comics": _comics, "releases": _releases, "busy": _busy,
-        "canary": _canary, "gate": _gate}
+        "canary": _canary, "gate": _gate, "invariants": _invariants}
 
 def main(argv=None):
     args = _parser().parse_args(argv)
