@@ -55,15 +55,19 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <p><input type="email" name="kindle_mail" value="{{ u.kindle_mail or '' }}" placeholder="yourname_123@kindle.com"></p>
 <div class="row"><button type="submit">Save Kindle address</button>
 {% if u.kindle_mail %}<span class="mut">Current: {{ u.kindle_mail }}</span>{% endif %}</div></form>
-<p class="mut" style="margin-top:8px">Find it under Amazon → Manage Your Content and Devices → Preferences → Personal Document Settings.
-There, also add <strong>{{ cfg.SMTP_FROM or 'the library sender address (ask the admin)' }}</strong> to <em>Approved Personal Document E-mail List</em>, or Amazon will drop the mail.
-Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files up to {{ cfg.KINDLE_MAX_MB }} MB.</p>
+<p class="mut" style="margin-top:8px">Find it on Amazon → Manage Your Content and Devices → Preferences → Personal Document Settings
+(<a href="https://www.amazon.com/mycd" target="_blank" rel="noopener">amazon.com/mycd</a>, or your country's Amazon). It ends in @kindle.com.</p>
+{% if kindle_enabled and kindle_sender() %}<p style="margin:6px 0">On that same Amazon page, add this address to the <em>Approved Personal Document E-mail List</em>:
+<span class="code">{{ kindle_sender() }}</span> <button class="sec" data-copy="{{ kindle_sender() }}" type="button">Copy</button><br>
+<span class="mut">Exactly this address, nothing around it. Amazon drops anything from an address that is not on the list, without telling anyone.</span></p>{% endif %}
+<p class="mut">Amazon takes EPUB, PDF and TXT by mail (not MOBI/AZW3); this library mails files up to {{ cfg.KINDLE_MAX_MB }} MB.</p>
 {% if kindle_enabled and u.kindle_mail %}
 <form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kindle_test">
 <button type="submit" class="sec">Send a test to my Kindle</button>
 <span class="mut">{% if prefs.last_kindle_test %}last test sent {{ prefs.last_kindle_test }}{% else %}proves the approved-sender step before the first real book{% endif %}</span></form>
 {% endif %}
-{% if not kindle_enabled %}<p class="mut">Sending from this portal is not enabled yet (the admin has not configured outgoing mail). You can still use <em>Send to Kindle</em> inside the <a href="{{ cfg.BOOKS_URL }}" target="_blank" rel="noopener">library site</a>.</p>{% endif %}
+{% if not kindle_enabled %}<p class="mut">Sending books to a Kindle is not set up in this library yet (the admin has not set up outgoing mail): ask them.
+Until then, a Kindle can still get a book through its own web browser: see the <a href="{{ url_for('help_page', topic='kindle') }}">Kindle guide</a>.</p>{% endif %}
 </div>
 
 
@@ -180,7 +184,7 @@ account, and so does your audiobook listening progress from Audiobookshelf.</li>
 </ul>
 </div>
 
-<div class="card">
+<div class="card" id="account">
 <h3>Account</h3>
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="email">
 <div class="row"><label style="flex:1;min-width:220px">Your e-mail <span class="mut">(for notifications; mail-to-library accepts books sent from it)</span>

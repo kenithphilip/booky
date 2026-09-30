@@ -10,7 +10,10 @@ Devices → Kobo → <strong>Test my link</strong>.</p>
 you removed it on the Kobo, or your Kobo gets only the books you send. Its page → <strong>Send to my Kobo</strong> brings it back, and it stays.
 <a href="{{ cfg.PORTAL_URL }}/library?kobo=off">My books → Not on my Kobo</a> lists every such book.</p>
 <h3>My Kindle never gets the mail</h3>
-<p>The library's sending address must be on your Amazon approved list (see <a href="{{ url_for('help_page', topic='kindle') }}">Kindle</a>). Devices → Send a test shows whether it works.</p>
+<p>The library's sending address{% if kindle_sender() %}, <span class="code">{{ kindle_sender() }}</span>,{% endif %} must be on your Amazon
+<em>Approved Personal Document E-mail List</em>, exactly (see <a href="{{ url_for('help_page', topic='kindle') }}">Kindle</a>), and the Kindle address on
+Devices must be the one Amazon shows for your Kindle. Devices → Send a test shows whether it works.
+<a href="{{ url_for('help_page', topic='troubleshooting') }}#kindle">More</a>.</p>
 <h3>The wrong book (or edition, or language) arrived</h3>
 <p>Its page → <strong>Wrong book</strong>. It leaves your library and the portal finds another copy, asking you first.</p>
 <h3>Search finds nothing</h3>
@@ -18,7 +21,22 @@ you removed it on the Kobo, or your Kobo gets only the books you send. Its page 
 <h3>Why am I asked to confirm every copy?</h3>
 <p>Release names are only labels someone typed. Showing you the copy first means a wrong edition never lands on your Kobo. The admin can let certain picks go through without asking.</p>
 <h3>Can someone see what I read?</h3>
-<p>No. Each library is private. When you get a book the library already holds, it is simply added to yours; nobody is told, and nothing says whose it was. A reader who keeps their books private (Your settings) is never counted.</p>
+<p>No other reader can: each library is private, and nothing ever tells one reader what another has or reads. When you get a book the library
+already holds, it is simply added to yours; nobody is told, and nothing says whose it was. A reader who keeps their books private (Your settings)
+is never counted. The library's admin, who runs it, can see every library (they need to, to fix problems); they are the only one.</p>
+<h3>I forgot my password, or the sign-in will not let me in</h3>
+<p>Ask your library admin to set a new one, then choose your own on Devices → Account. After {{ cfg.LOCKOUT_FAILS }} wrong tries the sign-in pauses for
+{{ cfg.LOCKOUT_SECONDS // 60 }} minutes: wait and try again. More in <a href="{{ url_for('help_page', topic='troubleshooting') }}#signin">Something’s not working</a>.</p>
+<h3>Which file should I download?</h3>
+<p>EPUB for nearly everything (phones, tablets, a Kobo), KEPUB for a Kobo if you want your exact page remembered, CBZ for comics, AZW3 only for
+copying to a Kindle by cable. Set your usual one on Devices → Preferences. <a href="{{ url_for('help_page', topic='words') }}">What the words mean</a>
+explains each.</p>
+<h3>Do books come back to my Kobo every time it syncs?</h3>
+<p>No: a sync sends only what is new or changed. To keep the Kobo tidy, choose what goes to it and whether finished books leave it in
+<a href="{{ url_for('hub') }}#settings">Your settings</a>.</p>
+<h3>Can I use the library on several devices?</h3>
+<p>Yes: a Kobo, a Kindle, a phone and a tablet at once, all with the same user name. Tick them under Your devices on the start page.</p>
 <h3>Something else is wrong</h3>
-<p>Tell the admin what you did and what you saw; a screenshot of <a href="{{ cfg.PORTAL_URL }}/status">Requests</a> helps.</p>
+<p>Look in <a href="{{ url_for('help_page', topic='troubleshooting') }}">Something’s not working</a>. Still stuck: tell the admin what you did and what you
+saw; a screenshot of <a href="{{ cfg.PORTAL_URL }}/status">Requests</a> helps{% if cfg.ADMIN_EMAIL %}, or reply to your welcome e-mail{% endif %}.</p>
 {% endblock %}

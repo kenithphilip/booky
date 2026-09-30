@@ -1,0 +1,86 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>Find what you see below. Each answer says why it happens and what to do. Words you do not know are explained in
+<a href="{{ url_for('help_page', topic='words') }}">What the words mean</a>. Still stuck? Tell your library admin what you did and what you saw
+(a screenshot helps).</p>
+
+<h3 id="signin">Signing in</h3>
+<ul>
+<li><strong>I forgot my password.</strong> Ask your library admin to set a new one for you (they do it in a minute). Then choose your own on
+<a href="{{ cfg.PORTAL_URL }}/devices#account">Devices → Account</a>.</li>
+<li><strong>It says my password is wrong, and now it will not let me try.</strong> After {{ cfg.LOCKOUT_FAILS }} wrong tries the sign-in pauses for
+{{ (cfg.LOCKOUT_SECONDS // 60) }} minutes, to keep guessers out. Wait, then type it carefully (the user name is lower case). Still refused: ask your admin.</li>
+{% if cfg.AUTHELIA_ENABLED %}<li><strong>It asks for a code or a passkey and I do not have my phone.</strong> Use another second step you set up (a passkey on
+another device, a security key). Without one, ask your library admin for help. Once back in, add a spare at
+<a href="{{ cfg.AUTH_URL }}/settings">sign-in settings</a> so it cannot happen again.</li>
+<li><strong>The sign-in page keeps coming back.</strong> Your browser is not keeping the sign-in: allow cookies for this site, turn off
+"block all cookies" or private browsing, and sign in again. On an iPhone: Settings → Safari → turn off "Block All Cookies".</li>{% endif %}
+<li><strong>The page says the library is restarting, or does not load.</strong> Wait a minute and reload. If it stays like that, tell your admin.</li>
+</ul>
+
+<h3 id="kobo">Kobo</h3>
+<ul>
+<li><strong>A book is in My books but not on the Kobo.</strong> Open the book's page: it says where it stands on your Kobo, with a button to
+<strong>Send to my Kobo</strong>. Then sync the Kobo (Wi-Fi on, tap the Sync icon at the top of the Home screen).</li>
+<li><strong>A book disappeared from the Kobo.</strong> It is still in your library: you finished it and your
+<a href="{{ url_for('hub') }}#settings">finished-books setting</a> took it off, or you removed it on the Kobo, or your Kobo gets only the books you send.
+Its page → <strong>Send to my Kobo</strong> brings it back to stay. <a href="{{ cfg.PORTAL_URL }}/library?kobo=off">My books → Not on my Kobo</a> lists them all.</li>
+<li><strong>The Kobo says it cannot sync, or nothing arrives at all.</strong> On <a href="{{ cfg.PORTAL_URL }}/devices">Devices → Kobo</a> press
+<strong>Test my link</strong>:
+<ul><li><em>"Your Kobo link works"</em>: the library is fine; check the Kobo's Wi-Fi, then check its config file still holds your link (below).</li>
+<li><em>"The library refused this link"</em>: the link was regenerated. Copy the new one into the Kobo's config file.</li>
+<li><em>"You have no Kobo link yet"</em>: press <strong>Generate my Kobo link</strong> and follow the <a href="{{ url_for('help_page', topic='kobo') }}">Kobo guide</a>.</li>
+<li><em>"did not answer"</em> or <em>"answered HTTP…"</em>: the library is busy or has a problem: try again in a minute, then tell your admin.</li></ul></li>
+<li><strong>It worked, then stopped after I signed out, signed in or reset the Kobo.</strong> Those rewrite the Kobo's config file and remove your link.
+Put it back: <a href="{{ url_for('help_page', topic='kobo') }}#link">Kobo guide, Link it</a>.</li>
+<li><strong>My place in the book is not saved.</strong> The Kobo sends your place when it syncs: sync before you switch devices. A book downloaded as a
+plain EPUB saves your place only per chapter; KEPUB (the Kobo's own format) saves the exact page.</li>
+<li><strong>A comic looks wrong on the Kobo (pages cut, too small, sideways).</strong> Its page → <em>Pages on e-readers</em> → choose another layout.
+The Kobo keeps the copy it has until you download it again: press and hold its cover → <em>Remove download</em>, then tap it.</li>
+<li><strong>The Kobo store or OverDrive stopped working.</strong> That is expected while the Kobo is linked to the library. Unlinking gives them back.</li>
+</ul>
+
+<h3 id="kindle">Kindle</h3>
+<ul>
+<li><strong>Nothing arrives, not even the test.</strong> Almost always the approved list: on Amazon (Manage Your Content and Devices → Preferences →
+Personal Document Settings) the <em>Approved Personal Document E-mail List</em> must hold {% if kindle_sender() %}<span class="code">{{ kindle_sender() }}</span>{% else %}the library's sending address (Devices shows it){% endif %}
+exactly, and the Kindle address saved on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> must be the one Amazon shows for that Kindle
+(it ends in @kindle.com). Fix either, then <strong>Send a test</strong> again and give it five minutes.</li>
+<li><strong>Amazon e-mailed me asking to verify a document.</strong> Amazon sometimes asks the account holder to confirm a new document: press its
+<em>Verify</em> link, and the book arrives.</li>
+<li><strong>The test arrived, but a book did not.</strong> The book may be larger than Amazon takes by mail ({{ cfg.KINDLE_MAX_MB }} MB): comics are
+sent in parts, a very large book may not go at all. The portal says so on the book's page; your Kindle's web browser can fetch it instead
+(<a href="{{ url_for('help_page', topic='kindle') }}">Kindle guide</a>).</li>
+<li><strong>A finished book is still on the Kindle.</strong> Amazon lets nobody else take books off a Kindle: delete it on the Kindle (press and hold →
+Remove from Device). My books reminds you of the ones you finished.</li>
+</ul>
+
+<h3 id="apps">Phone, tablet and downloads</h3>
+<ul>
+<li><strong>I downloaded a book and my phone cannot open it.</strong> Pick the format your app reads: EPUB for Apple Books and almost every reading app,
+CBZ for comics (Panels, Chunky, CDisplayEx), PDF only for books that are PDFs. Set your usual format on
+<a href="{{ cfg.PORTAL_URL }}/devices">Devices → Preferences</a>.</li>
+<li><strong>A reading app will not connect to the library.</strong> Use the catalog address exactly: <span class="code">{{ cfg.BOOKS_URL }}/opds/</span>
+(with the / at the end), and your library user name and password.</li>
+{% if cfg.AUDIO_URL %}<li><strong>The audiobook app will not sign in.</strong> The server is <span class="code">{{ cfg.AUDIO_URL }}</span>, with your library user
+name and password. On an iPhone use ShelfPlayer, SoundLeaf or AudioBooth (there is no official iPhone app yet).</li>{% endif %}
+</ul>
+
+<h3 id="books">Getting books</h3>
+<ul>
+<li><strong>My request says "looking" for days.</strong> No good copy was found yet; it keeps looking (within the hour, then every few hours, then daily).
+Very new books often appear a few days after release. Try <strong>Pick in Shelfmark</strong> to choose a copy yourself.</li>
+<li><strong>It says "confirm this copy".</strong> The library found a copy and shows you what it is before it downloads: press Yes if it is the book you want.</li>
+<li><strong>It says "check this file".</strong> What arrived did not look like the book you asked for; it is held, not added. Keep it anyway, or say it is not it
+and the library looks again.</li>
+<li><strong>The wrong book, edition or language arrived.</strong> Its page → <strong>Wrong book</strong>: it leaves your library and the library finds another copy,
+asking you first. Set the language you read in on Devices → Preferences.</li>
+<li><strong>Search finds nothing.</strong> Try the author's surname and one word of the title.</li>
+</ul>
+
+<h3 id="notifications">Notifications</h3>
+<ul>
+<li><strong>My phone gets no notifications.</strong> In the ntfy app, check you subscribed to your own topic (Devices shows it) and that the app may send
+notifications (your phone's Settings). Devices → <strong>Send a test</strong> shows whether the library can reach you.</li>
+<li><strong>I get no e-mails.</strong> Check the address on Devices → Account, the "E-mail me" box under Preferences, and your spam folder.</li>
+</ul>
+{% endblock %}

@@ -73,6 +73,8 @@ docker() {
     *"python -m abs remove-user"*) [ "${FAIL_ABS_REMOVE:-0}" = 1 ] && { echo '{"ok": false, "error": "401 Unauthorized"}'; return 1; }; echo '{"ok": true}';;
     *"python -m abs status"*) echo "{\"isInit\": ${ABS_INIT:-true}, \"app\": \"audiobookshelf\"}";;
     *"python -m abs "*) echo '{"ok": true}';;
+    *"python -m kindle sender"*) echo "${KINDLE_SENDER_JSON:-}";;
+    *"python -m kindle check-sender"*) echo "${KINDLE_CHECK_JSON:-}";;
     # admin_cli = the portal's admin back end (librarian/admin_cli.py). Its answers are variables
     # so a test can hand back a page, an empty page or a failure; CLI_FAIL makes every arm fail
     # the way the real one does (non-zero + one line of {"ok": false, "error": ...}).
@@ -589,6 +591,16 @@ expect '[ $rc = 1 ] && ! seen "add-user Alice"' "an uppercase name is refused wi
 reset "1" ".hidden" "5"; step_intake; rc=$?
 expect '[ ! -d "$STACK_DIR/library/dropbox/.hidden" ] && grep -F msgbox "$LOG" | grep -q "never scanned"' "Intake -> create a dropbox applies the same rule (A15)"
 reset "carl" "carl@mail.example" "carlpass-1234" "carlpass-1234" "no" "<cancel>"; step_user_add; expect '! seen "cwa kindle" && seen "User carl created"' "Cancel at the Kindle prompt during Add still finishes the user"
+# v6.3.1: the welcome e-mail (never the password) and the nudge to choose their own password
+expect 'seen "admin_cli temp-password carl" && ! seen "admin_cli welcome carl" && seen "outgoing mail is not set up"' "a new account is marked as having the admin's password; with no mail set up, no welcome e-mail is offered"
+envset SMTP_HOST smtp.example.test
+reset "fay" "fay@mail.example" "faypass-1234" "faypass-1234" "no" "" "yes"; step_user_add
+expect 'seen "admin_cli welcome fay" && grep -q "yesno: Send fay a welcome e-mail at fay@mail.example" "$LOG" && grep -q "never contains the password" "$LOG" && seen "Welcome e-mail sent to fay@mail.example"' "with mail set up, the admin is offered the welcome e-mail, told it never carries the password, and told it went"
+expect '! grep -q "faypass-1234" <(grep -v "docker-stdin" "$LOG")' "the password appears nowhere but on stdin (not in the prompts, the mail call or the summary)"
+reset "gus" "gus@mail.example" "guspass-1234" "guspass-1234" "no" "" "no"; step_user_add
+expect '! seen "admin_cli welcome gus" && seen "Users -> Send a welcome e-mail"' "declined: nothing sent, and the summary says where to send it later"
+reset "gus" "" "no"; step_user_welcome; expect 'seen "admin_cli welcome gus --preview" && [ "$(grep -c "admin_cli welcome gus" "$LOG")" = 1 ]' "Users -> Send a welcome e-mail shows it first and sends only on yes"
+envset SMTP_HOST ""
 reset "alice" "kindle@x.com"; step_user_kindle; expect 'seen "cwa kindle alice kindle@x.com"' "set Kindle address"
 reset "alice" "<cancel>"; step_user_kindle; expect '! seen "cwa kindle"' "Cancel at the Kindle prompt leaves the address unchanged"
 reset "alice" ""; step_user_kindle; expect '! seen "cwa kindle"' "blank at the Kindle prompt changes nothing"
@@ -596,6 +608,7 @@ reset "alice" "none"; step_user_kindle; expect 'grep -qE "cwa kindle alice $" "$
 reset "alice" "no"; step_user_kobo; expect 'seen "cwa kobo-url alice --reset"' "Kobo link regenerate"
 reset "alice" "yes"; step_user_kobo; expect '! seen "--reset"' "Kobo link show (no reset)"
 reset "alice" "newpass-1234" "newpass-1234"; step_user_passwd; expect 'seen "cwa passwd alice --password-stdin" && seen "docker-stdin: newpass-1234"' "password reset via stdin"
+expect 'seen "admin_cli temp-password alice"' "an admin reset marks it as the admin's password again (every portal page asks for their own)"
 expect '! seen "python -m abs"' "no Audiobookshelf calls while ABS is not set up"
 # J07: Shelfmark only reads app.db at login and keeps a SIGNED cookie -> restart it after a reset
 # V02: a plain restart does NOT end Shelfmark sessions — it re-reads the same signing key from
@@ -669,6 +682,17 @@ expect '[ "$(envget SMTP_HOST)" = smtp.example.test ] && [ "$(envget SMTP_PORT)"
 reset "smtp.example.test" "465" "ssl" "user@x" "" "lib@x" "me@x"; step_mail
 expect '[ "$(envget SMTP_PASS)" = smtp-pass ] && seen "python -m kindle test me@x"' "blank password keeps the old one; test mail sent"
 reset "smtp.example.test" "465" "ssl" "<cancel>"; step_mail; expect '[ "$(envget SMTP_USER)" = user@x ]' "Cancel at the SMTP username keeps the setting"
+# v6.3.1: the address readers approve at Amazon, checked the way Amazon will see it
+KINDLE_SENDER_JSON='{"ok": true, "sender": "books@example.test", "risk": null}'
+KINDLE_CHECK_JSON='{"ok": true, "sent_to": "books@example.test", "expected": "books@example.test", "seen_from": "books@example.test", "match": true}'
+reset "yes"; mail_sender_check; expect 'grep -q "Readers add THIS address" "$LOG" && seen "books@example.test" && seen "Checked: the probe arrived From books@example.test"' "Mail setup shows the exact address readers approve, and a probe that arrived From it is confirmed"
+KINDLE_CHECK_JSON='{"ok": true, "sent_to": "books@example.test", "expected": "books@example.test", "seen_from": "lib@gmail.com", "match": false}'
+reset "yes"; mail_sender_check; expect 'seen "PROBLEM: the probe arrived From lib@gmail.com, not books@example.test"' "a probe that arrived From another address is a PROBLEM, with the two ways to fix it"
+KINDLE_CHECK_JSON='{"ok": true, "sent_to": "admin@example.test", "expected": "books@example.test", "seen_from": null, "match": null}'
+reset "yes"; mail_sender_check; expect 'seen "its From line must read exactly"' "without a mailbox to read back, the admin is told what the probe must show"
+KINDLE_SENDER_JSON='{"ok": true, "sender": "books@example.test", "risk": "Gmail sends mail From the account you sign in with"}'
+reset "no"; mail_sender_check; expect 'seen "WARNING: Send to Kindle may be dropped by Amazon"' "a provider that rewrites the sender is a warning before anything else"
+KINDLE_SENDER_JSON=""; KINDLE_CHECK_JSON=""
 reset "<blank>"; step_mail; expect '[ -z "$(envget SMTP_HOST)" ]' "blank host disables mail"
 envset SMTP_PORT ""; envset SMTP_FROM ""
 reset "smtp2.example.test" "" "starttls" "u2@x" "pw2" "" ""; step_mail

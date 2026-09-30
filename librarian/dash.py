@@ -63,6 +63,14 @@ def needs(now=None):
         fol = _count("SELECT COUNT(*) FROM follows WHERE detail LIKE 'could not check%'")
         out.append(("bad", f"{fol} followed name{'s' if fol != 1 else ''} failing their daily check: " + ", ".join(bad)
                     + ("…" if fol > len(bad) else ""), None))
+    # v6.3.1: readers approve kindle.sender() at Amazon; a provider that rewrites From makes that the wrong address
+    try:
+        import kindle
+        risk = kindle.sender_risk() if kindle.configured() else None
+    except Exception:
+        risk = None
+    if risk:
+        out.append(("bad", "Send to Kindle may be dropped by Amazon: " + risk, None))
     # v6.2.1: the library's rules (crosscheck.py; the hourly self-check asks the same): problems
     # are failures, notes are normal states worth seeing
     try:

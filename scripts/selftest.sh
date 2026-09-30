@@ -722,6 +722,15 @@ echo "== Alerts"
 if [ -n "$(envget NOTIFY_WEBHOOK)" ]; then ok "alert webhook configured"
 elif [ -n "$(envget SMTP_HOST)" ]; then ok "alerts go by e-mail (SMTP configured, no webhook)"
 else bad "no alert channel: failed backups and a full disk reach nobody (Install -> Alerts)"; fi
+# v6.3.1: readers approve the From address at Amazon; a provider that rewrites it (Gmail and the
+# like, when From differs from the login) makes that the wrong address and books silently vanish
+if [ -n "$(envget SMTP_HOST)" ]; then
+  snd=$(docker exec librarian python -m kindle sender 2>/dev/null | tail -1)
+  risk=$(printf '%s' "$snd" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("risk") or "")' 2>/dev/null)
+  sender=$(printf '%s' "$snd" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("sender") or "")' 2>/dev/null)
+  if [ -n "$risk" ]; then warn "Send to Kindle: $risk"
+  elif [ -n "$sender" ]; then ok "Send to Kindle sends From $sender (the address readers approve at Amazon; Library -> Mail checks it)"; fi
+fi
 
 # Optional dead-man's switch. BACKUP_PING_URL (scripts/backup.sh) fires once a night from the
 # backup, so between backups nothing notices the VPS itself going away — the one failure no

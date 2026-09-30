@@ -307,7 +307,8 @@ def init():
                          ("kobo_finished", "INTEGER"),    # v6.3: take finished books off the Kobo after N days (NULL: never)
                          ("kindle_hint", "INTEGER DEFAULT 1"),   # v6.3: remind me to delete finished books from my Kindle
                          ("private", "INTEGER DEFAULT 0"),       # v6.3: my books are never offered to the family
-                         ("kobo_scope", "TEXT")):         # v6.3: an admin's Kobo: own (default) | choose | library
+                         ("kobo_scope", "TEXT"),          # v6.3: an admin's Kobo: own (default) | choose | library
+                         ("pw_temp", "INTEGER DEFAULT 0")):   # v6.3.1: still the password the admin set (a nudge to change it)
             if col not in pcols:
                 c.execute(f"ALTER TABLE prefs ADD COLUMN {col} {typ}")
         c.execute("""CREATE TABLE IF NOT EXISTS hc_want_seen(
@@ -496,6 +497,18 @@ def set_device_prefs(owner, **f):
     with _lock, _conn() as c:
         c.execute("INSERT OR IGNORE INTO prefs(owner, updated) VALUES(?,?)", (owner, time.time()))
         c.execute(f"UPDATE prefs SET {', '.join(f'{k}=?' for k in f)}, updated=? WHERE owner=?", (*f.values(), time.time(), owner))
+
+def set_pw_temp(owner, on):
+    """v6.3.1: the account still has the password the admin chose (set at creation or an admin
+    reset; cleared when the reader changes it on the portal)."""
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO prefs(owner, updated) VALUES(?,?)", (owner, time.time()))
+        c.execute("UPDATE prefs SET pw_temp=?, updated=? WHERE owner=?", (1 if on else 0, time.time(), owner))
+
+def pw_temp(owner):
+    with _conn() as c:
+        r = c.execute("SELECT pw_temp FROM prefs WHERE owner=?", (owner,)).fetchone()
+    return bool(r and r[0])
 
 def private_readers():
     """v6.3: readers whose books are never offered to the rest of the family."""

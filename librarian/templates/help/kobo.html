@@ -1,11 +1,26 @@
 {% extends "help/_layout.html" %}{% block guide %}
 <p>A Kobo gets your books by itself once it is linked: every book in your library, and every new one, arrives on its next sync. Comics come as proper fixed-layout books, made for your Kobo's screen (in colour on a Libra Colour or Clara Colour).</p>
-<h3>Link it (once)</h3>
+<h3 id="link">Link it (once)</h3>
+<p>You need the Kobo, its USB cable and a computer (Windows or Mac). About two minutes.</p>
 <ol>
-<li>On the portal open <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> and copy your <strong>Kobo sync link</strong>. Press <strong>Test my link</strong> to check it.</li>
-<li>Connect the Kobo to a computer by USB. Open the <span class="code">.kobo/Kobo/Kobo eReader.conf</span> file on it with a text editor.</li>
-<li>Find the line starting <span class="code">api_endpoint=</span> (in the <span class="code">[OneStoreServices]</span> section) and replace everything after the <span class="code">=</span> with your sync link. Save, eject, and sync the Kobo.</li>
+<li>On the portal open <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> → Kobo. Press <strong>Generate my Kobo link</strong> (once), then copy the link it shows.</li>
+<li>Plug the Kobo into the computer. On the Kobo, tap <strong>Connect</strong> when it asks. It appears like a USB stick, named KOBOeReader.</li>
+<li>Open it and go into the folder <span class="code">.kobo</span>, then <span class="code">Kobo</span>. Can't see <span class="code">.kobo</span>? It is hidden:
+<ul><li><strong>Windows:</strong> File Explorer → View → Show → <em>Hidden items</em>.</li>
+<li><strong>Mac:</strong> in Finder press <em>Cmd + Shift + .</em> (full stop).</li></ul></li>
+<li>Open the file <span class="code">Kobo eReader.conf</span> in a plain text editor: <strong>Notepad</strong> on Windows (right-click → Open with → Notepad),
+<strong>TextEdit</strong> on a Mac (right-click → Open With → TextEdit). Not Word: it would spoil the file.</li>
+<li>Find the line that starts with <span class="code">api_endpoint=</span> (Notepad: Ctrl+F; TextEdit: Cmd+F). Replace everything after the
+<span class="code">=</span> with your link, so the line reads <span class="code">api_endpoint=</span> followed by your link and nothing else.
+<em>No such line?</em> Add these two lines at the end of the file instead:<br>
+<span class="code">[OneStoreServices]</span><br><span class="code">api_endpoint=</span><em>your link</em></li>
+<li>Save the file, eject the Kobo (Windows: the eject icon near the clock; Mac: the eject arrow next to it in Finder), unplug it, and tap
+<strong>Sync</strong> at the top of the Home screen (Wi-Fi on).</li>
+<li>Back on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a>, <strong>Test my link</strong> says whether the library answers your Kobo. Your books appear
+over the next minutes (the first sync of a big library takes a while: leave it on Wi-Fi).</li>
 </ol>
+<p class="mut">Something not right? <a href="{{ url_for('help_page', topic='troubleshooting') }}#kobo">Something’s not working → Kobo</a> explains every
+answer <em>Test my link</em> can give.</p>
 <p class="mut">While linked, the Kobo store and OverDrive do not work on that Kobo. A brand-new Kobo pairs fine since the library moved to Calibre-Web v4.0.8.</p>
 <h3>Day to day</h3>
 <ul>

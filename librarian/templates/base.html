@@ -58,6 +58,8 @@ button:focus ~ .busy,button:active ~ .busy{display:inline}
 <form method="post" action="{{url_for('logout')}}" style="display:inline">{{ csrf_field() }}<button class="sec" type="submit">Log out</button></form>{% endif %}
 {% endif %}</nav>{% endblock %}</header>
 <div class="wrap">
+{% if session.user and request.endpoint not in ('login',) and pw_temp() %}<div class="flash">You are still using the password your library admin set.
+<a href="{{ cfg.PORTAL_URL }}/devices#account">Choose your own</a>: it takes a moment, and it changes it everywhere (the library, the audiobook app, the sign-in page).</div>{% endif %}
 {% with m=get_flashed_messages() %}{% for x in m %}<div class="flash">{{x}}</div>{% endfor %}{% endwith %}
 {% block body %}{% endblock %}</div>
 <script src="{{ url_for('static', filename='app.js') }}" defer></script></body></html>

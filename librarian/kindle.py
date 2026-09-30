@@ -150,11 +150,106 @@ def _deliver(msg):
             s.login(config.SMTP_USER, config.SMTP_PASS)
         s.send_message(msg)
 
+# ---- v6.3.1: the address readers add to Amazon's approved list, exactly as Amazon will see it ------
+# Amazon compares the approved list with the address in the From line (the bare address, never a
+# display name). Big providers put the account you SIGN IN with into that line unless the From
+# address is a verified alias there, so a From setting that differs from the login is what readers
+# are told to approve while Amazon sees the login, and every book is dropped without a word.
+REWRITING = {"smtp.gmail.com": "Gmail", "smtp.googlemail.com": "Gmail", "smtp.office365.com": "Microsoft 365",
+             "smtp-mail.outlook.com": "Outlook.com", "smtp.live.com": "Outlook.com", "smtp.mail.me.com": "iCloud",
+             "smtp.mail.yahoo.com": "Yahoo", "smtp.zoho.com": "Zoho", "smtp.zoho.eu": "Zoho", "smtp.fastmail.com": "Fastmail"}
+SENDER_CHECK = "[library] sender check"
+
+
+def sender():
+    """The bare address in the From line: what readers add to Amazon's list."""
+    from email.utils import parseaddr
+    return (parseaddr(config.SMTP_FROM or "")[1] or "").strip().lower()
+
+
+def sender_risk():
+    """None, or why Amazon may see another address than sender() (the provider rewrites From)."""
+    login = (config.SMTP_USER or "").strip().lower()
+    prov = REWRITING.get((config.SMTP_HOST or "").strip().lower())
+    frm = sender()
+    if not (prov and "@" in login and frm and frm != login):
+        return None
+    return (f"{prov} sends mail From the account you sign in with ({login}) unless {frm} is a verified alias there "
+            f"(Gmail: Settings, Accounts, 'Send mail as'). If it is not, Amazon sees {login} and drops every book sent to "
+            f"a Kindle: set the From address to {login} (Library -> Mail), or verify {frm} as an alias at {prov}.")
+
+
+def check_sender(to=None, wait=90, sleep=None):
+    """Send a probe and, when the portal can read that mailbox (IMAP intake on the same address),
+    read back the From line it arrived with. {'sent_to', 'expected', 'seen_from' (None: not read
+    back), 'match', 'risk'}. Without IMAP the probe itself asks its reader to look."""
+    import secrets, time as _t, imaplib, email as _email
+    from email.utils import parseaddr
+    if not configured():
+        raise MailNotConfigured("outgoing mail is not configured (SMTP_HOST/SMTP_FROM)")
+    sleep = sleep or _t.sleep
+    imap_box = (config.IMAP_USER or "").strip().lower()
+    to = (to or (imap_box if config.IMAP_HOST and "@" in imap_box else "") or config.ADMIN_EMAIL or
+          config.SMTP_USER or "").strip()
+    if "@" not in to:
+        raise ValueError("no address to send the check to (set ADMIN_EMAIL)")
+    token = secrets.token_hex(4)
+    msg = EmailMessage()
+    msg["From"] = config.SMTP_FROM
+    msg["To"] = to
+    msg["Subject"] = f"{SENDER_CHECK} {token}"
+    msg.set_content(f"This message checks the address your library sends from.\n\n"
+                    f"Its From line must show exactly: {sender()}\n"
+                    f"That is the address everyone adds to Amazon's Approved Personal Document E-mail List.\n\n"
+                    f"If your mail app shows another address as the sender, Amazon sees that one instead and drops "
+                    f"the books: fix the From address in the library's Mail settings.\n")
+    _deliver(msg)
+    out = {"sent_to": to, "expected": sender(), "seen_from": None, "match": None, "risk": sender_risk()}
+    if not (config.IMAP_HOST and to.lower() == imap_box):
+        return out
+    import imap
+    deadline = _t.time() + wait
+    while _t.time() < deadline:
+        sleep(5)
+        try:
+            M = imap._connect()
+        except Exception:
+            continue
+        try:
+            M.select(config.IMAP_FOLDER)
+            _, data = M.search(None, "SUBJECT", f'"{SENDER_CHECK} {token}"')
+            nums = data[0].split() if data and data[0] else []
+            if nums:
+                _, d = M.fetch(nums[0], "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+                hdr = d[0][1] if d and d[0] and not isinstance(d[0], bytes) else b""
+                seen = (parseaddr(_email.message_from_bytes(hdr).get("From", "") or "")[1] or "").lower()
+                for n in nums:                       # the probe is not left in the intake mailbox
+                    M.store(n, "+FLAGS", "\\Deleted")
+                M.expunge()
+                out.update(seen_from=seen, match=seen == sender())
+                return out
+        except imaplib.IMAP4.error:
+            pass
+        finally:
+            try:
+                M.logout()
+            except Exception:
+                pass
+    return out
+
+
 if __name__ == "__main__":
-    import sys
+    import sys, json
     if len(sys.argv) == 3 and sys.argv[1] == "test":
         try:
             print(send_test(sys.argv[2])); sys.exit(0)
         except Exception as e:
             print(f"FAILED: {e}"); sys.exit(1)
-    print("usage: python -m kindle test <address>"); sys.exit(2)
+    if len(sys.argv) in (2, 3) and sys.argv[1] == "check-sender":
+        try:
+            print(json.dumps(dict(ok=True, **check_sender(sys.argv[2] if len(sys.argv) == 3 else None)))); sys.exit(0)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)[:300]})); sys.exit(1)
+    if len(sys.argv) == 2 and sys.argv[1] == "sender":
+        print(json.dumps({"ok": True, "sender": sender(), "risk": sender_risk()})); sys.exit(0)
+    print("usage: python -m kindle test <address> | check-sender [address] | sender"); sys.exit(2)

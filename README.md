@@ -525,6 +525,9 @@ one arrives like a book:
   (Colorsoft, Paperwhite, the basic Kindle, Oasis, Scribe), iPhone, iPad, Android phone or tablet.
   Comics are made for those screens; the start page shows the steps and apps for each device. A
   reader who ticks nothing gets what v6.1 made (a Libra Colour / Colorsoft copy, in colour).
+- **Welcoming a new member (v6.3.1)**: Users -> Add a user can e-mail them a welcome (where to start,
+  their user name, the first steps, how to get books; never the password), and every page asks them
+  to choose their own password until they do.
 - **Devices kept tidy and private (v6.3)**: each reader chooses on the start page what goes to their
   Kobo (every book, or only those they send), whether finished books leave it (never / right away /
   7 / 30 days; Send to my Kobo brings one back to stay), reminders to delete finished books from a

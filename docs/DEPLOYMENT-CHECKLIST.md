@@ -200,6 +200,43 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.3.1 (a welcome e-mail for new family members; a nudge to choose their own password)
+- Users -> Add a user offers to e-mail the new member a welcome (when outgoing mail is set up): where
+  to start (the start page), their user name, the first five minutes (their devices, choosing their
+  own password, notifications, the Amazon approved-sender step when a Kindle address was saved), how
+  to get books, audiobooks and comics, that their library is private (and "Keep my books private"),
+  where the guides are; admins get two extra lines. Plain text with an HTML part; replies go to
+  ADMIN_EMAIL. It NEVER contains the password: the admin gives that in person or in a message.
+- It also walks them through setting up a Kobo (the sync link, the .kobo/Kobo/Kobo eReader.conf
+  line, Test my link), a Kindle (their @kindle.com address, the exact sending address to add to
+  Amazon's Approved Personal Document E-mail List, Send a test) and a phone or tablet (the OPDS
+  catalog and the apps), each with a link to the page where it is done and to the full guide.
+- Users -> Send a welcome e-mail: shows it first, then sends it (again) on yes.
+- The address readers add to Amazon's Approved Personal Document E-mail List is shown exactly (the bare
+  address, with a Copy button) on Devices, in the Kindle guide, the FAQ, Something's not working, the
+  glossary and the welcome e-mail. Devices used to print SMTP_FROM whole ("Library <x@y>"), and pointed
+  readers without portal mail at Calibre-Web's own Send to Kindle, whose mail settings Deploy never
+  sets (so its sender was unknown): now it says to ask the admin, and offers the Kindle's browser.
+- The sender as Amazon sees it: Gmail, Microsoft 365 / Outlook.com, iCloud, Yahoo, Zoho and Fastmail put
+  the login into the From line unless the From address is a verified alias there. When From differs
+  from the login on such a provider, Library -> Mail, the admin dashboard and the hourly self-check
+  say so (readers would approve an address Amazon never sees; every book silently dropped).
+- Library -> Mail -> check: a probe mail to the intake mailbox (the portal reads back the From line it
+  arrived with and deletes it) or to ADMIN_EMAIL (it asks its reader to look). `python -m kindle
+  check-sender` / `sender` do the same from the command line.
+- Guides: "Something's not working" (by symptom: signing in, Kobo with every Test my link answer,
+  Kindle, phone apps and downloads, getting books, notifications), "What the words mean", the FAQ
+  from 9 to 13 questions, beginner Kobo linking (Windows and Mac, the hidden .kobo folder, Notepad /
+  TextEdit, a missing api_endpoint line). The privacy answer is honest now: no other reader can see
+  a library; the admin, who runs it, can (FAQ, Account, welcome e-mail).
+- A new account, and an admin password reset, mark the password as the admin's: every portal page
+  and the start page ask the member to choose their own (Devices -> Account; it changes the portal,
+  the library site, Shelfmark, Audiobookshelf and the sign-in page) until they do.
+- After Deploy: nothing to do; Users -> Send a welcome e-mail works for accounts made before too.
+  Library -> Mail (save, keeping the settings) shows the exact address readers approve and offers the
+  sender check: run it once.
+- Tests: unit 898 passed, installer 844 passed, end-to-end 363 checks / 0 failed, lint clean.
+
 ## v6.3.0 (devices kept tidy and private, each reader choosing)
 - Every reader chooses on the start page (Your settings; also on Devices), and changes it any time:
   - What goes to their Kobo: every book in their library (as before), or only the books they send

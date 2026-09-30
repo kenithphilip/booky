@@ -1,0 +1,59 @@
+{% extends "help/_layout.html" %}{% block guide %}
+<p>The words the library uses, in plain language.</p>
+
+<h3>The sites</h3>
+<ul>
+<li><strong>Start page</strong> (<span class="code">{{ cfg.HOME_URL }}</span>): the one address to remember. Every site is one tap away, with your
+devices, your settings and these guides.</li>
+<li><strong>Portal</strong> (<span class="code">{{ cfg.PORTAL_URL }}</span>): where you search, get books, see My books, your requests and your devices.</li>
+<li><strong>Library site</strong> (Calibre-Web, <span class="code">{{ cfg.BOOKS_URL }}</span>): where the books are kept. You can read in the browser there;
+your Kobo syncs with it.</li>
+{% if cfg.AUDIO_URL %}<li><strong>Audiobookshelf</strong> (<span class="code">{{ cfg.AUDIO_URL }}</span>): the audiobook player, in the browser or its app;
+it remembers where you are.</li>{% endif %}
+<li><strong>Shelfmark</strong> (<span class="code">{{ cfg.SHELF_URL }}</span>): a search where you choose the exact copy yourself. For when the portal
+finds nothing.</li>
+</ul>
+
+<h3>Getting books</h3>
+<ul>
+<li><strong>Get it:</strong> the portal finds a good copy for you (the right book, your language, a format your devices read).</li>
+<li><strong>Confirm this copy:</strong> the portal shows you the copy it found before anything downloads; you say yes or "not this one".</li>
+<li><strong>Ready now, no download:</strong> the library already holds it; <strong>Add to mine</strong> puts it in your library at once.</li>
+<li><strong>Pick in Shelfmark:</strong> choose a copy yourself, in Shelfmark.</li>
+<li><strong>Keep looking:</strong> the library searches again by itself (within the hour, then every few hours, then daily) until a copy turns up.</li>
+<li><strong>Check this file:</strong> what arrived did not look like what you asked for, so it waits for you instead of being added.</li>
+<li><strong>Following / New for you:</strong> follow a series or an author, and what comes out next shows on your portal home page.</li>
+</ul>
+
+<h3>File types</h3>
+<ul>
+<li><strong>EPUB:</strong> the usual ebook file. Almost every reading app, Kobo and Kindle (by e-mail) read it.</li>
+<li><strong>KEPUB:</strong> the Kobo's own kind of EPUB; it remembers your exact page.</li>
+<li><strong>AZW3 / MOBI:</strong> older Kindle files, only copied to a Kindle by USB cable.</li>
+<li><strong>PDF:</strong> fixed pages, like paper; fine on a tablet, hard to read on a small screen.</li>
+<li><strong>CBZ / CBR:</strong> a comic: its pages as pictures. Comic apps read them; the library makes a Kobo copy of each.</li>
+<li><strong>Fixed layout:</strong> a book whose pages stay as drawn (comics), instead of text that re-flows to your screen.</li>
+</ul>
+
+<h3>Devices</h3>
+<ul>
+<li><strong>Sync:</strong> the Kobo asks the library what is new and fetches it (tap the Sync icon, or it happens by itself on Wi-Fi).</li>
+<li><strong>Kobo sync link:</strong> your private address that connects your Kobo to your library. Keep it to yourself; Devices can make a new one.</li>
+<li><strong>Kobo copy:</strong> a version of a comic made for your Kobo's screen.</li>
+<li><strong>Send to Kindle:</strong> Amazon's service that delivers a book e-mailed to your Kindle's own address (it ends in @kindle.com).</li>
+<li><strong>Approved Personal Document E-mail List:</strong> the list on Amazon of addresses allowed to send books to your Kindle. The library's
+{% if kindle_sender() %}<span class="code">{{ kindle_sender() }}</span>{% else %}sending address{% endif %} must be on it.</li>
+<li><strong>OPDS catalog:</strong> an address a reading app uses to browse and download your books
+(<span class="code">{{ cfg.BOOKS_URL }}/opds/</span>).</li>
+<li><strong>ntfy:</strong> a free phone app that shows the library's notifications.</li>
+</ul>
+
+<h3>Signing in and privacy</h3>
+<ul>
+{% if cfg.AUTHELIA_ENABLED %}<li><strong>Sign-in page:</strong> the one sign-in in front of every site.</li>
+<li><strong>Second step (two-factor):</strong> after your password, a code from an app on your phone or a passkey, so a stolen password alone is not enough.</li>
+<li><strong>Passkey:</strong> signing in with your phone's or computer's fingerprint, face or PIN instead of typing a code.</li>{% endif %}
+<li><strong>Keep my books private:</strong> none of your books is ever added to another reader's library (<a href="{{ url_for('hub') }}#settings">Your settings</a>).</li>
+<li><strong>Admin:</strong> the person who runs the library. They can see every library, fix problems and set up accounts.</li>
+</ul>
+{% endblock %}

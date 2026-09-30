@@ -155,6 +155,8 @@ def poll_once():
                 _too_big(M, num, len(raw))
                 continue
             msg = email.message_from_bytes(raw)
+            if str(msg.get("Subject", "")).startswith("[library] sender check"):
+                continue                 # v6.3.1: kindle.check_sender reads it back and deletes it
             target = _target_user(msg)
             user = _existing_user(target)
             frm = (parseaddr(msg.get("From", "") or "")[1] or "").lower()

@@ -2049,9 +2049,26 @@ step_user_add() {
   else absnote="(Audiobookshelf not set up yet: Library -> Audiobookshelf, then Users -> Repair.)"; fi
   km=$(ask "Kindle e-mail for $u (blank to skip; they can set it themselves under Devices):" "") || km=""
   [ -n "$km" ] && lib kindle "$u" "$km" >/dev/null 2>&1 || true
-  big "User $u created" "Give $u:
-  Portal:   https://request.$(envget DOMAIN)     login: $u / (the password you set)
-  Library:  https://books.$(envget DOMAIN)       Audiobooks: https://audio.$(envget DOMAIN)
+  # v6.3.1: the password is the admin's choice until they pick their own (every portal page nudges them)
+  admin_cli temp-password "$u" >/dev/null 2>&1 || true
+  local wnote="Welcome e-mail: not sent (Users -> Send a welcome e-mail, any time)." home; home=$(envget HOME_URL); home=${home:-https://home.$(envget DOMAIN)}
+  if [ -n "$(envget SMTP_HOST)" ]; then
+    if yesno "Send $u a welcome e-mail at $em now?
+
+It tells them where to start ($home), their user name, the first steps (their devices, choosing their own password) and how to get books. It never contains the password: give them that yourself.
+
+(Users -> Send a welcome e-mail shows it first, and sends it again.)"; then
+      wout=$(admin_cli welcome "$u" 2>&1 | tail -1)
+      if printf '%s' "$wout" | grep -q '"ok": true'; then wnote="Welcome e-mail sent to $em."
+      else wnote="Welcome e-mail NOT sent: $(printf '%s' "$wout" | json 'd.get("error","no answer")' 2>/dev/null || printf '%s' "$wout")"; fi
+    fi
+  else wnote="Welcome e-mail: outgoing mail is not set up (Library -> Mail); tell $u the steps yourself."; fi
+  big "User $u created" "$wnote
+Give $u their password yourself (in person or a message: it is never e-mailed). Every portal page
+asks them to choose their own until they do.
+
+  Start page: $home     login: $u / (the password you set)
+  Portal:   https://request.$(envget DOMAIN)     Library:  https://books.$(envget DOMAIN)     Audiobooks: https://audio.$(envget DOMAIN)
 
 Isolation: $([ -n "$role" ] && echo "admin — sees everything" || echo "Allowed Tags = owner:$u — sees only their own books, on every device")
 Kobo sync link (also shown to them under Devices in the portal):
@@ -2064,6 +2081,22 @@ $absnote
 Tell $u: change the password ONLY in the portal (Devices page). Calibre-Web's own profile
 page (/me) writes just its own database — Audiobookshelf would keep the old password."
 }
+step_user_welcome() { # v6.3.1: the welcome e-mail (librarian/welcome.py), shown first, then sent
+  portal_up || { msg "The portal is not running (Install -> Deploy first)."; return 1; }
+  u=$(ask "Username:"); [ -n "$u" ] || return 1
+  local pv
+  pv=$(admin_cli welcome "$u" --preview 2>&1 | tail -1)
+  printf '%s' "$pv" | grep -q '"ok": true' || { msg "Could not prepare it: $(printf '%s' "$pv" | json 'd.get("error","no answer")' 2>/dev/null || printf '%s' "$pv")"; return 1; }
+  printf '%s' "$pv" | json 'd["subject"] + "\n\n" + d["text"]' > "$STACK_DIR/.welcome-preview.txt" 2>/dev/null
+  whiptail --title "Welcome e-mail for $u (preview)" --scrolltext --textbox "$STACK_DIR/.welcome-preview.txt" 24 90 || true
+  rm -f "$STACK_DIR/.welcome-preview.txt"
+  [ -n "$(envget SMTP_HOST)" ] || { msg "Outgoing mail is not set up (Library -> Mail): it cannot be sent. You can copy the text above to them yourself."; return 0; }
+  yesno "Send it to $u's e-mail address now?" || return 0
+  local wout; wout=$(admin_cli welcome "$u" 2>&1 | tail -1)
+  if printf '%s' "$wout" | grep -q '"ok": true'; then msg "Sent to $(printf '%s' "$wout" | json 'd.get("sent_to","")')."
+  else msg "Not sent: $(printf '%s' "$wout" | json 'd.get("error","no answer")' 2>/dev/null || printf '%s' "$wout")"; fi
+}
+
 step_user_kindle() {
   u=$(ask "Username:") || return 1; [ -n "$u" ] || return 1
   km=$(ask "Kindle e-mail for $u (type  none  to clear the address; Cancel keeps it):" "") || return 1
@@ -2085,6 +2118,7 @@ step_user_passwd() {
   u=$(ask "Username:"); [ -n "$u" ] || return 1
   pw=$(askpw2 "New password for $u:") || return 1
   out=$(printf '%s' "$pw" | lib passwd "$u" --password-stdin 2>&1) || { msg "Failed:\n$out"; return 1; }
+  admin_cli temp-password "$u" >/dev/null 2>&1 || true     # v6.3.1: every page asks them to choose their own
   extra=""
   if abs_ready; then printf '%s' "$pw" | absctl ensure-user "$u" --password-stdin >/dev/null 2>&1 && extra="\nAudiobookshelf: same password (account created if it was missing)." || extra="\nAudiobookshelf: could not update (is it set up? Library -> Audiobookshelf)."; fi
   # blank display name / e-mail = keep what Authelia already has (2FA reset mails keep working)
@@ -2203,11 +2237,12 @@ menu_users() {
       7 "Repair: re-apply isolation + secure defaults to everyone" \
       8 "How isolation works (guide)" \
       9 "Login lockouts: who is locked out, and release them" \
+      W "Send a welcome e-mail (see it first; send again)" \
       0 "Back" 3>&1 1>&2 2>&3) || return 0
     case "$ch" in
       1) step_user_list || true;; 2) step_user_add || true;; 3) step_user_kindle || true;; 4) step_user_kobo || true;;
       5) step_user_passwd || true;; 6) step_user_remove || true;; 7) step_user_repair || true;; 8) step_isolation || true;;
-      9) step_lockout || true;; 0) return 0;;
+      9) step_lockout || true;; W) step_user_welcome || true;; 0) return 0;;
     esac
   done
 }
@@ -2309,8 +2344,29 @@ step_mail() {
   restart_portal_ok || true; wait_for http://127.0.0.1:8090/healthz 30 || true
   # Authelia mails enrolment / reset codes through the same SMTP (C9)
   if [ "$(envget AUTHELIA_ENABLED)" = true ]; then render_authelia_config; composeA up -d --force-recreate authelia >/dev/null 2>&1 || true; fi
+  mail_sender_check || true
   if t=$(ask "Send a test mail to (blank to skip):" "$(envget ADMIN_EMAIL)") && [ -n "$t" ]; then
     out=$(docker exec -i librarian python -m kindle test "$t" 2>&1) && msg "Mail works: $out\n\nAlso set the same SMTP in Calibre-Web (Admin -> Edit e-mail server settings) if you want its own Send-to-Kindle button; run Security -> Mail auth for SPF/DMARC." || msg "Test failed:\n$out"
+  fi
+}
+
+mail_sender_check() { # v6.3.1: the address readers add to Amazon's approved list, as Amazon will see it
+  local snd sender risk out seen box
+  snd=$(docker exec -i librarian python -m kindle sender 2>/dev/null | tail -1)
+  sender=$(printf '%s' "$snd" | json 'd.get("sender","")'); risk=$(printf '%s' "$snd" | json 'd.get("risk") or ""')
+  [ -n "$sender" ] || { msg "The portal did not answer, so the sending address could not be checked (Operations -> Logs -> librarian)."; return 1; }
+  [ -n "$risk" ] && msg "WARNING: Send to Kindle may be dropped by Amazon.\n\n$risk"
+  box=$(envget IMAP_USER); [ -n "$(envget IMAP_HOST)" ] && [[ "$box" == *@* ]] || box=$(envget ADMIN_EMAIL)
+  yesno "Readers add THIS address to Amazon's Approved Personal Document E-mail List:\n\n    $sender\n\nCheck it now? A short probe mail goes to ${box:-your admin address}$([ -n "$(envget IMAP_HOST)" ] && printf ' and the portal reads back the address it arrived From').\n\nIt is the one thing that decides whether books reach a Kindle." || return 0
+  out=$(docker exec -i librarian python -m kindle check-sender 2>&1 | tail -1)
+  printf '%s' "$out" | grep -q '"ok": true' || { msg "The check could not be sent:\n$(printf '%s' "$out" | json 'd.get("error","")' || printf '%s' "$out")"; return 1; }
+  seen=$(printf '%s' "$out" | json 'd.get("seen_from") or ""')
+  if [ -z "$seen" ]; then
+    msg "Probe sent to $(printf '%s' "$out" | json 'd.get("sent_to","")'). Open it: its From line must read exactly\n\n    $sender\n\nIf it shows another address, Amazon sees that one: fix the From address here, or make it a verified alias at your mail provider."
+  elif [ "$seen" = "$sender" ]; then
+    msg "Checked: the probe arrived From $sender, exactly the address readers approve at Amazon."
+  else
+    msg "PROBLEM: the probe arrived From $seen, not $sender.\n\nAmazon sees $seen, so books to Kindles would be dropped. Either set the From address to $seen (Library -> Mail), or verify $sender as a sending alias at your mail provider, then check again."
   fi
 }
 

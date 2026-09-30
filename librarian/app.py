@@ -109,6 +109,10 @@ def _inject():
             "new_for_you": lambda: db.notices(session["user"]) if session.get("user") else [],
             "ago_or_in": _ago_or_in, "shelf_search": follows.shelfmark_search_url,
             "can_get_books": _can_get,
+            # v6.3.1: the bare address readers approve at Amazon, read live (never a stale copy)
+            "kindle_sender": lambda: kindle.sender(),
+            # v6.3.1: still the password the admin set: a nudge on every page until they change it
+            "pw_temp": lambda: db.pw_temp(session["user"]) if session.get("user") else False,
             # v5.8.3: copies to confirm and held files, waiting for this reader
             "books_waiting": lambda: db.bookreq_waiting(session["user"]) if session.get("user") else 0,
             "comics_waiting": lambda: db.comic_waiting(session["user"]) if session.get("user") and config.COMICS_ENABLED else 0,
@@ -1479,6 +1483,7 @@ def comic_confirm_all(provider, sid):
 # ---- v6.0: home.<domain>, the family's start page and guides (templates/hub.html, help/*) ---------
 HELP_TOPICS = [
     ("getting-started", "Getting started", "The sites, your one sign-in, and where things are"),
+    ("troubleshooting", "Something’s not working", "Signing in, Kobo, Kindle, apps, requests: what you see and what to do"),
     ("kobo", "Reading on a Kobo", "Link it once; books and comics arrive by themselves"),
     ("kindle", "Reading on a Kindle", "Send to Kindle, automatic sending, and the browser route"),
     ("phone-tablet", "Phone, tablet, computer", "Reading apps, comics on an iPad, downloads"),
@@ -1490,6 +1495,7 @@ HELP_TOPICS = [
     ("notifications", "Notifications", "Mail and phone notifications for what you asked for"),
     ("account", "Your account and security", "Password, the sign-in page, a lost device"),
     ("faq", "Questions and answers", "When something did not arrive, or is not right"),
+    ("words", "What the words mean", "EPUB, sync link, OPDS, Get it, approved senders: in plain language"),
     ("admin", "For the admin", "The dashboard, the server menu, what to check"),
 ]
 
@@ -2441,6 +2447,7 @@ def devices():
                     flash("The new passwords do not match.")
                 else:
                     cwa.set_password(user, new)
+                    db.set_pw_temp(user, False)          # v6.3.1: their own password now
                     note = ""
                     if absapi.configured():
                         try:
