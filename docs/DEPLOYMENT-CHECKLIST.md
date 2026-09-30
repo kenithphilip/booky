@@ -200,6 +200,44 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.3.0 (devices kept tidy and private, each reader choosing)
+- Every reader chooses on the start page (Your settings; also on Devices), and changes it any time:
+  - What goes to their Kobo: every book in their library (as before), or only the books they send
+    (a book's page -> Send to my Kobo; the portal keeps one Kobo shelf, "From the library", so nobody
+    manages shelves in Calibre-Web). Switching keeps what is on the Kobo, unless they untick that.
+  - Finished books (the Kobo says so, or marked Read): stay (default), or leave the Kobo right away,
+    after 7 or after 30 days. Never out of the library; Send to my Kobo puts one back, and it stays.
+  - Kindle: a reminder to delete finished books they sent (Amazon lets nobody else take a book off a
+    Kindle): My books and the book's page list them with "I deleted it". Nothing is ever sent to a
+    Kindle twice by itself. On by default for readers with a Kindle; switchable.
+  - Keep my books private: none of their books is offered to another reader who asks for the same one
+    (they download their own); books, audiobooks and comics alike.
+- An admin account sees every reader's books in Calibre-Web, so an admin's Kobo synced everybody's.
+  An admin's Kobo now gets only their own books (the portal's shelf, filled with them); an admin can
+  choose "Every book in the library" or "Only the books I send" instead. On the first pass after
+  Deploy (within 10 minutes), other readers' books leave the admin's Kobo at its next sync.
+- Book pages: where the book stands on your Kobo, with Send to my Kobo / Take it off my Kobo / Send it
+  again; a book a reader does not have gets no Kobo line at all ("not-theirs"), admins included.
+  My books: "On my Kobo / Not on my Kobo" filter and badge.
+- Neutral wording: "ready now, no download" and "added to your library at once" replace "in the family
+  library" everywhere a reader sees it; never whose it is. The dashboard's notes about readers'
+  devices are counts per reader, never titles.
+- Guides: Kobo ("Keeping your Kobo tidy"), Kindle ("Finished books"), Account ("Keeping your books
+  private"), Questions (a book disappeared from my Kobo / is not on it).
+- Privacy audit (every route, page, message and family-copy lookup): every id is checked against the
+  reader. Fixed what it found: a comic's page named the other readers' Kobo models (and the model the
+  shared copy was made for); another reader's conversions and "Find a better copy" showed on a book's
+  page (and anyone who had the book could stop someone else's); a comic nobody owned was offered as
+  "ready now" (and never arrived); a private reader's removed book or audiobook was still offered
+  during its countdown (who removed it is recorded now); Shelfmark told a non-owner that another
+  reader was replacing a book; saving settings with family sharing off cleared "private"; the last
+  "the family has" wording; an audiobook id no longer tells whether it exists.
+- After Deploy: each reader opens the start page -> Your settings if they want any of this; nothing
+  changes for readers until they do. Admins with a Kobo: see above.
+- Tests: unit 885 passed, installer 834 passed, end-to-end 363 checks / 0 failed (new: finished books
+  leave the Kobo and come back to stay, only the books I send, an admin's Kobo gets only their own
+  books, a private reader's book is not offered), lint clean.
+
 ## v6.2.1 (where a book stands on your Kobo; Put it back; the library's rules in one place)
 - Found live (2026-09-30): the remade Peanuts never reached the Kobo. Deleting a book on a Kobo makes
   Calibre-Web archive it for that reader, and the next sync (telling the Kobo "removed") puts it on

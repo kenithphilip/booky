@@ -239,6 +239,10 @@ def init():
             calibre_id INTEGER PRIMARY KEY, since REAL NOT NULL, reason TEXT,
             status TEXT NOT NULL DEFAULT 'waiting',   -- waiting | due | deleted | kept | failed
             tags TEXT, attempts INTEGER DEFAULT 0, last_error TEXT, updated REAL)""")
+        # v6.3: who removed it last (a private reader's book is never given to anyone else)
+        for t in ("book_release", "audio_release"):
+            if "removed_by" not in {r[1] for r in c.execute(f"PRAGMA table_info({t})")}:
+                c.execute(f"ALTER TABLE {t} ADD COLUMN removed_by TEXT")
         # v6.1: a removal waits for the reader's Kobo to be told (not_before; kobo_wait = how)
         for col, typ in (("not_before", "REAL"), ("kobo_wait", "TEXT")):
             if col not in {r[1] for r in c.execute("PRAGMA table_info(tag_push)")}:
@@ -299,7 +303,11 @@ def init():
         for col, typ in (("ntfy_topic", "TEXT"), ("hc_want", "INTEGER DEFAULT 0"), ("hc_want_kind", "TEXT"),
                          ("hc_want_seeded", "REAL"),      # when the list was last recorded without requesting
                          ("hc_want_after", "INTEGER"),    # the newest list entry (user_book id) recorded then
-                         ("devices", "TEXT")):            # v6.2: the reader's devices (JSON list, devicemodels.py)
+                         ("devices", "TEXT"),             # v6.2: the reader's devices (JSON list, devicemodels.py)
+                         ("kobo_finished", "INTEGER"),    # v6.3: take finished books off the Kobo after N days (NULL: never)
+                         ("kindle_hint", "INTEGER DEFAULT 1"),   # v6.3: remind me to delete finished books from my Kindle
+                         ("private", "INTEGER DEFAULT 0"),       # v6.3: my books are never offered to the family
+                         ("kobo_scope", "TEXT")):         # v6.3: an admin's Kobo: own (default) | choose | library
             if col not in pcols:
                 c.execute(f"ALTER TABLE prefs ADD COLUMN {col} {typ}")
         c.execute("""CREATE TABLE IF NOT EXISTS hc_want_seen(
@@ -335,6 +343,11 @@ def init():
             c.execute("ALTER TABLE comic_convert ADD COLUMN remake INTEGER DEFAULT 0")   # v6.1: replace the Kobo copy
         if "made" not in {r[1] for r in c.execute("PRAGMA table_info(comic_convert)")}:
             c.execute("ALTER TABLE comic_convert ADD COLUMN made TEXT")    # v6.2: what the Kobo copy was made for (JSON)
+        # v6.3: books the portal took off a reader's device, or keeps on it, or reminded them about:
+        # device kobo|kindle; status waiting (finished, counting down) | off | kept | reminded | done
+        c.execute("""CREATE TABLE IF NOT EXISTS device_book(
+            owner TEXT NOT NULL, book_id INTEGER NOT NULL, device TEXT NOT NULL, status TEXT NOT NULL,
+            since REAL, updated REAL, PRIMARY KEY(owner, book_id, device))""")
         # v6.2: how a comic's pages are laid out on e-readers, when a reader chose it (else: from its pages)
         c.execute("""CREATE TABLE IF NOT EXISTS comic_layout(
             calibre_id INTEGER PRIMARY KEY, layout TEXT NOT NULL, owner TEXT, updated REAL)""")
@@ -469,7 +482,60 @@ def get_prefs(owner):
             "hc_want_kind": d.get("hc_want_kind") if d.get("hc_want_kind") in ("ebook", "audio", "both") else "ebook",
             "hc_want_seeded": d.get("hc_want_seeded"),
             # v6.2: the devices the reader reads on (devicemodels.py keys)
-            "devices": _json_list(d.get("devices"))}
+            "devices": _json_list(d.get("devices")),
+            # v6.3: keeping devices tidy, and privacy
+            "kobo_finished": d.get("kobo_finished") if d.get("kobo_finished") in (0, 7, 30) else None,
+            "kindle_hint": d.get("kindle_hint") != 0, "private": bool(d.get("private")),
+            "kobo_scope": d.get("kobo_scope") if d.get("kobo_scope") in ("own", "choose", "library") else "own"}
+
+def set_device_prefs(owner, **f):
+    """v6.3: kobo_finished (None/0/7/30), kindle_hint, private, kobo_scope (checked by the caller)."""
+    f = {k: v for k, v in f.items() if k in ("kobo_finished", "kindle_hint", "private", "kobo_scope")}
+    if not f:
+        return
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO prefs(owner, updated) VALUES(?,?)", (owner, time.time()))
+        c.execute(f"UPDATE prefs SET {', '.join(f'{k}=?' for k in f)}, updated=? WHERE owner=?", (*f.values(), time.time(), owner))
+
+def private_readers():
+    """v6.3: readers whose books are never offered to the rest of the family."""
+    with _conn() as c:
+        return {r[0] for r in c.execute("SELECT owner FROM prefs WHERE private=1")}
+
+def readers_with(col):
+    """v6.3: [(owner, value)] with kobo_finished set, or kindle_hint on."""
+    if col not in ("kobo_finished", "kindle_hint"):
+        return []
+    with _conn() as c:
+        q = "SELECT owner, kobo_finished FROM prefs WHERE kobo_finished IN (0, 7, 30)" if col == "kobo_finished" \
+            else "SELECT owner, 1 FROM prefs WHERE coalesce(kindle_hint, 1)=1"
+        return [(r[0], r[1]) for r in c.execute(q)]
+
+def device_book(owner, book_id, device):
+    with _conn() as c:
+        r = c.execute("SELECT * FROM device_book WHERE owner=? AND book_id=? AND device=?", (owner, int(book_id), device)).fetchone()
+    return dict(r) if r else None
+
+def device_books(owner, device, statuses=None):
+    with _conn() as c:
+        q, a = "SELECT * FROM device_book WHERE owner=? AND device=?", [owner, device]
+        if statuses:
+            q += f" AND status IN ({','.join('?' * len(statuses))})"
+            a += list(statuses)
+        return {r["book_id"]: dict(r) for r in c.execute(q, a)}
+
+def device_book_set(owner, book_id, device, status, now=None):
+    """Record what happened (since: when the status began; kept when it does not change)."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO device_book(owner, book_id, device, status, since, updated) VALUES(?,?,?,?,?,?) "
+                  "ON CONFLICT(owner, book_id, device) DO UPDATE SET since=CASE WHEN status=excluded.status "
+                  "THEN since ELSE excluded.since END, status=excluded.status, updated=excluded.updated",
+                  (owner, int(book_id), device, status, now, now))
+
+def device_book_clear(owner, book_id, device):
+    with _lock, _conn() as c:
+        c.execute("DELETE FROM device_book WHERE owner=? AND book_id=? AND device=?", (owner, int(book_id), device))
 
 def _json_list(v):
     try:
@@ -1493,24 +1559,34 @@ def untag_pending(calibre_id, owner):
         return c.execute("SELECT 1 FROM tag_push WHERE calibre_id=? AND owner=? AND op='remove' AND status='pending'",
                          (int(calibre_id), owner)).fetchone() is not None
 
-def release_note(calibre_id, reason, tags, now=None):
-    """This book has no reader any more: start (or keep) its countdown."""
+def release_note(calibre_id, reason, tags, now=None, removed_by=None):
+    """This book has no reader any more: start (or keep) its countdown. removed_by (v6.3): the
+    reader whose removal it was."""
     now = now or time.time()
     with _lock, _conn() as c:
-        c.execute("INSERT INTO book_release(calibre_id, since, reason, tags, updated) VALUES(?,?,?,?,?) "
+        c.execute("INSERT INTO book_release(calibre_id, since, reason, tags, updated, removed_by) VALUES(?,?,?,?,?,?) "
                   "ON CONFLICT(calibre_id) DO UPDATE SET tags=excluded.tags, updated=excluded.updated, "
+                  "removed_by=coalesce(excluded.removed_by, book_release.removed_by), "
                   "status=CASE WHEN book_release.status IN ('kept','failed') THEN 'waiting' ELSE book_release.status END, "
                   "since=CASE WHEN book_release.status IN ('kept','failed') THEN excluded.since ELSE book_release.since END",
-                  (int(calibre_id), now, reason, json.dumps(tags), now))
+                  (int(calibre_id), now, reason, json.dumps(tags), now, removed_by))
 
 # ---- v6.1: audiobooks nobody has any more (Audiobookshelf items), deleted after LIBRARY_RELEASE_DAYS ----
-def audio_release_note(item_id, title, now=None):
+def audio_release_note(item_id, title, now=None, removed_by=None):
     now = now or time.time()
     with _lock, _conn() as c:
-        c.execute("INSERT INTO audio_release(item_id, title, since, status, updated) VALUES(?,?,?,'waiting',?) "
+        c.execute("INSERT INTO audio_release(item_id, title, since, status, updated, removed_by) VALUES(?,?,?,'waiting',?,?) "
                   "ON CONFLICT(item_id) DO UPDATE SET status='waiting', since=CASE WHEN audio_release.status='waiting' "
-                  "THEN audio_release.since ELSE excluded.since END, title=excluded.title, updated=excluded.updated",
-                  (item_id, (title or "")[:300], now, now))
+                  "THEN audio_release.since ELSE excluded.since END, title=excluded.title, updated=excluded.updated, "
+                  "removed_by=excluded.removed_by",
+                  (item_id, (title or "")[:300], now, now, removed_by))
+
+def release_removed_by(kind, key):
+    """v6.3: who removed a book ('book', calibre id) or audiobook ('audio', item id) that is counting down."""
+    table, col = ("book_release", "calibre_id") if kind == "book" else ("audio_release", "item_id")
+    with _conn() as c:
+        r = c.execute(f"SELECT removed_by FROM {table} WHERE {col}=? AND status IN ('waiting','due')", (key,)).fetchone()
+    return r[0] if r else None
 
 def audio_releases(statuses=("waiting",)):
     marks = ",".join("?" * len(statuses))

@@ -146,7 +146,7 @@ def test_books_deleted_on_a_kobo_are_listed_as_a_note(kobo):
     add_calibre_book(1, "Mort", "Terry Pratchett", tags=["owner:bob"])
     _deleted_on_kobo(kobo, 1)
     r = crosscheck.run()
-    assert r["problems"] == [] and any("bob: Mort" in n["text"] for n in r["notes"] if n["code"] == "kobo-deleted")
+    assert r["problems"] == [] and any("bob 1" in n["text"] and "Mort" not in n["text"] for n in r["notes"] if n["code"] == "kobo-deleted")
 
 def test_audiobooks_follow_the_same_rules(users, monkeypatch):
     now = time.time()

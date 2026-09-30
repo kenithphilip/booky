@@ -13,5 +13,8 @@
 <li>A lost Kobo: Devices → Kobo → <strong>Regenerate link</strong> (the old one stops working).</li>
 </ol>
 <h3>Privacy</h3>
-<p>Your library is yours: nobody else sees which books you have or read. {% if cfg.FAMILY_SHARING %}When you look up a book someone in the family has, the portal can say "in the family library" (never who has it); getting it adds that one copy to your library too.{% else %}Each reader's copies are their own.{% endif %}</p>
+<p>Your library is yours: nobody else sees which books you have or read. {% if cfg.FAMILY_SHARING %}When you look up a book another reader has, the portal can say "ready now, no download" (never who has it); getting it adds that one copy to your library too.</p>
+<h3>Keeping your books private</h3>
+<p>On the <a href="{{ url_for('hub') }}#settings">start page</a> (or Devices), <strong>Keep my books private</strong> means no book you have is ever offered to anyone else: not as "ready now",
+not when they request it (they download their own copy). Your books stay yours either way; nobody else can see, open or download them.{% else %}Each reader's copies are their own.{% endif %}</p>
 {% endblock %}

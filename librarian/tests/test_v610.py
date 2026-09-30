@@ -88,7 +88,7 @@ def test_no_kobo_tables_means_no_kobo(users):
 def test_a_book_counting_down_is_given_back_not_downloaded(users, monkeypatch):
     monkeypatch.setattr(config, "APPROVALS_REQUIRED", False)
     add_calibre_book(1, "Mort", "Terry Pratchett", tags=[])
-    db.release_note(1, "its last reader removed it", ["owner:bob"])
+    db.release_note(1, "its last reader removed it", ["owner:bob"], removed_by="bob")
     given = []
     monkeypatch.setattr(share.db, "queue_tag_push", lambda *a, **k: given.append(a[:3]) or True)
     rid, what = bookreq.request("bob", "Mort", "Terry Pratchett")

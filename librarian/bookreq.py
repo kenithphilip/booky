@@ -83,7 +83,7 @@ def request(owner, title, author="", series=None, language=None, hardcover_id=No
             return rid, "owned"
         if m and _give_audiobook(m, owner):
             db.bookreq_update(rid, status="shared", abs_item=m["item_id"],
-                              detail="already in the family's audiobooks: added to yours, nothing downloaded")
+                              detail="added to your audiobooks at once (no download needed)")
             return rid, "shared"
         m = None
     else:
@@ -99,8 +99,10 @@ def request(owner, title, author="", series=None, language=None, hardcover_id=No
             return rid, "owned"
         share.give_ebook(m, owner)
         db.bookreq_update(rid, status="shared", calibre_id=m["book_id"],
-                          detail=("still in the library (removed lately): given back to you, nothing downloaded"
-                                  if m.get("released") else "already in the family library: added to yours, nothing downloaded"))
+                          # v6.3: 'given back' only to the reader who removed it; anyone else is told nothing more
+                          detail="you had removed it: given back to you, nothing downloaded"
+                          if m.get("released") and db.release_removed_by("book", m["book_id"]) == owner
+                          else "added to your library at once (no download needed)")
         notify.admin("shared", {"owner": owner, "title": title, "author": author, "source": "books",
                                 "status": "shared", "seq": notify.seq_id("book", rid)})
         return rid, "shared"
@@ -165,7 +167,7 @@ def search_once(req, shelfmark_api, now=None):
             status = "owned" if owner in a["owners"] else "shared"
             db.bookreq_update(rid, status=status, abs_item=a["item_id"],
                               detail="already in your audiobooks" if status == "owned" else
-                              "already in the family's audiobooks: added to yours, nothing downloaded")
+                              "added to your audiobooks at once (no download needed)")
             return status
     m = None if audio else _library_copy(req)
     if m:                                        # arrived for someone else while this one waited
@@ -174,7 +176,7 @@ def search_once(req, shelfmark_api, now=None):
         status = "owned" if owner in m["owners"] else "shared"
         db.bookreq_update(rid, status=status, calibre_id=m["book_id"],
                           detail="already in your library" if status == "owned" else
-                          "already in the family library: added to yours, nothing downloaded")
+                          "added to your library at once (no download needed)")
         return status
     if (req.get("candidate") or {}).get("_confirmed"):
         return _queue(req, req["candidate"], shelfmark_api, now)      # confirmed, was waiting for disk space

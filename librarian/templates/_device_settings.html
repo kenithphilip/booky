@@ -1,0 +1,44 @@
+{# v6.3: a reader's device settings (hub.html, devices.html). Posts to /hub (home. passes only /hub,
+   /help and /static to the portal). back=devices returns to the Devices page. #}
+<form method="post" action="{{ url_for('hub') }}">{{ csrf_field() }}<input type="hidden" name="action" value="device_settings">
+{% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
+
+<h3 style="margin-top:4px">Kobo</h3>
+{% if set_has_kobo %}
+<p class="mut" style="margin:0 0 6px">What goes to your Kobo:</p>
+{% for v, l in set_send_choices.items() %}<label style="display:flex;gap:8px;align-items:baseline;padding:2px 0">
+<input type="radio" name="kobo_send" value="{{ v }}" {{ 'checked' if set_kobo_send == v }}> <span>{{ l }}
+{% if v == 'all' and not set_admin %}<span class="mut">: new books arrive by themselves at each sync.</span>{% endif %}
+{% if v == 'all' and set_admin %}<span class="mut">: yours arrive by themselves; other readers' never do.</span>{% endif %}
+{% if v == 'choose' %}<span class="mut">: nothing arrives by itself; press <em>Send to my Kobo</em> on a book's page.</span>{% endif %}
+{% if v == 'library' %}<span class="mut">: your admin account sees every reader's books, and so would your Kobo.</span>{% endif %}</span></label>{% endfor %}
+<label style="display:flex;gap:8px;align-items:baseline;padding:2px 0 8px 24px" class="mut"><input type="checkbox" name="keep" value="1" checked>
+Switching to <em>Only the books I send</em>: keep what is on the Kobo now (untick to start it empty)</label>
+<label>Finished books
+<select name="kobo_finished" style="width:auto">{% for v, l in set_finished_choices %}<option value="{{ '' if v is none else v }}" {{ 'selected' if set_prefs.kobo_finished == v }}>{{ l }}</option>{% endfor %}</select></label>
+<p class="mut" style="margin:4px 0 0">A finished book (the Kobo says so, or you marked it Read) leaves the Kobo, never your library: its page offers
+<em>Send to my Kobo</em>, and a book you send back stays. Handy with hundreds of books: the Kobo holds what you are reading and what is next.</p>
+{% else %}
+<p class="mut">Link your Kobo first (<a href="{{ cfg.PORTAL_URL }}/devices">Devices → Kobo</a>); then choose here what goes to it and whether finished books leave it.</p>
+{% endif %}
+
+<h3>Kindle</h3>
+{% if set_has_kindle %}
+<label style="display:flex;gap:8px;align-items:baseline"><input type="checkbox" name="kindle_hint" value="1" {{ 'checked' if set_prefs.kindle_hint }}>
+<span>Remind me to delete finished books from my Kindle <span class="mut">(Amazon lets nobody else take a book off a Kindle: My books lists
+the finished ones you sent, with an <em>I deleted it</em> button). Nothing is ever sent to a Kindle twice by itself; <em>Send to Kindle</em> on a
+book's page sends it again.</span></span></label>
+{% else %}
+<p class="mut">No Kindle yet: save its address on <a href="{{ cfg.PORTAL_URL }}/devices">Devices → Kindle</a>.</p>
+<input type="hidden" name="kindle_hint" value="{{ '1' if set_prefs.kindle_hint else '' }}">
+{% endif %}
+
+{% if cfg.FAMILY_SHARING %}
+<h3>Privacy</h3>
+<label style="display:flex;gap:8px;align-items:baseline"><input type="checkbox" name="private" value="1" {{ 'checked' if set_prefs.private }}>
+<span>Keep my books private <span class="mut">(none of your books is ever added to another reader's library when they ask for the same one:
+they download their own copy). Either way nobody else can see, open or download your books, and nobody is told who has what.</span></span></label>
+{% endif %}
+{% if not cfg.FAMILY_SHARING %}<input type="hidden" name="private" value="{{ '1' if set_prefs.private else '' }}">{% endif %}
+<p style="margin-top:10px"><button type="submit">Save settings</button> <a class="mut" href="{{ url_for('help_page', topic='kobo') }}#tidy">How this works</a></p>
+</form>

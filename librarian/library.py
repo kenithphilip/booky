@@ -113,7 +113,8 @@ def books_for(owner, is_admin=False, limit=PAGE, offset=0, q="", kind=None, only
         fmts = sorted(set((r[4] or "").split(","))) if r[4] else []
         out.append({"id": r[0], "title": r[1], "added": (r[2] or "")[:10], "author": r[3] or "Unknown",
                     "formats": [f for f in fmts if f],
-                    "owners": [o[len(config.OWNER_PREFIX):] for o in (r[5] or "").split(",") if o],
+                    # v6.3: who else has a book is the admin's to see only
+                    "owners": [o[len(config.OWNER_PREFIX):] for o in (r[5] or "").split(",") if o] if is_admin else [],
                     "series": r[6], "index": r[7]})
     return out
 

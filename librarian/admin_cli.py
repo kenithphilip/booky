@@ -184,17 +184,17 @@ def _tags(args):
             import notify
             notify.send("needs-tag", db.get(row["rid"]))
     if args.outcome == "ok" and row.get("op") == "remove":
-        _maybe_release(row["calibre_id"])
+        _maybe_release(row["calibre_id"], row.get("owner"))
     db.audit("tag_push", None, "host", f"#{args.push_id} {args.outcome} {args.reason[:120]}")
     return {"ok": True, "status": row["status"]}
 
-def _maybe_release(book_id):
+def _maybe_release(book_id, removed_by=None):
     """The last reader just removed this book: its countdown to deletion from the VPS starts."""
     import cwa, worker
     names = {u["name"] for u in cwa.list_users(include_canary=True)}
     tags = worker._owner_tags_by_book().get(book_id, set())
     if names and not ({t[len(config.OWNER_PREFIX):] for t in tags} & names):
-        db.release_note(book_id, "its last reader removed it", sorted(tags))
+        db.release_note(book_id, "its last reader removed it", sorted(tags), removed_by=removed_by)
 
 def _releases(args):
     """Books no reader has any more, due for deletion from the VPS (the host job deletes)."""

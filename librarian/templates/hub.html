@@ -58,6 +58,11 @@ the steps and apps for each of your devices.</p>
 </div>
 {% endif %}
 
+<h2 id="settings">Your settings</h2>
+<div class="card">
+{% with back=None %}{% include "_device_settings.html" %}{% endwith %}
+</div>
+
 <h2>Your setup</h2>
 <div class="card">
 {% for label, done, hint, url in checklist %}

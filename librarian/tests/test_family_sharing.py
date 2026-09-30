@@ -221,7 +221,7 @@ def test_one_bad_request_does_not_block_the_rest(shelf, monkeypatch):
 def test_the_reader_reads_plain_words():
     import app
     d = f"{worker.NEEDS_TAG}: {worker.FAMILY_NOTE} (matched by isbn), nothing downloaded; {worker.AUTO_TAG_NOTE}: owner:bob"
-    assert "already in the family library" in app._friendly_detail(d) and "owner:" not in app._friendly_detail(d)
+    assert "added to your library at once" in app._friendly_detail(d) and "family" not in app._friendly_detail(d) and "owner:" not in app._friendly_detail(d)
 
 
 def test_the_gate_never_stales_the_admins_pending_card(monkeypatch):

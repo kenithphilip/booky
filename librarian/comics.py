@@ -48,14 +48,14 @@ def request(owner, series, item, language=None, reading=None, now=None):
     rid, created = db.comic_add(owner, fields, now)
     if not created:
         return rid, "exists"
-    m = find_in_library(library_series(fields), item["number"], kind)
+    m = find_in_library(library_series(fields), item["number"], kind, viewer=owner)
     if m and config.FAMILY_SHARING:
         if owner in m["owners"]:
             db.comic_update(rid, status="done", calibre_id=m["book_id"], detail="already in your library")
             return rid, "owned"
         share.give_ebook(m, owner)
         db.comic_update(rid, status="shared", calibre_id=m["book_id"],
-                        detail="already in the family library: added to yours, nothing downloaded")
+                        detail="added to your library at once (no download needed)")
         notify.admin("shared", {"owner": owner, "title": f"{series['name']} {fields['label']}", "source": "comics",
                                 "status": "shared", "seq": notify.seq_id("comic", rid)})
         return rid, "shared"
@@ -87,10 +87,11 @@ def _calibre():
     return c
 
 
-def find_in_library(series_name, number, kind="comic", exclude=()):
+def find_in_library(series_name, number, kind="comic", exclude=(), viewer=None):
     """The Calibre book that IS this issue/volume (a comic tag, the series, the number), with
     its owners, or None. Never guesses between two. `exclude`: Calibre ids a reader said were
-    the wrong comic."""
+    the wrong comic. v6.3: a copy only readers who keep their books private have is not there for
+    anyone but them (`viewer`)."""
     want = comicrel.norm(series_name)
     try:
         n = float(number)
@@ -111,6 +112,14 @@ def find_in_library(series_name, number, kind="comic", exclude=()):
                 "SELECT t.name FROM books_tags_link l JOIN tags t ON t.id=l.tag WHERE l.book=? AND t.name LIKE ?",
                 (hits[0], config.OWNER_PREFIX + "%")))
     except sqlite3.Error:
+        return None
+    if owners and not share.shareable(owners, viewer):
+        return None
+    if not owners:
+        # v6.3: an untagged comic is someone's import under way, or one removed lately; only the
+        # latter is offered, as a give-back, and not if a private reader removed it
+        if db.release_waiting(hits[0]) and share._released_ok("book", hits[0]):
+            return {"book_id": hits[0], "owners": [], "how": "series and number", "released": True}
         return None
     return {"book_id": hits[0], "owners": owners, "how": "series and number"}
 
@@ -133,12 +142,12 @@ def search_once(req, shelfmark_api, now=None):
     """One attempt for one queued request. Returns the new status."""
     now = now or time.time()
     rid, owner = req["id"], req["owner"]
-    m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
+    m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req), viewer=owner)
     if m and (config.FAMILY_SHARING or owner in m["owners"]):   # arrived (for someone else) while this one waited
         if owner not in m["owners"]:
             share.give_ebook(m, owner)
         db.comic_update(rid, status="shared" if owner not in m["owners"] else "done", calibre_id=m["book_id"],
-                        detail="already in the family library: added to yours, nothing downloaded")
+                        detail="added to your library at once (no download needed)")
         return "shared"
     if (req.get("candidate") or {}).get("_confirmed"):
         return _queue(req, req["candidate"], shelfmark_api, now)      # confirmed, was waiting for disk space
@@ -321,7 +330,7 @@ def watch_downloads(shelfmark_api, queue=None, now=None):
         # v6.0.1: already in the reader's library by series and number (it arrived under another
         # name, or the admin fixed its metadata in Calibre-Web): done, never downloaded again.
         # v6.1: a copy waiting for the reader's yes too (the Peanuts was offered again after it arrived)
-        m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req))
+        m = find_in_library(library_series(req), req["number"], req["kind"], exclude=_rejected_books(req), viewer=req["owner"])
         if m and req["owner"] in m["owners"]:
             db.comic_update(req["id"], status="done", calibre_id=m["book_id"], candidate=None,
                             detail="in your library" if req["status"] == "downloading" else

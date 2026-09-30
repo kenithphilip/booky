@@ -12,9 +12,26 @@
 <li><strong>New books</strong> arrive on the next sync (tap the sync icon, or it syncs by itself on Wi-Fi).</li>
 <li><strong>Your place</strong> is saved to the library, so the portal can show "Reading 45 %", and, with a Hardcover token, your Hardcover account too.</li>
 <li><strong>Finished on the Kobo</strong> shows as Read on the portal; <strong>Read</strong> marked on the portal shows as Finished on the Kobo after its next sync.</li>
-<li><strong>Only some books on the Kobo?</strong> Devices → Kobo → <em>Only sync the shelves I mark for Kobo</em>: then only books on shelves you mark for Kobo sync on the library site are sent.</li>
+<li><strong>Only some books on the Kobo?</strong> <a href="{{ url_for('hub') }}#settings">Your settings</a> → <em>Only the books I send</em> (below).</li>
 <li><strong>Deleted a book on the Kobo</strong> but want it back? It stays in your library: its page on the portal says so and offers <strong>Put it back on my Kobo</strong>; it returns at the next sync.</li>
 <li><strong>Removing a book</strong> from your library (its page → Remove) deletes it from the Kobo at its next sync (Wi-Fi on, Sync). If it is still there after that: My Books → press and hold the cover → Remove → Remove from My Books.</li>
+</ul>
+<h3 id="tidy">Keeping your Kobo tidy</h3>
+<p>With hundreds of books in your library, you may want the Kobo to hold only what you are reading and what is next. Everything is set on the
+<a href="{{ url_for('hub') }}#settings">start page → Your settings</a> (or Devices), and each reader chooses for themself:</p>
+<ul>
+<li><strong>What goes to your Kobo:</strong> <em>Every book in my library</em> (new books arrive by themselves) or <em>Only the books I send</em>
+(nothing arrives by itself; a book's page → <strong>Send to my Kobo</strong>). Switching keeps what is on the Kobo now, unless you untick that.
+On the Kobo, books you send show in a collection called <em>From the library</em>.</li>
+<li><strong>Finished books:</strong> never, right away, or 7 or 30 days after you finish one (the Kobo says so, or you marked it Read), it leaves the Kobo
+at a sync. It stays in your library with your place and your Read mark.</li>
+<li><strong>Getting one back:</strong> its page → <strong>Send to my Kobo</strong> (or <strong>Put it back on my Kobo</strong> for one you deleted on the Kobo).
+A book you send back stays: it is not taken off by itself again. <a href="{{ cfg.PORTAL_URL }}/library?kobo=off">My books → Not on my Kobo</a> lists them all.</li>
+<li><strong>Taking one off by hand:</strong> its page → <strong>Take it off my Kobo</strong> (or delete it on the Kobo: My Books → press and hold → Remove).
+Either way it stays in your library, and the page offers to send it back.</li>
+<li>A sync never re-sends books already on the Kobo: only new ones, and changes to your reading marks.</li>
+{% if admin %}<li><strong>Admins:</strong> an admin account sees every reader's books, so an admin's Kobo gets only their <em>own</em> books unless they choose
+<em>Every book in the library</em>.</li>{% endif %}
 </ul>
 <h3>Comics on your Kobo</h3>
 <ul>

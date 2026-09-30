@@ -296,7 +296,7 @@ def test_a_followed_name_opens_its_books_with_what_the_reader_has(shelf_on, monk
     assert r.status_code == 302 and r.headers["Location"].endswith("/books/series/44")
     page = shelf_on.get("/books/series/44").get_data(as_text=True)
     assert 'href="/book/5"' in page and "in your library" in page
-    assert "in the family library" in page and "Add to mine" in page
+    assert "ready now, no download" in page and "Add to mine" in page
     assert "Get it" in page and "Pick" in page and "not out yet" in page
     shelf_on.get("/books/series/44")
     assert asked == ["44"], "Hardcover is asked once; the page is cached"

@@ -39,6 +39,26 @@ def _owners_of_book(book_id):
         c.close()
 
 
+def shareable(owners, viewer=None):
+    """v6.3: the owners whose copy may be offered to `viewer`: everyone but readers who keep their
+    books private (Devices / the start page), and always the viewer themself."""
+    try:
+        private = db.private_readers()
+    except Exception:
+        private = set()
+    return [o for o in owners or [] if o == viewer or o not in private]
+
+
+def _released_ok(kind, key):
+    """v6.3: a book counting down may be given to another reader only if whoever removed it did
+    not keep their books private."""
+    try:
+        who = db.release_removed_by(kind, key)
+        return not who or who not in db.private_readers()
+    except Exception:
+        return False
+
+
 def isbn_ids(*values):
     """[{"kind": "isbn", "value": ...}] from loose ISBN strings (Shelfmark's isbn_10 / isbn_13)."""
     return [{"kind": "isbn", "value": str(v)} for v in values if v]
@@ -57,13 +77,15 @@ def find_ebook(title, author="", identifiers=()):
         log.warning("family sharing: could not read metadata.db: %s", e)
         return None
     if owners:
-        return dict(m, owners=owners)
+        # v6.3: only readers who share their books count; a copy only private readers have is not
+        # offered (whoever asks downloads their own)
+        return dict(m, owners=owners) if shareable(owners) else None
     # v6.1: nobody has it any more, but it is still here, counting down to deletion (removed in the
     # last LIBRARY_RELEASE_DAYS): asked for again, it is given back, never downloaded again. Not an
     # untagged book otherwise: that is someone's import still under way.
     try:
         import db
-        if db.release_waiting(m["book_id"]):
+        if db.release_waiting(m["book_id"]) and _released_ok("book", m["book_id"]):
             return dict(m, owners=[], released=True)
     except Exception as e:
         log.warning("family sharing: could not read the release countdown: %s", e)
@@ -122,6 +144,8 @@ def _audiobook_match(title, author="", owner=None, exclude=()):
             continue
         if dedupe.norm_title(md.get("title") or "") == want_t and want_a & dedupe.author_tokens(md.get("authorName") or ""):
             owners = sorted(t[len(config.OWNER_PREFIX):] for t in (media.get("tags") or []) if t.startswith(config.OWNER_PREFIX))
+            if owners and not shareable(owners, owner):
+                continue                         # v6.3: only private readers have it: not offered
             hits.append({"item_id": it["id"], "how": "title+author", "owners": owners})
     if owner:
         mine = [h for h in hits if owner in h["owners"]]
@@ -132,7 +156,7 @@ def _audiobook_match(title, author="", owner=None, exclude=()):
         # again. Any other untagged item is someone's import still under way.
         try:
             import db
-            back = [h for h in hits if db.audio_release_waiting(h["item_id"])]
+            back = [h for h in hits if db.audio_release_waiting(h["item_id"]) and _released_ok("audio", h["item_id"])]
         except Exception:
             back = []
         return dict(back[0], released=True) if back else None

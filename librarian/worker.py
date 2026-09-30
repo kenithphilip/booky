@@ -377,7 +377,8 @@ def _atomic_ingest(src, owner, final_base, ext, rid=None, title=None, author=Non
         raise
     return note
 
-FAMILY_NOTE = "already in the family library"
+FAMILY_NOTE = "already in the library"          # v6.3: says nothing about who else has it
+FAMILY_NOTE_OLD = "already in the family library"   # the wording of requests recorded before v6.3
 
 REPLACE_NOTE = "a better copy: it replaces the library's file of this book, for everyone who has it, within a few minutes"
 SHELF_PICK_EPUB = ("A better copy of this book is being looked for: request it again and choose an EPUB "
@@ -469,8 +470,8 @@ def _family_request(req):
     share.give_ebook(m, owner, req["id"])
     return f"{NEEDS_TAG}: {FAMILY_NOTE} (matched by {m['how']}), nothing downloaded; {AUTO_TAG_NOTE}: {_owner_tag(owner)}"
 
-SHELF_SHARED = ("Already in the family library: it has been added to your library, so nothing was "
-                "downloaded. It appears there within a few minutes.")
+SHELF_SHARED = ("Added to your library at once, so nothing was downloaded. It appears there within a few "
+                "minutes.")
 SHELF_OWNED = "Already in your library, so nothing was downloaded."
 
 def shelfmark_gate_once(now=None):
@@ -520,7 +521,9 @@ def shelfmark_gate_once(now=None):
             else:
                 m = share.find_ebook(x["title"], x["author"], share.isbn_ids(*x.get("isbns", ())))
                 job = db.replace_live(m["book_id"]) if m else None
-                if job and job["status"] == "open":
+                # v6.3: only a reader who has the book hears about a better copy being looked for; anyone
+                # else simply gets the library's copy (never told someone else is replacing it)
+                if job and job["status"] == "open" and owner in m["owners"]:
                     # 'Find a better copy': an EPUB release goes through (and replaces the file on
                     # arrival); anything else is sent back asking for an EPUB
                     if (x.get("format") or "").lower() == "epub":
@@ -2228,7 +2231,7 @@ def _link_arrived_comics(now):
     for req in db.comic_open(statuses=("done",)):
         if req.get("calibre_id") or req["id"] in _COMIC_LINKED or now - (req.get("updated") or now) > 86400:
             continue
-        m = comics.find_in_library(comics.library_series(req), req["number"], req["kind"])
+        m = comics.find_in_library(comics.library_series(req), req["number"], req["kind"], viewer=req["owner"])
         if not m or req["owner"] not in m["owners"]:
             continue
         _COMIC_LINKED.add(req["id"])
@@ -2497,6 +2500,18 @@ def expire_held(now=None):
             n += 1
     return n
 
+DEVICES_EVERY = 600
+
+def devices_once(now=None):
+    """v6.3 (ondevice.py): an admin's Kobo gets their own books only (unless they chose otherwise),
+    and finished books leave the Kobo of readers who asked for it, after their delay."""
+    import ondevice
+    try:
+        ondevice.admin_kobo_pass(now)
+    except Exception as e:
+        log.warning("admins' Kobos: %s", e)
+    return ondevice.offload_finished(now)
+
 def _loop(name, fn, every):
     _beat(name)
     while True:
@@ -2596,6 +2611,8 @@ def run_forever():
     threading.Thread(target=_loop, args=("books", books_once, BOOKS_EVERY), daemon=True).start()
     # v5.8: followed series and authors (each checked once a day), AniList progress
     threading.Thread(target=_loop, args=("follows", follows_once, FOLLOWS_EVERY), daemon=True).start()
+    # v6.3: finished books leave the Kobos of readers who chose it; admins' Kobos get only their own books
+    threading.Thread(target=_loop, args=("devices", devices_once, DEVICES_EVERY), daemon=True).start()
     if config.IMAP_HOST:
         import imap
         threading.Thread(target=imap.poll_forever, daemon=True).start()

@@ -525,6 +525,11 @@ one arrives like a book:
   (Colorsoft, Paperwhite, the basic Kindle, Oasis, Scribe), iPhone, iPad, Android phone or tablet.
   Comics are made for those screens; the start page shows the steps and apps for each device. A
   reader who ticks nothing gets what v6.1 made (a Libra Colour / Colorsoft copy, in colour).
+- **Devices kept tidy and private (v6.3)**: each reader chooses on the start page what goes to their
+  Kobo (every book, or only those they send), whether finished books leave it (never / right away /
+  7 / 30 days; Send to my Kobo brings one back to stay), reminders to delete finished books from a
+  Kindle, and whether to keep their books private (never offered to another reader). An admin's Kobo
+  gets only the admin's own books. Readers are never told whose a shared copy is.
 - **Your Kobo, in one place (v6.2.1)**: every book's page says where it stands on the reader's Kobo
   (on it, coming at the next sync, being removed, deleted on the Kobo, not on a synced shelf); a book
   deleted on the Kobo offers **Put it back on my Kobo**. Every removal tells the Kobo. The library's

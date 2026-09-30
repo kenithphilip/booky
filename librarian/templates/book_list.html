@@ -29,7 +29,7 @@ Requests; once you confirm it, Shelfmark downloads it and the file is checked be
 {% elif b.req and b.req.status in ('queued', 'pending', 'downloading') %}<span class="st-{{ b.req.status }}">{{ {'queued': 'looking for a copy', 'pending': 'waiting for approval', 'downloading': 'downloading'}[b.req.status] }}</span>
 {% elif not b.out %}<span class="mut">not out yet</span>
 {% else %}
-{% if b.lib == 'family' %}<span class="mut">in the family library ·</span>{% endif %}
+{% if b.lib == 'family' %}<span class="mut">ready now, no download ·</span>{% endif %}
 {% if can_get %}<form method="post" action="{{ url_for('book_request') }}" style="display:inline">{{ csrf_field() }}
 <input type="hidden" name="title" value="{{ b.title }}"><input type="hidden" name="author" value="{{ b.author }}">
 <input type="hidden" name="series" value="{{ series or '' }}"><input type="hidden" name="hardcover_id" value="{{ b.id }}">

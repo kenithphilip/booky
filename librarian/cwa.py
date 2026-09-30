@@ -13,7 +13,7 @@ live immediately. Also usable as a CLI (bookstack.sh menu "Users" calls it):
     python -m cwa remove-user alice | enable-kobo-sync | rename-user admin kenith-admin
     (--password-stdin instead of --password reads the secret from stdin; the installer uses it)
 """
-import sqlite3, os, sys, json, argparse, re, functools, datetime
+import sqlite3, os, sys, json, argparse, re, functools, datetime, uuid
 from binascii import hexlify
 from werkzeug.security import generate_password_hash
 import config
@@ -440,7 +440,7 @@ def set_read_status(name, book_id, status):
     return status
 
 @_guard
-def kobo_remove(name, book_id):
+def kobo_remove(name, book_id, even_unsent=False):
     """v6.1: take a book off this reader's Kobo at its next sync, as Calibre-Web itself does (CWA
     v4.0.8 cps/web.py toggle_archived, kobo.py HandleSyncRequest). Returns how, or None when the
     book never went to their Kobo:
@@ -450,7 +450,9 @@ def kobo_remove(name, book_id):
                 stay until it has happened (the portal waits for it).
       'shelf'   (the Kobo syncs only chosen shelves): off this reader's Kobo shelves; CWA's
                 two-way sync then sends the removal for a synced book no shelf holds any more,
-                whether or not the reader can still see it."""
+                whether or not the reader can still see it.
+    even_unsent (v6.3: 'Take it off my Kobo', finished books): a book not sent yet is archived too,
+    so it never is."""
     u = get_user(name)
     if not u:
         raise CwaError(f"no such user '{name}'")
@@ -461,7 +463,7 @@ def kobo_remove(name, book_id):
             synced = c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
         except sqlite3.OperationalError:
             return None                          # no Kobo has ever synced here
-        if not synced:
+        if not synced and not even_unsent:
             return None
         shelves_only = (c.execute("SELECT kobo_only_shelves_sync FROM user WHERE id=?", (uid,)).fetchone() or [0])[0]
         if shelves_only:
@@ -535,12 +537,13 @@ KOBO_STATES = {
 }
 
 @_guard
-def kobo_state(name, book_id):
-    """One of KOBO_STATES for this reader and book (see above)."""
+def kobo_states(name, book_ids):
+    """{book id: one of KOBO_STATES} for many books at once (My books, the daily passes)."""
     u = get_user(name)
+    ids = [int(b) for b in book_ids]
     if not u:
-        return "no-kobo"
-    uid, bid = u["id"], int(book_id)
+        return {b: "no-kobo" for b in ids}
+    uid = u["id"]
     with _conn() as c:
         try:
             # a Kobo: one has synced, or a sync link exists (every book put back empties the list)
@@ -548,22 +551,159 @@ def kobo_state(name, book_id):
                     or c.execute("SELECT 1 FROM archived_book WHERE user_id=? LIMIT 1", (uid,)).fetchone()
                     or c.execute("SELECT 1 FROM remote_auth_token WHERE user_id=? AND token_type=?",
                                  (uid, KOBO_TOKEN_TYPE)).fetchone()):
-                return "no-kobo"
-            synced = c.execute("SELECT 1 FROM kobo_synced_books WHERE user_id=? AND book_id=?", (uid, bid)).fetchone() is not None
+                return {b: "no-kobo" for b in ids}
+            synced = {r[0] for r in c.execute("SELECT book_id FROM kobo_synced_books WHERE user_id=?", (uid,))}
+            archived = {r[0] for r in c.execute("SELECT book_id FROM archived_book WHERE user_id=? AND is_archived=1", (uid,))}
             shelves_only = (c.execute("SELECT kobo_only_shelves_sync FROM user WHERE id=?", (uid,)).fetchone() or [0])[0]
-            if shelves_only:
-                on_shelf = c.execute("SELECT 1 FROM book_shelf_link l JOIN shelf s ON s.id=l.shelf WHERE l.book_id=? "
-                                     "AND s.user_id=? AND s.kobo_sync=1", (bid, uid)).fetchone() is not None
-                if synced:                       # CWA's two-way sync removes a synced book no shelf holds
-                    return "on-kobo" if on_shelf else "removing"
-                return "coming" if on_shelf else "not-on-shelf"
-            row = c.execute("SELECT is_archived FROM archived_book WHERE user_id=? AND book_id=?", (uid, bid)).fetchone()
+            on_shelf = {r[0] for r in c.execute("SELECT l.book_id FROM book_shelf_link l JOIN shelf s ON s.id=l.shelf "
+                                                "WHERE s.user_id=? AND s.kobo_sync=1", (uid,))} if shelves_only else set()
         except sqlite3.OperationalError:
-            return "no-kobo"
-    archived = bool(row and row[0])
-    if archived:
-        return "deleted" if synced else "removing"
-    return "on-kobo" if synced else "coming"
+            return {b: "no-kobo" for b in ids}
+    out = {}
+    for b in ids:
+        if shelves_only:                         # CWA's two-way sync removes a synced book no shelf holds
+            out[b] = ("on-kobo" if b in on_shelf else "removing") if b in synced else \
+                     ("coming" if b in on_shelf else "not-on-shelf")
+        elif b in archived:
+            out[b] = "deleted" if b in synced else "removing"
+        else:
+            out[b] = "on-kobo" if b in synced else "coming"
+    return out
+
+def kobo_state(name, book_id):
+    """One of KOBO_STATES for this reader and book. The portal asks ondevice.kobo_state, which first
+    answers 'not-theirs' for a book the reader does not have (v6.3)."""
+    return kobo_states(name, [book_id])[int(book_id)]
+
+# ---- v6.3: the portal's own Kobo shelf ('only the books I choose', and an admin's own books) -----------
+# Calibre-Web's "sync only the shelves I mark for Kobo" (kobo_only_shelves_sync) sends a Kobo only the
+# books on the reader's Kobo shelves, and takes a book off the Kobo once no such shelf holds it
+# (cps/kobo.py HandleSyncRequest, two-way deletion). The portal keeps ONE shelf for this, so nobody
+# has to manage shelves in Calibre-Web; on the Kobo it shows as a collection of this name.
+MANAGED_SHELF = "From the library"
+
+def _managed_shelf(c, uid, create=True):
+    r = c.execute("SELECT id FROM shelf WHERE user_id=? AND name=?", (uid, MANAGED_SHELF)).fetchone()
+    if r or not create:
+        return r[0] if r else None
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+    return c.execute("INSERT INTO shelf(uuid, name, is_public, user_id, kobo_sync, created, last_modified) "
+                     "VALUES(?,?,0,?,1,?,?)", (str(uuid.uuid4()), MANAGED_SHELF, uid, now, now)).lastrowid
+
+@_guard
+def kobo_choose_only(name):
+    """True when this reader's Kobo gets only books on their Kobo shelves."""
+    u = get_user(name)
+    if not u:
+        return False
+    with _conn() as c:
+        try:
+            return bool((c.execute("SELECT kobo_only_shelves_sync FROM user WHERE id=?", (u["id"],)).fetchone() or [0])[0])
+        except sqlite3.OperationalError:
+            return False
+
+@_guard
+def kobo_synced_ids(name):
+    """Books on the reader's Kobo now (synced, not archived)."""
+    u = get_user(name)
+    if not u:
+        return set()
+    with _conn() as c:
+        try:
+            synced = {r[0] for r in c.execute("SELECT book_id FROM kobo_synced_books WHERE user_id=?", (u["id"],))}
+        except sqlite3.OperationalError:
+            return set()
+        try:
+            archived = {r[0] for r in c.execute("SELECT book_id FROM archived_book WHERE user_id=? AND is_archived=1", (u["id"],))}
+        except sqlite3.OperationalError:
+            archived = set()
+    return synced - archived
+
+@_guard
+def kobo_archived_ids(name):
+    """Books archived for this reader (deleted on their Kobo, or taken off by the portal)."""
+    u = get_user(name)
+    if not u:
+        return set()
+    with _conn() as c:
+        try:
+            return {r[0] for r in c.execute("SELECT book_id FROM archived_book WHERE user_id=? AND is_archived=1", (u["id"],))}
+        except sqlite3.OperationalError:
+            return set()
+
+@_guard
+def kobo_shelf_ids(name):
+    """Books on the portal's Kobo shelf."""
+    u = get_user(name)
+    if not u:
+        return set()
+    with _conn() as c:
+        sid = _managed_shelf(c, u["id"], create=False)
+        return {r[0] for r in c.execute("SELECT book_id FROM book_shelf_link WHERE shelf=?", (sid,))} if sid else set()
+
+@_guard
+def kobo_shelf_add(name, book_ids, refresh=False):
+    """Onto the portal's Kobo shelf (it goes to the Kobo at the next sync), not archived any more
+    (in shelf mode Calibre-Web sends an archived book as removed). refresh: a book already on it is
+    dated now, so the next sync sends it again (in shelf mode Calibre-Web sends shelf entries newer
+    than the Kobo's last sync: one deleted on the Kobo is otherwise never sent again). Returns how
+    many were added."""
+    u = get_user(name)
+    if not u or not book_ids:
+        return 0
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S.%f")
+    n = 0
+    with _conn() as c:
+        sid = _managed_shelf(c, u["id"])
+        have = {r[0] for r in c.execute("SELECT book_id FROM book_shelf_link WHERE shelf=?", (sid,))}
+        if refresh:
+            c.execute(f"UPDATE book_shelf_link SET date_added=? WHERE shelf=? AND book_id IN ({','.join('?' * len(book_ids))})",
+                      (now, sid, *[int(x) for x in book_ids]))
+        for b in {int(x) for x in book_ids} - have:
+            c.execute('INSERT INTO book_shelf_link(book_id, "order", shelf, date_added) VALUES(?,?,?,?)', (b, 0, sid, now))
+            n += 1
+        c.execute(f"UPDATE archived_book SET is_archived=0, last_modified=? WHERE user_id=? AND is_archived=1 "
+                  f"AND book_id IN ({','.join('?' * len(book_ids))})", (now, u["id"], *[int(x) for x in book_ids]))
+        c.execute("UPDATE shelf SET last_modified=? WHERE id=?", (now, sid))
+        c.commit()
+    _checkpoint()
+    return n
+
+@_guard
+def kobo_shelf_remove(name, book_ids):
+    """Off every Kobo shelf of the reader: the next sync takes it off the Kobo (two-way sync)."""
+    u = get_user(name)
+    if not u or not book_ids:
+        return 0
+    with _conn() as c:
+        n = c.execute(f"DELETE FROM book_shelf_link WHERE book_id IN ({','.join('?' * len(book_ids))}) AND shelf IN "
+                      f"(SELECT id FROM shelf WHERE user_id=? AND kobo_sync=1)", (*[int(x) for x in book_ids], u["id"])).rowcount
+        c.commit()
+    _checkpoint()
+    return n
+
+@_guard
+def kobo_set_choose_only(name, on, keep=()):
+    """Switch 'only the books I choose' on (the books in `keep` go onto the portal's Kobo shelf FIRST,
+    so the next sync does not take them off the Kobo) or off (every book the reader can see is sent)."""
+    u = get_user(name)
+    if not u:
+        raise CwaError(f"no such user '{name}'")
+    if on:
+        if keep:
+            kobo_shelf_add(name, list(keep))
+        with _conn() as c:
+            try:
+                _managed_shelf(c, u["id"])
+            except sqlite3.OperationalError:
+                pass                             # no shelf table yet: Calibre-Web makes it; the switch still holds
+            c.execute("UPDATE user SET kobo_only_shelves_sync=1 WHERE id=?", (u["id"],))
+            c.commit()
+    else:
+        with _conn() as c:
+            c.execute("UPDATE user SET kobo_only_shelves_sync=0 WHERE id=?", (u["id"],))
+            c.commit()
+    _checkpoint()
 
 def kobo_put_back(name, book_id):
     """'Put it back on my Kobo': what Calibre-Web's Unarchive does. True when something changed."""

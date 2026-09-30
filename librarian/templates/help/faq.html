@@ -2,7 +2,13 @@
 <h3>I asked for a book and it has not arrived</h3>
 <p>Open <a href="{{ cfg.PORTAL_URL }}/status">Requests</a>. <em>Confirm this copy</em> means it waits for your yes; <em>looking</em> means no copy was found yet (it looks again within the hour, then every few hours, then daily); <em>downloading</em> is under way; <em>check this file</em> means what arrived did not look like the book.</p>
 <h3>It is in my library but not on my Kobo</h3>
-<p>Sync the Kobo. Still missing? Devices → Kobo → <strong>Test my link</strong>, and check <em>Only sync the shelves I mark for Kobo</em> is off (or the book is on a Kobo shelf).</p>
+<p>Open the book's page: it says where the book stands on your Kobo. <em>Not on it</em> or <em>you deleted it on the Kobo</em>: press <strong>Send to my Kobo</strong>
+(or <strong>Put it back on my Kobo</strong>) and sync. <em>It arrives at the next sync</em> but it never does: <strong>Send it again</strong>. Nothing on the page at all:
+Devices → Kobo → <strong>Test my link</strong>.</p>
+<h3>A book disappeared from my Kobo</h3>
+<p>It is still in your library. Either you finished it and chose <em>Finished books</em> leave the Kobo (<a href="{{ url_for('hub') }}#settings">Your settings</a>),
+you removed it on the Kobo, or your Kobo gets only the books you send. Its page → <strong>Send to my Kobo</strong> brings it back, and it stays.
+<a href="{{ cfg.PORTAL_URL }}/library?kobo=off">My books → Not on my Kobo</a> lists every such book.</p>
 <h3>My Kindle never gets the mail</h3>
 <p>The library's sending address must be on your Amazon approved list (see <a href="{{ url_for('help_page', topic='kindle') }}">Kindle</a>). Devices → Send a test shows whether it works.</p>
 <h3>The wrong book (or edition, or language) arrived</h3>
@@ -12,7 +18,7 @@
 <h3>Why am I asked to confirm every copy?</h3>
 <p>Release names are only labels someone typed. Showing you the copy first means a wrong edition never lands on your Kobo. The admin can let certain picks go through without asking.</p>
 <h3>Can someone see what I read?</h3>
-<p>No. Each library is private. When you get a book the family already has, it is simply added to yours; the others are not told.</p>
+<p>No. Each library is private. When you get a book the library already holds, it is simply added to yours; nobody is told, and nothing says whose it was. A reader who keeps their books private (Your settings) is never counted.</p>
 <h3>Something else is wrong</h3>
 <p>Tell the admin what you did and what you saw; a screenshot of <a href="{{ cfg.PORTAL_URL }}/status">Requests</a> helps.</p>
 {% endblock %}

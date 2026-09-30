@@ -15,6 +15,12 @@
 </ul>
 <h3>Through the Kindle's browser (no mail, no size limit)</h3>
 <p>On the Kindle open the Experimental Browser at <span class="code">{{ cfg.PORTAL_URL }}/send</span>, then on your phone use <strong>Send to an e-reader</strong> on the book's page with the code it shows. A Kindle's browser only opens AZW3, MOBI, PDF and TXT, never EPUB: on the book's page, pick AZW3 and press <strong>Convert</strong> first when needed.</p>
+<h3>Finished books</h3>
+<p>A Kindle only ever gets what you send (or what automatic sending sends, once): nothing is sent twice by itself, so it never fills up behind your back.
+Amazon lets nobody else take a book off a Kindle, so when you finish one you sent, <a href="{{ cfg.PORTAL_URL }}/library">My books</a> and the book's page
+remind you to delete it there (press and hold → Remove from Device, or Amazon → Manage Your Content and Devices), with an <em>I deleted it</em> button.
+It stays in your library; <strong>Send to Kindle</strong> sends it again any time. Switch the reminders off on the
+<a href="{{ url_for('hub') }}#settings">start page → Your settings</a>.</p>
 <h3>Reading progress</h3>
 <p>A Kindle does not report what you read. Mark books yourself on their page (<strong>Mark: Read · Reading · Unread</strong>), or <em>read up to here</em> on a comic series; your trackers (Hardcover, AniList, Metron) follow.</p>
 {% endblock %}

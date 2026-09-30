@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share, devicemodels
+import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share, devicemodels, ondevice
 import abs as absapi
 
 app = Flask(__name__)
@@ -66,8 +66,8 @@ def _friendly_detail(detail, is_admin=False):
         return "added to your audiobooks"
     if worker.TAG_WAIT_NOTE in d:
         return "in your audiobooks; the app is still indexing it"
-    if d.startswith(worker.NEEDS_TAG) and worker.FAMILY_NOTE in d:
-        return "already in the family library: it appears in your library in a few minutes, nothing was downloaded"
+    if d.startswith(worker.NEEDS_TAG) and (worker.FAMILY_NOTE in d or worker.FAMILY_NOTE_OLD in d):
+        return "added to your library at once: it appears there in a few minutes (no download needed)"
     if d.startswith(worker.NEEDS_TAG) and (worker.AUTO_TAG_NOTE in d or "being added in Calibre" in d):
         return "imported; it appears in your library in a few minutes"
     if d.startswith(worker.NEEDS_TAG):
@@ -998,6 +998,8 @@ def my_library():
     sort = request.args.get("sort", "added")
     sort = sort if sort in library.SORTS else "added"
     view = "list" if request.args.get("view") == "list" else "grid"
+    kobo = request.args.get("kobo", "")
+    kobo = kobo if kobo in ("on", "off") else ""
     prefs = db.get_prefs(user)
     state = cwa.reading_state(user)
     only = exclude = None
@@ -1005,18 +1007,34 @@ def my_library():
         only = [bid for bid, st in state.items() if st.get("status") == status]
     elif status == "unread":
         exclude = [bid for bid, st in state.items() if st.get("status") in ("reading", "read")]
+    # v6.3: on my Kobo / not on it (their own books; every page asks ondevice, one place)
+    has_kobo = False
+    try:
+        has_kobo = cwa.kobo_states(user, [0])[0] != "no-kobo"
+    except Exception:
+        pass
+    if kobo and has_kobo:
+        mine = ondevice._owned_ids(user)
+        ks = ondevice.kobo_states(user, mine, is_admin)
+        want = {"on": ("on-kobo", "coming"), "off": ("deleted", "removing", "not-on-shelf")}[kobo]
+        sel = [b for b, s in ks.items() if s in want]
+        only = sel if only is None else [b for b in only if b in set(sel)]
     books = library.books_for(user, is_admin, offset=page * library.PAGE, q=q, kind=kind or None,
                               only=only, exclude=exclude, sort=sort)
     total = library.count_for(user, is_admin, q=q, kind=kind or None, only=only, exclude=exclude)
     # removed by this reader a moment ago: gone for them now, the host job catches up in minutes
     books = [x for x in books if not db.untag_pending(x["id"], user)]
+    kst = ondevice.kobo_states(user, [b["id"] for b in books], is_admin) if has_kobo and books else {}
     for b in books:
         b["best"] = library.best_format(b, prefs["preferred_format"])
         b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"])
         b["reading"] = state.get(b["id"])
+        b["kobo"] = kst.get(b["id"])
     u = _cwa_user(user)
+    kindle_left = ondevice.kindle_to_delete(user) if u.get("kindle_mail") else []
     return render_template("library.html", books=books, prefs=prefs, admin=is_admin,
-                           status=status, kind=kind, sort=sort, view=view,
+                           status=status, kind=kind, sort=sort, view=view, kobo=kobo, has_kobo=has_kobo,
+                           kindle_left=kindle_left,
                            kindle_mail=u.get("kindle_mail") or "", q=q, page=page, total=total,
                            first=page * library.PAGE + 1, last=page * library.PAGE + len(books),
                            more=(page + 1) * library.PAGE < total)
@@ -1046,12 +1064,12 @@ def book_page(book_id):
     is_comic = "cbz" in b["formats"]
     layout = _layout_context(user, book_id, is_admin) if is_comic else {}
     kobo_where = None                            # v6.2.1: where it stands on the reader's own Kobo
-    mine = not is_admin or user in (b.get("owners") or [])   # a reader only ever opens their own books
-    if mine and any(f in b["formats"] for f in ("epub", "kepub")):
-        try:
-            kobo_where = cwa.kobo_state(user, book_id)
+    if any(f in b["formats"] for f in ("epub", "kepub")):
+        try:                                     # v6.3: 'not-theirs' for a book they do not have
+            kobo_where = ondevice.kobo_state(user, book_id, is_admin)
         except Exception:
             kobo_where = None
+    kindle_left = [k for k in (ondevice.kindle_to_delete(user) if _cwa_user(user).get("kindle_mail") else []) if k["book_id"] == book_id]
     return render_template(
         "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
@@ -1066,11 +1084,13 @@ def book_page(book_id):
         kindle_mail=_cwa_user(user).get("kindle_mail") or "",
         convert_to=[f for f in config.CONVERT_TARGETS if f not in b["formats"]]
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
-        converting=db.convert_for_book(book_id),
-        replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS,
+        # v6.3: another reader's conversions and 'Find a better copy' would tell them someone else has it
+        converting=[j for j in db.convert_for_book(book_id) if is_admin or j.get("owner") == user],
+        replacing=_my_replace(user, book_id, is_admin), replace_days=db.REPLACE_DAYS,
         got_it=db.bookreq_for_book(user, book_id) or db.comic_for_book(user, book_id),
         my_families={m["family"] for m in devicemodels.chosen(user)}, device_apps=devicemodels.APPS,
-        my_platforms=_platform_names(user), kobo_where=kobo_where, **layout)
+        my_platforms=_platform_names(user), kobo_where=kobo_where, kindle_left=bool(kindle_left),
+        kobo_kept=(db.device_book(user, book_id, "kobo") or {}).get("status"), **layout)
 
 def _platform_names(user):
     """{'ios': 'iPad', 'android': 'Android phone or Android tablet'}: the reader's phones and tablets."""
@@ -1088,9 +1108,20 @@ def _layout_context(user, book_id, is_admin):
         return {}
     k = comics.kobo_copy_status(b, db.comic_convert_state([book_id]).get(book_id))
     made = k["made"]
+    # v6.3: a reader is told about their OWN Kobo only: the copy is shared, and naming the model it
+    # was made for, or the other readers' Kobos, would say who else has this comic and on what
+    mine = {m["profile"] for m in devicemodels.chosen(user) if m["family"] == devicemodels.KOBO}
+    name = devicemodels.profile_name(made.get("profile")) if made and (is_admin or made.get("profile") in mine) else ""
     return {"layout": k["layout"], "layout_chosen": k["chosen"], "layouts": comics.LAYOUTS, "choosable": comics.CHOOSABLE,
-            "made": made, "made_name": devicemodels.profile_name(made.get("profile")) if made else "",
-            "kobo_for": k["names"], "kobo_stale": k["stale"]}
+            "made": made, "made_name": name, "kobo_for": k["names"] if is_admin else [],
+            "kobo_stale": k["stale"]}
+
+def _my_replace(user, book_id, is_admin):
+    """'Find a better copy' as this reader may see it: one they opened (or any, for an admin)."""
+    r = db.replace_for_book(book_id)
+    if r and not is_admin and r.get("opened_by") != user and r.get("status") in ("open", "staged"):
+        return None
+    return r
 
 @app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
 @login_required
@@ -1131,6 +1162,9 @@ def book_replace(book_id):
     if not library.book_detail(user, book_id, is_admin):
         abort(404)
     if request.form.get("action") == "cancel":
+        job = db.replace_for_book(book_id)
+        if job and not is_admin and job.get("opened_by") != user:   # v6.3: only who asked (or an admin) stops it
+            abort(404)
         if db.cancel_replace(book_id):
             _audit("replace_cancel", f"book {book_id}")
             flash("Stopped looking for a better copy.")
@@ -1344,7 +1378,7 @@ def comic_series(provider, sid):
     mine = db.comic_series_status(user, provider, sid)
     have, books, state = {}, {}, cwa.reading_state(user)
     for it in items:
-        m = comics.find_in_library(info["name"], it["number"], info["kind"])
+        m = comics.find_in_library(info["name"], it["number"], info["kind"], viewer=user)
         if m and (user in m["owners"] or config.FAMILY_SHARING):
             have[it["number"]] = "yours" if user in m["owners"] else "family"
             if user in m["owners"]:
@@ -1384,7 +1418,7 @@ def comic_request():
         except comics.ComicError as e:
             flash(str(e))
             break
-    words = {"queued": "requested", "shared": "added from the family library", "owned": "already yours",
+    words = {"queued": "requested", "shared": "added to your library (no download)", "owned": "already yours",
              "exists": "already requested", "pending": "waiting for approval"}
     if said:
         flash("; ".join(f"{n} {words[w]}" for w, n in said.items()) + ".")
@@ -1490,6 +1524,10 @@ def hub():
     checklist, the guides. POST (v6.2): the devices they read on (home. passes only /hub, /help
     and /static to the portal, so the form posts here)."""
     user, is_admin = session["user"], session.get("admin", False)
+    if request.method == "POST" and request.form.get("action") == "device_settings":
+        _save_device_settings(user, is_admin)
+        back = request.form.get("back")
+        return redirect(url_for("devices") + "#settings" if back == "devices" else url_for("hub") + "#settings")
     if request.method == "POST":
         keys = devicemodels.clean(request.form.getlist("device"))
         db.set_devices(user, keys)
@@ -1504,7 +1542,55 @@ def hub():
                            checklist=_setup_checklist(user), admin=is_admin,
                            waiting_books=db.bookreq_waiting(user),
                            waiting_comics=db.comic_waiting(user) if config.COMICS_ENABLED else 0,
-                           new=len(db.notices(user)), **_device_context(user))
+                           new=len(db.notices(user)), **_device_context(user), **_settings_context(user, is_admin))
+
+def _save_device_settings(user, is_admin):
+    """v6.3, the reader's device settings (templates/_device_settings.html): what goes to their Kobo,
+    finished books, the Kindle reminder, keeping their books private. Each message says what the
+    next sync will do."""
+    f, prefs, notes = request.form, db.get_prefs(user), []
+    fin = f.get("kobo_finished", "")
+    fin = int(fin) if fin in ("0", "7", "30") else None
+    db.set_device_prefs(user, kobo_finished=fin, kindle_hint=1 if f.get("kindle_hint") == "1" else 0,
+                        private=1 if f.get("private") == "1" else 0)
+    if fin != prefs["kobo_finished"]:
+        notes.append("Finished books stay on your Kobo." if fin is None else
+                     "Finished books leave your Kobo " + ("at its next sync" if fin == 0 else f"{fin} days after you finish them")
+                     + " (they stay in your library; Send to my Kobo on a book's page puts one back).")
+    if bool(f.get("private") == "1") != prefs["private"]:
+        notes.append("Your books are private: none is offered to anyone else." if f.get("private") == "1"
+                     else "Your books can be added to another reader's library when they ask for the same one (never saying whose).")
+    mode = f.get("kobo_send")
+    try:
+        has_kobo = ondevice.cwa.kobo_states(user, [0])[0] != "no-kobo"
+    except Exception:
+        has_kobo = False
+    if has_kobo and mode and mode != ondevice.kobo_send(user, is_admin):
+        try:
+            r = ondevice.set_kobo_send(user, mode, keep=f.get("keep") == "1", admin=is_admin)
+        except ValueError:
+            abort(400)
+        if mode == "choose":
+            notes.append("Your Kobo now gets only the books you send (Send to my Kobo on a book's page)."
+                         + (f" {r['removed']} book(s) leave it at the next sync." if r["removed"] else " What is on it now stays."))
+        elif mode == "library":
+            notes.append("Your Kobo now gets every book in the library, every reader's.")
+        else:
+            notes.append("Your Kobo now gets every book in your library" + (f": {r['sent']} arrive at the next sync." if r["sent"] else ".")
+                         if not is_admin else "Your Kobo now gets all your own books, and only those.")
+    _audit("device_settings", f"kobo={mode or '-'} finished={fin} kindle_hint={f.get('kindle_hint') == '1'} private={f.get('private') == '1'}")
+    flash("Saved. " + " ".join(notes) if notes else "Saved.")
+
+def _settings_context(user, is_admin):
+    try:
+        has_kobo = ondevice.cwa.kobo_states(user, [0])[0] != "no-kobo"
+    except Exception:
+        has_kobo = False
+    return {"set_prefs": db.get_prefs(user), "set_has_kobo": has_kobo, "set_admin": is_admin,
+            "set_kobo_send": ondevice.kobo_send(user, is_admin) if has_kobo else None,
+            "set_send_choices": ondevice.ADMIN_SEND if is_admin else ondevice.KOBO_SEND,
+            "set_finished_choices": ondevice.FINISHED_CHOICES,
+            "set_has_kindle": bool(_cwa_user(user).get("kindle_mail")) or devicemodels.has(user, devicemodels.KINDLE)}
 
 def _device_context(user):
     """The device picker and the per-device notes (templates/_devices_pick.html, hub.html)."""
@@ -1626,7 +1712,7 @@ def comic_read_up_to(provider, sid):
             v = comicrel._num(it["number"])
             if v is None or v > upto:
                 continue
-            m = comics.find_in_library(info["name"], it["number"], info["kind"])
+            m = comics.find_in_library(info["name"], it["number"], info["kind"], viewer=user)
             if m and user in m["owners"]:
                 cwa.set_read_status(user, m["book_id"], "read")
                 n += 1
@@ -1647,7 +1733,8 @@ def book_kobo_copy(book_id):
     db.comic_convert_force(book_id, remake=remake)
     back = False
     try:                                         # v6.2.1: deleted on their Kobo? asking for a copy puts it back
-        back = cwa.kobo_state(user, book_id) == "deleted" and cwa.kobo_put_back(user, book_id)
+        back = ondevice.kobo_state(user, book_id, is_admin) == "deleted" and \
+            ondevice.send_to_kobo(user, book_id, is_admin) not in ("deleted", "not-theirs")
     except Exception:
         pass
     _audit("comic_kobo_copy", f"book {book_id}" + (" (remake)" if remake else "") + (" (put back on the Kobo)" if back else ""))
@@ -1663,21 +1750,54 @@ def book_kobo_copy(book_id):
 @app.route("/book/<int:book_id>/kobo-back", methods=["POST"])
 @login_required
 def book_kobo_back(book_id):
-    """v6.2.1: 'Put it back on my Kobo' for a book the reader deleted on their Kobo (it stays in
-    their library): what Calibre-Web's own Unarchive does, for this reader only."""
+    """'Send to my Kobo' (v6.2.1 'Put it back on my Kobo'): for a book the reader deleted on the Kobo,
+    that was taken off, or that a 'choose' Kobo has not had yet. It stays there afterwards (v6.3)."""
     user, is_admin = session["user"], session.get("admin", False)
-    b = library.book_detail(user, book_id, is_admin)
-    if not b or (is_admin and user not in (b.get("owners") or [])):   # a reader only ever opens their own
+    if not library.book_detail(user, book_id, is_admin):
         abort(404)
     try:
-        done = cwa.kobo_put_back(user, book_id)
+        was = ondevice.kobo_state(user, book_id, is_admin)
+        now = ondevice.send_to_kobo(user, book_id, is_admin) if was not in ("not-theirs", "no-kobo") else was
     except cwa.CwaError as e:
         flash(str(e))
         return redirect(url_for("book_page", book_id=book_id))
-    _audit("kobo_put_back", f"book {book_id}")
-    flash("Put back: it comes to your Kobo at its next sync (it may need a tap to download)." if done
-          else "It was not deleted on your Kobo: nothing to put back.")
+    if now == "not-theirs":
+        abort(404)                               # an admin looking at someone else's book: never theirs to send
+    _audit("kobo_send", f"book {book_id}")
+    flash("Put back: it comes to your Kobo at its next sync (it may need a tap to download), and stays there."
+          if now in ("coming", "on-kobo") and was not in ("coming", "on-kobo") else
+          "Link your Kobo first (Devices → Kobo)." if now == "no-kobo" else
+          "Sent again: it comes at the next sync." if now == "coming" else "It is on your Kobo already.")
     return redirect(url_for("book_page", book_id=book_id))
+
+@app.route("/book/<int:book_id>/kobo-off", methods=["POST"])
+@login_required
+def book_kobo_off(book_id):
+    """v6.3: 'Take it off my Kobo': off the device at the next sync, still in the library."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not library.book_detail(user, book_id, is_admin):
+        abort(404)
+    try:
+        now = ondevice.take_off_kobo(user, book_id, is_admin)
+    except cwa.CwaError as e:
+        flash(str(e))
+        return redirect(url_for("book_page", book_id=book_id))
+    if now == "not-theirs":
+        abort(404)
+    _audit("kobo_take_off", f"book {book_id}")
+    flash("It leaves your Kobo at its next sync. It stays in your library: Send to my Kobo brings it back.")
+    return redirect(url_for("book_page", book_id=book_id))
+
+@app.route("/book/<int:book_id>/kindle-deleted", methods=["POST"])
+@login_required
+def book_kindle_deleted(book_id):
+    """v6.3: the reader deleted a finished book from their Kindle: no more reminders about it."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not library.book_detail(user, book_id, is_admin):
+        abort(404)
+    ondevice.kindle_deleted(user, book_id)
+    flash("Noted. Send to Kindle on its page sends it again whenever you like.")
+    return redirect(request.form.get("back") if request.form.get("back") in ("/library",) else url_for("book_page", book_id=book_id))
 
 @app.route("/book/<int:book_id>/layout", methods=["POST"])
 @login_required
@@ -1696,6 +1816,7 @@ def book_layout(book_id):
     kobo = has_kepub or any(comics.uses_kobo(o) for o in b.get("owners") or [])
     if kobo:                                    # no Kobo copy for a comic nobody reads on a Kobo
         db.comic_convert_force(book_id, remake=has_kepub)
+    kobo = has_kepub or comics.uses_kobo(user)  # v6.3: the message speaks of the reader's own Kobo only
     _audit("comic_layout", f"book {book_id} {layout}")
     name = "Automatic layout" if layout == "auto" else comics.LAYOUTS[layout].split(":")[0].split(" (")[0]
     flash(name + (": the Kobo copy is being made again with it — a few minutes, then sync your Kobo." if has_kepub else
@@ -1785,12 +1906,12 @@ def notice_action(nid, action):
                     else url_for("index"))
 
 REQUEST_SAID_AUDIO = {"queued": "Requested: the portal is looking for the audiobook and will ask you to confirm it before it downloads (Requests shows how far it got).",
-                      "shared": "The family has this audiobook: added to your audiobooks, nothing downloaded.",
+                      "shared": "Added to your audiobooks at once (no download needed).",
                       "owned": "You have this audiobook already.", "exists": "Already requested.",
                       "pending": "Requested; waiting for the admin's approval."}
 
 REQUEST_SAID = {"queued": "Requested: the portal is looking for a copy and will ask you to confirm it before it downloads (Requests shows how far it got).",
-                "shared": "It was in the family library: added to yours, nothing downloaded.",
+                "shared": "Added to your library at once (no download needed).",
                 "owned": "You have it already.", "exists": "Already requested.",
                 "pending": "Requested; waiting for the admin's approval."}
 
@@ -1827,7 +1948,7 @@ def _book_rows(user, books):
                 owners = []
             if user in owners:
                 row.update(lib="yours", book_id=m["book_id"])
-            elif owners and config.FAMILY_SHARING:      # only then is "Add to mine" true (and shown at all)
+            elif share.shareable(owners) and config.FAMILY_SHARING:   # only then is "Add to mine" true
                 row["lib"] = "family"
         rows.append(row)
     return rows
@@ -2110,11 +2231,12 @@ def audiobook_remove(item_id):
             return redirect(url_for("my_audiobooks"))
         share._ABS_ITEMS["at"] = 0.0
         left = absapi.item_owners(item_id)
-    except absapi.AbsError as e:
-        flash(f"Audiobookshelf did not take it out: {e}")
+    except absapi.AbsError:
+        # v6.3: the same answer as for one that is not theirs (an id never tells whether it exists)
+        flash("It is not in your audiobooks.")
         return redirect(url_for("my_audiobooks"))
     if left == [] and config.LIBRARY_RELEASE_DAYS > 0:
-        db.audio_release_note(item_id, meta.get("title"))
+        db.audio_release_note(item_id, meta.get("title"), removed_by=user)
     _audit("remove_audiobook", item_id)
     flash(f"“{meta.get('title') or 'The audiobook'}” is out of your audiobooks. A copy downloaded in the "
           "Audiobookshelf app stays on your phone until you delete it there (the book's ⋯ menu → Delete download).")
@@ -2294,8 +2416,9 @@ def devices():
                 cwa.reset_kobo_token(user); _audit("kobo_reset"); flash("Kobo link regenerated — update the device.")
             elif action == "kobo_test":
                 flash(_kobo_link_test(user))
-            elif action == "kobo_prefs":
-                cwa.set_kobo_prefs(user, shelves_only=request.form.get("shelves_only") == "1")
+            elif action == "kobo_prefs":                      # v6.3: through ondevice (the Kobo keeps its books)
+                ondevice.set_kobo_send(user, "choose" if request.form.get("shelves_only") == "1" else "all",
+                                       keep=True, admin=session.get("admin", False))
                 _audit("kobo_prefs")
                 flash("Kobo options saved.")
             elif action == "hardcover":                        # v6.0: its own card, Kobo or not
@@ -2380,7 +2503,8 @@ def devices():
                            anilist_link=db.anilist_get(user), metron_link=db.metron_get(user),
                            hc_audio=db.hc_audio_state(user), ntfy_base=notify.ntfy_base(),
                            hcwant_note=__import__("hcwant").note(user),
-                           hcwant_backlog=len(db.hc_want_unrequested(user)), **_device_context(user))
+                           hcwant_backlog=len(db.hc_want_unrequested(user)), **_device_context(user),
+                           **_settings_context(user, session.get("admin", False)))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])

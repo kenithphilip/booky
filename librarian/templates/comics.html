@@ -53,7 +53,7 @@ Each file is checked when it arrives (series, number, language, pages) before it
 {% if r.status == 'held' and r.held_meta %}{% set h = r.held_meta %}<div>The file <span class="code">{{ h.file }}</span>{% if h.series %} says {{ h.series }}{% if h.number %} #{{ h.number }}{% endif %}{% endif %}{% if h.language %} · {{ h.language }}{% endif %}{% if h.pages is not none and h.pages != '' %} · {{ h.pages }} pages{% endif %}.
 <span class="mut">Not added to your library. Keep it if it is right after all.</span></div>{% endif %}</td>
 <td class="st-{{ 'done' if r.status in ('done', 'shared') else 'error' if r.status in ('failed', 'not-found', 'held') else 'pending' if r.status == 'confirm' else r.status }}" style="white-space:nowrap">{{
-  {'queued': 'looking', 'downloading': 'downloading', 'done': 'in your library', 'shared': 'from the family library',
+  {'queued': 'looking', 'downloading': 'downloading', 'done': 'in your library', 'shared': 'in your library (no download)',
    'not-found': 'not found', 'failed': 'failed', 'cancelled': 'cancelled', 'pending': 'waiting for approval',
    'confirm': 'confirm this copy', 'held': 'check this file'}.get(r.status, r.status) }}</td>
 <td>

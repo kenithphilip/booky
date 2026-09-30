@@ -11,6 +11,11 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 </details>
 </div>
 
+<div class="card" id="settings">
+<h3>Your settings</h3>
+{% with back='devices' %}{% include "_device_settings.html" %}{% endwith %}
+</div>
+
 <div class="card">
 <h3>Kobo</h3>
 {% if not kobo_on %}<p class="mut">Kobo sync is not switched on for this library yet — ask the admin (it is one click in the admin tools).</p>{% endif %}
@@ -34,9 +39,8 @@ You can also download any of your books from <a href="{{ url_for('my_library') }
 <button type="submit" class="sec">Test my link</button> <span class="mut">(asks the library exactly what a Kobo asks first)</span></form>
 <form method="post" class="row">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_reset">
 <button type="submit" class="sec">Regenerate link</button> <span class="mut">(the old link stops working; update the device)</span></form>
-<form method="post" style="margin-top:6px">{{ csrf_field() }}<input type="hidden" name="action" value="kobo_prefs">
-<label><input type="checkbox" name="shelves_only" value="1" {{ 'checked' if kstat and kstat.shelves_only }}> Only sync the shelves I mark for Kobo in Calibre-Web (not my whole library)</label><br>
-<button type="submit" class="sec">Save Kobo options</button></form>
+{#- v6.3: what goes to the Kobo and finished books: "Your settings" below -#}
+<p class="mut" style="margin-top:6px">What goes to your Kobo, and whether finished books leave it: <a href="#settings">Your settings</a> above.</p>
 <p class="mut" style="margin-top:8px">This link is a key in its own right: anyone holding it reads your whole library, and
 <strong>changing your password does not change it</strong>. If the link leaked, or a device carrying it was lost, regenerate it here.</p>
 {% else %}
@@ -100,7 +104,7 @@ audiobook listening{% endif %} reach your Hardcover account, and your Want to Re
 <form method="post">{{ csrf_field() }}<input type="hidden" name="action" value="hcwant">
 <p><label><input type="checkbox" name="hc_want" value="1" {{ 'checked' if prefs.hc_want }}> Books I add to my Want to Read list on Hardcover become requests here</label>
 <select name="hc_want_kind" style="width:auto">{% for v, l in (('ebook', 'as ebooks'), ('audio', 'as audiobooks'), ('both', 'as both')) %}<option value="{{ v }}" {{ 'selected' if prefs.hc_want_kind == v }}>{{ l }}</option>{% endfor %}</select></p>
-<p class="mut">Checked every 10 minutes. A book the family has is added to yours with nothing downloaded; otherwise the copy found waits for your
+<p class="mut">Checked every 10 minutes. A book the library already holds is added to yours at once, nothing downloaded; otherwise the copy found waits for your
 yes on Requests, like any Get it. Switching this on requests nothing that is already on the list.</p>
 <button type="submit">Save</button></form>
 {% if hcwant_note %}<p class="mut">{{ hcwant_note }}</p>{% endif %}

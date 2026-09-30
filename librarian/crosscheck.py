@@ -86,17 +86,20 @@ def run(now=None):
 
         # books a reader deleted on their Kobo and still has: normal, and they can put them back
         try:
+            # deleted on the Kobo by the reader: not the ones the portal took off (finished books, Take it off)
             gone = [(u, bid) for u, bid in cwa.kobo_archived()
-                    if bid in owned.get(u, []) and not db.untag_pending(bid, u)]
+                    if bid in owned.get(u, []) and not db.untag_pending(bid, u)
+                    and (db.device_book(u, bid, "kobo") or {}).get("status") != "off"]
         except Exception:
             gone = []
         if gone:
+            # v6.3: counts per reader, never titles: what someone reads stays theirs, even on this page
             by = {}
-            for u, bid in gone:
-                by.setdefault(u, []).append(titles.get(bid, str(bid)))
+            for u, _bid in gone:
+                by[u] = by.get(u, 0) + 1
             notes.append({"code": "kobo-deleted", "text":
                           f"{len(gone)} book(s) deleted on a reader's Kobo but still in their library (their page offers "
-                          f"'Put it back on my Kobo'): " + "; ".join(f"{u}: {_first(t, 2)}" for u, t in sorted(by.items()))})
+                          f"'Put it back on my Kobo'): " + ", ".join(f"{u} {n}" for u, n in sorted(by.items()))})
 
     # audiobooks: the same rules in Audiobookshelf (owner tags on items; v6.1 removal countdown)
     _audiobooks(now, accounts, problems, notes)

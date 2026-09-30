@@ -372,9 +372,9 @@ def test_a_reader_requests_volumes_from_the_series_page(client, monkeypatch):
     _comic_book(9, "One Piece", 2, ["Manga", "owner:alice"])
     login(client, "bob", "bobpass1")
     page = client.get("/comics/series/mangaupdates/77").get_data(as_text=True)
-    assert "in the family library" in page
+    assert "ready now (ticking it adds it to yours" in page
     r = post(client, "/comics/request", provider="mangaupdates", series_id="77", number=["1", "2"], language="en", reading="rtl")
-    assert "1 requested" in r.get_data(as_text=True) and "1 added from the family library" in r.get_data(as_text=True)
+    assert "1 requested" in r.get_data(as_text=True) and "1 added to your library (no download)" in r.get_data(as_text=True)
     assert sorted((x["number"], x["status"]) for x in db.comic_list("bob")) == [("1", "queued"), ("2", "shared")]
     assert client.get("/comics/series/bad/77").status_code == 404
 

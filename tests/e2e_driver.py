@@ -855,6 +855,82 @@ if dd_id:
     st, titles = kobo_sync_titles(bob_kobo)
     check("E2E Device Delete" in titles, "and his Kobo gets it", str(sorted(titles))[:160])
 
+# --- v6.3: keeping a Kobo tidy, per reader (ondevice.py), on the real Calibre-Web
+def kobo_find(token, title):
+    st, h, b = Session().get(f"{CWA}/kobo/{token}/v1/library/sync", headers={"User-Agent": "Kobo eReader", "x-kobo-synctoken": ""})
+    return [e for it in (jload(b) if st == 200 else []) for e in [it.get("ChangedEntitlement") or it.get("NewEntitlement")]
+            if e and (e.get("BookMetadata") or {}).get("Title") == title]
+def devices_pass():
+    return subprocess.run(["docker", "exec", "librarian", "python", "-c", "import worker; print(worker.devices_once())"],
+                          capture_output=True, text=True)
+if dd_id:
+    # a book she sent back (Put it back, above) stays whatever the setting: that is the promise
+    st, h, b = portal_post(p, "/hub", "/hub", {"action": "device_settings", "kobo_send": "all", "kobo_finished": "0", "kindle_hint": "1"})
+    check(st in (302, 303), "alice chooses: finished books leave her Kobo right away", str(st))
+    fm_bytes = make_epub("E2E Finish Me", "Test Harness")
+    upload_as(p, "Test Harness - E2E Finish Me.epub", fm_bytes)
+    fm_id = wait(lambda: imported("E2E Finish Me", "alice"), 300, 5)
+    got = kobo_find(alice_kobo, "E2E Finish Me") if fm_id else []
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is False, "a new book reaches her Kobo", json.dumps(got)[:160])
+    r = subprocess.run(["docker", "exec", "librarian", "python", "-c",
+                        f"import cwa; cwa.set_read_status('alice', {fm_id}, 'read'); cwa.set_read_status('alice', {dd_id}, 'read')"],
+                       capture_output=True, text=True)
+    r2 = devices_pass()
+    got = kobo_find(alice_kobo, "E2E Finish Me")
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is True, "she finishes it: her Kobo's next sync takes it off",
+          json.dumps(got)[:160] + r.stderr[-150:] + r2.stdout[-40:] + r2.stderr[-150:])
+    check(imported("E2E Finish Me", "alice") == fm_id, "and it stays in her library")
+    kept = kobo_find(alice_kobo, "E2E Device Delete")
+    check(not kept or kept[0]["BookEntitlement"]["IsRemoved"] is False,
+          "the finished book she had sent back stays on her Kobo", json.dumps(kept)[:160])
+    st, h, b = p.get(PORTAL + f"/book/{fm_id}")
+    check(f'/book/{fm_id}/kobo-back"'.encode() in b and b"taken off it" in b and b"you deleted it on the Kobo" not in b,
+          "its page says it was taken off (not that she deleted it) and offers Send to my Kobo")
+    portal_post(p, f"/book/{fm_id}/kobo-back", f"/book/{fm_id}", {})
+    got = kobo_find(alice_kobo, "E2E Finish Me")
+    check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is False, "Send to my Kobo: it comes back at the next sync", json.dumps(got)[:160])
+    devices_pass()
+    got = kobo_find(alice_kobo, "E2E Finish Me")
+    check(not got or got[0]["BookEntitlement"]["IsRemoved"] is False, "and stays, although it is finished", json.dumps(got)[:160])
+    # only the books she sends
+    st, h, b = portal_post(p, "/hub", "/hub", {"action": "device_settings", "kobo_send": "choose", "keep": "1", "kobo_finished": "", "kindle_hint": "1"})
+    ch_bytes = make_epub("E2E Choose Me", "Test Harness")
+    upload_as(p, "Test Harness - E2E Choose Me.epub", ch_bytes)
+    ch_id = wait(lambda: imported("E2E Choose Me", "alice"), 300, 5)
+    check(ch_id is not None and not kobo_find(alice_kobo, "E2E Choose Me"), "'Only the books I send': a new book does not go to her Kobo by itself")
+    if ch_id:
+        st, h, b = p.get(PORTAL + f"/book/{ch_id}")
+        check(b"your Kobo gets only the books you send" in b, "its page says so")
+        portal_post(p, f"/book/{ch_id}/kobo-back", f"/book/{ch_id}", {})
+        got = kobo_find(alice_kobo, "E2E Choose Me")
+        check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is False, "Send to my Kobo sends it", json.dumps(got)[:160])
+        portal_post(p, f"/book/{ch_id}/kobo-off", f"/book/{ch_id}", {})
+        got = kobo_find(alice_kobo, "E2E Choose Me")
+        check(bool(got) and got[0]["BookEntitlement"]["IsRemoved"] is True, "Take it off my Kobo takes it off at the next sync", json.dumps(got)[:160])
+    portal_post(p, "/hub", "/hub", {"action": "device_settings", "kobo_send": "all", "kobo_finished": "", "kindle_hint": "1"})
+    check(not subprocess.run(["docker", "exec", "librarian", "python", "-c", "import cwa; print(cwa.kobo_choose_only('alice'))"],
+                             capture_output=True, text=True).stdout.strip() == "True", "back to every book in her library")
+
+# --- v6.3: an admin's Kobo gets only the admin's own books (their account sees the whole library)
+portal_post(pa, "/devices", "/devices", {"action": "kobo"})
+st, h, b = pa.get(PORTAL + "/devices"); m = re.search(rb"kobo/([0-9a-f]{32})", b)
+admin_kobo = m.group(1).decode() if m else None
+check(admin_kobo is not None, "the admin links a Kobo")
+if admin_kobo:
+    kobo_sync_titles(admin_kobo)                     # its first sync (an admin account sees every book)
+    r = devices_pass()
+    got = kobo_find(admin_kobo, "E2E Portal Book")      # alice's book
+    check(not got or got[0]["BookEntitlement"]["IsRemoved"] is True,
+          "alice's books never reach the admin's Kobo (or leave it at the next sync)", json.dumps(got)[:160] + r.stderr[-200:])
+
+# --- v6.3: a reader who keeps their books private: none is offered to anyone else
+r = subprocess.run(["docker", "exec", "librarian", "python", "-c",
+                    "import db, share, config; config.FAMILY_SHARING = True; db.set_device_prefs('bob', private=1); "
+                    "print(share.find_ebook('Intake Hook Book', 'Automation')); db.set_device_prefs('bob', private=0); "
+                    "print(bool(share.find_ebook('Intake Hook Book', 'Automation')))"], capture_output=True, text=True)
+check(r.stdout.split() == ["None", "True"], "bob keeps his books private: his book is not offered to anyone; switched back, it is",
+      (r.stdout + r.stderr)[-200:])
+
 # --- the admin's dashboard and the reader's Help
 st, h, b = pa.get(PORTAL + "/admin")
 check(st == 200 and b"What needs you" in b and b"This week" in b, "the admin dashboard opens with What needs you", str(st))
@@ -939,8 +1015,8 @@ if len(fam) >= 2:
     check(st == 201, f"bob requests '{t1}' (alice's) in Shelfmark", f"{st} {b[:120]!r}")
     def closed():
         st, h, b = sb.get(SHELF + "/api/requests")
-        return b if b'"status":"rejected"' in b.replace(b" ", b"") and b"family library" in b else None
-    check(wait(closed, 60, 3) is not None, "the portal closed it within seconds, BEFORE any download: 'already in the family library'")
+        return b if b'"status":"rejected"' in b.replace(b" ", b"") and b"Added to your library at once" in b else None
+    check(wait(closed, 60, 3) is not None, "the portal closed it within seconds, BEFORE any download: 'added to your library at once'")
     check(wait(lambda: (host_job(), imported(t1, "bob"))[1], 240, 20) == b1, "the host job gave bob alice's copy (the same Calibre book)")
     check(imported(t1, "alice") == b1, "alice keeps it")
     before = calibre("SELECT count(*) FROM books")[0][0]
