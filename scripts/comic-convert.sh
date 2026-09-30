@@ -8,9 +8,12 @@
 #           Kobo sync prefers a stored KEPUB and sends a pre-paginated one as EPUB3FL, so it
 #           reaches the Kobo through the reader's existing link. Stored as .kepub on purpose:
 #           Calibre-Web's cover/metadata enforcer rewrites only .epub/.azw3 files.
-#   Kindle: a comic sent to a Kindle is converted when it is sent (KCC's "Send to Kindle" EPUB, the
-#           Colorsoft profile), made to fit the mail limit, left in library/staging/kindle-comics/<job>/
+#   Kindle: a comic sent to a Kindle is converted when it is sent (KCC's "Send to Kindle" EPUB, for
+#           the reader's Kindle), made to fit the mail limit, left in library/staging/kindle-comics/<job>/
 #           for the portal to mail, and never stored in the library.
+#   v6.2:   the portal says which device each copy is for (the readers choose theirs on the start
+#           page; none chosen: KCC_KOBO_PROFILE / KCC_KINDLE_PROFILE, in colour, as before) and how
+#           the pages are laid out (spreads, landscape pages, webtoon strips, newspaper dailies).
 #
 # Why a host job: the portal has no Docker socket (on purpose). The portal decides what is due
 # (python -m admin_cli comics ...); this runs KCC in a throwaway container with no network, as
@@ -60,6 +63,37 @@ try:
     KOBO_MAX_MB = int(envget("KCC_KOBO_MAX_MB") or "1024")
 except ValueError:
     KOBO_MAX_MB = 1024
+
+# v6.2: how a comic's pages are laid out (the portal chooses from ALL its pages, or the reader does:
+# librarian/comics.py LAYOUTS). Only these, and only KCC profiles of real devices, are ever run.
+LAYOUT_FLAGS = {
+    "portrait": [],                          # no wide pages: nothing to cut or turn
+    "spreads": ["-r", "2", "-c", "0"],       # each half, then the whole spread turned; no margin crop,
+                                             # which cut uneven-margin spreads off the gutter (measured)
+    "split": ["-r", "0", "-c", "0"],         # halves only (KCC's classic), cut on the gutter
+    "rotate": ["-r", "1"],                   # a landscape book: turned, never cut (v6.1)
+    "strip": ["-w"],                         # a webtoon
+    "dailies": ["--maximizestrips"],         # every page a row of panels: two rows, no turning
+}
+# A Kindle copy is KCC's Send-to-Kindle format, which frames EVERY page of a book at one size taken
+# from its source pages: a landscape book gets a landscape frame, and a page turned sideways inside
+# it came out a narrow strip (measured: 646 x 916 of 1236 x 916, v6.1's -r 1), dailies made two rows
+# a thumbnail. On a Kindle such pages stay whole and upright (up to 1920 px): turned to landscape,
+# the Kindle shows them across its whole screen.
+KINDLE_FLAGS = {"rotate": ["-r", "1", "--norotate"], "dailies": ["-r", "1", "--norotate"]}
+PROFILES = {"KoLC", "KoCC", "KoC", "KoL", "KoS", "KoE", "KoF", "KoN", "KoGHD", "KoAO",
+            "KCS", "KSCS", "KPW6", "KPW5", "KPW34", "K11", "KO", "KS", "KS3", "KV"}
+
+def plan(row, default_profile):
+    """(profile, colour, layout, upscale) for one row. A portal from before v6.2 sends only
+    strip/landscape; a profile or layout this job does not know is never passed to KCC."""
+    layout = row.get("layout")
+    if layout not in LAYOUT_FLAGS:
+        layout = "strip" if row.get("strip") else "rotate" if row.get("landscape") else "portrait"
+    profile = row.get("profile") if row.get("profile") in PROFILES else default_profile
+    colour = row.get("colour") is not False
+    upscale = row.get("upscale") is True and layout not in ("strip", "dailies")
+    return profile, colour, layout, upscale
 
 class Final(RuntimeError):
     """A result another try cannot change (the Kobo copy is too large): recorded once, not retried."""
@@ -115,7 +149,7 @@ def own(path):
 def safe_rel(rel):
     return rel and not rel.startswith("/") and ".." not in rel.split("/")
 
-def kcc(src, outdir, profile, fmt, kind, strip, title, extra=(), landscape=False):
+def kcc(src, outdir, profile, fmt, kind, title, extra=(), layout="portrait", colour=True, upscale=False, kindle=False):
     """One KCC run in a throwaway container: no network, PUID:PGID, capped. [output files].
     v6.0.1: KCC sees the comic under a plain name of ours (comic.<ext>, alone in its folder): a
     library file whose name starts with '-' was read by KCC's 7-Zip as an option ('Extraction
@@ -136,17 +170,16 @@ def kcc(src, outdir, profile, fmt, kind, strip, title, extra=(), landscape=False
         args = ["docker", "run", "--rm", "--network", "none", "--user", f"{UID}:{GID}",
                 "--cpus", CPUS, "--memory", MEM, "--memory-swap", MEM,
                 "-v", f"{indir}:/in:ro", "-v", f"{outdir}:/out", IMG,
-                "-p", profile, "--forcecolor", "-f", fmt, "-t", title, "-o", "/out"]
+                "-p", profile, "-f", fmt, "-t", title, "-o", "/out"]
+        if colour:                             # v6.2: greyscale for a black-and-white e-reader (smaller, e-ink tuned)
+            args.append("--forcecolor")
         if fmt == "EPUB":
             args.append("--nokepub")
         if kind == "manga":
-            args.append("-m")
-        if strip:
-            args.append("-w")
-        elif landscape:
-            # v6.1: a landscape BOOK (every page wide: The Complete Peanuts) is rotated to fill the
-            # screen (turn the device); KCC's default cut each wide page in half as a 'spread'
-            args += ["-r", "1"]
+            args.append("-m")                  # right to left: the halves of a spread in manga order
+        args += (KINDLE_FLAGS.get(layout) if kindle else None) or LAYOUT_FLAGS[layout]   # v6.2: every page shape
+        if upscale:
+            args.append("-u")                  # a low-resolution scan: KCC resizes it (sharper than the device)
         args += list(extra) + [f"/in/{os.path.basename(plain)}"]
         r = run(args, timeout=3600)            # a 700-page colour volume took ~4 min; 2 GB, about 12
     finally:
@@ -190,8 +223,9 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         if shutil.disk_usage(WORK if os.path.isdir(WORK) else STACK).free < need:
             print(f"comic-convert: book {bid}: not enough free disk for its Kobo copy yet; later")
             continue                                        # not a failure: tried again next run
-        made = kcc(src, out, KOBO_PROFILE, "EPUB", row.get("kind"), row.get("strip"), row.get("title") or "Comic",
-                   ("-b", "0"), landscape=bool(row.get("landscape")))
+        profile, colour, layout, upscale = plan(row, KOBO_PROFILE)
+        made = kcc(src, out, profile, "EPUB", row.get("kind"), row.get("title") or "Comic",
+                   ("-b", "0"), layout=layout, colour=colour, upscale=upscale)
         if len(made) > 1:
             raise RuntimeError("KCC split it into several files although asked not to: not added")
         mb = os.path.getsize(made[0]) >> 20
@@ -218,7 +252,8 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
             raise RuntimeError("the owner tags changed: stopped")
         if r.returncode != 0 or "KEPUB" not in after["formats"]:
             raise RuntimeError(("calibredb add_format: " + (r.stderr or r.stdout or "no KEPUB afterwards"))[-250:])
-        admin("comics", "kobo-result", str(bid), "ok")
+        admin("comics", "kobo-result", str(bid), "ok", "--made",
+              json.dumps({"profile": profile, "colour": colour, "layout": layout, "upscale": upscale}))
         kobo_ok += 1
     except Exception as e:
         why = str(e)
@@ -245,13 +280,14 @@ for row in (due.get("rows") or []) if due.get("ok") else []:
         if not safe_rel(rel) or not os.path.isfile(src) or os.path.islink(src):
             raise RuntimeError("refused: the comic's file is not where Calibre says")
         title = row.get("title") or "Comic"
+        profile, colour, layout, upscale = plan(row, KINDLE_PROFILE)
         made = []
         # 1. KCC's Send-to-Kindle format; 2. the same at lower image quality; 3. split into parts
         for fmt, extra in (("KFX", ()), ("KFX", ("--jpeg-quality", "75")),
                            ("EPUB", ("--targetsize", str(max(10, int(row.get("max_mb") or 45) * 85 // 100)), "-b", "1"))):
             shutil.rmtree(out, ignore_errors=True)
-            made = kcc(src, out, KINDLE_PROFILE, fmt, row.get("kind"), row.get("strip"), title, extra,
-                       landscape=bool(row.get("landscape")))
+            made = kcc(src, out, profile, fmt, row.get("kind"), title, extra,
+                       layout=layout, colour=colour, upscale=upscale, kindle=True)
             if all(os.path.getsize(f) <= limit for f in made):
                 break
         else:

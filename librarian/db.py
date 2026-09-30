@@ -298,7 +298,8 @@ def init():
         # v6.0: phone notifications (a private ntfy topic) and the Hardcover Want to Read sync
         for col, typ in (("ntfy_topic", "TEXT"), ("hc_want", "INTEGER DEFAULT 0"), ("hc_want_kind", "TEXT"),
                          ("hc_want_seeded", "REAL"),      # when the list was last recorded without requesting
-                         ("hc_want_after", "INTEGER")):   # the newest list entry (user_book id) recorded then
+                         ("hc_want_after", "INTEGER"),    # the newest list entry (user_book id) recorded then
+                         ("devices", "TEXT")):            # v6.2: the reader's devices (JSON list, devicemodels.py)
             if col not in pcols:
                 c.execute(f"ALTER TABLE prefs ADD COLUMN {col} {typ}")
         c.execute("""CREATE TABLE IF NOT EXISTS hc_want_seen(
@@ -332,6 +333,11 @@ def init():
             forced INTEGER DEFAULT 0, attempts INTEGER DEFAULT 0, next_try REAL, detail TEXT, updated REAL)""")
         if "remake" not in {r[1] for r in c.execute("PRAGMA table_info(comic_convert)")}:
             c.execute("ALTER TABLE comic_convert ADD COLUMN remake INTEGER DEFAULT 0")   # v6.1: replace the Kobo copy
+        if "made" not in {r[1] for r in c.execute("PRAGMA table_info(comic_convert)")}:
+            c.execute("ALTER TABLE comic_convert ADD COLUMN made TEXT")    # v6.2: what the Kobo copy was made for (JSON)
+        # v6.2: how a comic's pages are laid out on e-readers, when a reader chose it (else: from its pages)
+        c.execute("""CREATE TABLE IF NOT EXISTS comic_layout(
+            calibre_id INTEGER PRIMARY KEY, layout TEXT NOT NULL, owner TEXT, updated REAL)""")
         # v5.8: what readers follow, what turned up for them, and their AniList link
         c.execute("""CREATE TABLE IF NOT EXISTS follows(
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL,
@@ -461,7 +467,22 @@ def get_prefs(owner):
             # v6.0
             "ntfy_topic": d.get("ntfy_topic") or "", "hc_want": bool(d.get("hc_want")),
             "hc_want_kind": d.get("hc_want_kind") if d.get("hc_want_kind") in ("ebook", "audio", "both") else "ebook",
-            "hc_want_seeded": d.get("hc_want_seeded")}
+            "hc_want_seeded": d.get("hc_want_seeded"),
+            # v6.2: the devices the reader reads on (devicemodels.py keys)
+            "devices": _json_list(d.get("devices"))}
+
+def _json_list(v):
+    try:
+        out = json.loads(v) if v else []
+    except ValueError:
+        return []
+    return [x for x in out if isinstance(x, str)] if isinstance(out, list) else []
+
+def set_devices(owner, keys):
+    """v6.2: the reader's devices, as chosen on the start page (keys already checked)."""
+    with _lock, _conn() as c:
+        c.execute("INSERT OR IGNORE INTO prefs(owner, updated) VALUES(?,?)", (owner, time.time()))
+        c.execute("UPDATE prefs SET devices=?, updated=? WHERE owner=?", (json.dumps(list(keys)), time.time(), owner))
 
 def set_prefs_v6(owner, **f):
     """v6.0 reader settings: ntfy_topic, hc_want, hc_want_kind (kept apart from set_prefs so its
@@ -1944,9 +1965,10 @@ def comic_convert_force(calibre_id, now=None, remake=False):
                   "status='due', forced=1, attempts=0, next_try=excluded.next_try, updated=excluded.updated, "
                   "remake=excluded.remake", (calibre_id, now, now, 1 if remake else 0))
 
-def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, final=False):
+def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, final=False, made=None):
     """ok: done. A failure is tried again after 1 h, then 6 h, and left 'failed' after three.
-    final (v6.0.1): a failure another try cannot change (too large for a Kobo) is 'failed' at once."""
+    final (v6.0.1): a failure another try cannot change (too large for a Kobo) is 'failed' at once.
+    made (v6.2): what the copy was made for ({profile, colour, layout}), kept with a success."""
     now = now or time.time()
     with _lock, _conn() as c:
         r = c.execute("SELECT attempts FROM comic_convert WHERE calibre_id=?", (calibre_id,)).fetchone()
@@ -1960,7 +1982,24 @@ def comic_convert_result(calibre_id, ok, detail=None, now=None, max_attempts=3, 
                   "updated=excluded.updated, forced=CASE WHEN excluded.status='due' THEN forced ELSE 0 END, "
                   "remake=CASE WHEN excluded.status='due' THEN remake ELSE 0 END",
                   (calibre_id, status, attempts, nxt, (detail or "")[:300], now))
+        if ok and made:
+            c.execute("UPDATE comic_convert SET made=? WHERE calibre_id=?", (json.dumps(made), calibre_id))
         return status
+
+def comic_layout_get(calibre_id):
+    with _conn() as c:
+        r = c.execute("SELECT layout FROM comic_layout WHERE calibre_id=?", (calibre_id,)).fetchone()
+    return r["layout"] if r else None
+
+def comic_layout_set(calibre_id, layout, owner=None):
+    """v6.2: a reader's choice of layout for a comic ('auto' clears it: from its pages again)."""
+    with _lock, _conn() as c:
+        if layout == "auto":
+            c.execute("DELETE FROM comic_layout WHERE calibre_id=?", (calibre_id,))
+        else:
+            c.execute("INSERT INTO comic_layout(calibre_id, layout, owner, updated) VALUES(?,?,?,?) "
+                      "ON CONFLICT(calibre_id) DO UPDATE SET layout=excluded.layout, owner=excluded.owner, "
+                      "updated=excluded.updated", (calibre_id, layout, owner, time.time()))
 
 def kindle_comic_jobs(status, limit=5):
     with _conn() as c:

@@ -5,9 +5,41 @@ issue or volume arrives on the reader's own devices, the same way books do.
 
 | Device | How it gets there |
 |---|---|
-| Kobo (Libra Colour, Clara Colour) | the Kobo link the reader already has (Calibre-Web Kobo sync): a colour, fixed-layout KEPUB made by KCC |
-| Kindle (Colorsoft) | Send-to-Kindle mail, like books (auto-send if the reader turned it on): a KCC "Send to Kindle" EPUB, made when it is sent, never stored |
-| Phone / iPad | My books → Download: the CBZ (Panels, Chunky, KOReader) or the KEPUB |
+| Kobo (any model since the Clara HD) | the Kobo link the reader already has (Calibre-Web Kobo sync): a fixed-layout KEPUB made by KCC for the readers' Kobo screens |
+| Kindle (any recent model) | Send-to-Kindle mail, like books (auto-send if the reader turned it on): a KCC "Send to Kindle" EPUB for the reader's Kindle, made when it is sent, never stored |
+| Phone / tablet | nothing converted: the OPDS catalog or My books → Download: the CBZ (Panels, Chunky, CDisplayEx, KOReader) |
+
+## Devices and page layouts (v6.2)
+
+**Which device.** Readers tick what they read on, on the start page (`devicemodels.py`). Each Kobo
+and Kindle model maps to its KCC profile (screen size) and to colour or greyscale. The Kobo copy
+is ONE per Calibre book, shared by everyone who has it, so it is made for the sharpest screen among
+its readers' Kobos, in colour when any of them is a colour Kobo (a reader whose Kobo syncs but who
+ticked no model counts as `KCC_KOBO_PROFILE`, in colour). A Kindle copy is made per send, for the
+sender's Kindle. Nobody ticked anything: `KCC_KOBO_PROFILE` / `KCC_KINDLE_PROFILE`, in colour, as
+before v6.2. What a Kobo copy was made for is kept; when the readers' Kobos call for another one,
+the comic's page says so (Remake Kobo copy).
+
+**Which layout.** From the header of every page (up to 400, spread evenly past that), never a
+whole image (`comics.page_shapes` / `auto_layout`); KCC counts a page as a spread above 1.16:
+
+| The pages | Layout | KCC (Kobo) | KCC (Kindle) |
+|---|---|---|---|
+| most 2.5 times taller than wide, or tagged Long strip | strip | `-w` | `-w` |
+| every one a row of panels (2.5 times wider than tall) | dailies | `--maximizestrips` | `-r 1 --norotate` |
+| at least 60% wide | rotate | `-r 1` | `-r 1 --norotate` |
+| some wide (two-page spreads) | spreads | `-r 2 -c 0` | `-r 2 -c 0` |
+| none wide | portrait | (none) | (none) |
+
+Measured with the real KCC v12 (`tests/kcc-layout-test.sh`): with KCC's default margin crop a
+spread whose margins are uneven was cut about 95 px off its gutter, so spreads run with `-c 0`;
+`--maximizestrips` cuts EVERY page in two (a portrait cover too), so dailies are only chosen when
+every page is a row of panels; KCC's Send-to-Kindle format frames every page of a book at one
+size taken from its source pages, which made a page turned sideways in a landscape book a narrow
+strip and dailies-as-two-rows a thumbnail, so on a Kindle wide pages stay whole and upright (the
+reader turns the Kindle to landscape). Most pages smaller than 80% of the screen: `-u` (KCC
+enlarges them, sharper than the device does). A reader can choose another layout per comic
+(`comic_layout`); the Kobo copy is then made again, for everyone who has it.
 
 **Where comics live.** In the same Calibre-Web library as the books, tagged Comics / Manga /
 Manhwa / Manhua, with the series and number set and the reader's owner tag. Shelfmark only

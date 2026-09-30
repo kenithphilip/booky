@@ -516,9 +516,22 @@ one arrives like a book:
 
 | Where | How |
 |---|---|
-| Kobo (colour) | its existing link: a colour, fixed-layout copy made by KCC. Made automatically for readers whose Kobo syncs, or with **Make Kobo copy** on the comic's page |
-| Kindle (Colorsoft) | **Send to Kindle** (or auto-send): a Kindle copy made at that moment, never stored; a big volume arrives in parts |
-| Phone / iPad | My books → download the CBZ (Panels, Chunky, KOReader) |
+| Kobo | its existing link: a fixed-layout copy made by KCC for the readers' Kobo screens (colour on a colour Kobo, greyscale on a black-and-white one). Made automatically for readers whose Kobo syncs or who ticked a Kobo on the start page, or with **Make Kobo copy** on the comic's page |
+| Kindle | **Send to Kindle** (or auto-send): a Kindle copy made at that moment for the reader's Kindle, never stored; a big volume arrives in parts |
+| Phone / tablet | nothing converted: the OPDS catalog or a CBZ download in Panels, Chunky (iPad), CDisplayEx, KOReader (Android) |
+
+- **Devices (v6.2)**: each reader ticks what they read on, on the start page (home.): which Kobo
+  (Libra Colour, Clara Colour, Clara BW, Libra 2, Sage, Elipsa, Forma, Nia), which Kindle
+  (Colorsoft, Paperwhite, the basic Kindle, Oasis, Scribe), iPhone, iPad, Android phone or tablet.
+  Comics are made for those screens; the start page shows the steps and apps for each device. A
+  reader who ticks nothing gets what v6.1 made (a Libra Colour / Colorsoft copy, in colour).
+- **Page layouts (v6.2)**: the portal reads every page's shape and chooses how KCC lays the comic
+  out: two-page spreads as each half (cut on the gutter) then the whole spread turned; a landscape
+  book (The Complete Peanuts) turned, never cut; webtoons cut into screens between panels;
+  newspaper dailies as two rows of panels; a low-resolution scan enlarged by KCC. On a Kindle, wide
+  pages stay whole and upright (its Send-to-Kindle format frames every page alike). A reader can
+  choose another layout on the comic's page (**Pages on e-readers**); the Kobo copy is made again.
+  `bash tests/kcc-layout-test.sh` proves each layout with the real KCC.
 
 - **Downloads go through Shelfmark**, as the reader: the seedbox, Shelfmark's ebook category and
   label, torrents kept seeding, Syncthing, the path mappings, the reader's dropbox. Nothing on the

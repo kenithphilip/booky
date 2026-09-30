@@ -1,0 +1,16 @@
+{# v6.2: the devices a reader reads on (hub.html and devices.html). Posts to /hub: home. passes only
+   /hub, /help and /static to the portal. back=devices returns to the Devices page. #}
+<form method="post" action="{{ url_for('hub') }}">{{ csrf_field() }}
+{% if back %}<input type="hidden" name="back" value="{{ back }}">{% endif %}
+<div class="grid" style="margin:6px 0 10px">
+{% for label, models in device_groups %}
+<fieldset style="border:1px solid var(--line);border-radius:10px;padding:8px 12px;margin:0">
+<legend class="mut" style="padding:0 4px">{{ label }}</legend>
+{% for m in models %}<label style="display:flex;gap:8px;align-items:baseline;padding:3px 0"><input type="checkbox" name="device" value="{{ m.key }}" {{ 'checked' if m.key in my_keys }}> <span>{{ m.name }}</span></label>
+{% endfor %}</fieldset>
+{% endfor %}
+</div>
+<div class="row"><button type="submit">Save my devices</button>
+<span class="mut">Tick every one you read on. Comics are made for these screens (a black-and-white e-reader gets greyscale copies:
+smaller and sharper on e-ink); phones and tablets read the files as they are.</span></div>
+</form>

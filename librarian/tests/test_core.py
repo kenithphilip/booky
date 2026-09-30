@@ -67,7 +67,8 @@ def test_a_job_interrupted_by_two_restarts_is_not_requeued_forever():
 def test_prefs_defaults_and_validation():
     assert db.get_prefs("alice") == {"preferred_format": "epub", "auto_kindle": False, "notify_email": False,
                                      "last_kindle_test": None, "language": "en",
-                                     "ntfy_topic": "", "hc_want": False, "hc_want_kind": "ebook", "hc_want_seeded": None}   # v6.0
+                                     "ntfy_topic": "", "hc_want": False, "hc_want_kind": "ebook", "hc_want_seeded": None,   # v6.0
+                                     "devices": []}                                                              # v6.2
     db.set_prefs("alice", preferred_format="azw3", auto_kindle=True)
     assert db.get_prefs("alice")["preferred_format"] == "azw3" and db.get_prefs("alice")["auto_kindle"] is True
     db.set_prefs("alice", notify_email=True)

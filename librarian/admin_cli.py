@@ -220,13 +220,27 @@ def _comics(args):
     if args.what == "kobo-due":
         return {"ok": True, "rows": comics.kobo_due(limit=args.limit)}
     if args.what == "kobo-result":
-        st = db.comic_convert_result(args.calibre_id, args.outcome == "ok", args.reason, final=args.outcome == "final")
+        st = db.comic_convert_result(args.calibre_id, args.outcome == "ok", args.reason, final=args.outcome == "final",
+                                     made=_made(args.made))
         db.audit("comic_kobo", None, "host", f"book {args.calibre_id} {args.outcome} {args.reason[:120]}")
         return {"ok": True, "status": st}
     if args.what == "kindle-due":
         return {"ok": True, "rows": comics.kindle_due(limit=args.limit)}
     comics.kindle_result(args.job, args.outcome == "ok", args.files, args.reason)
     return {"ok": True}
+
+def _made(raw):
+    """v6.2: what the host job made a Kobo copy for, kept only in the shape it has."""
+    import comics
+    try:
+        m = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(m, dict):
+        return None
+    profile = m.get("profile") if isinstance(m.get("profile"), str) and m["profile"].isalnum() and len(m["profile"]) <= 12 else None
+    layout = m.get("layout") if m.get("layout") in comics.LAYOUTS else None
+    return {"profile": profile, "colour": m.get("colour") is True, "layout": layout, "upscale": m.get("upscale") is True}
 
 def _replaces(args):
     """'Find a better copy': the host job swaps a staged EPUB into the same Calibre book."""
@@ -403,6 +417,7 @@ def _parser():
     kr.add_argument("calibre_id", type=int)
     kr.add_argument("outcome", choices=("ok", "fail", "final"))       # final: another try cannot help
     kr.add_argument("--reason", default="")
+    kr.add_argument("--made", default="")                              # v6.2: JSON {profile, colour, layout, upscale}
     cm.add_parser("kindle-due").add_argument("--limit", type=int, default=1)
     kk = cm.add_parser("kindle-result")
     kk.add_argument("job", type=int)

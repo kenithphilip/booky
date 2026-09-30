@@ -200,6 +200,28 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.2.0 (your devices on the start page; comics made for them; every page shape laid out)
+- The start page (home.) asks each reader which devices they read on: Kobo and Kindle models,
+  iPhone, iPad, Android phone and tablet. It then shows, per device, what to do and which apps to use
+  (OPDS catalog, the Audiobookshelf apps), and the setup checklist only lists the steps for those
+  devices. The form posts to /hub, the one path home. passes to the portal (no Caddy change).
+- Comics: the Kobo copy is made for the readers' Kobo screens (KCC profile per model; greyscale for
+  black-and-white Kobos: smaller, e-ink tuned); a Kindle copy for the sender's Kindle. A reader who
+  ticked a Kobo gets Kobo copies before its first sync. Nobody ticked anything: exactly v6.1's copies.
+- Page layouts chosen from every page's shape: spreads (each half, cut on the gutter, then the
+  whole spread turned), landscape books turned (v6.1), webtoons, newspaper dailies (two rows of
+  panels), small scans enlarged. Per comic, a reader can pick another layout on its page.
+- Fixed on the way: v6.1 turned a landscape book's pages for a Kindle too, which KCC's
+  Send-to-Kindle format shrank to a narrow strip (a page frame is chosen per book); on a Kindle wide
+  pages now stay whole and upright.
+- Existing Kobo copies are not remade by themselves (one KCC run at a time on the 4 GB box): a
+  comic's page says when its readers' Kobos call for a new one; Remake Kobo copy makes it.
+- After Deploy: tick your devices on the start page; on The Complete Peanuts, nothing to do (it
+  was already turned); a portrait comic with spreads looks better after Remake Kobo copy.
+- Tests: unit 847 passed (32 new), installer 830 passed, end-to-end 334 checks / 0 failed (one run
+  had a single Send to Kindle form-token 400 in untouched code; it did not recur), real-KCC layouts
+  20 / 0 failed (`bash tests/kcc-layout-test.sh`: every layout, a Kindle send), lint clean.
+
 ## v6.1.1 (disk upkeep: build cache, seedbox copies, a fuller daily summary)
 - Measured on the live server (2026-09-30): 21 GB of 79 GB used, of which the library was about
   1 GB, Docker about 15 GB (images 9.6 GB, of them 1.8 GB the rollback set and on-demand images

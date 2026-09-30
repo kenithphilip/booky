@@ -14,9 +14,19 @@
 </ul>
 <h3>Reading</h3>
 <ul>
-<li><strong>Kobo:</strong> a Kobo copy is made automatically when you read on a Kobo; <strong>Make Kobo copy</strong> on the comic's page if not. Wide books (every page landscape, like The Complete Peanuts) are turned, not cut in half: hold the Kobo sideways. A copy made before that, or one that looks wrong: <strong>Remake Kobo copy</strong>.</li>
-<li><strong>Kindle:</strong> Send to Kindle on its page (converted for the Colorsoft on the way).</li>
-<li><strong>iPad:</strong> download the CBZ into Panels or Chunky.</li>
+<li><strong>Kobo:</strong> a Kobo copy is made automatically when you read on a Kobo (a synced one, or one you ticked on the <a href="{{ url_for('hub') }}#devices">start page</a>), for its screen; <strong>Make Kobo copy</strong> on the comic's page if not.</li>
+<li><strong>Kindle:</strong> Send to Kindle on its page (converted for your Kindle on the way).</li>
+<li><strong>iPhone, iPad, Android:</strong> Panels or Chunky (iPad), CDisplayEx or KOReader (Android): add the OPDS catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span>, or download the CBZ. Nothing is converted: the app shows the pages as they are, and turning the tablet shows a wide page whole.</li>
 <li><strong>Wrong comic?</strong> Its page → <strong>Wrong comic</strong>.</li>
 </ul>
+<h3>How pages are laid out on an e-reader</h3>
+<p>An e-reader's screen is tall, and comics are not all shaped alike. The library looks at every page of a comic and chooses:</p>
+<ul>
+<li><strong>Portrait pages</strong> (most comics and manga): as they are.</li>
+<li><strong>Some two-page spreads:</strong> each half in turn (in manga order for manga), then the whole spread turned sideways, so the full picture is there too.</li>
+<li><strong>A landscape book</strong> (most pages wide: The Complete Peanuts, art books): never cut. On a Kobo the pages are turned sideways: lock its screen rotation to portrait and turn it. On a Kindle they stay whole and upright: switch it to landscape in its Aa menu.</li>
+<li><strong>Webtoons</strong> (very tall pages): cut into screens, top to bottom.</li>
+<li><strong>Newspaper dailies</strong> (every page a single row of panels): on a Kobo each row becomes two rows that fill the screen, no turning needed; on a Kindle each strip stays whole, across the screen.</li>
+</ul>
+<p>Not right for a comic? Its page → <em>Pages on e-readers</em> → choose another layout. It is kept for that comic, for everyone who has it: the Kobo copy is made again and a copy sent to a Kindle follows it.</p>
 {% endblock %}

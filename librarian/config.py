@@ -277,6 +277,10 @@ METRON_USER = os.environ.get("METRON_USER", "")
 METRON_PASS = os.environ.get("METRON_PASS", "")
 COMICVINE_API_KEY = os.environ.get("COMICVINE_API_KEY", "")
 COMIC_EXTS = ("cbz", "cbr", "cb7")
+# v6.2: the KCC profiles the host job uses when a reader has not chosen their device (it reads
+# them from .env itself; here they only rank screens, see devicemodels.kobo_target)
+KCC_KOBO_PROFILE = os.environ.get("KCC_KOBO_PROFILE") or "KoLC"
+KCC_KINDLE_PROFILE = os.environ.get("KCC_KINDLE_PROFILE") or "KCS"
 # A comic request nothing matched is searched again after 1 h, 6 h, then daily, for this long.
 COMIC_SEARCH_DAYS = int(os.environ.get("COMIC_SEARCH_DAYS", "30") or 30)
 COMIC_MAX_OPEN_PER_USER = int(os.environ.get("COMIC_MAX_OPEN_PER_USER", "50") or 50)

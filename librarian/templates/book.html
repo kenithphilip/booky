@@ -23,7 +23,7 @@
 </div>
 {% if is_comic %}
 <p class="mut" style="margin:8px 0 0">{% if kobo_ahead is not none %}The {{ 'new ' if 'kepub' in b.formats }}Kobo copy is {% if kobo_ahead == 0 %}being made now{% else %}in the queue, {{ kobo_ahead }} comic{{ '' if kobo_ahead == 1 else 's' }} ahead of it (one at a time, a few minutes each; readers take turns){% endif %} — then sync your Kobo.
-{% elif 'kepub' in b.formats %}Kobo copy ready (colour, fixed layout): it reaches your Kobo on its next sync. The CBZ is for phones and tablets (Panels, Chunky).
+{% elif 'kepub' in b.formats %}Kobo copy ready ({{ 'greyscale' if made and not made.colour else 'colour' }}, fixed layout{% if made and made_name %}, made for a {{ made_name }}{% endif %}): it reaches your Kobo on its next sync. The CBZ is for phones and tablets{% if not my_platforms %} (Panels, Chunky){% endif %}.
 {% elif kobo_state and kobo_state.status == 'due' %}The Kobo copy is being made — a few minutes, then sync your Kobo.
 {% elif kobo_state and kobo_state.status == 'failed' %}The Kobo copy could not be made ({{ kobo_state.detail or 'see the admin' }}). The CBZ can still be downloaded.
 {% endif %}</p>
@@ -34,7 +34,21 @@
 {% if 'kepub' in b.formats and kobo_ahead is none %}
 <form method="post" action="{{ url_for('book_kobo_copy', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
 <input type="hidden" name="remake" value="1"><button type="submit" class="sec">Remake Kobo copy</button>
-<span class="mut">Pages cut in half, or looking wrong? This makes it again with today's settings (wide pages are turned, not split) and replaces it on your Kobo.</span></form>{% endif %}
+<span class="mut">Pages cut wrongly, or looking wrong? This makes it again for your family's Kobos, laid out as below, and replaces it on your Kobo.</span></form>{% endif %}
+{% for p in my_platforms | sort %}<p class="mut" style="margin:8px 0 0">On your {{ my_platforms[p] }}: {{ device_apps[p].comics }}.</p>{% endfor %}
+{% if layout %}
+<details style="margin-top:8px" {{ 'open' if kobo_stale }}><summary>Pages on e-readers: {{ layouts[layout].split(':')[0].split(' (')[0] }}{% if not layout_chosen %} (chosen from its pages){% endif %}</summary>
+<p class="mut">{{ layouts[layout] }}.{% if made %} Its Kobo copy was made for a {{ made_name or 'Kobo' }}, {{ 'in colour' if made.colour else 'in greyscale' }}{% if made.upscale %}, enlarged from a small scan{% endif %}.{% endif %}
+{% if kobo_stale %} <strong>The Kobos of the readers who have it ({{ kobo_for | join(', ') }}) call for a different copy now: press Remake Kobo copy above.</strong>{% endif %}</p>
+<form method="post" action="{{ url_for('book_layout', book_id=b.id) }}" class="row">{{ csrf_field() }}
+<select name="layout" style="width:auto;max-width:100%">
+<option value="auto" {{ 'selected' if not layout_chosen }}>Automatic, from the shape of its pages</option>
+{% for k in choosable %}<option value="{{ k }}" {{ 'selected' if layout_chosen and layout == k }}>{{ layouts[k] }}</option>{% endfor %}
+</select><button type="submit" class="sec">Use this layout</button></form>
+<p class="mut">For everyone who has this comic: its Kobo copy is made again this way; a copy sent to a Kindle follows it.
+Turned pages on a Kobo: lock its rotation to portrait and turn it. On a Kindle wide pages stay upright: switch it to landscape
+in its Aa menu. Phones and tablets show the pages as they are.</p>
+</details>{% endif %}
 {% endif %}
 {% if convert_to %}<form method="post" action="{{ url_for('book_convert', book_id=b.id) }}" class="row" style="margin-top:8px">{{ csrf_field() }}
 <span class="mut">Need another format?</span>

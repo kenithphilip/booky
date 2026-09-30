@@ -709,14 +709,112 @@ def looks_landscape(cbz, sample=12):
         return False
 
 
-def _shape_flags(rel, tags_landscape):
-    """Landscape from the tag, or (a comic imported before v6.1) from its pages."""
-    if tags_landscape:
-        return True
+# ---- v6.2: how a comic's pages are laid out on an e-reader, from the shape of ALL its pages -------------
+# KCC (v12) counts a page as a two-page spread when it is more than 1.16 times wider than tall;
+# its default cuts every such page in half, which is right for a spread and ruins a landscape
+# page (a strip across the whole width). The layout is chosen per book, from its pages, and a
+# reader can choose another on the comic's page; the host job turns it into KCC's options.
+WIDE = 1.16                 # KCC's own threshold (image.py splitCheck)
+STRIP_RATIO = 2.5           # taller than this: a webtoon strip; wider than this: a row of panels
+LAYOUTS = {                 # what the reader reads; KCC's options for each: scripts/comic-convert.sh LAYOUT_FLAGS
+    "portrait": "Pages as they are (no wide pages)",
+    "spreads": "Two-page spreads: each half in turn, then the whole spread turned sideways",
+    "split": "Wide pages cut in half (the classic way)",
+    "rotate": "Wide pages turned sideways, never cut (landscape books, like The Complete Peanuts)",
+    "strip": "Long strip (webtoon): each tall page is cut into screens",
+    "dailies": "Newspaper dailies: each row of panels becomes two rows (every page must be a row of panels)",
+}
+CHOOSABLE = ("spreads", "split", "rotate", "strip", "dailies")
+_SHAPES = {}                # (path, size, mtime) -> page_shapes(): a book page is shown often
+
+
+def _read_size(z, name):
+    with z.open(name) as f:
+        head = f.read(64 * 1024)
+        size = image_size(head)
+        if size is None and len(head) == 64 * 1024:          # a JPEG with a large EXIF block first
+            size = image_size(head + f.read(448 * 1024))
+    return size
+
+
+def page_shapes(cbz, limit=400):
+    """{pages, seen, wide, tall, panels, sizes} from the image headers of a CBZ: every page up to
+    `limit` (spread out evenly past it), headers only, never a whole image. wide: w/h > 1.16;
+    tall: h/w >= 2.5 (webtoon); panels: w/h >= 2.5 (a row of newspaper panels)."""
+    out = {"pages": 0, "seen": 0, "wide": 0, "tall": 0, "panels": 0, "sizes": []}
     try:
-        return looks_landscape(os.path.join(config.LIBRARY_DIR, rel)) if rel else False
-    except Exception:
+        st = os.stat(cbz)
+        key = (cbz, st.st_size, st.st_mtime)
+        if key in _SHAPES:
+            return _SHAPES[key]
+        with zipfile.ZipFile(cbz) as z:
+            names = sorted((n for n in z.namelist() if n.lower().endswith(IMAGE_EXTS) and "__macosx" not in n.lower()),
+                           key=_natural)
+            out["pages"] = len(names)
+            step = max(1, -(-len(names) // limit))
+            for n in names[::step]:
+                size = _read_size(z, n)
+                if not size or not size[0] or not size[1]:
+                    continue
+                w, h = size
+                out["seen"] += 1
+                out["sizes"].append((w, h))
+                out["wide"] += w / h > WIDE
+                out["tall"] += h / w >= STRIP_RATIO
+                out["panels"] += w / h >= STRIP_RATIO
+    except (zipfile.BadZipFile, OSError, RuntimeError):
+        return out
+    if len(_SHAPES) > 500:
+        _SHAPES.clear()
+    _SHAPES[key] = out
+    return out
+
+
+def auto_layout(shapes, strip_tag=False):
+    """The layout a book's pages call for:
+      strip    - a webtoon (the Long strip tag, or most pages 2.5 times taller than wide);
+      dailies  - EVERY page a row of panels (2.5 times wider than tall): KCC's maximizestrips
+                 reshapes every page, so one portrait cover rules it out;
+      rotate   - a landscape book: at least 60% of the pages wide (The Complete Peanuts);
+      spreads  - a portrait book with some two-page spreads: each half, then the whole spread;
+      portrait - no wide page at all."""
+    seen = shapes.get("seen") or 0
+    if strip_tag or (seen and shapes["tall"] * 2 > seen):
+        return "strip"
+    if not seen:
+        return "portrait"
+    if shapes["panels"] == seen and seen >= 3:
+        return "dailies"
+    if shapes["wide"] * 10 >= seen * 6:
+        return "rotate"
+    if shapes["wide"]:
+        return "spreads"
+    return "portrait"
+
+
+def wants_upscale(shapes, profile, layout, default=None):
+    """KCC's -u: most pages smaller than 80% of the screen (a low-resolution scan). Resized by
+    KCC (Lanczos, tuned for e-ink) rather than by the device, which shows it sharper; never for a
+    webtoon (KCC refuses) or dailies."""
+    import devicemodels
+    screen = devicemodels.SCREEN.get(profile or default or config.KCC_KOBO_PROFILE)
+    sizes = shapes.get("sizes") or []
+    if not screen or not sizes or layout in ("strip", "dailies"):
         return False
+    small = sum(1 for w, h in sizes if max(w, h) < 0.8 * screen[1] and min(w, h) < 0.8 * screen[0])
+    return small * 10 >= len(sizes) * 6
+
+
+def layout_for(b, shapes=None):
+    """(layout, chosen_by_reader) for a comic_books() row."""
+    chosen = db.comic_layout_get(b["calibre_id"])
+    if chosen in LAYOUTS:
+        return chosen, True
+    if b.get("strip"):
+        return "strip", False
+    if shapes is None:
+        shapes = page_shapes(os.path.join(config.LIBRARY_DIR, b["rel"])) if b.get("rel") else {}
+    return auto_layout(shapes), False
 
 
 def looks_like_strip(cbz, sample=8):
@@ -783,6 +881,13 @@ def comic_books(ids=None):
 
 
 def uses_kobo(owner):
+    """The reader's Kobo syncs, or (v6.2) they said on the start page that they read on a Kobo."""
+    try:
+        import devicemodels
+        if devicemodels.has(owner, devicemodels.KOBO):
+            return True
+    except Exception:
+        pass
     try:
         st = cwa.kobo_status(owner)
         return bool(st.get("books_on_device") or st.get("last_reading"))
@@ -809,7 +914,7 @@ def kobo_queue(now=None):
         if st and st.get("next_try") and st["next_try"] > now:
             continue
         row = {"calibre_id": bid, "rel": b["rel"], "title": b["title"], "kind": b["kind"], "strip": b["strip"],
-               "landscape": b["landscape"], "remake": remake}
+               "landscape": b["landscape"], "remake": remake, "owners": b["owners"]}
         if st and st.get("forced") and st["status"] == "due":
             forced.append((st.get("updated") or 0, row))
             continue
@@ -827,11 +932,27 @@ def kobo_queue(now=None):
     return out
 
 
+def _device_fields(row, profile, colour, default):
+    """What the host job runs KCC with (v6.2): the layout (from the pages, or the reader's choice),
+    the device profile (None: its configured one), colour, upscaling. strip/landscape stay for a
+    host job from before v6.2."""
+    shapes = page_shapes(os.path.join(config.LIBRARY_DIR, row["rel"])) if row.get("rel") else {}
+    layout, chosen = layout_for(row, shapes)
+    row.update(layout=layout, layout_chosen=chosen, profile=profile, colour=colour,
+               upscale=wants_upscale(shapes, profile, layout, default),
+               strip=layout == "strip", landscape=layout == "rotate")
+    return row
+
+
 def kobo_due(now=None, limit=3):
-    """The next comics for the host job (kobo_queue's head), each with its page shape."""
+    """The next comics for the host job (kobo_queue's head), each with its layout and the Kobo it
+    is made for: the sharpest of its readers' Kobos (devicemodels.kobo_target)."""
+    import devicemodels
     rows = kobo_queue(now)[:limit]
     for r in rows:
-        r["landscape"] = not r["strip"] and _shape_flags(r["rel"], r["landscape"])
+        readers = [o for o in r.pop("owners", []) if uses_kobo(o)]
+        profile, colour, _names = devicemodels.kobo_target(readers)
+        _device_fields(r, profile, colour, config.KCC_KOBO_PROFILE)
     return rows
 
 
@@ -856,14 +977,16 @@ def kindle_due(limit=2):
     rows = db.kindle_comic_jobs("converting", limit)
     books = comic_books([r["book_id"] for r in rows]) if rows else {}
     out = []
+    import devicemodels
     for j in rows:
         b = books.get(j["book_id"])
         if not b or not b["rel"] or (j["owner"] not in b["owners"] and not j["is_admin"]):
             db.kindle_update(j["id"], status="failed", detail="the comic is no longer in your library")
             continue
-        out.append({"job": j["id"], "calibre_id": j["book_id"], "rel": b["rel"], "title": b["title"],
-                    "kind": b["kind"], "strip": b["strip"], "max_mb": config.KINDLE_MAX_MB,
-                    "landscape": not b["strip"] and _shape_flags(b["rel"], b["landscape"])})
+        profile, colour, _name = devicemodels.kindle_target(j["owner"])     # v6.2: their Kindle's screen
+        out.append(_device_fields({"job": j["id"], "calibre_id": j["book_id"], "rel": b["rel"], "title": b["title"],
+                                   "kind": b["kind"], "strip": b["strip"], "max_mb": config.KINDLE_MAX_MB},
+                                  profile, colour, config.KCC_KINDLE_PROFILE))
     return out
 
 

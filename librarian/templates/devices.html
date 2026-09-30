@@ -3,6 +3,14 @@
 <p class="mut">Link an e-reader once; every book you request or upload then arrives on it by itself.
 You can also download any of your books from <a href="{{ url_for('my_library') }}">My books</a>.</p>
 
+<div class="card" id="mine">
+<h3>What you read on</h3>
+{% if my_devices %}<p>{{ my_devices | map(attribute='name') | join(' · ') }}</p>{% else %}<p class="mut">Not chosen yet: comics are made for a {{ default_kobo }} and a {{ default_kindle }}, in colour, until you do.</p>{% endif %}
+<details {{ 'open' if not my_devices }}><summary>{{ 'Change' if my_devices else 'Choose' }} my devices</summary>
+{% with back='devices' %}{% include "_devices_pick.html" %}{% endwith %}
+</details>
+</div>
+
 <div class="card">
 <h3>Kobo</h3>
 {% if not kobo_on %}<p class="mut">Kobo sync is not switched on for this library yet — ask the admin (it is one click in the admin tools).</p>{% endif %}

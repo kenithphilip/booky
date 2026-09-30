@@ -22,6 +22,42 @@ Bookmark this page: <span class="code">{{ cfg.HOME_URL }}</span></p>
 <a class="tile" href="{{ cfg.MONITOR_URL }}"><strong>Uptime Kuma</strong><span class="mut">Monitors (over Tailscale only)</span></a>{% endif %}
 </div>
 
+<h2 id="devices">Your devices</h2>
+{% if my_devices %}
+<div class="devcards">
+{% for m in my_devices %}
+<div class="tile"><strong>{{ m.name }}</strong>
+<ul class="devlist">
+{% if m.family == 'kobo' %}
+<li><b>Books and comics</b> arrive at each sync once it is linked: <a href="{{ cfg.PORTAL_URL }}/devices">Devices → Kobo</a>.</li>
+{% if cfg.COMICS_ENABLED %}<li><b>Comics</b> come as Kobo copies made for its screen.</li>
+<li><b>Landscape pages</b> come turned sideways: lock the screen rotation to portrait, then turn the Kobo.</li>{% endif %}
+<li><a href="{{ url_for('help_page', topic='kobo') }}">Kobo guide</a></li>
+{% elif m.family == 'kindle' %}
+<li><b>Books</b> go by Send to Kindle: save your @kindle.com address on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a>.</li>
+{% if cfg.COMICS_ENABLED %}<li><b>Comics</b> are converted for it when you send them, {{ 'in colour' if m.profile in ('KCS', 'KSCS') or not m.profile else 'in greyscale' }}.</li>
+<li><b>Wide pages</b> stay whole: switch the Kindle to landscape in its Aa menu to read them.</li>{% endif %}
+<li><a href="{{ url_for('help_page', topic='kindle') }}">Kindle guide</a></li>
+{% else %}{% set apps = device_apps[m.platform] %}
+<li><b>Books:</b> {{ apps.books }}.</li>
+{% if cfg.COMICS_ENABLED %}<li><b>Comics:</b> {{ apps.comics }}.</li>{% endif %}
+<li><b>Audiobooks:</b> {{ apps.audio }}.</li>
+<li><b>Catalog</b> for the apps: <span class="code">{{ cfg.BOOKS_URL }}/opds/</span>, your library login.</li>
+<li><a href="{{ url_for('help_page', topic='phone-tablet') }}">Phone and tablet guide</a></li>
+{% endif %}
+</ul></div>
+{% endfor %}
+</div>
+<details class="card"><summary>Change my devices</summary>
+{% with back=None %}{% include "_devices_pick.html" %}{% endwith %}
+</details>
+{% else %}
+<div class="card"><p style="margin-top:0">Which do you read on? The library then makes comics for your e-reader's screen and shows
+the steps and apps for each of your devices.</p>
+{% with back=None %}{% include "_devices_pick.html" %}{% endwith %}
+</div>
+{% endif %}
+
 <h2>Your setup</h2>
 <div class="card">
 {% for label, done, hint, url in checklist %}

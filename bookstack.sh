@@ -4063,7 +4063,7 @@ step_comics() {
   docker pull -q "$(img IMG_KCC)" >/dev/null 2>&1 || note="$note\nWARNING: could not pull $(img IMG_KCC); Kobo/Kindle copies wait until it can be pulled (Operations -> Update retries)."
   wait_for http://127.0.0.1:8090/healthz 30 || true
   out=$(comics_check)
-  msg "Comics & manga are ON.$note\n\nMetadata check: ${out:-the portal did not answer}\n\nOne thing to do in Shelfmark: Settings -> Formats: tick CBR (EPUB, PDF and CBZ are already allowed). Many comics come as CBR; the portal repacks them as CBZ.\n\nDevice copies: a colour, fixed-layout Kobo copy is made for readers whose Kobo syncs (or with 'Make Kobo copy' on the comic's page); Kindle copies are made when a comic is sent. KCC runs one conversion at a time, with at most $(adv_value KCC_MEMORY 1536m) of memory."
+  msg "Comics & manga are ON.$note\n\nMetadata check: ${out:-the portal did not answer}\n\nOne thing to do in Shelfmark: Settings -> Formats: tick CBR (EPUB, PDF and CBZ are already allowed). Many comics come as CBR; the portal repacks them as CBZ.\n\nDevice copies: a fixed-layout Kobo copy is made for readers whose Kobo syncs or who ticked a Kobo on the start page (or with 'Make Kobo copy' on the comic's page), for their Kobo's screen; Kindle copies are made when a comic is sent, for the reader's Kindle. Each comic's pages are laid out from their shapes (spreads, landscape books, webtoons, dailies). KCC runs one conversion at a time, with at most $(adv_value KCC_MEMORY 1536m) of memory."
   return $rc
 }
 # ---------- Library -> Seedbox ----------

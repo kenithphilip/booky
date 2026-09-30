@@ -1,4 +1,4 @@
-import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress
+import threading, os, re, hmac, secrets, shutil, datetime, time, sqlite3, ipaddress, json
 from functools import wraps
 from urllib.parse import urlsplit, quote
 from uuid import uuid4
@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share
+import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share, devicemodels
 import abs as absapi
 
 app = Flask(__name__)
@@ -1044,6 +1044,7 @@ def book_page(book_id):
     b["best"] = library.best_format(b, prefs["preferred_format"])
     b["kindle_ok"] = any(f in config.KINDLE_FORMATS for f in b["formats"]) or "cbz" in b["formats"]
     is_comic = "cbz" in b["formats"]
+    layout = _layout_context(user, book_id, is_admin) if is_comic else {}
     return render_template(
         "book.html", b=b, admin=is_admin, is_comic=is_comic, state=cwa.reading_state(user).get(book_id),
         kobo_state=db.comic_convert_state([book_id]).get(book_id) if is_comic else None,
@@ -1060,7 +1061,37 @@ def book_page(book_id):
                    if any(f in b["formats"] for f in config.CONVERT_SOURCES) else [],
         converting=db.convert_for_book(book_id),
         replacing=db.replace_for_book(book_id), replace_days=db.REPLACE_DAYS,
-        got_it=db.bookreq_for_book(user, book_id) or db.comic_for_book(user, book_id))
+        got_it=db.bookreq_for_book(user, book_id) or db.comic_for_book(user, book_id),
+        my_families={m["family"] for m in devicemodels.chosen(user)}, device_apps=devicemodels.APPS,
+        my_platforms=_platform_names(user), **layout)
+
+def _platform_names(user):
+    """{'ios': 'iPad', 'android': 'Android phone or Android tablet'}: the reader's phones and tablets."""
+    out = {}
+    for m in devicemodels.chosen(user):
+        if m["platform"]:
+            out.setdefault(m["platform"], []).append(m["name"])
+    return {p: " or ".join(n) for p, n in out.items()}
+
+def _layout_context(user, book_id, is_admin):
+    """v6.2, a comic's page: how its pages are laid out on e-readers, what its Kobo copy was made
+    for, and whether the readers' Kobos now call for another one."""
+    b = comics.comic_books([book_id]).get(book_id)
+    if not b or not b.get("rel"):
+        return {}
+    layout, chosen = comics.layout_for(b)
+    st = db.comic_convert_state([book_id]).get(book_id) or {}
+    try:
+        made = json.loads(st.get("made") or "null")
+    except ValueError:
+        made = None
+    readers = [o for o in b["owners"] if comics.uses_kobo(o)]
+    profile, colour, names = devicemodels.kobo_target(readers)
+    stale = bool(made and names and (made.get("profile") != (profile or made.get("profile")) or made.get("colour") != colour
+                                     or made.get("layout") != layout))
+    return {"layout": layout, "layout_chosen": chosen, "layouts": comics.LAYOUTS, "choosable": comics.CHOOSABLE,
+            "made": made, "made_name": devicemodels.profile_name(made.get("profile")) if made else "",
+            "kobo_for": names, "kobo_stale": stale}
 
 @app.route("/book/<int:book_id>/remove", methods=["GET", "POST"])
 @login_required
@@ -1444,24 +1475,53 @@ def _setup_checklist(user):
     u = _cwa_user(user)
     prefs = db.get_prefs(user)
     portal = config.PORTAL_URL or ""
-    out.append(("Kobo linked (if you have one)", bool(ks.get("books_on_device") or ks.get("last_reading")),
-                "Devices -> Kobo: copy your sync link into the Kobo once", f"{portal}/devices"))
-    out.append(("Kindle address (if you have one)", bool(u.get("kindle_mail")), "Devices -> Kindle: your @kindle.com address", f"{portal}/devices"))
+    fams = {devicemodels.BY_KEY[k]["family"] for k in prefs["devices"] if k in devicemodels.BY_KEY}
+    # v6.2: the devices first; then only the steps for the devices chosen (all of them until then)
+    out.append(("Your devices", bool(fams), "Choose them below: books and comics are then made for their screens", "#devices"))
+    if not fams or devicemodels.KOBO in fams:
+        out.append(("Kobo linked" + ("" if fams else " (if you have one)"), bool(ks.get("books_on_device") or ks.get("last_reading")),
+                    "Devices -> Kobo: copy your sync link into the Kobo once", f"{portal}/devices"))
+    if not fams or devicemodels.KINDLE in fams:
+        out.append(("Kindle address" + ("" if fams else " (if you have one)"), bool(u.get("kindle_mail")),
+                    "Devices -> Kindle: your @kindle.com address", f"{portal}/devices"))
     out.append(("Notifications", bool(prefs.get("notify_email") or prefs.get("ntfy_topic")),
                 "Devices -> Notifications: mail or the ntfy app on your phone", f"{portal}/devices"))
     out.append(("Hardcover (optional)", bool(ks.get("hardcover")), "Devices: your Hardcover token, for reading progress", f"{portal}/devices"))
     return out
 
-@app.route("/hub")
+@app.route("/hub", methods=["GET", "POST"])
 @login_required
 def hub():
-    """The start page on home.<domain>: every site one tap away, a setup checklist, the guides."""
+    """The start page on home.<domain>: every site one tap away, the reader's devices, a setup
+    checklist, the guides. POST (v6.2): the devices they read on (home. passes only /hub, /help
+    and /static to the portal, so the form posts here)."""
     user, is_admin = session["user"], session.get("admin", False)
+    if request.method == "POST":
+        keys = devicemodels.clean(request.form.getlist("device"))
+        db.set_devices(user, keys)
+        _audit("devices_set", ", ".join(keys) or "(none)")
+        names = [devicemodels.BY_KEY[k]["name"] for k in keys]
+        flash(("Saved: " + ", ".join(names) + "." + (" Comics are made for these screens from now on; a Kobo copy made "
+               "before stays until you press Remake Kobo copy on its page." if any(k.startswith(("kobo", "kindle")) for k in keys) else ""))
+              if names else "Saved: no devices chosen.")
+        back = request.form.get("back")
+        return redirect(url_for("devices") if back == "devices" else url_for("hub") + "#devices")
     return render_template("hub.html", topics=_topics(is_admin),
                            checklist=_setup_checklist(user), admin=is_admin,
                            waiting_books=db.bookreq_waiting(user),
                            waiting_comics=db.comic_waiting(user) if config.COMICS_ENABLED else 0,
-                           new=len(db.notices(user)))
+                           new=len(db.notices(user)), **_device_context(user))
+
+def _device_context(user):
+    """The device picker and the per-device notes (templates/_devices_pick.html, hub.html)."""
+    mine = devicemodels.chosen(user)
+    return {"my_devices": mine, "my_keys": {m["key"] for m in mine},
+            "device_groups": [(label, [devicemodels.BY_KEY[m[0]] for m in devicemodels.MODELS if m[1] in fams])
+                              for label, fams in (("Kobo", (devicemodels.KOBO,)), ("Kindle", (devicemodels.KINDLE,)),
+                                                  ("Phone or tablet", (devicemodels.PHONE, devicemodels.TABLET)))],
+            "device_apps": devicemodels.APPS,
+            "default_kobo": devicemodels.profile_name(config.KCC_KOBO_PROFILE),
+            "default_kindle": devicemodels.profile_name(config.KCC_KINDLE_PROFILE)}
 
 def _topics(is_admin):
     """The guides this reader can use: the admin guide for admins, the comics guide only while
@@ -1476,7 +1536,7 @@ def help_page(topic):
     if topic not in names:
         abort(404)
     return render_template(f"help/{topic}.html", topic=names[topic], topics=_topics(is_admin), admin=is_admin,
-                           abs_linked=absapi.configured())
+                           abs_linked=absapi.configured(), device_apps=devicemodels.APPS)
 
 # ---- v5.9.1: send a book to an e-reader's browser with a short code (sendcode.py) -----------------
 SEND_COOKIE = "send_secret"
@@ -1594,6 +1654,30 @@ def book_kobo_copy(book_id):
     _audit("comic_kobo_copy", f"book {book_id}" + (" (remake)" if remake else ""))
     flash(("Remaking" if remake else "Making") + " the Kobo copy — a few minutes. Then sync your Kobo"
           + (" (it replaces the old copy there)." if remake else "."))
+    return redirect(url_for("book_page", book_id=book_id))
+
+@app.route("/book/<int:book_id>/layout", methods=["POST"])
+@login_required
+def book_layout(book_id):
+    """v6.2: how a comic's pages are laid out on e-readers (for everyone who has it: its Kobo copy
+    is shared). The Kobo copy is made again with it; a Kindle send uses it from now on."""
+    user, is_admin = session["user"], session.get("admin", False)
+    if not library.visible(user, book_id, is_admin) or not library.file_for(user, book_id, "cbz", is_admin):
+        abort(404)
+    layout = request.form.get("layout")
+    if layout != "auto" and layout not in comics.CHOOSABLE:
+        abort(400)
+    db.comic_layout_set(book_id, layout, user)
+    b = comics.comic_books([book_id]).get(book_id) or {}
+    has_kepub = "KEPUB" in b.get("formats", {})
+    kobo = has_kepub or any(comics.uses_kobo(o) for o in b.get("owners") or [])
+    if kobo:                                    # no Kobo copy for a comic nobody reads on a Kobo
+        db.comic_convert_force(book_id, remake=has_kepub)
+    _audit("comic_layout", f"book {book_id} {layout}")
+    name = "Automatic layout" if layout == "auto" else comics.LAYOUTS[layout].split(":")[0].split(" (")[0]
+    flash(name + (": the Kobo copy is being made again with it — a few minutes, then sync your Kobo." if has_kepub else
+                  ": the Kobo copy is being made with it — a few minutes, then sync your Kobo." if kobo else ".")
+          + " A comic sent to a Kindle from now on is laid out the same way.")
     return redirect(url_for("book_page", book_id=book_id))
 
 # ---- following series and authors; New for you (v5.8, follows.py) -------------------------------
@@ -2273,7 +2357,7 @@ def devices():
                            anilist_link=db.anilist_get(user), metron_link=db.metron_get(user),
                            hc_audio=db.hc_audio_state(user), ntfy_base=notify.ntfy_base(),
                            hcwant_note=__import__("hcwant").note(user),
-                           hcwant_backlog=len(db.hc_want_unrequested(user)))
+                           hcwant_backlog=len(db.hc_want_unrequested(user)), **_device_context(user))
 
 # ---- admin dashboard ---------------------------------------------------------------
 @app.route("/admin/catalogs", methods=["POST"])

@@ -1,13 +1,25 @@
 {% extends "help/_layout.html" %}{% block guide %}
-<h3>Reading books</h3>
+<p>Phones and tablets read the library's files as they are: nothing is converted for them. Tick yours on the
+<a href="{{ url_for('hub') }}#devices">start page</a> and it shows the apps for it. Most apps connect to the library through its
+<strong>OPDS catalog</strong>: <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the slash at the end), with your library user name and password.</p>
+<h3>iPhone and iPad</h3>
+<ul>
+<li><strong>Books:</strong> {{ device_apps.ios.books }}.</li>
+<li><strong>Comics:</strong> {{ device_apps.ios.comics }}. On an iPad, turning it sideways shows two pages, or a wide page whole.</li>
+<li><strong>Audiobooks:</strong> {{ device_apps.ios.audio }}: server <span class="code">{{ cfg.AUDIO_URL }}</span>, your library login.</li>
+</ul>
+<h3>Android phone and tablet</h3>
+<ul>
+<li><strong>Books:</strong> {{ device_apps.android.books }}.</li>
+<li><strong>Comics:</strong> {{ device_apps.android.comics }}.</li>
+<li><strong>Audiobooks:</strong> {{ device_apps.android.audio }}: server <span class="code">{{ cfg.AUDIO_URL }}</span>, your library login.</li>
+</ul>
+<h3>Any device</h3>
 <ul>
 <li><strong>In the browser:</strong> open the <a href="{{ cfg.BOOKS_URL }}">library site</a> and press Read on a book.</li>
-<li><strong>In a reading app</strong> (KOReader, Moon+ Reader, Thorium, Readest, Panels, Chunky...): add an OPDS catalog <span class="code">{{ cfg.BOOKS_URL }}/opds/</span> (keep the slash at the end) with your library user name and password.</li>
-<li><strong>Downloading:</strong> <a href="{{ cfg.PORTAL_URL }}/library">My books</a> → Download, in the format you choose on Devices (EPUB, KEPUB, PDF...).</li>
+<li><strong>Downloading:</strong> <a href="{{ cfg.PORTAL_URL }}/library">My books</a> → Download, in the format you choose on Devices (EPUB, KEPUB, PDF...). A comic's page offers its CBZ.</li>
 <li><strong>KOReader progress:</strong> KOReader's built-in progress sync does not work with this library; Devices explains the plugin that does.</li>
 </ul>
-<h3>Comics on an iPad or phone</h3>
-<p>Download the CBZ from the comic's page and open it in Panels or Chunky (iPad), or any comic reader. Or add the OPDS catalog above in Panels or Chunky and browse your comics there.</p>
 <h3>Mark what you read</h3>
-<p>Apps on a phone or iPad do not report your progress to the library: mark books Read on their page in the portal.</p>
+<p>Apps on a phone or tablet do not report your progress to the library: mark books Read on their page in the portal.</p>
 {% endblock %}
