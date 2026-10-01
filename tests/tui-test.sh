@@ -61,7 +61,7 @@ docker() {
     # it exits 1 with "Error: EOF" and prints nothing. The stub is just as strict.
     *"caddy hash-password"*) [ "${HASH_STUB_BROKEN:-0}" = 1 ] && { echo "Error: EOF" >&2; return 1; }
        case "$stdin_raw" in *$'\n') echo '$2a$14$STUBHASH/abc';; *) echo "Error: EOF" >&2; return 1;; esac;;
-    *"authelia crypto hash"*) echo 'Digest: $argon2id$v=19$m=65536,t=3,p=4$stubsalt$stubhash';;
+    *"authelia crypto hash"*) [ "${AUTH_HASH_FAIL:-0}" = 1 ] && { echo "Error: stub hash failure" >&2; return 1; }; echo 'Digest: $argon2id$v=19$m=65536,t=3,p=4$stubsalt$stubhash';;
     *"python -m cwa add-user"*) echo '{"ok": true, "user": "alice", "id": 2, "kobo_url": "https://books.example.test/kobo/abc123"}';;
     *"caddy validate"*) [ "${FAIL_VALIDATE:-0}" = 1 ] && { echo "Error: adapting config: bad directive"; return 1; }; :;;
     *"python -m cwa rename-user"*) [ "${FAIL_RENAME:-0}" = 1 ] && return 1; echo '{"ok": true}';;
@@ -501,6 +501,7 @@ cp "$f" "$T/users.keep"
 # C9: SMTP notifier rendered into configuration.yml (password via Authelia's template filter only)
 envset SMTP_HOST smtp.example.test; envset SMTP_PORT 587; envset SMTP_SECURITY starttls; envset SMTP_USER "lib@example.test"; envset SMTP_FROM "Library <lib@example.test>"
 render_authelia_config; ac="$STACK_DIR/authelia/configuration.yml"
+expect 'grep -A1 "^  password_reset:" "$ac" | grep -q "disable: true"' "the sign-in page has no Reset password (v6.3.2: a reset there changed only its own copy; the apps kept the old password)"
 if grep -q "@NOTIFIER_BEGIN@" "$STACK_DIR/authelia/configuration.yml.template"; then
   expect 'grep -q "address: '"'"'submission://smtp.example.test:587'"'"'" "$ac" && grep -qF '"'"'password: {{ env "BOOKSTACK_SMTP_PASS" | quote }}'"'"' "$ac" && ! grep -q "^  filesystem:" "$ac" && ! grep -q "^[^#]*AUTHELIA_NOTIFIER_SMTP_PASSWORD" "$ac" && grep -q "@NOTIFIER_END@" "$ac"' "SMTP set: smtp notifier (submission://, password from env template) replaces the filesystem one"
   envset SMTP_SECURITY ssl; envset SMTP_PORT 465; render_authelia_config
@@ -577,9 +578,13 @@ expect '! seen "alicepass-123 --admin"' "non-admin by default"
 expect '[ -d "$STACK_DIR/library/dropbox/alice" ]' "dropbox created"
 expect 'seen "https://books.example.test/kobo/abc123"' "Kobo link shown to the admin"
 expect 'seen "authelia crypto hash"' "Authelia login created alongside (Authelia enabled)"
+expect 'seen "Authelia sign-in created with the same password." && ! seen "could NOT be created" && ! seen "second factor is set up"' "a reader's sign-in is reported as created (v6.3.2: every reader's was reported as failed although it was made)"
 reset "boss" "boss@mail.example" "bosspass-123" "bosspass-123" "yes" "k@kindle.com"; step_user_add
 expect 'seen "add-user boss --email boss@mail.example --password-stdin --admin" && ! grep -q "ask: .*e-mail.*boss@example.test" "$LOG"' "admin flag; the e-mail is asked, not pre-filled as <user>@DOMAIN (F49)"
 expect 'seen "cwa kindle boss k@kindle.com"' "Kindle set during creation"
+expect 'seen "Authelia sign-in created with the same password (a second factor is set up at first sign-in)."' "an admin's sign-in is reported as created, with the second-factor note"
+AUTH_HASH_FAIL=1; reset "hal" "hal@mail.example" "halpass-1234" "halpass-1234" "no" ""; step_user_add; AUTH_HASH_FAIL=0
+expect 'seen "Authelia sign-in could NOT be created: hashing the password failed (Error: stub hash failure)"' "a real failure says why, and where to finish it"
 reset "nomail" ""; step_user_add; expect '[ $? = 1 ] && ! seen "add-user nomail"' "blank e-mail refused (F49)"
 # A15: the dropbox watcher skips folders starting with '.', so such an account can never import
 reset ".kim"; step_user_add; rc=$?

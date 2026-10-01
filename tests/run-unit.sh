@@ -13,6 +13,11 @@ if [[ -z "${SKIP_AUDIT:-}" ]]; then
   uvx pip-audit --require-hashes --strict -r librarian/requirements.lock
 fi
 docker build -q -t bookstack/librarian:test librarian/ >/dev/null
+# Parallel (pytest-xdist): each worker is its own process, and conftest gives every process its own
+# temporary databases and folders, so workers never share state. UNIT_WORKERS=0 runs them one at a
+# time (to compare, or to chase a test that leans on another's leftovers); default: one per core.
+workers="${UNIT_WORKERS:-auto}"
+par=""; [ "$workers" = 0 ] || par="-n $workers"
 # scripts/ too, read-only: test_canary loads scripts/synthetic.py (host-side, stdlib only)
-docker run --rm -e LIBRARIAN_TEST=1 -v "$PWD/librarian/tests:/app/tests:ro" -v "$PWD/scripts:/scripts:ro" bookstack/librarian:test \
-  sh -c 'pip install -q pytest >/dev/null 2>&1 && python -m pytest -q -p no:cacheprovider tests "$@"' -- "$@"
+docker run --rm -e LIBRARIAN_TEST=1 -e PAR="$par" -v "$PWD/librarian/tests:/app/tests:ro" -v "$PWD/scripts:/scripts:ro" bookstack/librarian:test \
+  sh -c 'pip install -q pytest pytest-xdist >/dev/null 2>&1 && python -m pytest -q -p no:cacheprovider $PAR tests "$@"' -- "$@"

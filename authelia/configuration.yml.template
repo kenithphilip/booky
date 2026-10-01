@@ -8,6 +8,12 @@ totp:
   issuer: '@@DOMAIN@@'
 
 authentication_backend:
+  # v6.3.2: no "Reset password?" on the sign-in page. A reset there changes only this file:
+  # passwords flow from the portal to here (gate-sync), never back, so the audiobook app, reading
+  # apps and Shelfmark kept the old one. One way only: the admin resets it (bookstack.sh Users ->
+  # Reset a user's password), the reader chooses their own on the portal (Devices -> Account).
+  password_reset:
+    disable: true
   file:
     path: /config/users_database.yml
     # L05: the host's gate-sync writes portal password changes here; Authelia re-reads the file

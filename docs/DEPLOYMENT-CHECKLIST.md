@@ -200,6 +200,26 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.3.2 (Authelia: no false "could NOT be added"; no password reset on the sign-in page)
+- Users -> Add a user created the reader's Authelia sign-in, then said "Authelia user could NOT be
+  added": its success note was built with a $(...) that exits 1 for a reader without a second
+  factor, and a shell assignment takes the exit status of its last $(...). Every reader since
+  v6.0 got the false message (found adding namrata, 2026-09-30). The note is now built after the
+  outcome; a real failure says why (hashing, the user file, a missing e-mail address).
+- The sign-in page's "Reset password?" is off (authentication_backend.password_reset.disable). A
+  reset there changed only Authelia's file: passwords flow portal -> Authelia (gate-sync), never
+  back, so Audiobookshelf's app, reading apps (OPDS) and Shelfmark kept the old password. The one
+  path: the admin resets it (Users -> Reset a user's password), the reader chooses their own on the
+  portal (Devices -> Account), which reaches every site.
+- Unit tests run in parallel (pytest-xdist, one worker per core; UNIT_WORKERS=0 for one at a time):
+  about 3 minutes instead of 10, same 898 tests.
+- After Deploy: nothing to do. Readers added before: their sign-in exists (the message was wrong);
+  `grep -E '^  [a-z0-9._-]+:$' /srv/bookstack/authelia/users_database.yml` lists them.
+- Tests (run side by side for the first time: 13 minutes in all, was about 40): unit 898 passed,
+  installer 848 passed, end-to-end 362 checks / 0 failed (the Open Library search check skipped:
+  Open Library did not answer during the run; it passed the run before and search is untouched),
+  lint clean.
+
 ## v6.3.1 (a welcome e-mail for new family members; a nudge to choose their own password)
 - Users -> Add a user offers to e-mail the new member a welcome (when outgoing mail is set up): where
   to start (the start page), their user name, the first five minutes (their devices, choosing their

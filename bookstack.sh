@@ -2041,7 +2041,19 @@ step_user_add() {
   out=$(printf '%s' "$pw" | lib add-user "$u" --email "$em" --password-stdin $role 2>&1) || { msg "Could not create user:\n\n$out"; return 1; }
   install -d -o 1000 -g 1000 "$STACK_DIR/library/dropbox/$u"
   kobo=$(printf '%s' "$out" | json 'd.get("kobo_url","")')
-  if [ "$(envget AUTHELIA_ENABLED)" = "true" ]; then authelia_add_user "$u" "$u" "$em" "$pw" && { authelia_sync_admin_groups >/dev/null 2>&1 || true; } && anote="Authelia SSO account created with the same password$([ -n "$role" ] || [ "$(envget AUTHELIA_READERS_2FA)" = true ] && printf ' (a second factor is set up at first sign-in)')." || anote="Authelia user could NOT be added — use Security -> Authelia add user."; else anote="(Authelia is off; enable it under Security for SSO + 2FA.)"; fi
+  # v6.3.2: the note is built AFTER the outcome is known. It used to be built inside the success
+  # branch with a $(...) that exits 1 for a reader without a second factor, and an assignment takes
+  # the exit status of its last $(...): every reader's login was created, then reported as failed.
+  if [ "$(envget AUTHELIA_ENABLED)" = "true" ]; then
+    local second=""
+    if [ -n "$role" ] || [ "$(envget AUTHELIA_READERS_2FA)" = true ]; then second=" (a second factor is set up at first sign-in)"; fi
+    if authelia_add_user "$u" "$u" "$em" "$pw"; then
+      authelia_sync_admin_groups >/dev/null 2>&1 || true
+      anote="Authelia sign-in created with the same password$second."
+    else
+      anote="Authelia sign-in could NOT be created: ${AUTHELIA_ERR:-unknown reason}. Security -> Authelia: add or reset a user creates it (use the same password)."
+    fi
+  else anote="(Authelia is off; enable it under Security for SSO + 2FA.)"; fi
   if abs_ready; then
     if [ -n "$role" ]; then absnote="Audiobookshelf: admins use the ABS root account (Library -> Audiobookshelf)."
     elif printf '%s' "$pw" | absctl ensure-user "$u" --password-stdin >/dev/null 2>&1; then absnote="Audiobookshelf account created with the same password; sees only audiobooks tagged owner:$u."
@@ -3031,17 +3043,21 @@ gate_sso_off(){
   remove_gate_sync_units
 }
 authelia_add_user() { # name displayname email password (blank displayname/email = keep the stored ones; a NEW user needs an e-mail)
-  local hash f
-  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  # v6.3.2: AUTHELIA_ERR says why when it fails (the callers show it)
+  local hash f rc herr
+  AUTHELIA_ERR=""
+  [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] || { AUTHELIA_ERR="'$1' is not a valid user name"; return 1; }
   # The password reaches the container through the environment (`-e PW` passes the variable
   # through from docker's own env), never through the host's argv / `ps` / `docker inspect`.
-  hash=$(PW="$4" docker run --rm -e PW "$(img IMG_AUTHELIA)" sh -c 'authelia crypto hash generate argon2 --password "$PW"' 2>/dev/null | awk -F': ' '/Digest|Hash/{print $2; exit}')
-  [ -n "$hash" ] || return 1
+  herr=$(mktemp)
+  hash=$(PW="$4" docker run --rm -e PW "$(img IMG_AUTHELIA)" sh -c 'authelia crypto hash generate argon2 --password "$PW"' 2>"$herr" | awk -F': ' '/Digest|Hash/{print $2; exit}')
+  [ -n "$hash" ] || { AUTHELIA_ERR="hashing the password failed ($(tail -1 "$herr" | cut -c1-120))"; rm -f "$herr"; return 1; }
+  rm -f "$herr"
   f="$STACK_DIR/authelia/users_database.yml"
   [ -f "$f" ] || echo "users: {}" > "$f"
   # Scalars are written JSON-quoted (valid YAML double-quoted strings): a quote or colon in a
   # display name or e-mail can no longer break the file and lock everyone out (Authelia fails closed).
-  python3 - "$f" "$1" "$2" "$3" "$hash" <<'PYU' || return 1
+  python3 - "$f" "$1" "$2" "$3" "$hash" <<'PYU'
 import sys, re, json
 f, u, dn, em, h = sys.argv[1:6]
 s = open(f).read()
@@ -3070,6 +3086,11 @@ s = s.rstrip("\n") + "\n  %s:\n    displayname: %s\n    password: %s\n    email:
 with open(f, "w") as out:
     out.write(s)
 PYU
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    if [ "$rc" = 3 ]; then AUTHELIA_ERR="a new sign-in needs an e-mail address"; else AUTHELIA_ERR="could not write $f"; fi
+    return 1
+  fi
   chown 1000:1000 "$f"
   authelia_sync_admin_groups >/dev/null 2>&1 || true     # admins group = Calibre-Web admins (L05)
   composeA restart authelia >/dev/null 2>&1 || true
@@ -3123,7 +3144,7 @@ step_authelia_user() {
   [ -z "$em" ] || valid_email "$em" || { msg "'$em' is not an e-mail address."; return 1; }
   pw=$(askpw2 "Password:") || return 1
   clear; echo "Hashing password..."
-  authelia_add_user "$u" "$dn" "$em" "$pw" && { authelia_sync_admin_groups >/dev/null 2>&1 || true; } && msg "User '$u' added/updated. They sign in at https://auth.$(envget DOMAIN)$( { authelia_is_admin "$u" || [ "$(envget AUTHELIA_READERS_2FA)" = true ]; } && printf ' and set up a second factor at their first sign-in')." || msg "Could not add/update '$u' (password hashing failed, or a NEW login needs an e-mail address)."
+  authelia_add_user "$u" "$dn" "$em" "$pw" && { authelia_sync_admin_groups >/dev/null 2>&1 || true; } && msg "User '$u' added/updated. They sign in at https://auth.$(envget DOMAIN)$( { authelia_is_admin "$u" || [ "$(envget AUTHELIA_READERS_2FA)" = true ]; } && printf ' and set up a second factor at their first sign-in')." || msg "Could not add/update '$u': ${AUTHELIA_ERR:-unknown reason}."
 }
 
 # ---------- 21. Intake & dropboxes ----------
