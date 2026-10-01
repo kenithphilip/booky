@@ -344,6 +344,13 @@ def init():
             c.execute("ALTER TABLE comic_convert ADD COLUMN remake INTEGER DEFAULT 0")   # v6.1: replace the Kobo copy
         if "made" not in {r[1] for r in c.execute("PRAGMA table_info(comic_convert)")}:
             c.execute("ALTER TABLE comic_convert ADD COLUMN made TEXT")    # v6.2: what the Kobo copy was made for (JSON)
+        # v6.4.0: self-service password reset links: only the SHA-256 of the token is kept; one-time,
+        # short-lived, one live link per reader (asking again cancels the last one)
+        c.execute("""CREATE TABLE IF NOT EXISTS password_reset(
+            token_hash TEXT PRIMARY KEY, owner TEXT NOT NULL, ip TEXT, created REAL NOT NULL,
+            expires REAL NOT NULL, used REAL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS password_reset_owner ON password_reset(owner, created)")
+        c.execute("""CREATE TABLE IF NOT EXISTS password_reset_ask(ip TEXT, owner TEXT, at REAL NOT NULL)""")
         # v6.3: books the portal took off a reader's device, or keeps on it, or reminded them about:
         # device kobo|kindle; status waiting (finished, counting down) | off | kept | reminded | done
         c.execute("""CREATE TABLE IF NOT EXISTS device_book(
@@ -509,6 +516,48 @@ def pw_temp(owner):
     with _conn() as c:
         r = c.execute("SELECT pw_temp FROM prefs WHERE owner=?", (owner,)).fetchone()
     return bool(r and r[0])
+
+def reset_add(owner, token_hash, ip, ttl, now=None):
+    """A new reset link for this reader; any earlier live one stops working."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("UPDATE password_reset SET used=? WHERE owner=? AND used IS NULL", (now, owner))
+        c.execute("INSERT INTO password_reset(token_hash, owner, ip, created, expires) VALUES(?,?,?,?,?)",
+                  (token_hash, owner, ip, now, now + ttl))
+        c.execute("DELETE FROM password_reset WHERE created < ?", (now - 30 * 86400,))
+
+def reset_owner(token_hash, now=None):
+    """The reader a live (unused, unexpired) link belongs to, or None."""
+    now = now or time.time()
+    with _conn() as c:
+        r = c.execute("SELECT owner FROM password_reset WHERE token_hash=? AND used IS NULL AND expires > ?",
+                      (token_hash, now)).fetchone()
+    return r[0] if r else None
+
+def reset_use(token_hash, now=None):
+    """Spend a link (and every other live link of the same reader). True when it was live."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        r = c.execute("SELECT owner FROM password_reset WHERE token_hash=? AND used IS NULL AND expires > ?",
+                      (token_hash, now)).fetchone()
+        if not r:
+            return False
+        c.execute("UPDATE password_reset SET used=? WHERE owner=? AND used IS NULL", (now, r[0]))
+        return True
+
+def reset_asked(ip, owner=None, now=None):
+    """Record a reset request (for the rate limits)."""
+    now = now or time.time()
+    with _lock, _conn() as c:
+        c.execute("INSERT INTO password_reset_ask(ip, owner, at) VALUES(?,?,?)", (ip, owner, now))
+        c.execute("DELETE FROM password_reset_ask WHERE at < ?", (now - 86400,))
+
+def reset_asks(ip=None, owner=None, since=3600, now=None):
+    now = now or time.time()
+    with _conn() as c:
+        if owner is not None:
+            return c.execute("SELECT COUNT(*) FROM password_reset_ask WHERE owner=? AND at > ?", (owner, now - since)).fetchone()[0]
+        return c.execute("SELECT COUNT(*) FROM password_reset_ask WHERE ip=? AND at > ?", (ip, now - since)).fetchone()[0]
 
 def private_readers():
     """v6.3: readers whose books are never offered to the rest of the family."""

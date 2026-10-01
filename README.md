@@ -525,6 +525,9 @@ one arrives like a book:
   (Colorsoft, Paperwhite, the basic Kindle, Oasis, Scribe), iPhone, iPad, Android phone or tablet.
   Comics are made for those screens; the start page shows the steps and apps for each device. A
   reader who ticks nothing gets what v6.1 made (a Libra Colour / Colorsoft copy, in colour).
+- **Forgot password? (v6.4)**: a reader resets it themselves from the sign-in page: a one-time e-mailed
+  link, and the new password is set in every place at once (or nowhere, if the audiobook server cannot
+  take it). Admin accounts are reset on the server.
 - **Welcoming a new member (v6.3.1)**: Users -> Add a user can e-mail them a welcome (where to start,
   their user name, the first steps, how to get books; never the password), and every page asks them
   to choose their own password until they do.

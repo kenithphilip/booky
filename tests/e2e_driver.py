@@ -11,7 +11,7 @@ dashboard -> Shelfmark login -> Authelia gate (bypass for Kobo/OPDS, gate for th
 Audiobookshelf API (init, library, users, scan, tag, per-user visibility).
 Exit code = number of failed checks."""
 import sys, os, re, json, time, sqlite3, zipfile, subprocess, urllib.request, urllib.parse, urllib.error
-import http.cookiejar, mimetypes, uuid, base64, smtplib, imaplib, email, io
+import http.cookiejar, mimetypes, uuid, base64, smtplib, imaplib, email, email.policy, io
 from email.message import EmailMessage
 
 STACK = sys.argv[1]
@@ -533,6 +533,50 @@ check(authelia_ok("carol", "carol-third-pw-e2e"), "Authelia accepts the new pass
 check(authelia_cookie("carol", "carol-new-pw-e2e")[0] in (401, 403), "and no longer the old one")
 r = subprocess.run(["docker", "exec", "librarian", "python", "-m", "admin_cli", "gate", "pending"], capture_output=True, text=True)
 check('"rows": []' in r.stdout, "the queue is empty afterwards (no hash left behind)", r.stdout[-160:])
+
+# --- v6.4.0: a reader resets a forgotten password themselves, and it changes EVERYWHERE at once
+def mail_body(user, subject_contains):
+    M = imaplib.IMAP4(IMAP_HOST, IMAP_PORT); M.login(user, "x"); M.select("INBOX")
+    _, data = M.search(None, "ALL"); body = None
+    for num in data[0].split():
+        _, d = M.fetch(num, "(RFC822)"); msg = email.message_from_bytes(d[0][1], policy=email.policy.default)
+        if subject_contains in (msg.get("Subject") or ""):
+            body = msg.get_body(preferencelist=("plain",)).get_content()
+    M.logout(); return body
+portal_post(pa, "/admin", "/admin", {"action": "add_user", "name": "dana", "email": "dana@example.test", "password": "dana-first-pw1"})
+r = gate_sync()
+check("dana: ok (gate login created)" in r.stdout and authelia_ok("dana", "dana-first-pw1"), "dana has a reader account everywhere, the sign-in page included", r.stdout[-200:])
+rg = Session()                                     # NOT signed in: whoever forgot cannot sign in first
+gq = {"Host": "request.example.test", "X-Forwarded-Proto": "https", **BROWSER}
+st, h, b = rg.get(GATE + "/forgot", headers=gq)
+check(st == 200 and b'name="ident"' in b, "the reset page opens through the gate without signing in", str(st) + " " + h.get("Location", ""))
+st, h, b = rg.post(GATE + "/forgot", {"ident": "dana", "csrf": csrf(b)}, headers=gq)
+check(st == 200 and b"is on its way" in b, "she asks for a link with her user name", str(st))
+body = wait(lambda: mail_body("dana@example.test", "Reset your library password"), 60, 3) or ""
+m = re.search(r"https://request\.example\.test(/reset/[A-Za-z0-9_-]+)", body)
+check(bool(m), "the link arrives in her inbox", body[:200])
+if m:
+    st, h, b = rg.get(GATE + m.group(1), headers=gq)
+    check(st == 200 and b"Choose a new password" in b and b"dana" in b, "the link opens through the gate: choose a new password", str(st))
+    st, h, b = rg.post(GATE + m.group(1), {"new": "dana-reset-pw1", "repeat": "dana-reset-pw1", "csrf": csrf(b)}, headers=gq)
+    check(st == 200 and b"Password changed" in b, "she sets dana-reset-pw1", str(st) + " " + b[:200].decode("utf-8", "replace"))
+    r = gate_sync()
+    check(authelia_ok("dana", "dana-reset-pw1") and authelia_cookie("dana", "dana-first-pw1")[0] in (401, 403),
+          "the sign-in page takes the new password, and no longer the old one", r.stdout[-160:])
+    pd, st, loc = portal_login("dana", "dana-reset-pw1")
+    check(st in (302, 303) and "/login" not in loc, "the portal takes it")
+    _, stc, locc, _ = cwa_login("dana", "dana-reset-pw1")
+    _, sto, loco, _ = cwa_login("dana", "dana-first-pw1")
+    check(stc in (302, 303) and "/login" not in locc and (sto == 200 or "/login" in loco), "the library site takes it, and not the old one")
+    st1, _, _ = Session().get(CWA + "/opds", headers=basic("dana", "dana-reset-pw1"))
+    st2, _, _ = Session().get(CWA + "/opds", headers=basic("dana", "dana-first-pw1"))
+    check(st1 == 200 and st2 == 401, "a reading app (OPDS) takes it, and not the old one", f"{st1} {st2}")
+    st1, _, _ = Session().post(ABS + "/login", json_body={"username": "dana", "password": "dana-reset-pw1"})
+    st2, _, _ = Session().post(ABS + "/login", json_body={"username": "dana", "password": "dana-first-pw1"})
+    check(st1 == 200 and st2 == 401, "the audiobook app (Audiobookshelf) takes it, and not the old one: never two passwords", f"{st1} {st2}")
+    check(bool(wait(lambda: mail_body("dana@example.test", "Your library password was changed"), 60, 3)), "and she is told by e-mail that it changed")
+    st, h, b = rg.get(GATE + m.group(1), headers=gq)
+    check(b"no longer works" in b, "the link works only once", str(st))
 
 print("== 13. Audiobookshelf: bootstrapped by the installer, accounts by the Users menu, tagging by the worker")
 def absctl(*args):

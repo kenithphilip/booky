@@ -200,6 +200,27 @@ stop fitting in the night — not for memory. `docs/RESEARCH-GAPS.md` §2 has th
   for approval, a Review button; tomorrow at 09:05 the first disk summary arrives ("First
   report"), the day after it shows the growth; Self-test shows "daily disk summary scheduled".
 
+## v6.4.0 (a reader resets a forgotten password themselves; it changes everywhere at once)
+- "Forgot password?" on the sign-in page (Authelia password_reset.custom_url) and on the portal's own
+  sign-in page opens request./forgot: a user name or e-mail address, always the same answer (it never
+  tells whether an account exists). A matching READER gets a one-time link by e-mail (random, 30
+  minutes, kept only as its SHA-256; asking again cancels the last one). Admins never: their second
+  factor must not be got around by an e-mailed link; they are reset on the server (Users -> 5).
+- The link's page sets the new password through librarian/passwords.py, the ONE way a password changes
+  (Devices -> Account uses it too): Audiobookshelf FIRST, and if it cannot take it nothing changes
+  anywhere; then Calibre-Web (portal, library site, OPDS apps, Shelfmark), retried through a CWA
+  restart; then the sign-in page, queued for gate-sync (seconds; a 10-minute timer retries). Never two
+  passwords. The link is spent, the reader's lockout cleared, a confirmation mailed, the admin told.
+- Only /forgot and /reset/<token> bypass the gate on request. (Caddy and Authelia, in step); POSTs to
+  them share the sign-in pages' per-address limit, and the portal allows a few requests an hour per
+  account and per address.
+- Guides, the FAQ and the welcome e-mail say "Forgot password? on the sign-in page" now.
+- After Deploy: nothing to do (it needs the outgoing mail you already have).
+- Tests (side by side, 13 minutes): unit 907 passed, installer 849 passed, end-to-end 376 checks / 0
+  failed (new: a reader asks through the real gate without signing in, opens the link from the test
+  inbox, sets a new password; it then works on the sign-in page, the portal, the library site, OPDS
+  and Audiobookshelf, and the old one on none of them; the link works once), lint clean.
+
 ## v6.3.2 (Authelia: no false "could NOT be added"; no password reset on the sign-in page)
 - Users -> Add a user created the reader's Authelia sign-in, then said "Authelia user could NOT be
   added": its success note was built with a $(...) that exits 1 for a reader without a second

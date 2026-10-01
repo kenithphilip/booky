@@ -8,7 +8,7 @@ from concurrent.futures import TimeoutError as FutureTimeout
 from werkzeug.middleware.proxy_fix import ProxyFix
 from markupsafe import Markup
 import config, db, auth, fetchers, worker, notify, dedupe, enrich, cwa, library, kindle, wanted, bookmeta
-import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share, devicemodels, ondevice
+import comics, comicmeta, comicrel, follows, hardcover, anilist, bookreq, share, devicemodels, ondevice, passwords
 import abs as absapi
 
 app = Flask(__name__)
@@ -339,6 +339,42 @@ def login():
         return _login_page(401)       # 401 so Caddy's log / fail2ban can count it
     _csrf_token()
     return _login_page()
+
+# ---- v6.4.0: a reader resets a forgotten password themselves (pwreset.py; reachable without signing in) ----
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot():
+    """'Forgot password?': the same answer whatever was typed, so it never tells whether an account
+    exists. The sign-in page's own link (Authelia password_reset.custom_url) leads here."""
+    import pwreset
+    sent = False
+    if request.method == "POST":
+        pwreset.request(request.form.get("ident", ""), _ip())
+        sent = True
+    _csrf_token()
+    return render_template("forgot.html", sent=sent, available=pwreset.available())
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    """The link from the reset e-mail: choose a new password; it is set everywhere at once."""
+    import pwreset
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", token or ""):
+        abort(404)
+    owner = pwreset.owner_of(token)
+    error = None
+    if request.method == "POST" and owner:
+        try:
+            pwreset.complete(token, request.form.get("new", ""), request.form.get("repeat", ""), _ip())
+            session.clear()                      # any half-signed-in state from before the reset
+            _csrf_token()
+            return render_template("reset.html", done=True, owner=owner)
+        except passwords.PasswordError as e:
+            error = str(e).capitalize() + "."
+        except ValueError:
+            owner = None
+    _csrf_token()
+    resp = Response(render_template("reset.html", owner=owner, error=error, done=False, min_len=passwords.MIN_LENGTH))
+    resp.headers["Referrer-Policy"] = "no-referrer"      # the token is in this page's address
+    return resp
 
 @app.route("/logout", methods=["POST"])
 def logout():
@@ -2443,23 +2479,19 @@ def devices():
                     flash("The library is restarting. Try again in a minute.")
                 elif not ok:
                     _audit("password_change_failed"); flash("Current password is wrong.")
-                elif new != rep:
-                    flash("The new passwords do not match.")
+                elif passwords.check(new, rep):
+                    flash(passwords.check(new, rep).capitalize() + ".")
                 else:
-                    cwa.set_password(user, new)
-                    db.set_pw_temp(user, False)          # v6.3.1: their own password now
-                    note = ""
-                    if absapi.configured():
-                        try:
-                            absapi.set_password(user, new); note = " Audiobookshelf too."
-                        except Exception:
-                            note = " (Audiobookshelf could not be updated — tell the admin.)"
-                    fp = auth.fingerprint(user)          # keep THIS session; older cookies expire
-                    if fp and fp is not auth.UNAVAILABLE:
-                        session["fp"], session["chk"] = fp[0], time.time()
-                        db.set_pw_fingerprint(user, fp[0])   # this change IS synced: do not warn about it
-                    if config.AUTHELIA_ENABLED:
-                        db.gate_queue(user, new)
+                    # v6.4.0: one way a password changes, everywhere at once (passwords.py)
+                    try:
+                        res = passwords.set_everywhere(user, new)
+                    except passwords.PasswordError as e:
+                        flash(str(e).capitalize() + ".")
+                        return redirect(url_for("devices") + "#account")
+                    note = " Audiobookshelf too." if res["abs"] else ""
+                    if res["fp"]:                        # keep THIS session; older cookies expire
+                        session["fp"], session["chk"] = res["fp"], time.time()
+                    if res["gate"]:
                         note += " The sign-in page in front of the sites (Authelia) takes the new password within a minute."
                     _audit("password_change")
                     # NOT Shelfmark: it signs its own session cookie and only checks app.db at

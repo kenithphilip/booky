@@ -466,7 +466,7 @@ reset "example.test" "admin@example.test" "UTC" "cf-token-123" "yes"; step_confi
 
 echo "== Authelia gate + users"
 inject_authelia_gate >/dev/null; expect '[ "$(grep -cE "^\s*forward_auth " "$STACK_DIR/caddy/Caddyfile")" = 5 ] && [ "$(grep -cE "^\s*forward_auth @authelia_protected " "$STACK_DIR/caddy/Caddyfile")" = 3 ] && [ "$(grep -cE "^\s*forward_auth 127.0.0.1:9091" "$STACK_DIR/caddy/Caddyfile")" = 2 ]' "gate injected into 5 vhosts (shelf and home. without a bypass matcher)"
-expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/intake$|/send$|/send/file$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader and intake bypasses present as anchored, case-sensitive regexps"
+expect 'grep -qF "not path_regexp ^(?:/api/UserStorage/|/api/internal/notebooks(/|$)|/api/v3/content/|/kobo/|/kosync(/|$)|/opds(/|$))" "$STACK_DIR/caddy/Caddyfile" && grep -qF "not path_regexp ^(?:/forgot$|/intake$|/reset/|/send$|/send/file$)" "$STACK_DIR/caddy/Caddyfile" && ! grep -q "@@BYPASS@@" "$STACK_DIR/caddy/Caddyfile"' "Kobo/OPDS/KOReader, intake and password-reset (v6.4.0) bypasses present as anchored, case-sensitive regexps"
 render_caddyfile; expect '! grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "re-render removes the gate (disable path)"
 envset AUTHELIA_ENABLED true; reset "example.test" "admin@example.test" "UTC" "" "yes"; step_configure >/dev/null
 expect 'grep -q forward_auth "$STACK_DIR/caddy/Caddyfile"' "Configure re-applies the gate when Authelia is enabled"
@@ -501,7 +501,11 @@ cp "$f" "$T/users.keep"
 # C9: SMTP notifier rendered into configuration.yml (password via Authelia's template filter only)
 envset SMTP_HOST smtp.example.test; envset SMTP_PORT 587; envset SMTP_SECURITY starttls; envset SMTP_USER "lib@example.test"; envset SMTP_FROM "Library <lib@example.test>"
 render_authelia_config; ac="$STACK_DIR/authelia/configuration.yml"
-expect 'grep -A1 "^  password_reset:" "$ac" | grep -q "disable: true"' "the sign-in page has no Reset password (v6.3.2: a reset there changed only its own copy; the apps kept the old password)"
+# v6.4.0: Forgot password? on the sign-in page opens the portal's reset (it sets the password everywhere)
+reset_link_ok(){ grep -A2 "^  password_reset:" "$ac" | grep -q "disable: false" && grep -A2 "^  password_reset:" "$ac" | grep -qF "custom_url: 'https://request.example.test/forgot'"; }
+reset_bypass_ok(){ grep -qF -- "- '^/forgot\$'" "$ac" && grep -qF -- "- '^/reset/[A-Za-z0-9_-]{20,100}\$'" "$ac"; }
+expect 'reset_link_ok' "Forgot password? on the sign-in page opens the portal reset, which sets it everywhere (v6.4.0)"
+expect 'reset_bypass_ok' "only the two reset pages bypass the gate on request. (whoever forgot their password cannot sign in first)"
 if grep -q "@NOTIFIER_BEGIN@" "$STACK_DIR/authelia/configuration.yml.template"; then
   expect 'grep -q "address: '"'"'submission://smtp.example.test:587'"'"'" "$ac" && grep -qF '"'"'password: {{ env "BOOKSTACK_SMTP_PASS" | quote }}'"'"' "$ac" && ! grep -q "^  filesystem:" "$ac" && ! grep -q "^[^#]*AUTHELIA_NOTIFIER_SMTP_PASSWORD" "$ac" && grep -q "@NOTIFIER_END@" "$ac"' "SMTP set: smtp notifier (submission://, password from env template) replaces the filesystem one"
   envset SMTP_SECURITY ssl; envset SMTP_PORT 465; render_authelia_config

@@ -1,5 +1,7 @@
 {% extends "help/_layout.html" %}{% block guide %}
 <h3>Your password</h3>
+<p>Forgot it? <strong>Forgot password?</strong> on the sign-in page e-mails you a link to choose a new one
+(<a href="{{ url_for('forgot') }}">{{ cfg.PORTAL_URL }}/forgot</a>).</p>
 <p>Change it on <a href="{{ cfg.PORTAL_URL }}/devices">Devices</a> → Account. It changes it for the portal, the library site, Shelfmark{% if abs_linked %}, Audiobookshelf{% endif %}{% if cfg.AUTHELIA_ENABLED %} and the sign-in page{% endif %} at once.</p>
 {% if cfg.AUTHELIA_ENABLED %}
 <h3>The sign-in page</h3>

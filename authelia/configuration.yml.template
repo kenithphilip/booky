@@ -8,12 +8,13 @@ totp:
   issuer: '@@DOMAIN@@'
 
 authentication_backend:
-  # v6.3.2: no "Reset password?" on the sign-in page. A reset there changes only this file:
-  # passwords flow from the portal to here (gate-sync), never back, so the audiobook app, reading
-  # apps and Shelfmark kept the old one. One way only: the admin resets it (bookstack.sh Users ->
-  # Reset a user's password), the reader chooses their own on the portal (Devices -> Account).
+  # v6.4.0: "Forgot password?" on the sign-in page opens the PORTAL's reset (librarian/pwreset.py),
+  # which sets the new password everywhere at once. Authelia's own reset stays unused: it changed
+  # only this file (passwords flow portal -> here via gate-sync, never back), so the audiobook app,
+  # reading apps and Shelfmark kept the old one (v6.3.2 switched it off for that reason).
   password_reset:
-    disable: true
+    disable: false
+    custom_url: 'https://request.@@DOMAIN@@/forgot'
   file:
     path: /config/users_database.yml
     # L05: the host's gate-sync writes portal password changes here; Authelia re-reads the file
@@ -80,6 +81,10 @@ access_control:
         - '^/intake(\?.*)?$'
         # send-to-e-reader: the e-reader's browser shows a code; the book needs that browser's cookie
         - '^/send(/file)?(\?.*)?$'
+        # v6.4.0: the self-service password reset: someone who forgot their password cannot sign in
+        # first. Only these two pages; rate-limited in Caddy and in the portal (librarian/pwreset.py)
+        - '^/forgot$'
+        - '^/reset/[A-Za-z0-9_-]{20,100}$'
     # everything else on the public apps requires a login at Authelia first. v6.0: a second factor
     # for admins always; for readers only with AUTHELIA_READERS_2FA=true (bookstack.sh renders
     # @@READER_POLICY@@ as two_factor or one_factor). First matching rule wins: admins first.

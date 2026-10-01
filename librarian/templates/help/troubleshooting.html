@@ -5,8 +5,10 @@
 
 <h3 id="signin">Signing in</h3>
 <ul>
-<li><strong>I forgot my password.</strong> Ask your library admin to set a new one for you (they do it in a minute). Then choose your own on
-<a href="{{ cfg.PORTAL_URL }}/devices#account">Devices → Account</a>.</li>
+<li><strong>I forgot my password.</strong> Tap <strong>Forgot password?</strong> on the sign-in page (or open
+<a href="{{ url_for('forgot') }}">{{ cfg.PORTAL_URL }}/forgot</a>), type your user name or e-mail address, and open the link that arrives
+(it works once, for 30 minutes). The new password works everywhere at once: the library, the sign-in page, the audiobook app and your reading apps.
+No e-mail? Check spam, ask again, or ask your library admin.</li>
 <li><strong>It says my password is wrong, and now it will not let me try.</strong> After {{ cfg.LOCKOUT_FAILS }} wrong tries the sign-in pauses for
 {{ (cfg.LOCKOUT_SECONDS // 60) }} minutes, to keep guessers out. Wait, then type it carefully (the user name is lower case). Still refused: ask your admin.</li>
 {% if cfg.AUTHELIA_ENABLED %}<li><strong>It asks for a code or a passkey and I do not have my phone.</strong> Use another second step you set up (a passkey on

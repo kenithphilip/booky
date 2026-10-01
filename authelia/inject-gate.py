@@ -34,7 +34,8 @@ BYPASS = {
     # intake webhook (bearer INTAKE_TOKEN); /healthz stays gated - health checks use loopback.
     # /send: an e-reader's browser cannot do SSO; the page only shows a code, and a book only
     # reaches the browser holding that code's secret cookie (librarian/sendcode.py)
-    "request": "/intake /send /send/file",
+    # /forgot, /reset/*: the self-service password reset (v6.4.0) - whoever forgot it cannot sign in
+    "request": "/intake /send /send/file /forgot /reset/*",
     # Shelfmark: nothing bypassed
     "shelf": "",
     # v6.0 home. (the start page): nothing bypassed, it is where people sign in

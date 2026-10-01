@@ -25,7 +25,8 @@ Devices must be the one Amazon shows for your Kindle. Devices → Send a test sh
 already holds, it is simply added to yours; nobody is told, and nothing says whose it was. A reader who keeps their books private (Your settings)
 is never counted. The library's admin, who runs it, can see every library (they need to, to fix problems); they are the only one.</p>
 <h3>I forgot my password, or the sign-in will not let me in</h3>
-<p>Ask your library admin to set a new one, then choose your own on Devices → Account. After {{ cfg.LOCKOUT_FAILS }} wrong tries the sign-in pauses for
+<p>Tap <strong>Forgot password?</strong> on the sign-in page: a link by e-mail lets you choose a new one, and it works everywhere at once.
+(Or ask your library admin.) After {{ cfg.LOCKOUT_FAILS }} wrong tries the sign-in pauses for
 {{ cfg.LOCKOUT_SECONDS // 60 }} minutes: wait and try again. More in <a href="{{ url_for('help_page', topic='troubleshooting') }}#signin">Something’s not working</a>.</p>
 <h3>Which file should I download?</h3>
 <p>EPUB for nearly everything (phones, tablets, a Kobo), KEPUB for a Kobo if you want your exact page remembered, CBZ for comics, AZW3 only for

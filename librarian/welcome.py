@@ -32,6 +32,8 @@ def _sections(user):
         f"Start here: {home}  (bookmark it: every part of the library is one tap away from there)",
         f"User name: {user}",
         "Password: the one your library admin gave you. For your safety it is never sent by e-mail.",
+        "Forgot it one day? Tap \"Forgot password?\" on the sign-in page: an e-mailed link lets you choose a new one, and it "
+        "works everywhere at once.",
     ] + (["The first time you sign in you are asked to set up a second step (an authenticator app on your "
           "phone, or a passkey). It takes a minute and keeps your account yours."] if second else [])))
     steps = [

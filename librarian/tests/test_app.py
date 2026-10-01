@@ -504,6 +504,7 @@ def test_self_service_password_change_keeps_abs_in_step(client, users, monkeypat
     assert b"do not match" in r.data
     changed = []
     monkeypatch.setattr(config, "ABS_TOKEN", "k"); monkeypatch.setattr(absapi, "set_password", lambda n, p, token=None: changed.append((n, p)))
+    monkeypatch.setattr(absapi, "find_user", lambda n, token=None: {"id": "u1"})   # v6.4.0: it must answer before anything changes
     r = post(client, "/devices", action="password", current=users["alice"], new="newpass-123", repeat="newpass-123")
     assert b"Password changed" in r.data and b"Audiobookshelf too" in r.data and changed == [("alice", "newpass-123")]
     assert auth.verify("alice", "newpass-123") and not auth.verify("alice", users["alice"])

@@ -8,5 +8,6 @@
 <p><input type="text" name="username" placeholder="Username" autofocus autocomplete="username"></p>
 <p><input type="password" name="password" placeholder="Password" autocomplete="current-password"></p>
 {% if turnstile %}<div class="cf-turnstile" data-sitekey="{{ turnstile }}" style="margin:8px 0"></div>{% endif %}
-<button type="submit">Sign in</button></form></div>
+<button type="submit">Sign in</button></form>
+<p class="mut" style="margin-top:12px"><a href="{{ url_for('forgot') }}">Forgot your password?</a></p></div>
 {% endblock %}

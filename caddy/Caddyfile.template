@@ -154,7 +154,8 @@
 		zone {args[0]}_login {
 			match {
 				method POST
-				path /login* /api/auth/*
+				# v6.4.0: and the portal's password reset (open without signing in)
+				path /login* /api/auth/* /forgot /reset/*
 			}
 			key {client_ip}
 			events 15

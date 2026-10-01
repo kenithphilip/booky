@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% block body %}
+<div class="card" style="max-width:420px;margin:8vh auto">
+{% if done %}
+<h2>Password changed</h2>
+<p>Your new password works everywhere now: the library, the audiobook app and your reading apps, and the sign-in page within a
+minute. A confirmation is on its way to your e-mail.</p>
+<p><a class="btn" href="{{ cfg.HOME_URL or url_for('login') }}">Sign in</a></p>
+{% elif not owner %}
+<h2>This link no longer works</h2>
+<p>It has expired (links last 30 minutes) or was already used. <a href="{{ url_for('forgot') }}">Ask for a new one</a>.</p>
+{% else %}
+<h2>Choose a new password</h2>
+<p class="mut">For <strong>{{ owner }}</strong>. At least {{ min_len }} characters; it will work everywhere at once.</p>
+{% if error %}<div class="flash">{{ error }}</div>{% endif %}
+<form method="post">{{ csrf_field() }}
+<p><input type="password" name="new" placeholder="New password" minlength="{{ min_len }}" autocomplete="new-password" required autofocus></p>
+<p><input type="password" name="repeat" placeholder="The same again" minlength="{{ min_len }}" autocomplete="new-password" required></p>
+<button type="submit">Save my new password</button></form>
+{% endif %}
+</div>
+{% endblock %}
